@@ -400,6 +400,38 @@ fn parse_post(
 ) -> PostCandidate {
     let start_error_count = diagnostics.len();
     let path = source.path().clone();
+    if super::path::PortableLogicalPath::parse(path.as_str(), usize::MAX).is_err() {
+        diagnostics.push(ContentValidationError::new(
+            path.clone(),
+            "$path",
+            ContentValidationCode::InvalidLogicalContentPath,
+            "post source path must use portable logical-path components",
+        ));
+    }
+    if !source.collection().contains_path(path.as_str()) {
+        diagnostics.push(ContentValidationError::new(
+            path.clone(),
+            "$path",
+            ContentValidationCode::PostCollectionPathMismatch,
+            format!(
+                "post source collection requires a path below {}/",
+                source.collection().directory()
+            ),
+        ));
+    }
+    if !path
+        .as_str()
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.ends_with(".md"))
+    {
+        diagnostics.push(ContentValidationError::new(
+            path.clone(),
+            "$path",
+            ContentValidationCode::UnexpectedPostEntry,
+            "post source path must use the exact lowercase .md suffix",
+        ));
+    }
     let Some((frontmatter, markdown)) = split_frontmatter(source.contents(), &path, diagnostics)
     else {
         return PostCandidate {
@@ -560,10 +592,23 @@ fn parse_post(
                 }
             })
             .collect();
-    let draft = match take_optional_bool(&mut table, "draft", "draft", &path, diagnostics) {
-        OptionalField::Missing | OptionalField::Valid(false) => DraftStatus::Publishable,
-        OptionalField::Valid(true) => DraftStatus::Draft,
-        OptionalField::Invalid => DraftStatus::Publishable,
+    let authored_draft = take_optional_bool(&mut table, "draft", "draft", &path, diagnostics);
+    let draft = match (source.collection(), authored_draft) {
+        (super::PostCollection::Drafts, OptionalField::Valid(false)) => {
+            diagnostics.push(ContentValidationError::new(
+                path.clone(),
+                "draft",
+                ContentValidationCode::DraftDirectoryConflict,
+                "a post in drafts/ cannot set draft to false",
+            ));
+            DraftStatus::Draft
+        }
+        (super::PostCollection::Drafts, _) => DraftStatus::Draft,
+        (
+            super::PostCollection::Posts,
+            OptionalField::Missing | OptionalField::Valid(false) | OptionalField::Invalid,
+        ) => DraftStatus::Publishable,
+        (super::PostCollection::Posts, OptionalField::Valid(true)) => DraftStatus::Draft,
     };
     let tips = match take_optional_bool(&mut table, "tips", "tips", &path, diagnostics) {
         OptionalField::Missing => Some(PostTipPolicy::InheritPublication),

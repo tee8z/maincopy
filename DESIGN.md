@@ -177,6 +177,11 @@ The content path is always explicit. Maincopy does not require a Git submodule.
 Production can use a Git worktree, a checkout, or a content-only deployment
 artifact.
 
+The configured content root is an operator-trusted deployment boundary. The
+path can be a symbolic link. Each compilation follows the configured path once
+and pins the opened directory. A later root-link swap affects only the next
+compilation.
+
 The live database, `-wal`, and `-shm` files must remain on local storage. A
 network filesystem can hold only the Litestream replica.
 
@@ -231,8 +236,8 @@ and emits a typed Mermaid placeholder until Slice 6 selects the renderer.
 use a local asset or an absolute HTTPS URL from the same allowlist for its
 preview image, Markdown images, and file links.
 
-`maincopy.toml` belongs to the host. It contains paths, listeners, database
-limits, and secret references.
+`maincopy.toml` belongs to the host. It contains paths, listeners, resource
+limits, database limits, and secret references.
 
 The host configuration selects a typed Lightning receive provider. The v1
 configuration enum contains only `Lexe`. Maincopy will add an `Lnd` variant
@@ -309,7 +314,7 @@ text = "SQLite is a file, but deployment still has coordination rules."
 | `image` | Optional | It is a local asset or an allowed HTTPS URL. |
 | `tags` | Optional | Maincopy normalizes case and rejects duplicates. |
 | `aliases` | Optional | Each alias redirects to the current slug. |
-| `draft` | Optional | The default is `false`. |
+| `draft` | Optional | Below `posts/`, the authored default is `false`. The `drafts/` collection forces the effective value to `true`. |
 | `tips` | Optional | It inherits the publication default. |
 | `distribution` | Optional | It contains target-specific policy and copy. |
 
@@ -332,9 +337,17 @@ only the typed `x` distribution target.
 `published_at` is not an authored frontmatter field in v1. Validation rejects
 it so that Git and SQLite cannot provide conflicting publication times.
 
-Draft posts validate but cannot be scheduled. A non-draft post is eligible for
-publication, but it remains absent from every public route until SQLite records
-its canonical activation.
+A file below `drafts/` always has an effective `Draft` status. An explicit
+`draft = false` value below `drafts/` is a validation error.
+
+A file below `posts/` uses its authored draft value. Draft posts validate but
+cannot be scheduled. A non-draft post is eligible for publication. It remains
+absent from public routes until SQLite records its canonical activation.
+
+Each typed post source also carries its `Posts` or `Drafts` collection. The
+collection must match the `posts/` or `drafts/` prefix in its logical path.
+Validation rejects a mismatch, so an incorrectly constructed source cannot
+bypass the draft policy.
 
 The admin API supplies `scheduled_for`. When activation is claimed, SQLite
 records one `activation_at` value immediately before the visibility swap. A
@@ -346,10 +359,86 @@ The canonical post route is `/posts/{slug}`. A slug change does not change the
 post ID, feed GUID, or prior alias redirects.
 
 Validation rejects duplicate IDs, slugs, aliases, and asset paths. Validation
-also rejects path traversal and symlinks that escape the content root.
+also rejects path traversal and every descendant symbolic link.
 
 V1 disables raw HTML in Markdown. V1 also rejects authored SVG assets. The
 diagram pipeline can emit sanitized SVG through one audited boundary.
+
+### Content-tree boundary
+
+The compiler manages only the following entries below the pinned content root:
+
+| Entry | Requirement | Managed content |
+| --- | --- | --- |
+| `publication.toml` | Required regular file | UTF-8 publication configuration |
+| `posts/` | Optional directory | UTF-8 Markdown post files |
+| `drafts/` | Optional directory | UTF-8 Markdown draft files |
+| `assets/` | Optional directory | Opaque content-owned files |
+
+The compiler ignores unrelated top-level entries, such as `.git/` and
+`README.md`. It rejects a case variant of a reserved managed entry. For
+example, `Posts/` cannot replace or accompany `posts/`.
+
+V1 content discovery supports Linux in the Nix development and deployment
+environments. The compiler pins the trusted root first. It then opens each
+descendant relative to that directory descriptor with `rustix` and `openat2`.
+
+Each descendant lookup uses `BENEATH`, `NO_SYMLINKS`, `NO_MAGICLINKS`, and
+`NO_XDEV`. These flags prevent path escape, descendant links, magic links, and
+mount-boundary traversal. An unsupported platform, kernel, or flag set returns
+a typed failure. Maincopy never uses a weaker fallback.
+
+WARNING: Do not replace descriptor-relative lookup with a path-prefix check.
+A descendant swap can escape after the check and before the open.
+
+Every managed descendant path component uses the portable ASCII filename
+characters `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`. A component cannot be empty,
+`.` or `..`. Maincopy also rejects these path forms:
+
+- non-UTF-8 or non-ASCII text;
+- percent signs or encoded traversal;
+- backslashes or control characters;
+- absolute paths; and
+- Windows drive-prefixed paths.
+
+The same grammar and exact lowercase `.md` suffix apply when an internal caller
+supplies a typed post source directly. Direct validation cannot bypass the
+content-tree path contract.
+
+A logical path preserves the accepted component spelling. It uses `/` between
+components. Its case-collision key converts only ASCII letters to lowercase.
+Validation rejects exact logical duplicates and ASCII case collisions. The
+check includes directory prefixes.
+
+Post and draft filenames use the exact lowercase `.md` suffix. Assets remain
+opaque bytes. The compiler rejects `.svg` and `.svgz` asset suffixes without
+regard to ASCII case.
+
+The compiler rejects descendant symbolic links, FIFOs, sockets, devices, and
+other special entries. It accepts regular-file hard links. Each hard-link path
+counts as a separate entry and contributes its full byte length.
+
+The host can configure each content-tree limit. V1 uses these defaults:
+
+| Limit | Default | Counting rule |
+| --- | ---: | --- |
+| `publication.toml` bytes | 256 KiB | Count the configuration file bytes. |
+| Post or draft file bytes | 4 MiB | Count each Markdown file separately. |
+| Asset file bytes | 32 MiB | Count each asset file separately. |
+| Total managed file bytes | 256 MiB | Count every managed logical file path. |
+| Managed entries | 10,000 | Exclude only the pinned content root. |
+| Logical path depth | 16 components | Count from the pinned content root. |
+| Logical path length | 1,024 bytes | Count the full `/`-separated logical path. |
+
+One kibibyte (KiB) is 1,024 bytes. One mebibyte (MiB) is 1,024 KiB. Every
+limit is inclusive.
+
+The loader enforces byte limits while it reads. It does not trust file metadata
+as the only size check. Before it returns a candidate, it verifies the pinned
+root and every loaded directory and file against their discovery fingerprints.
+A change before, during, or after an individual file read rejects the complete
+candidate. After discovery, the candidate owns all configuration, post, draft,
+and asset bytes. Later compiler stages never reopen source paths.
 
 ### Local and external assets
 
@@ -445,12 +534,17 @@ flowchart LR
     Index --> Candidate[Candidate content snapshot]
     Candidate --> Published[Apply SQLite publication ledger]
     Published -->|all checks pass| Activate[Atomic SiteSnapshot activation]
-    Validate -->|any error| Reject[Reject candidate]
+    Walk -->|any error| Reject[Reject candidate]
+    Parse -->|any error| Reject
+    Validate -->|any error| Reject
     Render -->|any error| Reject
 ```
 
 The compiler aggregates independent validation errors. Each error identifies a
 path, field, and stable error code.
+
+The tree walk produces owned candidate bytes in deterministic logical-path
+order. Parsing and later compiler stages use only those owned bytes.
 
 Request handlers never parse Markdown, execute a diagram renderer, or read the
 mutable content tree. They read an immutable `SiteSnapshot`.

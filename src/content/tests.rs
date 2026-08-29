@@ -43,7 +43,7 @@ fn validate<'source>(
         PublicationSource::new("publication.toml", publication),
         posts
             .iter()
-            .map(|(path, contents)| PostSource::new(*path, contents)),
+            .map(|(path, contents)| PostSource::in_posts(*path, contents)),
     )
 }
 
@@ -168,6 +168,100 @@ fn minimal_documents_apply_every_documented_default() {
     assert_eq!(post.tips(), PostTipPolicy::InheritPublication);
     assert_eq!(post.distribution().x().mode(), DistributionMode::Disabled);
     assert!(post.distribution().x().copy().is_none());
+}
+
+#[test]
+fn draft_collection_is_typed_and_cannot_be_overridden_publishable() {
+    let drafted = validate_content(
+        PublicationSource::new("publication.toml", MINIMAL_PUBLICATION),
+        [PostSource::in_drafts("drafts/minimal.md", MINIMAL_POST)],
+    )
+    .unwrap();
+    assert_eq!(drafted.posts()[0].metadata().draft(), DraftStatus::Draft);
+
+    let explicit_true = MINIMAL_POST.replace(
+        "description = \"Only the required post fields are present.\"",
+        "description = \"Only the required post fields are present.\"\ndraft = true",
+    );
+    let drafted = validate_content(
+        PublicationSource::new("publication.toml", MINIMAL_PUBLICATION),
+        [PostSource::in_drafts("drafts/explicit.md", &explicit_true)],
+    )
+    .unwrap();
+    assert_eq!(drafted.posts()[0].metadata().draft(), DraftStatus::Draft);
+
+    let explicit_false = MINIMAL_POST.replace(
+        "description = \"Only the required post fields are present.\"",
+        "description = \"Only the required post fields are present.\"\ndraft = false",
+    );
+    let error = validate_content(
+        PublicationSource::new("publication.toml", MINIMAL_PUBLICATION),
+        [PostSource::in_drafts("drafts/conflict.md", &explicit_false)],
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.errors()[0].code(),
+        ContentValidationCode::DraftDirectoryConflict
+    );
+}
+
+#[test]
+fn post_collection_and_logical_path_must_agree() {
+    for source in [
+        PostSource::in_posts("drafts/wrong.md", MINIMAL_POST),
+        PostSource::in_drafts("posts/wrong.md", MINIMAL_POST),
+    ] {
+        let path = source.path().as_str().to_owned();
+        assert_eq!(
+            error_contract(validate_content(
+                PublicationSource::new("publication.toml", MINIMAL_PUBLICATION),
+                [source],
+            )),
+            [(
+                path,
+                "$path".to_owned(),
+                ContentValidationCode::PostCollectionPathMismatch,
+            )]
+        );
+    }
+}
+
+#[test]
+fn direct_post_sources_enforce_portable_markdown_paths() {
+    for path in [
+        "posts/../drafts/x.md",
+        "posts/./x.md",
+        "posts//x.md",
+        "posts\\x.md",
+        "posts/%2e%2e/x.md",
+        "posts/café.md",
+        "/posts/x.md",
+    ] {
+        let errors = error_contract(validate_content(
+            PublicationSource::new("publication.toml", MINIMAL_PUBLICATION),
+            [PostSource::in_posts(path, MINIMAL_POST)],
+        ));
+        assert!(
+            errors.iter().any(|(_, field, code)| {
+                field == "$path" && *code == ContentValidationCode::InvalidLogicalContentPath
+            }),
+            "missing portable-path diagnostic for {path}: {errors:?}"
+        );
+    }
+
+    for path in ["posts/readme.txt", "posts/upper.MD", "posts/no-extension"] {
+        assert_eq!(
+            error_contract(validate_content(
+                PublicationSource::new("publication.toml", MINIMAL_PUBLICATION),
+                [PostSource::in_posts(path, MINIMAL_POST)],
+            )),
+            [(
+                path.to_owned(),
+                "$path".to_owned(),
+                ContentValidationCode::UnexpectedPostEntry,
+            )]
+        );
+    }
 }
 
 #[test]
@@ -762,9 +856,50 @@ fn enum_and_validation_code_wire_names_are_stable() {
             serde_json::to_value(MermaidRenderingMode::Placeholder).unwrap(),
             "placeholder",
         ),
+        (
+            serde_json::to_value(PostCollection::Posts).unwrap(),
+            "posts",
+        ),
+        (
+            serde_json::to_value(PostCollection::Drafts).unwrap(),
+            "drafts",
+        ),
     ] {
         assert_eq!(value, serde_json::json!(expected));
     }
+
+    for (error, expected) in [
+        (LogicalTreePathError::Empty, "empty"),
+        (LogicalTreePathError::Absolute, "absolute"),
+        (
+            LogicalTreePathError::UnsupportedComponent,
+            "unsupported_component",
+        ),
+        (LogicalTreePathError::EncodedTraversal, "encoded_traversal"),
+        (LogicalTreePathError::TooLong, "too_long"),
+        (
+            LogicalTreePathError::WrongAssetNamespace,
+            "wrong_asset_namespace",
+        ),
+    ] {
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::json!(expected)
+        );
+    }
+
+    assert_eq!(
+        serde_json::to_value(ContentTreeLimits::default()).unwrap(),
+        serde_json::json!({
+            "publication_file_bytes": 262_144,
+            "post_file_bytes": 4_194_304,
+            "asset_file_bytes": 33_554_432,
+            "total_tree_bytes": 268_435_456,
+            "entries": 10_000,
+            "depth": 16,
+            "path_bytes": 1_024,
+        })
+    );
 
     assert_eq!(
         serde_json::to_value(SubscriptionSettings::Disabled).unwrap(),
@@ -800,6 +935,86 @@ fn enum_and_validation_code_wire_names_are_stable() {
     );
 
     let codes = [
+        (
+            ContentValidationCode::ContentPlatformUnsupported,
+            "content_platform_unsupported",
+        ),
+        (
+            ContentValidationCode::ContentRootUnavailable,
+            "content_root_unavailable",
+        ),
+        (
+            ContentValidationCode::PublicationFileMissing,
+            "publication_file_missing",
+        ),
+        (
+            ContentValidationCode::ContentNamespaceInvalid,
+            "content_namespace_invalid",
+        ),
+        (
+            ContentValidationCode::ContentEntryUnreadable,
+            "content_entry_unreadable",
+        ),
+        (
+            ContentValidationCode::UnsupportedFilenameEncoding,
+            "unsupported_filename_encoding",
+        ),
+        (
+            ContentValidationCode::InvalidLogicalContentPath,
+            "invalid_logical_content_path",
+        ),
+        (
+            ContentValidationCode::UnexpectedPostEntry,
+            "unexpected_post_entry",
+        ),
+        (
+            ContentValidationCode::ContentSymlinkUnsupported,
+            "content_symlink_unsupported",
+        ),
+        (
+            ContentValidationCode::UnsupportedContentEntryKind,
+            "unsupported_content_entry_kind",
+        ),
+        (
+            ContentValidationCode::ContentTextInvalidUtf8,
+            "content_text_invalid_utf8",
+        ),
+        (
+            ContentValidationCode::AuthoredSvgUnsupported,
+            "authored_svg_unsupported",
+        ),
+        (
+            ContentValidationCode::ContentFileTooLarge,
+            "content_file_too_large",
+        ),
+        (
+            ContentValidationCode::ContentTreeTooLarge,
+            "content_tree_too_large",
+        ),
+        (
+            ContentValidationCode::ContentEntryLimitExceeded,
+            "content_entry_limit_exceeded",
+        ),
+        (
+            ContentValidationCode::ContentDepthLimitExceeded,
+            "content_depth_limit_exceeded",
+        ),
+        (
+            ContentValidationCode::ContentPathTooLong,
+            "content_path_too_long",
+        ),
+        (
+            ContentValidationCode::DuplicateLogicalAssetPath,
+            "duplicate_logical_asset_path",
+        ),
+        (
+            ContentValidationCode::LogicalPathCaseCollision,
+            "logical_path_case_collision",
+        ),
+        (
+            ContentValidationCode::ContentEntryChanged,
+            "content_entry_changed",
+        ),
         (
             ContentValidationCode::PublicationTomlInvalid,
             "publication_toml_invalid",
@@ -897,6 +1112,14 @@ fn enum_and_validation_code_wire_names_are_stable() {
         (
             ContentValidationCode::PostTipsUnconfigured,
             "post_tips_unconfigured",
+        ),
+        (
+            ContentValidationCode::DraftDirectoryConflict,
+            "draft_directory_conflict",
+        ),
+        (
+            ContentValidationCode::PostCollectionPathMismatch,
+            "post_collection_path_mismatch",
         ),
         (
             ContentValidationCode::InternalValidationInvariant,

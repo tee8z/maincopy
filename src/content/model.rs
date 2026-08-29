@@ -53,13 +53,27 @@ impl<'source> PublicationSource<'source> {
 pub struct PostSource<'source> {
     path: LogicalContentPath,
     contents: &'source str,
+    collection: PostCollection,
 }
 
 impl<'source> PostSource<'source> {
-    pub fn new(path: impl Into<String>, contents: &'source str) -> Self {
+    pub fn in_posts(path: impl Into<String>, contents: &'source str) -> Self {
+        Self::in_collection(path, contents, PostCollection::Posts)
+    }
+
+    pub fn in_drafts(path: impl Into<String>, contents: &'source str) -> Self {
+        Self::in_collection(path, contents, PostCollection::Drafts)
+    }
+
+    pub(crate) fn in_collection(
+        path: impl Into<String>,
+        contents: &'source str,
+        collection: PostCollection,
+    ) -> Self {
         Self {
             path: LogicalContentPath::new(path),
             contents,
+            collection,
         }
     }
 
@@ -69,6 +83,32 @@ impl<'source> PostSource<'source> {
 
     pub const fn contents(&self) -> &'source str {
         self.contents
+    }
+
+    pub const fn collection(&self) -> PostCollection {
+        self.collection
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostCollection {
+    Posts,
+    Drafts,
+}
+
+impl PostCollection {
+    pub const fn directory(self) -> &'static str {
+        match self {
+            Self::Posts => "posts",
+            Self::Drafts => "drafts",
+        }
+    }
+
+    pub(crate) fn contains_path(self, path: &str) -> bool {
+        path.strip_prefix(self.directory())
+            .and_then(|remainder| remainder.strip_prefix('/'))
+            .is_some_and(|remainder| !remainder.is_empty())
     }
 }
 

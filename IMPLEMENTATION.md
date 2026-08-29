@@ -259,7 +259,7 @@ Rust toolchain and the project license.
 | UUIDs | `uuid` with only the features used by typed identifiers | 0 and 1 |
 | Operational time | `time::OffsetDateTime` with `serde-well-known`; no custom timestamp type | 0 and 1 |
 | Revision digests | BLAKE3 | 1 |
-| Tree walking | Select a walker with explicit symlink control | 1 |
+| Tree walking | Linux `rustix` `openat2` with strict resolve flags | 1 |
 | Asset URLs and origins | Select one standards-compliant URL parser | 0 and 1 |
 | Markdown | Select a CommonMark implementation through fixtures | 1 |
 | Snapshot activation | Select a lock-free or short-lock `Arc` swap | 1 |
@@ -513,23 +513,130 @@ Tests:
 
 ### Work package 1.2: Safe content-tree walk
 
-Walk posts, drafts, and assets without escaping the configured root.
+Load one bounded content candidate without escaping its pinned content root.
+
+The configured root is an operator-trusted deployment boundary. The loader
+follows that path once and pins the opened directory for one discovery. A root
+symbolic-link swap affects only the next discovery.
+
+V1 content discovery supports Linux in Nix development and deployment
+environments. Use fd-relative `rustix` `openat2` lookups for every descendant.
+Set `BENEATH`, `NO_SYMLINKS`, `NO_MAGICLINKS`, and `NO_XDEV` on each lookup.
+Return a typed failure when the platform, kernel, or flag set cannot enforce
+this contract. Do not use a weaker fallback.
+
+Manage only `publication.toml` and the optional `posts/`, `drafts/`, and
+`assets/` directories. Ignore other top-level entries. Reject ASCII case
+variants of each reserved managed name.
+
+Use these configurable and inclusive defaults:
+
+| Limit | Default | Scope |
+| --- | ---: | --- |
+| Publication file | 256 KiB | `publication.toml` |
+| Post file | 4 MiB | Each file below `posts/` or `drafts/` |
+| Asset file | 32 MiB | Each file below `assets/` |
+| Total file bytes | 256 MiB | All managed logical file paths |
+| Entries | 10,000 | All managed entries except the pinned root |
+| Path depth | 16 components | Relative to the pinned root |
+| Path length | 1,024 bytes | Full logical path with `/` separators |
+
+One kibibyte (KiB) is 1,024 bytes. One mebibyte (MiB) is 1,024 KiB.
 
 Deliverables:
 
-- Explicit file and total-tree size limits.
-- Explicit symlink policy.
-- Normalized logical asset paths.
-- Duplicate and case-collision detection.
-- A platform policy for unsupported filename encodings.
+- Typed configuration for every content-tree limit.
+- A pinned root directory descriptor for each discovery.
+- Strict fd-relative descendant lookup with no fallback path.
+- Stable typed errors for platform, path, entry, collision, and limit failures.
+- A required regular UTF-8 `publication.toml` file.
+- Recursive discovery in each optional managed directory.
+- Exact lowercase `.md` post and draft suffixes.
+- Opaque asset bytes with ASCII-case-insensitive `.svg` and `.svgz` rejection.
+- Portable ASCII descendant path components.
+- Logical paths that preserve spelling and use `/` separators.
+- Exact duplicate and ASCII case-collision detection for all path prefixes.
+- Typed source collections for `posts/` and `drafts/`.
+- Validation that each typed source collection matches its logical path prefix.
+- One shared portable-path grammar for tree discovery and direct post-source
+  validation.
+- Effective `Draft` status for every file below `drafts/`.
+- Owned configuration, Markdown, and asset bytes after discovery.
+- Deterministic lexical ordering by logical path bytes.
+
+Each descendant component can contain only `A-Z`, `a-z`, `0-9`, `.`, `_`,
+and `-`. Reject empty components, `.` components, and `..` components. Also
+reject non-UTF-8, non-ASCII, percent signs, backslashes, controls, absolute
+paths, Windows drive prefixes, and encoded traversal forms.
+
+The case-collision key converts only ASCII letters to lowercase. Preserve the
+accepted spelling in the logical path. Apply duplicate and collision checks to
+directories and files.
+
+Reject descendant symbolic links and all special entries. Special entries
+include FIFOs, sockets, and devices. Accept regular-file hard links. Count each
+hard-link path as one entry and count its full bytes in the tree total.
+
+Enforce each byte limit while reading with a bounded extra-byte check. Do not
+trust metadata as the only size check. Before returning a candidate, verify the
+pinned root and every loaded directory and file against their discovery
+fingerprints. Reject the complete candidate if any entry changes before,
+during, or after its individual read. Later compiler stages must use the owned
+bytes and must not reopen a source path.
+
+Acceptance tests:
+
+- Load a repository that contains only a valid `publication.toml` file.
+- Treat absent `posts/`, `drafts/`, and `assets/` directories as empty.
+- Ignore unrelated top-level files and directories.
+- Follow and pin an operator-configured root symbolic link once.
+- Swap the configured root link during discovery and read only one target.
+- Read the new root-link target during the next discovery.
+- Discover nested post, draft, and asset files.
+- Accept exact lowercase `.md` post and draft suffixes.
+- Force every file below `drafts/` to effective `Draft` status.
+- Honor `draft = true` for a file below `posts/`.
+- Preserve accepted component spelling in each logical path.
+- Preserve opaque non-UTF-8 bytes inside an asset file.
+- Accept a value exactly equal to each configured limit.
+- Accept regular-file hard links.
+- Count each hard-link path and its full bytes separately.
+- Produce the same lexical order across different creation orders.
+- Produce the same error order across repeated discoveries.
+- Validate a discovered candidate after the source tree becomes unavailable.
 
 Failure tests:
 
-- Reject `..`, absolute paths, and encoded traversal attempts.
-- Reject a symlink that leaves the content root.
-- Reject an authored SVG asset.
-- Reject duplicate logical asset paths.
-- Reject a tree that exceeds a configured limit.
+- Fail with a typed error when strict `openat2` resolution is unavailable.
+- Reject a missing root or a root that does not resolve to a directory.
+- Reject a missing or non-regular `publication.toml` entry.
+- Reject invalid UTF-8 in `publication.toml` or a Markdown file.
+- Reject a reserved top-level name with different ASCII case.
+- Reject a managed directory name that resolves to a non-directory.
+- Reject internal, external, broken, and magic descendant symbolic links.
+- Reject a descendant that changes to a symbolic link before its open.
+- Reject a descendant mount or other cross-device lookup.
+- Reject FIFOs, sockets, devices, and other special entries.
+- Reject non-UTF-8 and non-ASCII descendant names.
+- Reject percent signs, backslashes, and control characters in logical paths.
+- Reject empty, `.`, and `..` path components.
+- Reject absolute, Windows drive-prefixed, and encoded traversal forms.
+- Reject a post or draft file without the exact `.md` suffix.
+- Reject `.svg`, `.SVG`, `.svgz`, and case variants below `assets/`.
+- Reject an explicit `draft = false` value below `drafts/`.
+- Reject a typed `Posts` or `Drafts` collection that does not match the logical
+  path prefix.
+- Reject duplicate logical paths and ASCII case collisions.
+- Reject a collision in any directory prefix.
+- Reject each file that exceeds its type-specific byte limit by one byte.
+- Reject a tree that exceeds the total byte limit by one byte.
+- Reject a tree that exceeds the entry limit by one entry.
+- Reject a path that exceeds the depth limit by one component.
+- Reject a path that exceeds the byte-length limit by one byte.
+- Reject a file that grows past its limit while the loader reads it.
+- Reject a file that changes after its individual read but before discovery
+  completes.
+- Preserve deterministic diagnostics when input enumeration order changes.
 
 ### Work package 1.3: Revision identity and immutable assets
 

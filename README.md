@@ -32,8 +32,9 @@ usable release is built.
 
 The repository contains the accepted v1 architecture, the ordered development
 plan, the process-composition scaffold, the canonical publication-job domain,
-the provider-neutral payment domain, the typed content contract, and a locked
-Nix development environment. Most product slices remain under construction.
+the provider-neutral payment domain, the typed content contract, the bounded
+Linux content-tree loader, and a locked Nix development environment. Most
+product slices remain under construction.
 
 - [DESIGN.md](DESIGN.md) defines system behavior and trust boundaries.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) defines the delivery order and exit
@@ -74,6 +75,12 @@ API. They will never open the live SQLite database for writes.
 The private API controls when a pinned article revision first becomes public.
 A content reload cannot expose an unpublished or scheduled post. Distribution
 jobs become eligible only after the canonical post is active.
+
+Each content compilation pins the configured root once. It loads only
+`publication.toml`, `posts/`, `drafts/`, and `assets/` through confined
+descriptor-relative lookups. Descendant links, special files, mount crossings,
+unsafe names, and resource-limit excesses fail closed. Later compiler stages
+use owned bytes and never reopen the mutable source tree.
 
 Maud templates remain Rust modules. A custom build script deterministically
 combines and minifies first-party CSS and optional JavaScript, writes typed
