@@ -192,7 +192,13 @@ the external asset origins that content can use. For example:
 
 ```toml
 [site]
+title = "Example Blog"
+base_url = "https://blog.example.com/"
+description = "Technical notes and projects."
 favicon = "assets/favicon.png"
+
+[author]
+name = "Example Author"
 
 [assets]
 allowed_https_origins = ["https://cdn.example.com"]
@@ -206,6 +212,20 @@ enabled = true
 minimum_sats = 100
 maximum_sats = 100000
 ```
+
+`site.title`, `site.base_url`, `site.description`, and `author.name` are
+required. The base URL must be an HTTPS origin. It cannot contain user
+information, a query, a fragment, or a non-root path. Maincopy normalizes the
+base URL to include one trailing slash.
+
+The site favicon is optional. The asset origin list defaults to an empty list.
+Subscriptions and tips are disabled when their sections are absent. An enabled
+subscription requires a privacy-policy revision. Enabled tips require positive
+minimum and maximum amounts, and the minimum cannot exceed the maximum.
+
+Renderer policy is not authored configuration in v1. The compiler uses typed,
+versioned renderer settings. V1 disables raw HTML, escapes plain code blocks,
+and emits a typed Mermaid placeholder until Slice 6 selects the renderer.
 
 `favicon` can also be an absolute HTTPS URL from an allowed origin. A post can
 use a local asset or an absolute HTTPS URL from the same allowlist for its
@@ -292,6 +312,22 @@ text = "SQLite is a file, but deployment still has coordination rules."
 | `draft` | Optional | The default is `false`. |
 | `tips` | Optional | It inherits the publication default. |
 | `distribution` | Optional | It contains target-specific policy and copy. |
+
+Post UUID text must use the canonical lowercase hyphenated form. Slugs and
+aliases use lowercase ASCII letters, digits, and single hyphens. They cannot
+start or end with a hyphen.
+
+Tags use the same route-safe grammar after Maincopy trims outer whitespace and
+converts ASCII letters to lowercase. Maincopy preserves authored tag and alias
+order. It rejects duplicates after normalization.
+
+Maincopy preserves the authored UTC offset in `authored_at` and `updated_at`.
+The compiler compares the two values as instants. These timestamps never make
+a post public.
+
+The publication tip setting is the default for a post. An explicit post
+`tips = true` or `tips = false` overrides that default. V1 frontmatter supports
+only the typed `x` distribution target.
 
 `published_at` is not an authored frontmatter field in v1. Validation rejects
 it so that Git and SQLite cannot provide conflicting publication times.

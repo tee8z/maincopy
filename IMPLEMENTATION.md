@@ -488,16 +488,28 @@ Deliverables:
 - Stable validation codes with path and field context.
 - Aggregation of independent validation failures.
 - Explicit normalization rules with golden fixtures.
+- Required site title, HTTPS canonical origin, site description, and author
+  name in `publication.toml`.
+- Canonical lowercase hyphenated UUID text.
+- Route-safe ASCII slugs, aliases, and normalized tags.
+- Authored UTC-offset preservation for authored metadata.
+- A fixed typed renderer policy that is not authored configuration in v1.
+- Publication-default tip behavior with explicit per-post overrides.
 
 Tests:
 
 - Parse every documented field and default.
+- Reject a canonical base URL with user information, a query, a fragment, or a
+  non-root path.
+- Normalize the canonical base URL to one trailing slash.
 - Reject malformed delimiters and unknown unsafe values.
 - Reject duplicate IDs, slugs, tags, and aliases.
 - Reject `published_at` in frontmatter as an unsupported policy field.
 - Reject `updated_at` values earlier than `authored_at`.
 - Prove that `authored_at` does not control public visibility.
 - Prove stable error ordering across repeated runs.
+- Prove stable error ordering across input permutations.
+- Preserve authored tag and alias order after normalization.
 
 ### Work package 1.2: Safe content-tree walk
 

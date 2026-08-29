@@ -6,17 +6,17 @@ use thiserror::Error;
 pub const CURRENT_PAYLOAD_VERSION: u16 = 1;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DistributionTarget(String);
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributionTarget {
+    X,
+}
 
 impl DistributionTarget {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X => "x",
+        }
     }
 }
 
@@ -95,8 +95,9 @@ pub enum PayloadError {
 pub(crate) fn target_idempotency_key(
     stable_post_id: &str,
     revision_digest: &str,
-    target: &str,
+    target: DistributionTarget,
 ) -> TargetIdempotencyKey {
+    let target = target.as_str();
     TargetIdempotencyKey(
         [stable_post_id, revision_digest, target]
             .into_iter()
@@ -144,8 +145,8 @@ mod tests {
     #[test]
     fn idempotency_keys_do_not_have_separator_collisions() {
         assert_ne!(
-            target_idempotency_key("post|revision", "digest", "target"),
-            target_idempotency_key("post", "revision|digest", "target")
+            target_idempotency_key("post|revision", "digest", DistributionTarget::X),
+            target_idempotency_key("post", "revision|digest", DistributionTarget::X)
         );
     }
 
@@ -153,5 +154,19 @@ mod tests {
     fn deserialization_rejects_unknown_payload_fields() {
         let json = r#"{"version":1,"body":"copy","new_field":true}"#;
         assert!(serde_json::from_str::<TargetPayload>(json).is_err());
+    }
+
+    #[test]
+    fn distribution_targets_have_stable_names() {
+        assert_eq!(
+            serde_json::to_value(DistributionTarget::X).unwrap(),
+            serde_json::json!("x")
+        );
+        assert_eq!(
+            serde_json::from_value::<DistributionTarget>(serde_json::json!("x")).unwrap(),
+            DistributionTarget::X
+        );
+        assert!(serde_json::from_value::<DistributionTarget>(serde_json::json!("nostr")).is_err());
+        assert_eq!(DistributionTarget::X.as_str(), "x");
     }
 }

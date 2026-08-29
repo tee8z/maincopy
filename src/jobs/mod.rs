@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
 
-use crate::distribution::{
-    DistributionTarget, TargetIdempotencyKey, TargetPayload, target_idempotency_key,
+use crate::{
+    content::PostId,
+    distribution::{
+        DistributionTarget, TargetIdempotencyKey, TargetPayload, target_idempotency_key,
+    },
 };
 
 macro_rules! string_identifier {
@@ -26,7 +29,6 @@ macro_rules! string_identifier {
     };
 }
 
-string_identifier!(StablePostId);
 string_identifier!(PostRevisionDigest);
 string_identifier!(SourceCommit);
 
@@ -62,7 +64,7 @@ pub enum ActivationBlockReason {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CanonicalPublication {
     state: CanonicalState,
-    stable_post_id: StablePostId,
+    stable_post_id: PostId,
     pinned_post_digest: PostRevisionDigest,
     source_commit: Option<SourceCommit>,
     #[serde(with = "time::serde::rfc3339")]
@@ -78,7 +80,7 @@ pub struct CanonicalPublication {
 
 impl CanonicalPublication {
     pub fn schedule(
-        stable_post_id: StablePostId,
+        stable_post_id: PostId,
         pinned_post_digest: PostRevisionDigest,
         source_commit: Option<SourceCommit>,
         scheduled_at: OffsetDateTime,
@@ -100,7 +102,7 @@ impl CanonicalPublication {
     pub const fn state(&self) -> CanonicalState {
         self.state
     }
-    pub const fn stable_post_id(&self) -> &StablePostId {
+    pub const fn stable_post_id(&self) -> &PostId {
         &self.stable_post_id
     }
     pub const fn pinned_post_digest(&self) -> &PostRevisionDigest {
@@ -233,7 +235,7 @@ impl CanonicalPublication {
 pub struct TargetJob {
     state: TargetJobState,
     target: DistributionTarget,
-    stable_post_id: StablePostId,
+    stable_post_id: PostId,
     pinned_post_digest: PostRevisionDigest,
     #[serde(with = "time::serde::rfc3339")]
     scheduled_at: OffsetDateTime,
@@ -244,7 +246,7 @@ pub struct TargetJob {
 impl TargetJob {
     pub fn waiting(
         target: DistributionTarget,
-        stable_post_id: StablePostId,
+        stable_post_id: PostId,
         pinned_post_digest: PostRevisionDigest,
         scheduled_at: OffsetDateTime,
         payload: TargetPayload,
@@ -266,7 +268,7 @@ impl TargetJob {
     pub const fn target(&self) -> &DistributionTarget {
         &self.target
     }
-    pub const fn stable_post_id(&self) -> &StablePostId {
+    pub const fn stable_post_id(&self) -> &PostId {
         &self.stable_post_id
     }
     pub const fn pinned_post_digest(&self) -> &PostRevisionDigest {
@@ -285,7 +287,7 @@ impl TargetJob {
         target_idempotency_key(
             self.stable_post_id().as_str(),
             self.pinned_post_digest().as_str(),
-            self.target().as_str(),
+            *self.target(),
         )
     }
 
@@ -459,17 +461,20 @@ pub enum TransitionError {
 mod tests {
     use super::*;
 
+    const POST_A: &str = "11111111-1111-4111-8111-111111111111";
+    const POST_B: &str = "22222222-2222-4222-8222-222222222222";
+
     fn at(seconds: i64) -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(seconds).unwrap()
     }
-    fn post_id(value: &str) -> StablePostId {
-        StablePostId::new(value)
+    fn post_id(value: &str) -> PostId {
+        PostId::parse(value).unwrap()
     }
     fn digest(value: &str) -> PostRevisionDigest {
         PostRevisionDigest::new(value)
     }
     fn scheduled_publication(scheduled_at: OffsetDateTime) -> CanonicalPublication {
-        CanonicalPublication::schedule(post_id("post-a"), digest("digest-a"), None, scheduled_at)
+        CanonicalPublication::schedule(post_id(POST_A), digest("digest-a"), None, scheduled_at)
     }
     fn published_publication(scheduled_at: OffsetDateTime) -> CanonicalPublication {
         let mut publication = scheduled_publication(scheduled_at);
@@ -479,8 +484,8 @@ mod tests {
     }
     fn job(scheduled_at: OffsetDateTime) -> TargetJob {
         TargetJob::waiting(
-            DistributionTarget::new("nostr"),
-            post_id("post-a"),
+            DistributionTarget::X,
+            post_id(POST_A),
             digest("digest-a"),
             scheduled_at,
             TargetPayload::new("copy").unwrap(),
@@ -490,7 +495,7 @@ mod tests {
     #[test]
     fn canonical_success_path_assigns_publication_time() {
         let mut publication = CanonicalPublication::schedule(
-            post_id("post-a"),
+            post_id(POST_A),
             digest("digest-a"),
             Some(SourceCommit::new("commit-a")),
             at(10),
@@ -611,7 +616,7 @@ mod tests {
         assert_eq!(target, before);
 
         let mut other_post =
-            CanonicalPublication::schedule(post_id("post-b"), digest("digest-a"), None, at(10));
+            CanonicalPublication::schedule(post_id(POST_B), digest("digest-a"), None, at(10));
         other_post.begin_activation(1, at(10)).unwrap();
         other_post.commit_published(2).unwrap();
         assert_eq!(
@@ -621,7 +626,7 @@ mod tests {
         assert_eq!(target, before);
 
         let mut other_revision =
-            CanonicalPublication::schedule(post_id("post-a"), digest("digest-b"), None, at(10));
+            CanonicalPublication::schedule(post_id(POST_A), digest("digest-b"), None, at(10));
         other_revision.begin_activation(1, at(10)).unwrap();
         other_revision.commit_published(2).unwrap();
         assert_eq!(
@@ -751,7 +756,7 @@ mod tests {
         let target = job(at(10));
         assert_eq!(
             target.idempotency_key().as_str(),
-            "6:post-a|8:digest-a|5:nostr"
+            "36:11111111-1111-4111-8111-111111111111|8:digest-a|1:x"
         );
     }
 

@@ -1,0 +1,7 @@
+[site]
+title = "Minimal Publication"
+base_url = "https://minimal.example.test"
+description = "Only the required publication fields are present."
+
+[author]
+name = "Minimal Author"

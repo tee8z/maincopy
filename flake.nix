@@ -48,6 +48,8 @@
               path: type:
               (craneLib.filterCargoSources path type)
               || (builtins.match ".*\\.(css|html|js|json|sql|svg)$" path != null)
+              || (builtins.match ".*/examples/content(/.*)?" path != null)
+              || (builtins.match ".*/tests/fixtures(/.*)?" path != null)
               || (builtins.match ".*/migrations(/.*)?" path != null)
               || (builtins.match ".*/templates(/.*)?" path != null);
           };

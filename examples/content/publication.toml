@@ -1,0 +1,7 @@
+[site]
+title = "Maincopy Example"
+base_url = "https://example.test"
+description = "A minimal publication that demonstrates Maincopy's content contract."
+
+[author]
+name = "Example Author"
