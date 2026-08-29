@@ -54,10 +54,13 @@ wire representation. For example, the admin API version and a feature-contract
 version are separate enum types, even when both serialize as `v1`. Liveness and
 readiness also use separate status enums inside a typed response wrapper.
 
-Newtypes distinguish identifiers, digests, idempotency keys, timestamps,
-addresses, and other primitives that are not interchangeable. A function must
-accept the narrowest meaningful type instead of a generic `String`, integer, or
-UUID.
+Newtypes distinguish identifiers, digests, idempotency keys, addresses, and
+other primitives that are not interchangeable. A function must accept the
+narrowest meaningful type instead of a generic `String`, integer, or UUID.
+
+Operational timestamps use `time::OffsetDateTime` directly. Constructors
+normalize values to `UtcOffset::UTC`. Serde fields use Time's RFC 3339 adapter.
+Maincopy does not define a custom timestamp wrapper or timestamp module.
 
 Raw external values can exist only at an input, serialization, database, or
 protocol boundary. Boundary code parses them into domain types before it calls
@@ -84,7 +87,7 @@ V1 is the first release that an author can operate on one host.
 | Favicon and post preview images | Image transformation and optimization service |
 | First-party email capture with double opt-in | Subscriber segmentation and campaign analytics |
 | Code, ASCII, and Mermaid rendering | ActivityPub and WebFinger |
-| Lightning invoice creation | Payment confirmation |
+| Provider-neutral BOLT11 tip invoices with a Lexe v1 adapter | LND adapter, paid articles, access grants, and refunds |
 | SQLite publication and distribution ledger | Multiple active writer processes |
 | Private admin API and minimal admin UI | General plugin system |
 | Scheduled canonical publication and manual distribution jobs | Automatic closed-network adapters |
@@ -113,7 +116,15 @@ flowchart LR
     Reads --> DB
 
     Scheduler --> Targets[Distribution targets]
-    Public --> Lightning[Lightning provider]
+    Public --> Tips[TipService]
+    UpdateSubscriber[Payment-update subscriber] --> Tips
+    Reconciler[Payment reconciler] --> Tips
+    Tips --> Writer
+    Tips --> Lightning[Lightning receive boundary]
+    Lightning --> LexeHandle[Lexe v1 provider handle]
+    LexeHandle --> LexeNode[Remote Lexe node]
+    LexeHandle --> LexeCache[(Optional disposable SDK cache)]
+    Lightning -. future .-> LndAdapter[LND adapter]
     DB --> Litestream[Litestream]
     Litestream --> Replica[Local folder, network folder, or S3]
 ```
@@ -133,8 +144,12 @@ listeners and separate trust boundaries.
 | Publication jobs and attempts | SQLite | Jobs bind to immutable content revisions. |
 | Remote IDs and URLs | SQLite | Records describe completed external actions. |
 | Subscriber consent and lifecycle | SQLite | These records contain protected personal data. |
-| Credentials | Secret file or secret manager | Credentials never enter Git or SQLite. |
+| Tip intent and public receive status | SQLite | The record uses provider-neutral invoice and settlement types. |
+| Lightning provider reference and update cursor | SQLite | The record stores `ProviderKind::Lexe`, an opaque payment locator, and an opaque typed provider cursor. |
+| Lightning payment truth | Remote Lexe node | A local Lexe SDK cache is disposable and cannot establish invoice or settlement state. |
+| Credentials | Secret file or secret manager | Maincopy SQLite never stores credentials. Lexe client credentials are revocable and narrowly scoped. |
 | Database backup | Litestream replica | Git content needs a separate Git backup. |
+| Provider recovery state | Remote Lexe node plus Maincopy's tip ledger | Restore reconciles the local ledger against remote payment indexes before tips become ready. |
 
 ## Repository and runtime layout
 
@@ -150,7 +165,8 @@ The engine and publication content use separate repositories.
 |   `-- assets/
 |-- state/
 |   |-- maincopy.db         # local disk only
-|   `-- compiled-assets/
+|   |-- compiled-assets/
+|   `-- lexe-cache/         # optional; disposable and non-authoritative
 
 /run/maincopy/              # tmpfs runtime state, created at service start
 |-- maincopy.lock
@@ -184,6 +200,11 @@ allowed_https_origins = ["https://cdn.example.com"]
 [subscriptions]
 enabled = true
 privacy_policy_revision = "2026-08-29"
+
+[tips]
+enabled = true
+minimum_sats = 100
+maximum_sats = 100000
 ```
 
 `favicon` can also be an absolute HTTPS URL from an allowed origin. A post can
@@ -193,11 +214,42 @@ preview image, Markdown images, and file links.
 `maincopy.toml` belongs to the host. It contains paths, listeners, database
 limits, and secret references.
 
+The host configuration selects a typed Lightning receive provider. The v1
+configuration enum contains only `Lexe`. Maincopy will add an `Lnd` variant
+only when that adapter exists. Public and admin contracts do not contain the
+selected provider. A stable persisted `ProviderKind` and opaque provider
+locator preserve historical payment records across future adapters.
+
+The Lexe adapter uses the public `lexe` 0.1.22 crate. Its typed configuration
+selects the Bitcoin network, the client-credential file, an optional local SDK
+cache path, maximum in-flight operations, maximum pending operations, request
+and reconciliation timeouts, a bounded reconciliation page size, and a
+periodic recovery interval. The provider-operation deadline also bounds each
+payment-update long poll. The typed in-flight limit rejects zero and one when
+tips are enabled. The operator must provision revocable
+credentials with exactly the
+`Receive`, `ReadPayments`, and `ReadInfo` scopes and an empty explicit
+`permissions` collection. `ReadInfo` supports node identity and health checks.
+The Lexe 0.1.22 `ClientCredentials` blob does not expose its grants, so
+Maincopy cannot prove that extra scopes or endpoint permissions are absent at
+runtime. Provisioning audit is an operator security control.
+Maincopy's code never calls spend, channel-management, full-administration, or
+client-management operations.
+
+Lexe client credentials and bearer tokens never appear in `publication.toml`,
+Git, Maincopy SQLite, logs, metrics, or API responses. The remote Lexe node is
+the source of payment truth. An SDK cache can improve local queries, but it is
+non-authoritative, can be deleted, and is not part of Maincopy's Litestream
+backup contract.
+
 Command-line arguments can override non-secret runtime settings. Secret values
 come from environment variables, credential files, or a secret manager.
 
 Maincopy validates the complete effective configuration before it opens a
-listener.
+listener. A syntactically invalid or internally inconsistent host
+configuration fails startup. Failure to load, authenticate, or authorize an
+enabled Lexe credential fails the optional tip subsystem closed and keeps its
+readiness false; it does not prevent the core article listener from starting.
 
 ## Content contract
 
@@ -248,9 +300,11 @@ Draft posts validate but cannot be scheduled. A non-draft post is eligible for
 publication, but it remains absent from every public route until SQLite records
 its canonical activation.
 
-The admin API supplies `scheduled_for`. SQLite records the actual
-`published_at` time when activation completes. Public pages, feeds, and
-structured metadata use that operational timestamp.
+The admin API supplies `scheduled_for`. When activation is claimed, SQLite
+records one `activation_at` value immediately before the visibility swap. A
+successful final commit copies that value to `published_at`. It is the durable
+canonical visibility timestamp, not a measurement taken after activation
+finishes. Public pages, feeds, and structured metadata use it.
 
 The canonical post route is `/posts/{slug}`. A slug change does not change the
 post ID, feed GUID, or prior alias redirects.
@@ -284,6 +338,39 @@ not appear versioned, but it does not guess from remote headers.
 The site favicon follows the same rules. A local favicon receives an immutable
 snapshot URL. An external favicon remains a direct allowlisted HTTPS URL.
 
+### Application frontend assets
+
+Application and theme assets belong to the Maincopy source tree. Author and
+site assets belong to the content repository. The build pipeline never treats
+a favicon, post image, content attachment, or CDN reference as a compile-time
+application asset.
+
+Maud templates remain Rust modules. A custom `build.rs` processes only
+first-party CSS and optional JavaScript pieces. It discovers declared inputs,
+normalizes and sorts their paths, combines them in that order, minifies the
+result, and calculates a content digest. A read, minification, or write error
+fails the build. The script does not skip an input or serve an unminified
+fallback.
+
+The script writes bundles and generated Rust metadata to `OUT_DIR`. It does not
+write generated files into the source tree. It emits `cargo:rerun-if-changed`
+directives for the input roots, files, and build logic that affect output.
+
+The generated `FrontendAssetManifest` contains typed `CssAsset` and optional
+`JavaScriptAsset` values. Each value contains typed asset identity, MIME type,
+content digest, immutable public path, and embedded bytes. Runtime code uses
+the manifest instead of constructing filenames or MIME types from strings.
+
+The binary embeds the generated bundles and serves them from
+`/app-assets/{digest}/{name}`. The route uses exact manifest lookup. It never
+maps an untrusted path to the host filesystem. Valid assets use their exact
+CSS or JavaScript MIME type, ETag, and immutable cache headers. Unknown,
+malformed, and traversal-like paths return `404`.
+
+`FrontendBundleDigest` is part of `SiteShellRendererIdentity` and every
+`SiteSnapshot` digest. A CSS or JavaScript byte change therefore changes the
+renderer identity, snapshot identity, and immutable application-asset URL.
+
 ### Revision identity
 
 Each post revision receives a BLAKE3 digest. The digest includes:
@@ -300,11 +387,12 @@ Each post revision receives a BLAKE3 digest. The digest includes:
 The site snapshot also receives a digest. The snapshot digest covers the
 publication configuration, every local site-asset path and byte digest,
 normalized external site-asset URLs, the effective CDN allowlist, the
-versioned site-shell renderer identity and its deterministic output digest
-before snapshot-URL injection, all public post revision digests, and their
-canonical activation timestamps. A same-path favicon or site-asset byte change
-therefore creates a new snapshot URL. Golden tests require an explicit renderer
-identity change when an implementation change alters output.
+versioned site-shell renderer identity, the generated frontend bundle digest,
+the deterministic shell output digest before snapshot-URL injection, all
+public post revision digests, and their canonical activation timestamps. A
+same-path favicon, site-asset byte, CSS byte, or JavaScript byte change creates
+a new snapshot and immutable asset URL. Golden tests require an explicit
+renderer identity change when an implementation change alters output.
 
 Git commit metadata is recorded when available. Content digests remain valid
 when a deployment artifact does not include `.git`.
@@ -331,8 +419,10 @@ path, field, and stable error code.
 Request handlers never parse Markdown, execute a diagram renderer, or read the
 mutable content tree. They read an immutable `SiteSnapshot`.
 
-Compiled assets live under a directory named by the snapshot digest. Public
-asset URLs include that digest and use immutable cache headers.
+Compiled content assets live under a directory named by the snapshot digest.
+Public content-asset URLs include that digest and use immutable cache headers.
+Compile-time application bundles use their separate frontend bundle digest and
+are embedded in the binary.
 
 The initial content snapshot must compile before the service becomes ready. A
 later validation or other pre-swap reload failure keeps the current public
@@ -371,6 +461,17 @@ exact retained candidate, then committing step 4. Missing or corrupt retained
 input fails startup closed. The service never infers the current published
 digest from whichever files happen to be newest.
 
+One snapshot-transition coordinator serializes published-revision reloads and
+first-publication activations. It is the only component that can swap the
+active `SiteSnapshot`. This rule prevents an `Applying` reload and an
+`Activating` publication from installing competing snapshots. On startup, the
+coordinator first resolves every retained `Applying` candidate and then every
+claimed `Activating` revision in deterministic ledger order. Recovery can
+perform the required intermediate snapshot installs and digest commits while
+both listeners remain closed; no reader can observe them. After all replay is
+complete, the coordinator compiles, installs, and asserts one final canonical
+initial snapshot before listener binding.
+
 A scheduled canonical publication pins one post revision. A later content
 reload cannot change the revision that the scheduler will publish. The
 operator must cancel or replace the schedule to select another revision.
@@ -403,14 +504,15 @@ until a representative fixture corpus passes.
 | `GET /sitemap.xml` | XML sitemap |
 | `GET /robots.txt` | Crawler policy |
 | `GET /assets/{revision}/{*path}` | Immutable compiled asset |
+| `GET /app-assets/{digest}/{name}` | Immutable embedded CSS or JavaScript bundle |
 | `POST /subscriptions` | Start a double-opt-in subscription |
 | `GET /subscriptions/confirm` | Render a confirmation result |
 | `POST /subscriptions/confirm` | Confirm a pending subscription token |
 | `GET /subscriptions/unsubscribe` | Render an unsubscribe confirmation form |
 | `POST /subscriptions/unsubscribe` | Complete an unsubscribe request |
-| `POST /posts/{slug}/tips/invoice` | Lightning invoice request |
+| `POST /posts/{slug}/tips/invoices` | Create a provider-neutral BOLT11 tip invoice |
 | `GET /health/live` | Process liveness |
-| `GET /health/ready` | Snapshot and subsystem readiness |
+| `GET /health/ready` | Snapshot and required core-subsystem readiness; optional tip health does not gate it |
 
 Public pages include canonical links, Open Graph metadata, and `BlogPosting`
 JSON-LD. Feeds use stable post IDs as GUIDs and absolute canonical URLs.
@@ -516,8 +618,8 @@ sequenceDiagram
     H-->>C: Success or typed error
 ```
 
-Exactly one Tokio task owns exactly one write connection. Every runtime write
-uses one bounded `mpsc` channel.
+Exactly one Tokio task owns exactly one SQLx write connection. Every runtime
+write uses one bounded `mpsc` channel.
 
 Cloning the database handle clones only the channel sender and read pool. A
 clone never creates another writer task.
@@ -720,7 +822,8 @@ stateDiagram-v2
 At the scheduled time, Maincopy uses this sequence:
 
 1. The writer changes `Scheduled` to `Activating`, records one activation UTC
-   timestamp, and keeps each target job in `WaitingForCanonical`.
+   timestamp named `activation_at`, and keeps each target job in
+   `WaitingForCanonical`.
 2. The scheduler builds and atomically swaps a public `SiteSnapshot` that
    contains the pinned revision and committed activation timestamp. It does not
    hold a database transaction.
@@ -787,25 +890,314 @@ Attempts use durable leases. Startup recovers expired `Running` attempts before
 the scheduler accepts new work. A retry selects only an eligible failed or
 unknown target and never repeats a successful target.
 
-## Lightning tips
+## Lightning tip boundary
 
-The public tip form submits an amount to the server. The server resolves the
-configured Lightning Address and requests an LNURL-pay invoice.
+Maincopy owns the tip intent, invoice, and settlement contracts. These
+contracts do not expose a wallet vendor. A closed `LightningProvider` enum owns
+the production adapter. Its inherent methods accept a typed
+`CreateTipInvoiceRequest`, return a verified `TipInvoice`, and observe
+settlement through a typed `ProviderPaymentReference`.
 
-The network layer treats all provider data as untrusted. It:
+V1 has one production variant:
 
-- permits only expected schemes;
-- resolves and validates every destination;
-- rejects private, loopback, and link-local addresses;
-- validates again after redirects and DNS changes;
-- bounds response size and request duration;
-- caps the amount; and
-- verifies the returned BOLT11 invoice amount and expiry.
+```text
+LightningProvider::Lexe(Arc<LexeProvider>)
+```
 
-Maincopy vendors the QR component and its license. Plain invoice text and wallet
-links remain usable when JavaScript is disabled.
+Tests can add one `#[cfg(test)]` substitute. Each inherent method uses an
+exhaustive match to delegate to the active adapter. Maincopy does not need a
+provider manager, registry, `DashMap`, or dynamic string dispatch.
+`LightningProvider` is a cloneable application-facing handle. The Lexe variant
+clones only its `Arc`.
 
-V1 does not confirm payment.
+`TipService` is an ordinary service that composes the database handle with one
+configured `LightningProvider`. It does not add a second queue. The Lexe
+provider owns the sole bounded operation queue. One dispatcher owns its
+receiver and a `JoinSet`, starts no more than the configured number of SDK
+futures, and reaps each completion immediately. Because Maincopy has one
+provider instance, one typed concurrency limit applies provider-wide. V1
+rejects limits below two and runs exactly one update subscriber. Its long poll
+can therefore use no more than one slot while at least one slot remains for an
+ordinary provider operation. No provider registry or `DashMap` is required. No
+provider call runs on the Maincopy database writer task or inside a Maincopy
+database transaction.
+
+The internal `TipInvoice` persistence model contains a validated BOLT11
+invoice, exact amount, payment hash, expiry, and provider reference. The public
+`TipInvoiceView` contains only the BOLT11 invoice, amount, and expiry. The
+public route derives a `lightning:` link and never exposes the payment hash,
+provider kind, provider locator, or provider update index.
+
+`TipSettlement` contains the exact received amount and settlement time.
+Operational timestamps use `time::OffsetDateTime`, are normalized to UTC, and
+serialize with `time::serde::rfc3339`.
+
+V1 ships `LexeProvider` through the public crates.io `lexe` 0.1.22 SDK. A
+future `LndProvider` will add an intentional exhaustive enum variant without
+changing the tip intent, public route, or admin contracts. V1 does not accept
+an `Lnd` configuration value before that adapter exists.
+
+### Tip intent state
+
+The provider seam uses two separate closed result domains.
+`InvoiceCreationReconciliation` has `Found(TipInvoice)`, `Missing`, and
+`Ambiguous`. `ProviderPaymentState` has `InvoiceOpen`,
+`Received(TipSettlement)`, `Expired`, and
+`RecoveryRequired(TipRecoveryReason)`. `TipRecoveryReason` contains only
+`SettlementIncomplete` and `ProviderConflict`. Missing and ambiguous creation
+matches are not settlement reasons.
+
+The later durable tip ledger surrounds those provider results with the local
+`Requested` and `InvoiceCreating` phases:
+
+```text
+Requested -> InvoiceCreating -> InvoiceOpen
+InvoiceCreating -> Requested                 # conclusive pre-create failure
+InvoiceCreating -> InvoiceCreating            # OutcomeUnknown, Missing, or Ambiguous; creation stays blocked
+InvoiceOpen -> Received(_)
+InvoiceOpen -> Expired
+InvoiceOpen -> RecoveryRequired(_)
+RecoveryRequired(_) -> InvoiceOpen | Received(_) | Expired
+```
+
+The ledger records the last `CreateTipInvoiceError` or
+`InvoiceCreationReconciliation` outcome while it stays in `InvoiceCreating`.
+`OutcomeUnknown`, `Missing`, and `Ambiguous` never authorize automatic
+recreation. Provider-specific details stay in the adapter and in redacted
+operator diagnostics.
+
+`Received` wraps a verified `TipSettlement`. A provider status named “settled”
+is not sufficient by itself. For Lexe, the adapter requires one matching
+inbound invoice payment with `Completed` status, the expected created index,
+payment hash and amount, a finalization time, and the provider's completed
+payment evidence. Missing final settlement fields produce
+`ProviderPaymentState::RecoveryRequired(SettlementIncomplete)`. An identity
+conflict in a direct known-payment reconciliation returns
+`PaymentOperationError::ProviderConflict`, which `TipService` maps to durable
+provider-conflict recovery. The update-poll path represents the same conflict
+as `ProviderPaymentUpdate::TipRecoveryRequired` so it can advance in cursor
+order without losing the recovery signal.
+
+### Invoice creation and idempotency
+
+The public tip form submits a bounded amount in sats and a bounded request
+idempotency key. Maincopy first commits a typed `TipIntent` with a unique
+opaque `TipIntentId`. It then commits `InvoiceCreating` before it calls Lexe. A
+repeated request for the same idempotency key returns the existing result or
+starts reconciliation. It never creates another provider invoice while a prior
+call can have completed.
+
+Lexe's `create_invoice` request has no provider idempotency field. Maincopy
+therefore writes the deterministic marker
+`maincopy-tip:<canonical TipIntentId UUID>` to Lexe's `personal_note` field.
+The marker is bounded, contains no post, reader, or author data, and is not
+visible to the payer. The BOLT11 description remains a separate, human-facing
+value. Maincopy never requests `Spend`, so it cannot edit the personal note
+after creation.
+
+The provider-neutral request does not let a public caller select invoice
+lifetime. V1 leaves Lexe's `expiration_secs` unset and uses the SDK's documented
+86,400-second default. The adapter validates that the signed invoice is not
+expired at the injected validation time.
+
+`CreateTipInvoiceError` distinguishes `NotAccepted`, `NotCreated`, and
+`OutcomeUnknown`. Local validation, concurrency rejection, or a conclusive
+failure before the remote create request begins can be retried. Once the Lexe
+create request begins, a timeout, transport error, dropped response, invalid
+response, or process crash is `OutcomeUnknown` and requires reconciliation.
+Lexe cannot prove `NotCreated` after an accepted remote call. Maincopy never
+blindly repeats that call.
+
+Lexe's fresh-create response does not echo `personal_note`. Before it reports
+success, the adapter therefore reads the payment back by the returned created
+index. It requires the exact marker, inbound invoice kind and direction,
+matching created index and invoice identity, and the same encoded invoice. It
+then validates the signed invoice's network, exact amount, payment hash,
+human-facing description, and unexpired expiry. The create call and confirming
+read share one response deadline. A failure or timeout in either call is
+`OutcomeUnknown` because the invoice can already exist.
+
+The adapter stores Lexe's `PaymentCreatedIndex` as an opaque locator inside a
+`ProviderPaymentReference` whose stable kind is `ProviderKind::Lexe`. The HTTP
+response succeeds only after Maincopy commits `InvoiceOpen`.
+
+An `InvoiceCreating` intent always reconciles before another creation attempt.
+The provider boundary exposes marker reconciliation as the closed result
+`Found(TipInvoice)`, `Missing`, or `Ambiguous`. The Lexe adapter searches remote
+payments by the exact `personal_note` marker and validates every candidate.
+It attaches only one unique match. `Missing` and `Ambiguous` keep the durable
+intent blocked in `InvoiceCreating` with the exact reconciliation outcome;
+neither result proves that a prior remote create call had no effect. Maincopy
+never guesses or recreates automatically.
+
+### Lexe source of truth and reconciliation
+
+The remote Lexe node is authoritative for invoice and settlement state. The
+SDK can use an on-disk or in-memory payment cache, and it can run without a
+local database. Any local cache is only a performance aid. Clearing or losing
+it does not change remote payments. A cache result alone cannot make an intent
+`Received`, prove that an invoice is missing, or authorize invoice recreation.
+
+The adapter maps Lexe's `PaymentCreatedIndex` and `PaymentUpdatedIndex` into
+bounded, opaque provider locator and cursor types. Native Lexe index types stay
+inside the adapter. Maincopy persists the last processed provider cursor in its
+own database and processes repeated updates idempotently. One common catch-up
+routine reads authoritative updated-payment pages after that cursor, validates
+each relevant payment through the provider-neutral reconciliation path, and
+commits the ledger decision and new cursor in one SQLite writer transaction.
+The routine advances the cursor only after it has durably handled every
+earlier update in the page.
+
+Startup recovery, periodic recovery after an error, and the long-lived payment
+update subscriber all call the same provider-neutral `next_payment_updates`
+operation. The Lexe adapter first reads an updated-payment page after the last
+durable cursor. Only when that page is empty does it call
+`wait_for_next_payment` under a finite operation deadline. The closed
+`ProviderPaymentUpdatePoll` result is `Updates(ProviderPaymentUpdateBatch)` or
+`Idle`. `Idle` is a normal heartbeat: it does not advance the cursor, degrade
+payment health, or trigger error backoff. A transport or provider error is not
+idle. It degrades subscriber health, uses bounded backoff, and resumes from the
+durable cursor so a failed event is read again. Suspected cursor gaps also
+resume paged catch-up from the durable cursor.
+
+The closed `ProviderPaymentUpdate` enum is
+`Tip(ObservedTipPaymentUpdate)`,
+`TipRecoveryRequired(ObservedTipRecoveryUpdate)`, or
+`Ignored(IgnoredProviderPaymentUpdate)`. The ignored wrapper contains the next
+cursor and one closed `IgnoredPaymentUpdateReason`: `MissingMarker` or
+`UnrecognizedMarker`. A `Tip` is provider-neutral observed evidence which
+`TipService` must compare with the persisted intent before it can change the
+ledger. An update with a valid Maincopy marker but conflicting provider
+evidence becomes `TipRecoveryRequired`; it cannot disappear into `Ignored`.
+`TipService` records durable
+`RecoveryRequired(TipRecoveryReason::ProviderConflict)` only when that marker
+matches a persisted Maincopy intent. An unknown marker does not create an
+intent. An unrelated or outgoing wallet payment without a Maincopy marker
+produces the typed `Ignored` notice with the applicable marker reason. The
+writer handles each notice and commits its cursor so unrelated wallet activity
+cannot stall the subscriber. The ignored path can update a bounded aggregate
+diagnostic, but it does not persist the unrelated payment, note, invoice, or
+counterparty data.
+
+A returned live payment enters this same mapping and state-transition path as
+a paged payment; it is not settlement proof by itself. Repeated notifications
+are expected.
+
+For an `InvoiceCreating` record without a provider reference, reconciliation
+scans remote updated-payment pages and uses Lexe's polling or long-poll
+tailing APIs for the exact marker:
+
+- Zero valid matches produce `Missing` and keep the intent in
+  blocked creation recovery.
+- One valid match produces `Found(TipInvoice)` and attaches its opaque created
+  index.
+- More than one valid match produces `Ambiguous` and keeps every candidate for
+  redacted operator review. The intent remains blocked in creation recovery.
+
+For a known provider reference, the adapter requires an inbound invoice
+payment whose created index, signed invoice, provider payment hash, marker, and
+network match the Maincopy record. The signed invoice always supplies and must
+match the exact amount. Lexe can omit `Payment.amount` for `Pending` and
+`Failed`; when present, that field must also match. A `Completed` payment must
+include the exact provider amount. The signed invoice hash, Lexe payment hash,
+and Maincopy hash must all agree. It maps Lexe evidence as follows:
+
+| Lexe evidence | Maincopy result |
+| --- | --- |
+| Matching inbound invoice with `Pending` status, valid future expiry, and an absent or exact provider amount | `InvoiceOpen` |
+| Matching inbound invoice with `Completed` status, finalization time, and exact provider amount | `Received(TipSettlement)` |
+| Matching unpaid inbound invoice with `Pending` or `Failed` status after signed expiry and an absent or exact provider amount | `Expired` |
+| Matching inbound invoice with `Failed` status before signed expiry and an absent or exact provider amount | `ProviderPaymentState::RecoveryRequired(TipRecoveryReason::ProviderConflict)` |
+| Wrong direction, kind, reference, amount, hash, marker, network, or contradictory identity fields | Direct reconciliation returns `PaymentOperationError::ProviderConflict`; update polling returns `TipRecoveryRequired`; `TipService` records `ProviderPaymentState::RecoveryRequired(TipRecoveryReason::ProviderConflict)` |
+| Matching completed record without a finalization time or provider amount | `ProviderPaymentState::RecoveryRequired(TipRecoveryReason::SettlementIncomplete)` |
+
+The adapter does not infer settlement from a status message. It does not
+expose Lexe SDK types through public JSON, OpenAPI, application services, or
+persisted provider-neutral enums.
+
+### Operations and privacy
+
+`Application` owns the Lexe queue runtime, its dispatcher join handle, the
+long-lived payment-update subscriber, and the periodic and startup recovery
+work. `LightningProvider` clones hold only operation intake and cannot close or
+terminate these tasks. The queue has separate maximum in-flight and pending
+limits. A full or closed queue rejects
+work before acceptance with a typed `NotAccepted` result and retry guidance.
+An accepted create operation returns its result through a oneshot reply. A
+dropped reply does not cancel the accepted operation.
+
+The subscriber and recovery work use bounded pages, finite waits, backoff,
+cancellation, and the same persisted cursor. Neither holds a Maincopy database
+transaction during a network wait. Application cancellation closes queue
+intake, rejects later submissions, and lets the dispatcher drain every pending
+entry and in-flight `JoinSet` completion. A provider operation panic also
+closes intake, drains the other accepted work, and returns a typed runtime
+failure. An abrupt process stop can still interrupt an accepted create. Any
+create result that Maincopy did not commit remains an unknown outcome and must
+reconcile on restart.
+
+Payment readiness is independent of core publication readiness. Invalid Lexe
+credentials, a remote-node outage, subscriber or reconciliation lag, or a
+failed payment task makes the tip endpoint unavailable and reports degraded
+payment health. It does not hide a published article, fail the public article
+readiness gate, or start global shutdown. Application shutdown cancels the
+subscriber and periodic recovery work, closes the operation queue, drains its
+accepted work, and keeps database intake open for final durable results.
+
+The browser receives the verified BOLT11 value, expiry, and a `lightning:`
+wallet link. Maincopy vendors the QR component and its license. Plain invoice
+text and the wallet link work without JavaScript. The route has amount, body,
+rate, concurrency, and request-duration limits.
+
+The operator provisions the Lexe credential with exactly `Receive`,
+`ReadPayments`, and `ReadInfo`, with no explicit endpoint permissions.
+Maincopy does not request or call spend, channel-management,
+full-administration, or client-management operations and never receives seed
+material. Lexe 0.1.22 does not let this limited client introspect its own grants
+or manage clients. An operator with separate client-management authority uses
+Lexe `ClientInfo` to audit the exact scopes and an empty `permissions` list,
+then creates, rotates, or revokes the client outside Maincopy. Startup can
+capability-check the required non-mutating reads. It cannot prove `Receive`
+without creating an invoice, and success cannot prove the absence of extra
+grants. The operator provisioning test covers `Receive`. The credential file
+uses owner-only permissions. Maincopy disables unsanitized provider log targets
+by default and emits typed redacted events. A release gate scans logs and
+errors for invoices, payment hashes, preimages, client credentials, bearer
+tokens, and provider locators.
+
+Lexe currently documents a 0.5% fee for received Lightning payments. This fee
+is an operator-cost and user-experience consideration, not a protocol or
+correctness constant. Maincopy can surface the fee that the provider reports in
+operator diagnostics, but it does not hard-code the published rate.
+
+Litestream backs up `maincopy.db`, including the local tip ledger and update
+cursor. It does not back up the remote Lexe node. An optional Lexe SDK cache is
+not part of the recovery point and can be rebuilt from the remote node. The
+cache can contain payment metadata, so its directory still requires owner-only
+permissions and the same log and path redaction as other protected state.
+
+### Deferred provider research
+
+The attributed Bark work remains only on a local deferred R&D branch in an
+upstream clone; no fork project or private remote is planned. It retains the
+original repository history, license, copyright, and package attribution. The
+work can later become an upstream pull request. Maincopy v1 has no Bark
+dependency or Bark release prerequisite.
+
+### Deferred paid articles
+
+Paid articles are a post-v1 capability. The content repository will hold an
+explicit authored preview boundary or `preview` document. Maincopy will not cut
+Markdown at an arbitrary character or byte count.
+
+A future payment intent will bind the post ID, immutable revision digest,
+price, currency unit, and expiry. A settled payment will create a separate,
+revocable `AccessGrant` and an opaque, short-lived reader credential. A payment
+address, invoice, payment hash, or preimage will never be a bearer credential.
+Private responses will use cache controls that prevent a CDN or shared cache
+from publishing the full article. The feature requires a separate threat model
+for replay, sharing, refunds, settlement confidence, and recovery before it can
+enter a release plan.
 
 ## Startup and shutdown
 
@@ -814,6 +1206,12 @@ imports and calls `startup::run_until_stop`. It can initialize bootstrap
 logging before that call. It does not load typed application configuration,
 bind listeners, open the database, construct handlers, or spawn background
 components.
+
+V1 intentionally chooses startup-owned typed configuration. The earlier
+allowance for `main.rs` to read configuration was permission, not a requirement.
+Keeping the exact no-argument `run_until_stop().await` expression without a
+global configuration singleton makes `src/startup.rs` the coherent owner. A
+future signature change can revisit this decision explicitly.
 
 `src/startup.rs` parses a typed `ProcessCommand`, loads the configuration for
 that command, and performs process dispatch. `Serve` constructs the server
@@ -824,16 +1222,21 @@ server or open SQLite. This arrangement preserves the exact no-argument
 For `Serve`, `src/startup.rs` owns configuration validation, dependency
 construction, listener binding, task supervision, and graceful shutdown. Its
 `Application` value owns the public server, admin server, writer task,
-scheduler, workers, cancellation token, socket cleanup, and process lock.
+scheduler, workers, configured Lightning provider, startup and periodic
+payment recovery work, long-lived payment-update subscriber, cancellation
+token, socket cleanup, and process lock.
 
 The public and admin router constructors remain separate from listener binding.
 Tests can construct either router with injected state and call it through Tower
 without starting a process. Integration tests can inject ephemeral listeners,
 a clock, and a shutdown future.
 
-The application supervisor observes both servers and every critical background
-task. An unexpected exit from a server, writer, or scheduler makes readiness
-fail, cancels the other components, drains accepted work, and returns an error.
+The application supervisor observes both servers and every background task. An
+unexpected exit from a core server, writer, or scheduler makes core readiness
+fail, cancels the other core components, drains accepted work, and returns an
+error. Payment reconciliation and update subscription are feature tasks. Their
+failure makes payment readiness fail and disables tip operations, but article
+routes stay ready.
 
 Before either listener binds, startup reconciles all durable `Applying` reload
 operations and all canonical `Activating` records. Public requests therefore
@@ -843,25 +1246,41 @@ Startup follows this order:
 
 1. Parse and validate configuration.
 2. Acquire the process lock.
-3. Open the write connection and configure WAL.
-4. Apply embedded migrations.
-5. Open the query-only read pool.
-6. Spawn the writer task.
-7. Compile the initial site snapshot.
-8. Reconcile canonical activations, durable jobs, and expired leases.
-9. Bind the public and admin listeners.
-10. Mark the service ready.
+3. When a restore acceptance marker is required or present, open the database
+   read-only, verify the accepted schema and digests, prove that no migration
+   is pending, and close that connection.
+4. Open the write connection and configure WAL.
+5. Apply embedded migrations. This step is a no-op for an accepted restore.
+6. Open the query-only read pool.
+7. Spawn the writer task.
+8. Start the one snapshot-transition coordinator. Reconcile retained
+   `Applying` reloads and then claimed `Activating` publications in
+   deterministic ledger order. Any intermediate installs occur while listeners
+   are closed.
+9. Compile and install the canonical initial snapshot produced by that
+   recovered ledger state.
+10. Build the configured `LightningProvider` and start its bounded `JoinSet`
+    operation queue when tips are enabled. Run paged remote catch-up from the
+    durable update cursor. Keep payment readiness false until it succeeds.
+11. Start the long-lived payment-update subscriber at that durable cursor. It
+    uses finite long-poll waits and the same catch-up and state-transition path.
+12. Bind the public and admin listeners.
+13. Mark core article service readiness true. Do not wait for Lexe.
 
 Shutdown follows this order:
 
 1. Stop accepting public and admin requests.
 2. Stop the scheduler from claiming work.
-3. Drain active requests and workers.
-4. Reject new database commands.
-5. Drain accepted database commands.
-6. Close the read pool and writer connection.
-7. Remove the admin socket and release the process lock.
-8. Let the service manager stop Litestream after its final synchronization.
+3. Signal the payment-update subscriber and periodic recovery work to stop.
+   Cancel the provider runtime so it closes queue intake.
+4. Drain active requests and workers. Drain every provider operation accepted
+   before closure, await the provider `JoinSet`, and allow final writer
+   commands. A dropped oneshot reply does not stop its accepted operation.
+5. Reject new database commands.
+6. Drain accepted database commands.
+7. Close the read pool and writer connection.
+8. Remove the admin socket and release the process lock.
+9. Let the service manager stop Litestream after its final synchronization.
 
 Maincopy does not force a WAL checkpoint during ordinary shutdown. Litestream
 owns its compatible checkpoint and replication policy.
@@ -869,7 +1288,8 @@ owns its compatible checkpoint and replication policy.
 ## Backup and recovery
 
 Litestream is the supported SQLite backup tool. It runs beside Maincopy and
-replicates the local WAL database.
+replicates the local WAL operational database. This policy applies only to
+`maincopy.db`. A Lexe SDK cache is disposable and is not a backup target.
 
 Development uses a separate local replica folder. This setup tests replication
 and restore behavior, but it does not protect against disk loss.
@@ -883,30 +1303,44 @@ procedures must satisfy the same privacy boundary as the live database.
 
 Maincopy never places the live database on the network mount.
 
-A restore is an offline operation:
+A Maincopy database restore is an offline operation:
 
 1. Stop Maincopy and Litestream.
 2. Preserve the existing database and sidecar files.
 3. Restore into a new local path.
-4. Run the offline restore verifier. It performs `PRAGMA integrity_check`,
-   schema compatibility, pending-payload checks, and subscriber retention and
-   deletion checks without opening a listener.
-5. Review the verifier's redacted subscriber-state report. When the database
-   contains subscriber data, record explicit operator acceptance bound to the
-   restored database digest.
-6. Start Maincopy. It applies supported migrations and repeats the restore
-   gates before it binds either listener or becomes ready.
-7. Verify canonical publication, target, subscriber, and audit records through
+4. Run the candidate Maincopy binary's offline restore preparation. It applies
+   all supported migrations, completes a final WAL checkpoint, closes the
+   database, and records the resulting schema version. It does not bind a
+   listener or start a worker.
+5. Run the offline restore verifier against that post-migration database. It
+   performs `PRAGMA integrity_check`, pending-payload checks, and subscriber
+   retention and deletion checks. It produces a canonical logical digest, a
+   final database digest, and a redacted subscriber-state report.
+6. Review the report. When the database contains subscriber data, record
+   explicit operator acceptance bound to both digests and the schema version.
+7. Start Maincopy. Before any database mutation, listener, readiness change,
+   or worker, it verifies that the accepted schema and digests still match and
+   that no migration is pending. If another migration is required, stop and
+   repeat offline preparation and acceptance with the new binary.
+8. Verify canonical publication, target, subscriber, and audit records through
    the admin service.
-8. Restart Litestream replication.
+9. Restart Litestream replication.
 
-Maincopy fails closed when the offline acceptance marker is missing, does not
-match the database digest, or a repeated gate fails. A retained recovery point
-can predate a subscriber deletion. The report must expose that risk before any
-restored subscriber state becomes available to an operator or worker.
+Maincopy fails closed when the offline acceptance marker is missing, the
+accepted schema or either digest does not match, a migration is pending, or a
+repeated gate fails. A retained recovery point can predate a subscriber
+deletion. The report must expose that risk before any restored subscriber state
+becomes available to an operator or worker. Startup never invalidates its own
+acceptance marker by migrating the database after verification.
 
 The release process must exercise this restore sequence. Production operations
 must record the achieved recovery point and recovery time.
+
+After a Maincopy restore, the Lexe adapter discards or ignores any local SDK
+cache and reconciles the restored tip ledger against the remote node. It checks
+known payment indexes and marker-only `InvoiceCreating` records before payment
+readiness becomes true. This process does not delay article listeners or core
+readiness.
 
 ## Nix and release model
 
@@ -952,25 +1386,30 @@ maintainer commitment.
 Maincopy starts as one crate.
 
 ```text
+build.rs
+frontend/
+|-- css/
+`-- js/
+
 src/
 |-- main.rs
 |-- lib.rs
 |-- startup.rs
 |-- cli.rs
-|-- config.rs
+|-- config/
 |-- error.rs
 |-- content/
 |-- render/
+|-- frontend_assets/
 |-- web/
 |-- admin/
 |-- database/
 |-- jobs/
 |-- distribution/
 |-- subscriptions/
-`-- lightning/
+`-- payments/
 
 migrations/
-static/
 examples/content/
 tests/fixtures/
 ```
@@ -992,7 +1431,20 @@ V1 must prove these properties:
 - Raw email addresses and subscription tokens never enter logs or public errors.
 - Job recovery handles crashes before and after remote side effects.
 - Public routing exposes no admin endpoint.
-- Hostile Lightning responses fail closed.
+- Frontend input order is deterministic, and any frontend build error fails the
+  build.
+- A frontend bundle byte change changes its immutable URL, renderer identity,
+  and site snapshot digest.
+- Invalid or inconsistent Lightning provider responses fail closed.
+- Provider-specific progress never enters a public or persisted domain enum.
+- A tip is never `Received` before settlement evidence and operational state agree.
+- Lexe logs and errors pass the provider-secret redaction gate.
+- A Lexe outage disables tips without changing public article availability.
+- Marker reconciliation never treats zero matches as proof that recreation is safe.
+- The update subscriber commits each ledger decision with its opaque cursor,
+  replays repeated updates idempotently, and catches up after disconnects.
+- Unrelated or outgoing Lexe updates produce typed ignored decisions and do not
+  stall the durable cursor.
 - Litestream can restore the complete operational history.
 - A clean checkout passes `nix flake check` and `nix build`.
 
@@ -1005,6 +1457,8 @@ The following decisions do not change the architecture:
 - Select the confirmation email transport and retention policy before subscription capture is enabled.
 - Set queue, pool, retry, and retention defaults from measured tests.
 - Choose the final FlakeHub cache tier before v1 release.
+- Define the LND adapter only after v1. Its implementation must preserve the
+  existing provider-neutral contracts.
 
 ## References
 
@@ -1014,3 +1468,8 @@ The following decisions do not change the architecture:
 - [Litestream operation](https://litestream.io/how-it-works/)
 - [Litestream configuration](https://litestream.io/reference/config/)
 - [FlakeHub publishing](https://docs.determinate.systems/flakehub/publishing/)
+- [Lexe 0.1.22 crate](https://crates.io/crates/lexe/0.1.22)
+- [Lexe Rust SDK](https://docs.lexe.tech/rust/)
+- [Lexe authentication and scopes](https://docs.lexe.tech/authentication/)
+- [Lexe pricing](https://docs.lexe.app/pricing/)
+- [Lexe public Rust repository](https://github.com/lexe-app/lexe-public)
