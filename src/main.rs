@@ -1,6 +1,6 @@
-use maincopy::startup::run_until_stop;
+use maincopy::{error::ProcessExit, startup::run_until_stop};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ProcessExit {
     run_until_stop().await
 }

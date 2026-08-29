@@ -1,3 +1,13 @@
 pub mod admin;
+pub mod cli;
+pub mod config;
+pub mod content;
+pub mod database;
+pub mod distribution;
+pub mod error;
+pub mod jobs;
+pub mod payments;
+pub mod render;
 pub mod startup;
+pub mod subscriptions;
 pub mod web;
