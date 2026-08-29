@@ -8,6 +8,7 @@ axum = "0.8.9"
 clap = { version = "4.6.6", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
+time = { version = "0.3.55", features = ["serde-well-known"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 utoipa = { version = "5.5.0", features = ["axum_extras", "preserve_order", "preserve_path_order"] }
