@@ -281,6 +281,9 @@ pub struct PublicationBaseUrl(Url);
 
 impl PublicationBaseUrl {
     pub fn parse(value: &str) -> Result<Self, PublicationBaseUrlError> {
+        if value.chars().any(char::is_control) || value.contains('\\') {
+            return Err(PublicationBaseUrlError);
+        }
         let value = value.trim();
         let has_valid_raw_authority = value.split_once("://").is_some_and(|(_, remainder)| {
             let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());

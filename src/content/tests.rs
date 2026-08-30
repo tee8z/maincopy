@@ -346,6 +346,18 @@ fn base_url_accepts_only_an_absolute_https_root_origin() {
     );
 
     for invalid in [
+        "https://exa\tmple.com",
+        "https://example.com\\",
+        "https:\\example.com",
+    ] {
+        assert_eq!(
+            PublicationBaseUrl::parse(invalid),
+            Err(PublicationBaseUrlError),
+            "URL parser unexpectedly normalized {invalid:?}"
+        );
+    }
+
+    for invalid in [
         "http://example.com/",
         "https://user@example.com/",
         "https://@example.com/",

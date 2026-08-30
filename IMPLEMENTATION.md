@@ -418,9 +418,16 @@ Implement layered configuration without a listener or database dependency.
 
 Deliverables:
 
-- Typed `publication.toml` and `maincopy.toml` loaders.
-- Command-line overrides for non-secret runtime settings.
+- A typed, closed `maincopy.toml` loader with a 1 MiB source bound.
+- Publication validation from the exact descriptor-pinned content-tree
+  candidate. Do not add an independent publication-file read.
+- Typed content-tree limits for all seven discovery resources. The documented
+  defaults are also the v1 hard maxima.
+- Command-line overrides for the documented host paths, listener, database,
+  and all seven content-tree limits. Keep Lightning settings in the host file.
+- Built-in-default, file, and command-line precedence with explicit path bases.
 - Secret references that never print their values.
+- File-only effective Lexe credentials and no secret command-line flags.
 - Stable error categories for configuration, validation, availability,
   conflict, and internal failure.
 - Structured tracing with request and task correlation fields.
@@ -429,7 +436,15 @@ Deliverables:
 Tests:
 
 - Reject an invalid effective configuration before startup advances.
-- Verify precedence for file and command-line values.
+- Verify default, file, and command-line precedence for every override.
+- Verify every host table rejects unknown fields.
+- Reject zero, over-limit, and inconsistent content-tree limits.
+- Prove one injected discovery receives the exact effective root and limits.
+- Prove the validated publication and retained content tree come from the same
+  owned candidate, even when the source path changes later.
+- Require a configured Lightning receive provider for every configured tip
+  range, including a disabled default with a post-level opt-in.
+- Do not resolve or open a credential when publication tips are unconfigured.
 - Snapshot redacted diagnostics that contain secret references.
 - Verify all accepted timestamp inputs contain a UTC offset.
 

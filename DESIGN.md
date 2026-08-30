@@ -147,7 +147,7 @@ listeners and separate trust boundaries.
 | Tip intent and public receive status | SQLite | The record uses provider-neutral invoice and settlement types. |
 | Lightning provider reference and update cursor | SQLite | The record stores `ProviderKind::Lexe`, an opaque payment locator, and an opaque typed provider cursor. |
 | Lightning payment truth | Remote Lexe node | A local Lexe SDK cache is disposable and cannot establish invoice or settlement state. |
-| Credentials | Secret file or secret manager | Maincopy SQLite never stores credentials. Lexe client credentials are revocable and narrowly scoped. |
+| Credentials | Explicit host-referenced secret file | Maincopy SQLite never stores credentials. V1 has no secret-manager adapter. Lexe client credentials are revocable and narrowly scoped. |
 | Database backup | Litestream replica | Git content needs a separate Git backup. |
 | Provider recovery state | Remote Lexe node plus Maincopy's tip ledger | Restore reconciles the local ledger against remote payment indexes before tips become ready. |
 
@@ -239,6 +239,99 @@ preview image, Markdown images, and file links.
 `maincopy.toml` belongs to the host. It contains paths, listeners, resource
 limits, database limits, and secret references.
 
+`maincopy serve` reads `./maincopy.toml` by default. `--config PATH` selects a
+different required file. The host document must be UTF-8 and at most 1 MiB.
+Every table is closed. Maincopy rejects unknown fields at every nesting level.
+
+This example shows the complete host schema. All duration field names include
+their units.
+
+```toml
+[paths]
+content_root = "content"
+state_root = "state"
+runtime_root = "run"
+
+[content]
+publication_file_bytes = 262144
+post_file_bytes = 4194304
+asset_file_bytes = 33554432
+total_tree_bytes = 268435456
+entries = 10000
+depth = 16
+path_bytes = 1024
+
+[public]
+bind = "127.0.0.1:3000"
+
+[admin]
+socket = "run/admin.sock"
+
+[database]
+path = "state/maincopy.db"
+busy_timeout_ms = 5000
+writer_queue_capacity = 128
+read_pool_size = 4
+
+[lightning]
+provider = "lexe"
+network = "mainnet"
+credentials = { source = "file", path = "secrets/lexe-client-credentials.json" }
+cache_path = "state/lexe-cache"
+max_in_flight = 4
+max_pending = 64
+response_timeout_ms = 15000
+reconciliation_page_size = 100
+recovery_interval_seconds = 60
+```
+
+An empty host file uses these built-in values:
+
+| Setting | Default | Accepted range |
+| --- | --- | --- |
+| `paths.content_root` | `./content` | Non-empty path |
+| `paths.state_root` | `./state` | Non-empty path |
+| `paths.runtime_root` | `./run` | Non-empty path |
+| `public.bind` | `127.0.0.1:3000` | Socket address |
+| `admin.socket` | `<runtime_root>/admin.sock` | Non-empty path |
+| `database.path` | `<state_root>/maincopy.db` | Non-empty path |
+| `database.busy_timeout_ms` | `5000` | 1 through 300,000 ms |
+| `database.writer_queue_capacity` | `128` | 1 through 65,536 entries |
+| `database.read_pool_size` | `4` | 1 through 256 connections |
+
+The seven `[content]` defaults in the example are also the v1 hard maxima.
+The host can tighten them but cannot raise them. Every value must be positive.
+Each per-file byte limit must not exceed `content.total_tree_bytes`.
+
+The complete effective precedence is built-in default, then file, then command
+line. A relative path from the host file is relative to that file's parent. A
+relative command-line path is relative to the process working directory.
+Built-in root paths are also relative to the process working directory.
+Derived admin and database paths follow the effective runtime and state roots.
+There is no general environment-variable overlay. Command-line arguments can
+override only the documented host paths, listener, database, and content-tree
+limits. Lightning provider selection and provider settings stay in the host
+file. Secrets and secret references never come from the command line.
+
+| Host field | `maincopy serve` override |
+| --- | --- |
+| `paths.content_root` | `--content-root PATH` |
+| `paths.state_root` | `--state-root PATH` |
+| `paths.runtime_root` | `--runtime-root PATH` |
+| `public.bind` | `--public-bind ADDRESS` |
+| `admin.socket` | `--admin-socket PATH` |
+| `database.path` | `--database-path PATH` |
+| `database.busy_timeout_ms` | `--database-busy-timeout-ms MILLISECONDS` |
+| `database.writer_queue_capacity` | `--database-writer-queue-capacity COUNT` |
+| `database.read_pool_size` | `--database-read-pool-size COUNT` |
+| `content.publication_file_bytes` | `--content-publication-file-bytes BYTES` |
+| `content.post_file_bytes` | `--content-post-file-bytes BYTES` |
+| `content.asset_file_bytes` | `--content-asset-file-bytes BYTES` |
+| `content.total_tree_bytes` | `--content-total-tree-bytes BYTES` |
+| `content.entries` | `--content-entries COUNT` |
+| `content.depth` | `--content-depth COUNT` |
+| `content.path_bytes` | `--content-path-bytes BYTES` |
+
 The host configuration selects a typed Lightning receive provider. The v1
 configuration enum contains only `Lexe`. Maincopy will add an `Lnd` variant
 only when that adapter exists. Public and admin contracts do not contain the
@@ -250,9 +343,20 @@ selects the Bitcoin network, the client-credential file, an optional local SDK
 cache path, maximum in-flight operations, maximum pending operations, request
 and reconciliation timeouts, a bounded reconciliation page size, and a
 periodic recovery interval. The provider-operation deadline also bounds each
-payment-update long poll. The typed in-flight limit rejects zero and one when
-tips are enabled. The operator must provision revocable
-credentials with exactly the
+payment-update long poll. The `[lightning]` table is optional. If it is
+present, `provider`, `network`, and `credentials` are required. The accepted
+networks are `mainnet`, `testnet3`, `testnet4`, `signet`, and `regtest`.
+
+| Lexe setting | Default | Accepted range |
+| --- | ---: | ---: |
+| `cache_path` | None | Non-empty path when present |
+| `max_in_flight` | 4 | 2 through 1,024 operations |
+| `max_pending` | 64 | 1 through 65,536 operations |
+| `response_timeout_ms` | 15,000 | 1 through 300,000 ms |
+| `reconciliation_page_size` | 100 | 1 through 1,000 payments |
+| `recovery_interval_seconds` | 60 | 1 through 86,400 seconds |
+
+The operator must provision revocable credentials with exactly the
 `Receive`, `ReadPayments`, and `ReadInfo` scopes and an empty explicit
 `permissions` collection. `ReadInfo` supports node identity and health checks.
 The Lexe 0.1.22 `ClientCredentials` blob does not expose its grants, so
@@ -267,8 +371,24 @@ the source of payment truth. An SDK cache can improve local queries, but it is
 non-authoritative, can be deleted, and is not part of Maincopy's Litestream
 backup contract.
 
-Command-line arguments can override non-secret runtime settings. Secret values
-come from environment variables, credential files, or a secret manager.
+Generic secret-reference primitives represent tagged file and environment
+references and redact both forms. The effective v1 Lexe configuration accepts
+only `{ source = "file", path = "..." }`. The provider resolves that file
+explicitly at provider startup. It rejects an environment reference and does
+not expose the variable name or secret path in diagnostics. V1 has no ambient
+environment overlay, secret-manager adapter, or command-line secret input.
+
+Startup loads the host file first. It then discovers and validates one pinned
+content-tree candidate with the effective content root and limits. The
+validated `publication.toml` bytes from that same candidate decide whether a
+Lightning receive provider is required. Startup does not reopen the
+publication file through a second path.
+
+A configured tip range requires a receive provider even when
+`tips.enabled = false`, because a post can opt in. If publication tips are
+unconfigured, startup does not open or decode the credential file. If tips are
+configured and `[lightning]` is absent, startup returns the stable
+`tip_provider_required` configuration error.
 
 Maincopy validates the complete effective configuration before it opens a
 listener. A syntactically invalid or internally inconsistent host
@@ -431,7 +551,8 @@ The host can configure each content-tree limit. V1 uses these defaults:
 | Logical path length | 1,024 bytes | Count the full `/`-separated logical path. |
 
 One kibibyte (KiB) is 1,024 bytes. One mebibyte (MiB) is 1,024 KiB. Every
-limit is inclusive.
+limit is inclusive. Each default is also the v1 hard maximum. A host can
+tighten a limit but cannot raise it.
 
 The loader enforces byte limits while it reads. It does not trust file metadata
 as the only size check. Before it returns a candidate, it verifies the pinned
@@ -1068,14 +1189,26 @@ Errors use one stable envelope:
   "error": {
     "code": "job_conflict",
     "message": "The job changed after the client loaded it.",
-    "request_id": "01J...",
+    "request_id": "2e776d7d-7d5f-4ab7-8c63-434c66a262aa",
     "details": {}
   }
 }
 ```
 
-The CLI supports JSON output and stable exit codes. Agents never need to parse
-human-formatted tables.
+The current CLI writes redaction-safe human diagnostics to standard error and
+uses stable exit codes. Automation that needs structured results uses the
+admin JSON API. A future CLI JSON mode must reuse the stable categories; it is
+not part of the v1 foundation contract.
+
+| Exit | Category | Meaning |
+| ---: | --- | --- |
+| 0 | Success | The requested operation completed. |
+| 2 | Usage | The command line is invalid. |
+| 65 | Validation | Git-owned content is invalid. |
+| 69 | Availability | A required service or resource is unavailable. |
+| 70 | Internal | An application invariant or internal operation failed. |
+| 75 | Conflict | Current state conflicts with the requested operation. |
+| 78 | Configuration | Host-owned configuration is invalid. |
 
 The admin API exposes fixed operations only. It never exposes a shell command,
 raw SQL, or arbitrary file access.

@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
+    path::Path,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -8,13 +9,22 @@ use std::{
 use clap::{Parser, error::ErrorKind};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::{
-    cli::{AdminCommand, ProcessArguments, ProcessCommand},
+    cli::{AdminCommand, ProcessArguments, ProcessCommand, ServeArguments},
+    config::{
+        HostConfiguration, HostConfigurationLoader, LightningConfiguration, tip_provider_required,
+    },
+    content::{
+        ContentTreeLimits, ContentValidationErrors, DiscoveredContentTree, ValidatedContent,
+        discover_content_tree,
+    },
     error::{
         ApplicationError, CriticalTaskName, PanicMessage, ProcessComponent, ProcessError,
         ProcessExit, ShutdownSignal, UnavailableReason,
     },
+    observability::{TaskCorrelationId, task_span},
     web::Readiness,
 };
 
@@ -28,10 +38,57 @@ type CriticalTaskResult = Result<(), CriticalTaskFailure>;
 /// task creation belong in [`Application::build`]. Runtime supervision and
 /// ordered shutdown belong in [`Application::run_until_stop`].
 pub(crate) struct Application {
+    _startup: Option<StartupConfiguration>,
     readiness: Readiness,
     cancellation: CancellationToken,
     shutdown: ShutdownFuture,
     critical_tasks: JoinSet<(CriticalTaskName, CriticalTaskCompletion)>,
+}
+
+struct StartupConfiguration {
+    _host: HostConfiguration,
+    _content_tree: DiscoveredContentTree,
+    _validated_content: ValidatedContent,
+    _lightning: Option<LightningConfiguration>,
+}
+
+impl StartupConfiguration {
+    fn load(arguments: ServeArguments) -> Result<Self, ProcessError> {
+        Self::load_with_discovery(arguments, discover_content_tree)
+    }
+
+    fn load_with_discovery<Discover>(
+        arguments: ServeArguments,
+        discover: Discover,
+    ) -> Result<Self, ProcessError>
+    where
+        Discover: FnOnce(
+            &Path,
+            ContentTreeLimits,
+        ) -> Result<DiscoveredContentTree, ContentValidationErrors>,
+    {
+        let (path, overrides) = arguments.into_configuration();
+        let host =
+            HostConfigurationLoader::from_process_working_directory()?.load(&path, overrides)?;
+        let content_tree = discover(host.paths().content_root(), host.content())?;
+        let validated_content = content_tree.validate()?;
+        let lightning = if validated_content.publication().tips().is_configured() {
+            Some(
+                host.lightning()
+                    .cloned()
+                    .ok_or_else(tip_provider_required)?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Self {
+            _host: host,
+            _content_tree: content_tree,
+            _validated_content: validated_content,
+            _lightning: lightning,
+        })
+    }
 }
 
 /// Parses one process command and runs it to completion.
@@ -82,8 +139,8 @@ where
     Driver: ProcessDriver,
 {
     match arguments.command {
-        ProcessCommand::Serve => {
-            let application = driver.build_application().await?;
+        ProcessCommand::Serve(arguments) => {
+            let application = driver.build_application(*arguments).await?;
             driver.run_application(application).await
         }
         ProcessCommand::Admin(arguments) => driver.run_admin_command(arguments.command).await,
@@ -93,7 +150,10 @@ where
 trait ProcessDriver {
     type Application;
 
-    async fn build_application(&mut self) -> Result<Self::Application, ProcessError>;
+    async fn build_application(
+        &mut self,
+        arguments: ServeArguments,
+    ) -> Result<Self::Application, ProcessError>;
 
     async fn run_application(&mut self, application: Self::Application)
     -> Result<(), ProcessError>;
@@ -103,11 +163,27 @@ trait ProcessDriver {
 
 struct ProductionDriver;
 
+fn build_application_with<Startup, BuiltApplication, LoadStartup, BuildApplication>(
+    arguments: ServeArguments,
+    load_startup: LoadStartup,
+    build_application: BuildApplication,
+) -> Result<BuiltApplication, ProcessError>
+where
+    LoadStartup: FnOnce(ServeArguments) -> Result<Startup, ProcessError>,
+    BuildApplication: FnOnce(Startup) -> Result<BuiltApplication, ApplicationError>,
+{
+    let startup = load_startup(arguments)?;
+    build_application(startup).map_err(ProcessError::from)
+}
+
 impl ProcessDriver for ProductionDriver {
     type Application = Application;
 
-    async fn build_application(&mut self) -> Result<Self::Application, ProcessError> {
-        Application::build().map_err(ProcessError::from)
+    async fn build_application(
+        &mut self,
+        arguments: ServeArguments,
+    ) -> Result<Self::Application, ProcessError> {
+        build_application_with(arguments, StartupConfiguration::load, Application::build)
     }
 
     async fn run_application(
@@ -131,8 +207,11 @@ impl ProcessDriver for ProductionDriver {
 }
 
 impl Application {
-    fn build() -> Result<Self, ApplicationError> {
-        Self::build_with_signal_installer(Readiness::default(), install_termination_signal)
+    fn build(startup: StartupConfiguration) -> Result<Self, ApplicationError> {
+        let mut application =
+            Self::build_with_signal_installer(Readiness::default(), install_termination_signal)?;
+        application._startup = Some(startup);
+        Ok(application)
     }
 
     fn build_with_signal_installer<Install>(
@@ -164,10 +243,12 @@ impl Application {
     ) -> Self {
         let mut supervisor = JoinSet::new();
         for task in critical_tasks {
-            supervisor.spawn(SupervisedTask::new(task));
+            let span = task_span(TaskCorrelationId::new(), task.name);
+            supervisor.spawn(SupervisedTask::new(task).instrument(span));
         }
 
         Self {
+            _startup: None,
             readiness,
             cancellation,
             shutdown,
@@ -387,9 +468,15 @@ fn install_termination_signal() -> Result<ShutdownFuture, ApplicationError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+    use std::{
+        cell::Cell,
+        ffi::OsString,
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
     };
 
     use clap::Parser;
@@ -397,6 +484,56 @@ mod tests {
 
     use super::*;
     use crate::error::StartupStage;
+
+    const VALID_PUBLICATION: &str = "[site]\n\
+title = \"Pinned startup source\"\n\
+base_url = \"https://startup.example.test\"\n\
+description = \"Startup configuration test.\"\n\
+[author]\n\
+name = \"Startup Tester\"\n";
+
+    fn serve_arguments_for(config: &Path, content_root: &Path) -> ServeArguments {
+        serve_arguments_for_with(config, content_root, &[])
+    }
+
+    fn serve_arguments_for_with(
+        config: &Path,
+        content_root: &Path,
+        overrides: &[(&str, &str)],
+    ) -> ServeArguments {
+        let mut command = vec![
+            OsString::from("maincopy"),
+            OsString::from("serve"),
+            OsString::from("--config"),
+            config.as_os_str().to_owned(),
+            OsString::from("--content-root"),
+            content_root.as_os_str().to_owned(),
+        ];
+        for (flag, value) in overrides {
+            command.push(OsString::from(flag));
+            command.push(OsString::from(value));
+        }
+        let arguments = ProcessArguments::try_parse_from(command).unwrap();
+        let ProcessCommand::Serve(arguments) = arguments.command else {
+            panic!("serve command must parse");
+        };
+        *arguments
+    }
+
+    fn startup_fixture(
+        host_source: &str,
+        publication_source: &str,
+    ) -> (tempfile::TempDir, ServeArguments, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let content_root = root.path().join("content");
+        fs::create_dir(&content_root).unwrap();
+        let publication_path = content_root.join("publication.toml");
+        fs::write(&publication_path, publication_source).unwrap();
+        let config_path = root.path().join("maincopy.toml");
+        fs::write(&config_path, host_source).unwrap();
+        let arguments = serve_arguments_for(&config_path, &content_root);
+        (root, arguments, publication_path)
+    }
 
     #[derive(Clone, Copy)]
     enum BuildOutcome {
@@ -434,7 +571,10 @@ mod tests {
     impl ProcessDriver for FakeDriver {
         type Application = ();
 
-        async fn build_application(&mut self) -> Result<Self::Application, ProcessError> {
+        async fn build_application(
+            &mut self,
+            _arguments: ServeArguments,
+        ) -> Result<Self::Application, ProcessError> {
             self.build_calls += 1;
             self.runtime_seen = tokio::runtime::Handle::try_current().is_ok();
 
@@ -523,6 +663,173 @@ mod tests {
         ));
         assert_eq!(driver.build_calls, 1);
         assert_eq!(driver.run_calls, 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn content_discovery_runs_once_receives_effective_limits_and_validation_reuses_owned_bytes() {
+        let host_source = "[content]\n\
+publication_file_bytes = 1024\n\
+post_file_bytes = 2048\n\
+asset_file_bytes = 3072\n\
+total_tree_bytes = 4096\n\
+entries = 100\n\
+depth = 8\n\
+path_bytes = 512\n";
+        let (root, _, publication_path) = startup_fixture(host_source, VALID_PUBLICATION);
+        let arguments = serve_arguments_for_with(
+            &root.path().join("maincopy.toml"),
+            &root.path().join("content"),
+            &[
+                ("--content-publication-file-bytes", "512"),
+                ("--content-post-file-bytes", "1536"),
+                ("--content-asset-file-bytes", "2560"),
+                ("--content-total-tree-bytes", "3584"),
+                ("--content-entries", "90"),
+                ("--content-depth", "7"),
+                ("--content-path-bytes", "400"),
+            ],
+        );
+        let discovery_calls = Cell::new(0);
+        let observed_limits = Cell::new(None);
+
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, |content_root, limits| {
+                discovery_calls.set(discovery_calls.get() + 1);
+                observed_limits.set(Some(limits));
+                let tree = discover_content_tree(content_root, limits)?;
+                fs::write(&publication_path, "not the discovered publication").unwrap();
+                Ok(tree)
+            })
+            .unwrap();
+
+        assert_eq!(discovery_calls.get(), 1);
+        let limits = observed_limits.get().unwrap();
+        assert_eq!(limits.publication_file_bytes().get(), 512);
+        assert_eq!(limits.post_file_bytes().get(), 1536);
+        assert_eq!(limits.asset_file_bytes().get(), 2560);
+        assert_eq!(limits.total_tree_bytes().get(), 3584);
+        assert_eq!(limits.entries().get(), 90);
+        assert_eq!(limits.depth().get(), 7);
+        assert_eq!(limits.path_bytes().get(), 400);
+        assert!(
+            startup
+                ._content_tree
+                .publication()
+                .source()
+                .contains("Pinned startup source")
+        );
+        assert_eq!(
+            startup
+                ._validated_content
+                .publication()
+                .site()
+                .title()
+                .as_str(),
+            "Pinned startup source"
+        );
+    }
+
+    #[test]
+    fn host_configuration_failure_prevents_content_and_application_stages() {
+        let root = tempfile::tempdir().unwrap();
+        let arguments = serve_arguments_for(
+            &root.path().join("missing-maincopy.toml"),
+            &root.path().join("content"),
+        );
+        let discovery_calls = Cell::new(0);
+        let application_build_calls = Cell::new(0);
+
+        let result = build_application_with(
+            arguments,
+            |arguments| {
+                StartupConfiguration::load_with_discovery(arguments, |_, _| {
+                    discovery_calls.set(discovery_calls.get() + 1);
+                    unreachable!("content discovery must follow host configuration")
+                })
+            },
+            |_| {
+                application_build_calls.set(application_build_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(ProcessError::Configuration(_))));
+        assert_eq!(discovery_calls.get(), 0);
+        assert_eq!(application_build_calls.get(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn content_validation_failure_has_stable_exit_and_prevents_application_stages() {
+        let (_root, arguments, _) = startup_fixture("", "unknown = true\n");
+        let discovery_calls = Cell::new(0);
+        let application_build_calls = Cell::new(0);
+
+        let result = build_application_with(
+            arguments,
+            |arguments| {
+                StartupConfiguration::load_with_discovery(arguments, |root, limits| {
+                    discovery_calls.set(discovery_calls.get() + 1);
+                    discover_content_tree(root, limits)
+                })
+            },
+            |_| {
+                application_build_calls.set(application_build_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, ProcessError::Validation(_)));
+        assert_eq!(error.exit(), ProcessExit::Validation);
+        assert_eq!(discovery_calls.get(), 1);
+        assert_eq!(application_build_calls.get(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn configured_disabled_tip_range_still_requires_a_provider() {
+        let publication = format!(
+            "{VALID_PUBLICATION}[tips]\n\
+             enabled = false\n\
+             minimum_sats = 1\n\
+             maximum_sats = 2\n"
+        );
+        let (_root, arguments, _) = startup_fixture("", &publication);
+
+        let result = StartupConfiguration::load_with_discovery(arguments, discover_content_tree);
+        let Err(error) = result else {
+            panic!("a configured tip range must require a provider");
+        };
+
+        assert_eq!(error.exit(), ProcessExit::Configuration);
+        let ProcessError::Configuration(errors) = error else {
+            panic!("missing tip capability must be a host configuration error");
+        };
+        assert_eq!(errors.diagnostics().len(), 1);
+        assert_eq!(
+            errors.diagnostics()[0].code(),
+            crate::config::ConfigurationValidationCode::TipProviderRequired
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unconfigured_tips_do_not_activate_or_open_lexe_credentials() {
+        let host = "[lightning]\n\
+provider = \"lexe\"\n\
+network = \"signet\"\n\
+credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
+        let (root, arguments, _) = startup_fixture(host, VALID_PUBLICATION);
+        let credential_path = root.path().join("must-not-open.json");
+
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+
+        assert!(startup._host.lightning().is_some());
+        assert!(startup._lightning.is_none());
+        assert!(!credential_path.exists());
     }
 
     #[test]

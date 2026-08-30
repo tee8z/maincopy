@@ -1717,6 +1717,8 @@ dependencies = [
  "tokio-util",
  "toml",
  "tower",
+ "tracing",
+ "tracing-subscriber",
  "url",
  "utoipa",
  "utoipa-axum",

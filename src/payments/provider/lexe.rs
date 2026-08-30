@@ -24,6 +24,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::clock::{Clock, SystemClock};
+
 use super::super::{
     Bolt11Invoice, CommandNotAcceptedReason, CreateTipInvoiceError, CreateTipInvoiceRequest,
     CreateTipInvoiceResult, IgnoredPaymentUpdateReason, IgnoredProviderPaymentUpdate,
@@ -1050,18 +1052,6 @@ where
                 }
             }
         }
-    }
-}
-
-trait Clock: Send + Sync {
-    fn now(&self) -> OffsetDateTime;
-}
-
-struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
     }
 }
 

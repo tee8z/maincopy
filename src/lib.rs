@@ -3,6 +3,7 @@ mod frontend_digest_contract;
 
 pub mod admin;
 pub mod cli;
+pub mod clock;
 pub mod config;
 pub mod content;
 pub mod database;
@@ -10,6 +11,7 @@ pub mod distribution;
 pub mod error;
 pub mod frontend_assets;
 pub mod jobs;
+pub mod observability;
 pub mod payments;
 pub mod render;
 pub mod startup;

@@ -1,12 +1,16 @@
 use std::{fmt, process::Termination};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::{config::ConfigurationErrors, content::ContentValidationErrors};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ProcessExit {
     Success = 0,
     Usage = 2,
+    Validation = 65,
     Unavailable = 69,
     Internal = 70,
     Conflict = 75,
@@ -27,8 +31,11 @@ impl Termination for ProcessExit {
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
-    #[error("application configuration is invalid")]
-    Configuration,
+    #[error(transparent)]
+    Configuration(#[from] ConfigurationErrors),
+
+    #[error(transparent)]
+    Validation(#[from] ContentValidationErrors),
 
     #[error("{component} is unavailable: {reason}")]
     Unavailable {
@@ -49,12 +56,33 @@ pub enum ProcessError {
 impl ProcessError {
     pub const fn exit(&self) -> ProcessExit {
         match self {
-            Self::Configuration => ProcessExit::Configuration,
+            Self::Configuration(_) => ProcessExit::Configuration,
+            Self::Validation(_) => ProcessExit::Validation,
             Self::Unavailable { .. } => ProcessExit::Unavailable,
             Self::Conflict { .. } => ProcessExit::Conflict,
             Self::Application(_) | Self::Internal => ProcessExit::Internal,
         }
     }
+
+    pub const fn category(&self) -> ProcessErrorCategory {
+        match self {
+            Self::Configuration(_) => ProcessErrorCategory::Configuration,
+            Self::Validation(_) => ProcessErrorCategory::Validation,
+            Self::Unavailable { .. } => ProcessErrorCategory::Availability,
+            Self::Conflict { .. } => ProcessErrorCategory::Conflict,
+            Self::Application(_) | Self::Internal => ProcessErrorCategory::Internal,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessErrorCategory {
+    Configuration,
+    Validation,
+    Availability,
+    Conflict,
+    Internal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,10 +260,35 @@ impl fmt::Display for PanicMessage {
 mod tests {
     use super::*;
 
+    fn configuration_errors() -> ConfigurationErrors {
+        ConfigurationErrors::from_diagnostics(vec![crate::config::ConfigurationDiagnostic::new(
+            crate::config::ConfigurationAuthority::Host,
+            "$document",
+            crate::config::ConfigurationValidationCode::HostTomlInvalid,
+            "host TOML does not match the schema",
+        )])
+    }
+
+    fn validation_errors() -> ContentValidationErrors {
+        let root = tempfile::tempdir().unwrap();
+        crate::content::discover_content_tree(
+            &root.path().join("missing"),
+            crate::content::ContentTreeLimits::default(),
+        )
+        .unwrap_err()
+    }
+
     #[test]
     fn process_error_categories_have_stable_exit_codes() {
         let cases = [
-            (ProcessError::Configuration, ProcessExit::Configuration),
+            (
+                ProcessError::Configuration(configuration_errors()),
+                ProcessExit::Configuration,
+            ),
+            (
+                ProcessError::Validation(validation_errors()),
+                ProcessExit::Validation,
+            ),
             (
                 ProcessError::Unavailable {
                     component: ProcessComponent::AdminApi,
@@ -267,9 +320,51 @@ mod tests {
     fn process_exit_values_follow_the_documented_cli_contract() {
         assert_eq!(ProcessExit::Success.code(), 0);
         assert_eq!(ProcessExit::Usage.code(), 2);
+        assert_eq!(ProcessExit::Validation.code(), 65);
         assert_eq!(ProcessExit::Unavailable.code(), 69);
         assert_eq!(ProcessExit::Internal.code(), 70);
         assert_eq!(ProcessExit::Conflict.code(), 75);
         assert_eq!(ProcessExit::Configuration.code(), 78);
+    }
+
+    #[test]
+    fn process_error_categories_have_stable_wire_names_and_mappings() {
+        let cases = [
+            (
+                ProcessError::Configuration(configuration_errors()),
+                ProcessErrorCategory::Configuration,
+                "configuration",
+            ),
+            (
+                ProcessError::Validation(validation_errors()),
+                ProcessErrorCategory::Validation,
+                "validation",
+            ),
+            (
+                ProcessError::Unavailable {
+                    component: ProcessComponent::AdminApi,
+                    reason: UnavailableReason::NotImplemented,
+                },
+                ProcessErrorCategory::Availability,
+                "availability",
+            ),
+            (
+                ProcessError::Conflict {
+                    resource: ConflictResource::Application,
+                },
+                ProcessErrorCategory::Conflict,
+                "conflict",
+            ),
+            (
+                ProcessError::Internal,
+                ProcessErrorCategory::Internal,
+                "internal",
+            ),
+        ];
+
+        for (error, category, wire_name) in cases {
+            assert_eq!(error.category(), category);
+            assert_eq!(serde_json::to_value(category).unwrap(), wire_name);
+        }
     }
 }
