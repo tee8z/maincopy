@@ -32,3 +32,20 @@ jobs:
 
       - name: Build Maincopy
         run: nix build --print-build-logs
+
+  windows-client:
+    name: Windows shared and CLI tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Select stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Test shared contracts and CLI
+        run: cargo test --locked --package maincopy-shared --package maincopy-cli --all-targets

@@ -46,7 +46,7 @@ The script runs these pinned measurement commands:
 cargo llvm-cov --all-targets --all-features --include-build-script \
   --locked --offline --lcov --output-path target/crap/coverage.lcov
 knots --recursive --language rust --count-anonymous-closures --format json \
-  src tests build.rs build_support >target/crap/complexity.json
+  crates >target/crap/complexity.json
 ```
 
 The parser resolves source paths before it joins the inputs. It merges duplicate
@@ -86,7 +86,7 @@ The 2026-08-30 baseline measured 1,461 of 1,624 named functions. Twelve
 production functions and three build functions had scores of at least 20. The
 highest production, build, and test scores were 90.00, 26.18, and 6.00.
 
-After the simplification pass, the same-day final report measured 1,313 of
-1,451 named functions. Canonical line coverage was 15,459 of 17,000 lines
-(90.94%). No measured function had a score of 20 or higher. The highest
+After the simplification and workspace split, the same-day final report measured
+1,334 of 1,498 named functions. Canonical line coverage was 15,786 of 17,307
+lines (91.21%). No measured function had a score of 20 or higher. The highest
 production, build, and test scores were 15.02, 16.47, and 6.00.

@@ -50,7 +50,13 @@ The supported path uses Nix:
 ```console
 nix develop
 cargo test
-cargo run -- serve
+cargo run -p maincopy-server --bin maincopyd --
+```
+
+While `maincopyd` runs, use another shell for an operator command:
+
+```console
+cargo run -p maincopy-cli --bin maincopy -- capabilities
 ```
 
 Run the complete local quality gate with:
@@ -66,14 +72,27 @@ formatter.
 
 ## Architecture in one minute
 
-`maincopy serve` will own the public listener, private Unix-socket admin API,
-scheduler, and database lifecycle. Exactly one task will own one SQLite write
-connection. All writers will use a shared bounded channel and receive a reply
-only after commit. Query handlers will use a separate, bounded, query-only pool
-against the same local WAL database.
+The root manifest defines one Cargo workspace with three crates. `maincopyd`
+from `crates/server` owns the listeners, scheduler, and database lifecycle.
+`maincopy` from `crates/cli` is a short-lived operator client.
+`crates/shared` contains wire contracts and transport defaults used by both.
+
+Exactly one task in `maincopyd` will own one SQLite write connection. All
+writers will use a shared bounded channel and receive a reply only after commit.
+Query handlers will use a separate, bounded, query-only pool against the same
+local write-ahead logging (WAL) database.
 
 The CLI, future admin UI, and other agents will use the same versioned admin
 API. They will never open the live SQLite database for writes.
+
+The private API uses HTTP/JSON over a Unix domain socket on Linux and macOS.
+On Windows, it uses a local named pipe that rejects remote clients. The pipe
+grants access only to its owner and Windows `SYSTEM`. Maincopy has no admin TCP
+fallback.
+
+The CLI transport cross-compiles and runs on Windows. This does not make the
+complete daemon a supported Windows target. Content discovery remains
+Linux-only, and the native frontend build backend supports Linux and macOS.
 
 The private API controls when a pinned article revision first becomes public.
 A content reload cannot expose an unpublished or scheduled post. Distribution
@@ -94,18 +113,16 @@ projection, so a partial compiler stage cannot mint a final identity.
 Maud templates remain Rust modules. A custom build script deterministically
 combines and minifies first-party CSS and optional JavaScript, writes typed
 generated metadata and bundles under `OUT_DIR`, and embeds those bundles in the
-binary. The bundle digest changes the immutable asset URL, renderer identity,
-and site snapshot identity. Favicon, post-image, attachment, and CDN assets
-remain part of the separate content pipeline.
+server binary. The bundle digest changes the immutable asset URL, renderer
+identity, and site snapshot identity. Favicon, post-image, attachment, and CDN
+assets remain part of the separate content pipeline.
 
-`src/main.rs` stays as a small process entry point. It can initialize bootstrap
-logging before its final `run_until_stop().await` call. `src/startup.rs` parses
-the typed process command, loads its configuration, and dispatches server or
-admin-client behavior without global configuration state. It also owns server
-dependency wiring, task supervision, and graceful shutdown so the application
-can be built and tested as a library. The public and admin router constructors
-remain independent. API tests call each router directly through Tower, and
-socket-based tests are reserved for transport behavior.
+`crates/server/src/main.rs` stays as a small process entry point.
+`crates/server/src/startup.rs` loads server configuration and owns dependency
+wiring, task supervision, and graceful shutdown. The separate CLI constructs a
+concrete admin client and does not construct the server. The public and admin
+router constructors remain independent. API tests call each router directly
+through Tower, and transport tests use real local endpoints only when needed.
 
 This startup-owned configuration choice is intentional for the exact
 no-argument call boundary; it can change only with an explicit signature
@@ -147,8 +164,8 @@ article access or core article readiness.
 
 The repository flake is the installation source during pre-v1 development. V1
 will use signed Semantic Versioning tags and GitHub Releases. The approved
-release workflow will publish the Rust crate to crates.io and the tagged flake
-to FlakeHub. A nixpkgs submission can follow when the project has stable users
-and a long-term maintainer.
+release workflow will publish the Rust packages to crates.io and the tagged
+flake to FlakeHub. A nixpkgs submission can follow when the project has stable
+users and a long-term maintainer.
 
 The default branch is `master`.

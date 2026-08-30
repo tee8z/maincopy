@@ -1,7 +1,7 @@
 # Maincopy design
 
 Status: accepted direction for v1
-Last updated: 2026-08-29
+Last updated: 2026-08-30
 
 ## Purpose
 
@@ -41,8 +41,9 @@ cannot be required for reading or navigation.
 
 ### Features must earn their complexity
 
-V1 uses one Rust crate, one service process, and one local SQLite database.
-Maincopy adds a new component only when a current requirement needs it.
+V1 uses one Cargo workspace with three focused Rust crates. It uses one service
+process and one local SQLite database. Maincopy adds a component only when a
+current requirement needs it.
 
 ### Finite domains use strong types
 
@@ -107,7 +108,9 @@ flowchart LR
     Snapshot --> Public[Public Axum service]
     Public --> Reader[Reader]
 
-    Operator[Operator, CLI, or agent] --> Admin[Private admin service]
+    Operator[Operator] --> CLI[Short-lived maincopy CLI]
+    CLI -->|private HTTP/JSON| Admin[Private admin service]
+    Agent[Agent] -->|private HTTP/JSON| Admin
     Admin --> Writer[Database writer task]
     Scheduler[Scheduler and workers] --> Writer
     Writer --> DB[(Local SQLite WAL)]
@@ -129,8 +132,9 @@ flowchart LR
     Litestream --> Replica[Local folder, network folder, or S3]
 ```
 
-The public service and admin service run in one process. They use separate
-listeners and separate trust boundaries.
+The public service and admin service run in the one long-lived `maincopyd`
+process. They use separate listeners and separate trust boundaries. The
+`maincopy` CLI exits after each operation.
 
 ## Source-of-truth boundaries
 
@@ -153,7 +157,19 @@ listeners and separate trust boundaries.
 
 ## Repository and runtime layout
 
-The engine and publication content use separate repositories.
+The root `Cargo.toml` defines only the workspace. All Rust package source lives
+under these crate boundaries:
+
+```text
+crates/
+|-- server/                 # maincopyd service and application domains
+|-- cli/                    # short-lived maincopy operator client
+`-- shared/                 # wire contracts and shared transport defaults
+```
+
+The CLI depends on `maincopy-shared`. It does not depend on
+`maincopy-server`. The server and publication content use separate
+repositories at deployment time.
 
 ```text
 /srv/maincopy/
@@ -240,12 +256,13 @@ preview image, Markdown images, and file links.
 `maincopy.toml` belongs to the host. It contains paths, listeners, resource
 limits, database limits, and secret references.
 
-`maincopy serve` reads `./maincopy.toml` by default. `--config PATH` selects a
+`maincopyd` reads `./maincopy.toml` by default. `--config PATH` selects a
 different required file. The host document must be UTF-8 and at most 1 MiB.
 Every table is closed. Maincopy rejects unknown fields at every nesting level.
 
-This example shows the complete host schema. All duration field names include
-their units.
+This Unix example shows the complete host schema. On Windows, replace the
+admin socket value with a canonical local named-pipe name. All duration field
+names include their units.
 
 ```toml
 [paths]
@@ -286,6 +303,13 @@ reconciliation_page_size = 100
 recovery_interval_seconds = 60
 ```
 
+On Windows, use a TOML literal string for the named-pipe value:
+
+```toml
+[admin]
+socket = '\\.\pipe\maincopy'
+```
+
 An empty host file uses these built-in values:
 
 | Setting | Default | Accepted range |
@@ -294,7 +318,8 @@ An empty host file uses these built-in values:
 | `paths.state_root` | `./state` | Non-empty path |
 | `paths.runtime_root` | `./run` | Non-empty path |
 | `public.bind` | `127.0.0.1:3000` | Socket address |
-| `admin.socket` | `<runtime_root>/admin.sock` | Non-empty path |
+| `admin.socket` on Unix | `<runtime_root>/admin.sock` | Non-empty filesystem path |
+| `admin.socket` on Windows | `\\.\pipe\maincopy` | Canonical local `\\.\pipe\name` |
 | `database.path` | `<state_root>/maincopy.db` | Non-empty path |
 | `database.busy_timeout_ms` | `5000` | 1 through 300,000 ms |
 | `database.writer_queue_capacity` | `128` | 1 through 65,536 entries |
@@ -308,15 +333,20 @@ The complete effective precedence is built-in default, then file, then command
 line. A relative path from the host file is relative to that file's parent. A
 relative command-line path is relative to the process working directory.
 Built-in root paths are also relative to the process working directory.
-Derived admin and database paths follow the effective runtime and state roots.
+
+On Unix, the derived admin path follows the effective runtime root. On Windows,
+`admin.socket` and `--admin-socket` require a canonical local named-pipe name.
+The `maincopy --socket` option uses the same platform default as `maincopyd`.
+The database path follows the effective state root on all platforms.
+
 There is no general environment-variable overlay. `RUST_LOG` is the only
 operational environment input and selects the process log level. Command-line
-arguments can
-override only the documented host paths, listener, database, and content-tree
-limits. Lightning provider selection and provider settings stay in the host
-file. Secrets and secret references never come from the command line.
+arguments can override only the documented host paths, listener, database, and
+content-tree limits. Lightning provider selection and provider settings stay
+in the host file. Secrets and secret references never come from the command
+line.
 
-| Host field | `maincopy serve` override |
+| Host field | `maincopyd` override |
 | --- | --- |
 | `paths.content_root` | `--content-root PATH` |
 | `paths.state_root` | `--state-root PATH` |
@@ -626,10 +656,10 @@ site assets belong to the content repository. The build pipeline never treats
 a favicon, post image, content attachment, or CDN reference as a compile-time
 application asset.
 
-Maud templates remain Rust modules. A custom `build.rs` processes only
+Maud templates remain Rust modules. `crates/server/build.rs` processes only
 first-party CSS and optional JavaScript pieces. V1 requires
-`frontend/css/site.css` and does not include JavaScript until a feature needs
-it. The script discovers the required file and any additional declared CSS
+`crates/server/frontend/css/site.css` and does not include JavaScript until a
+feature needs it. The script discovers the required file and declared CSS
 pieces, normalizes and sorts their paths, combines them in that order,
 minifies the complete output with a parser-backed minifier, and calculates a
 content digest. A traversal, read, minification, metadata, or write error fails
@@ -659,7 +689,7 @@ rejects linked, special, replaced, and multiply hard-linked output paths.
 | Frontend build limit | Inclusive maximum |
 | --- | ---: |
 | Discovered files and directories | 256 entries |
-| Path depth below `frontend/css` | 16 segments |
+| Path depth below `crates/server/frontend/css` | 16 segments |
 | One CSS input | 4 MiB |
 | Combined parser stream, including one inserted newline per file | 8 MiB |
 | Emitted CSS bundle | 8 MiB |
@@ -672,7 +702,7 @@ contains its kind, name, content digest, immutable public path, and embedded
 bytes. Runtime code uses the manifest instead of constructing filenames or
 MIME types from strings.
 
-The binary embeds the generated bundles and serves them from
+`maincopyd` embeds the generated bundles and serves them from
 `/app-assets/{bundle-digest}/{name}`. The bundle digest uses the full
 `frontend-b3-v1-` encoding. The route parses the digest and typed asset name,
 then uses exact manifest lookup. It never maps an untrusted path to the host
@@ -835,14 +865,15 @@ mutable content tree. They read an immutable `SiteSnapshot`.
 Compiled content assets live under a directory named by the snapshot digest.
 Public content-asset URLs include that digest and use immutable cache headers.
 Compile-time application bundles use their separate frontend bundle digest and
-are embedded in the binary.
+are embedded in `maincopyd`.
 
 The initial content snapshot must compile before the service becomes ready. A
 later validation or other pre-swap reload failure keeps the current public
 snapshot live.
 
 After startup, `POST /api/admin/v1/reloads` is the only v1 reload trigger. The
-CLI and deployment automation call this operation through the Unix socket.
+CLI and deployment automation call this operation through the private local
+transport.
 Repeated requests coalesce with an in-progress reload and return the same
 operation ID. V1 does not use an implicit file watcher.
 
@@ -1124,7 +1155,7 @@ and a tested restore procedure.
 
 ### Process ownership
 
-The `serve` process acquires an exclusive lock before it opens the write
+The `maincopyd` process acquires an exclusive lock before it opens the write
 connection. A second writer process fails before it mutates the database.
 
 The CLI and admin UI never open SQLite for writes. They send requests to the
@@ -1167,15 +1198,23 @@ wait time, writer health, WAL size, and checkpoint results.
 
 ## Private admin plane
 
-The canonical admin transport is HTTP/JSON over a Unix domain socket. The
-default path is `/run/maincopy/admin.sock`.
+The admin protocol is HTTP/JSON over one private local transport:
 
-The runtime creates the parent directory with restricted permissions. The
-socket uses owner or group permissions as the first authorization boundary.
+| Platform | Transport | Built-in default | Access boundary |
+| --- | --- | --- | --- |
+| Linux and macOS | Unix domain socket | `<runtime_root>/admin.sock` | Owner-only directory and socket permissions |
+| Windows | Local named pipe | `\\.\pipe\maincopy` | Remote clients rejected; owner and `SYSTEM` allowed |
 
-Admin TCP is disabled by default. Development can enable a loopback listener.
-Production browser access requires an authenticated reverse proxy or SSH
-tunnel to the Unix socket.
+Both processes use the same Windows default from `maincopy-shared`. A Windows
+override must use the canonical `\\.\pipe\name` form.
+
+Maincopy does not bind an admin TCP listener and has no TCP fallback. A Unix
+browser gateway can connect to the Unix domain socket after it authenticates
+the operator.
+
+The CLI transport cross-compiles and runs on Windows. This transport support
+does not declare `maincopyd` supported on Windows. Full content discovery is
+Linux-only. The native frontend build backend supports Linux and macOS.
 
 The admin UI is served by the admin listener. It is never added to the public
 router. State-changing forms use CSRF and Origin validation when a browser
@@ -1226,10 +1265,9 @@ Errors use one stable envelope:
 }
 ```
 
-The current CLI writes redaction-safe human diagnostics to standard error and
-uses stable exit codes. Automation that needs structured results uses the
-admin JSON API. A future CLI JSON mode must reuse the stable categories; it is
-not part of the v1 foundation contract.
+The CLI writes redaction-safe human diagnostics to standard error and uses
+stable exit codes. Its `--json` mode writes one machine-readable document and
+uses the same stable error categories as the admin API.
 
 | Exit | Category | Meaning |
 | ---: | --- | --- |
@@ -1680,35 +1718,26 @@ enter a release plan.
 
 ## Startup and shutdown
 
-`src/main.rs` is the process entry point. Its async Tokio `main` function
-imports and calls `startup::run_until_stop`. It can initialize bootstrap
-logging before that call. It does not load typed application configuration,
-bind listeners, open the database, construct handlers, or spawn background
-components.
+`crates/server/src/main.rs` is the `maincopyd` entry point. Its async Tokio
+`main` function calls `startup::run_until_stop`. It does not bind listeners,
+open SQLite, construct handlers, or spawn background components.
 
-V1 intentionally chooses startup-owned typed configuration. The earlier
-allowance for `main.rs` to read configuration was permission, not a requirement.
-Keeping the exact no-argument `run_until_stop().await` expression without a
-global configuration singleton makes `src/startup.rs` the coherent owner. A
-future signature change can revisit this decision explicitly.
+`crates/server/src/startup.rs` parses `ServerArguments` and loads the host
+configuration. It owns dependency construction, listener binding, task
+supervision, and graceful shutdown. Its `Application` value owns the public
+server, admin server, writer task, scheduler, workers, configured Lightning
+provider, payment tasks, cancellation token, endpoint cleanup, and process
+lock.
 
-`src/startup.rs` parses a typed `ProcessCommand`, loads the configuration for
-that command, and performs process dispatch. `Serve` constructs the server
-`Application`. Admin-client commands use the UDS API and do not construct the
-server or open SQLite. This arrangement preserves the exact no-argument
-`run_until_stop().await` boundary without a global configuration singleton.
-
-For `Serve`, `src/startup.rs` owns configuration validation, dependency
-construction, listener binding, task supervision, and graceful shutdown. Its
-`Application` value owns the public server, admin server, writer task,
-scheduler, workers, configured Lightning provider, startup and periodic
-payment recovery work, long-lived payment-update subscriber, cancellation
-token, socket cleanup, and process lock.
+`crates/cli/src/main.rs` parses operator commands independently. It constructs
+the concrete `AdminClient`, sends one operation, and exits. It does not
+construct `Application` or open SQLite. `crates/shared` supplies the stable
+wire types and shared transport defaults.
 
 The public and admin router constructors remain separate from listener binding.
 Tests can construct either router with injected state and call it through Tower
-without starting a process. Integration tests can inject ephemeral listeners,
-a clock, and a shutdown future.
+without starting a process. Integration tests can use ephemeral listeners,
+explicit instants, paused Tokio time, and a controlled shutdown future.
 
 The application supervisor observes both servers and every background task. An
 unexpected exit from a core server, writer, or scheduler makes core readiness
@@ -1758,7 +1787,7 @@ Shutdown follows this order:
 5. Reject new database commands.
 6. Drain accepted database commands.
 7. Close the read pool and writer connection.
-8. Remove the admin socket and release the process lock.
+8. Remove the Unix socket or close the named pipe, then release the process lock.
 9. Let the service manager stop Litestream after its final synchronization.
 
 Maincopy does not force a WAL checkpoint during ordinary shutdown. Litestream
@@ -1860,40 +1889,33 @@ completed release because crates.io versions are immutable.
 The project can enter nixpkgs after it has a stable license, users, and a
 maintainer commitment.
 
-## Module layout
+## Workspace layout
 
-Maincopy starts as one crate.
+The root `Cargo.toml` is a workspace manifest. It does not define a package.
 
 ```text
-build.rs
-frontend/
-|-- css/
-`-- js/
-
-src/
-|-- main.rs
-|-- lib.rs
-|-- startup.rs
-|-- cli.rs
-|-- config/
-|-- error.rs
-|-- content/
-|-- render/
-|-- frontend_assets/
-|-- web/
-|-- admin/
-|-- database/
-|-- jobs/
-|-- distribution/
-|-- subscriptions/
-`-- payments/
-
-migrations/
-examples/content/
-tests/fixtures/
+Cargo.toml
+crates/
+|-- server/
+|   |-- Cargo.toml          # maincopy-server and maincopyd
+|   |-- build.rs
+|   |-- build_support/
+|   |-- frontend/
+|   |-- examples/
+|   |-- src/
+|   `-- tests/
+|-- cli/
+|   |-- Cargo.toml          # maincopy-cli and maincopy
+|   |-- src/
+|   `-- tests/
+`-- shared/
+    |-- Cargo.toml          # maincopy-shared
+    `-- src/
 ```
 
-The project can split crates only after stable code boundaries appear.
+`maincopy-server` owns application and domain behavior. `maincopy-cli` owns
+operator interaction and one concrete HTTP client. `maincopy-shared` owns only
+wire contracts and defaults that both executable packages must share.
 
 ## Required quality gates
 

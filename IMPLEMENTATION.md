@@ -1,7 +1,7 @@
 # Maincopy v1 implementation plan
 
 Status: executable plan for v1
-Last updated: 2026-08-29
+Last updated: 2026-08-30
 
 ## Purpose
 
@@ -13,7 +13,7 @@ Crate and flake publication require a separate owner approval.
 
 ## Delivery rules
 
-- Keep v1 in one Rust crate and one service process.
+- Keep v1 in one Cargo workspace with three Rust crates and one service process.
 - Keep each pull request small enough for one focused review.
 - Merge infrastructure only when a product slice needs it.
 - Add each dependency in the pull request that first uses it.
@@ -30,34 +30,27 @@ It must not combine unrelated work packages for convenience.
 
 ## Non-negotiable code boundaries
 
-`src/main.rs` must stay tiny. Its asynchronous Tokio `main` must use
-`maincopy::startup::run_until_stop` and call `run_until_stop().await`.
+The root `Cargo.toml` must define a workspace only. The workspace contains
+`maincopy-server`, `maincopy-cli`, and `maincopy-shared` under `crates/`.
 
-`src/main.rs` can install bootstrap logging. It must not load typed application
-configuration, bind a listener, open SQLite, or spawn a long-lived task. The
-no-argument call boundary does not use global configuration state.
+`crates/server/src/main.rs` must stay tiny. Its asynchronous Tokio `main` uses
+`maincopy_server::startup::run_until_stop` and calls `run_until_stop().await`.
+It must not load configuration, bind a listener, open SQLite, or spawn a task.
 
-V1 intentionally selects startup-owned typed configuration. The accepted
-allowance for `main.rs` to read a configuration file did not require that
-choice. The exact no-argument `run_until_stop().await` expression and the ban on
-global configuration state make `src/startup.rs` the owner unless a future
-change explicitly revises the function signature.
-
-The final two lines of `src/main.rs` must remain:
+The final two lines of `crates/server/src/main.rs` must remain:
 
 ```rust
     run_until_stop().await
 }
 ```
 
-Keep `src/main.rs` below 20 non-blank lines.
+Keep `crates/server/src/main.rs` below 20 non-blank lines.
 
-`src/startup.rs` owns process dispatch, application wiring, and lifecycle
-behavior. It must:
+`crates/server/src/startup.rs` owns server wiring and lifecycle behavior. It
+must:
 
-- parse one typed `ProcessCommand`;
-- load and validate the configuration required by that command;
-- dispatch `Serve` to `Application` and admin commands to the UDS client;
+- parse typed `ServerArguments`;
+- load and validate host configuration;
 - construct concrete dependencies;
 - acquire the process lock;
 - start the database components;
@@ -68,21 +61,27 @@ behavior. It must:
 - handle termination signals; and
 - perform ordered shutdown.
 
-`src/startup.rs` must define the `run_until_stop` composition boundary. The
-`#[tokio::main]` macro in `src/main.rs` creates the runtime first.
+`crates/server/src/startup.rs` defines the `run_until_stop` composition
+boundary. The `#[tokio::main]` macro in the server entry point creates the
+runtime first.
 
-The free `run_until_stop` function must parse and dispatch one command. For
-`Serve`, it builds an `Application` and invokes
-`Application::run_until_stop`. Admin-client commands call the versioned UDS
-API and return without constructing server state. `Application` owns all
-supervised components and cleanup guards.
+The free `run_until_stop` function parses server arguments and builds one
+`Application`. `Application` owns all supervised components and cleanup
+guards.
+
+`crates/cli` parses operator commands independently. It constructs the concrete
+`AdminClient`, sends an HTTP/JSON request through the private local transport,
+and exits. It never constructs server state or opens SQLite.
+
+`crates/shared` contains wire contracts and shared transport defaults. It does
+not contain runtime wiring or application-domain behavior.
 
 Startup can call component constructors. No handler can construct a database,
 network client, scheduler, or renderer.
 
-`src/lib.rs` exposes testable components and the startup boundary. Domain
-components must accept explicit dependencies, clocks, and clients where tests
-need control.
+`crates/server/src/lib.rs` exposes testable components and the startup boundary.
+Domain components accept explicit values and concrete dependencies where tests
+need control. Add a trait only when production needs substitutable behavior.
 
 The library must not perform work during import. Avoid process-wide mutable
 singletons and hidden service locators.
@@ -90,20 +89,14 @@ singletons and hidden service locators.
 Use these dependency directions:
 
 ```text
-src/main.rs -- Tokio runtime and optional bootstrap logging
+maincopy CLI ---- uses ----> maincopy-shared <---- uses ---- server crate
     |
+    | HTTP/JSON over private local transport
     v
-startup::run_until_stop() ---- builds Application
-    |
-    v
-Application::run_until_stop() ---- supervises tasks and shutdown
-    |
-    v
-src/lib.rs modules ---- expose testable domain components
-    |
-    v
-traits and domain types ---- do not depend on startup or handlers
+maincopyd admin listener -> Application -> server domain modules
 ```
+
+`maincopy-cli` must not depend on `maincopy-server`.
 
 The startup tests must inject listeners, shutdown signals, and task failures.
 Component tests must not start the production process composition root.
@@ -117,7 +110,8 @@ Every slice must preserve these invariants:
 3. Request handlers read an immutable `SiteSnapshot`.
 4. A failed compilation cannot replace the active snapshot.
 5. The public router cannot serve an admin route.
-6. The Unix domain socket is the canonical admin transport.
+6. The admin API uses a Unix domain socket on Linux and macOS or a protected
+   local named pipe on Windows. It has no TCP fallback.
 7. Exactly one Tokio task owns the runtime SQLx write connection.
 8. Every runtime database write uses one bounded command channel.
 9. Read connections use a bounded, query-only SQLx pool.
@@ -271,7 +265,7 @@ Rust toolchain and the project license.
 | Snapshot activation | Pin `arc-swap` 1.9.2 without optional features | 2 |
 | HTTP service | Axum and Tower | 0 and 2 |
 | HTML templates | Maud | 2 |
-| Frontend asset build | A custom deterministic `build.rs`; Lightning CSS 1.0.0-alpha.72 for V1 CSS; add a reviewed JavaScript minifier only with the first JavaScript input | 2 |
+| Frontend asset build | Deterministic `crates/server/build.rs`; Lightning CSS 1.0.0-alpha.72 for V1 CSS; add a reviewed JavaScript minifier only with the first JavaScript input | 2 |
 | SQLite | SQLx with SQLite and embedded migrations | 3 |
 | Process lock | Select a cross-process file-lock implementation | 3 |
 | OpenAPI | `utoipa` and `utoipa-axum` with stable path/schema ordering | 0 and 4 |
@@ -348,20 +342,22 @@ Use the smallest test that can prove a property.
 | Unit | Validate domain rules, state transitions, and error codes. |
 | Component | Test a module with real storage or a controlled fake dependency. |
 | Router | Call Axum services without a network socket. |
-| Process | Start the real binary with temporary paths and sockets. |
+| Process | Start the applicable executable with temporary paths and local endpoints. |
 | Fault injection | Force failures at commit, task, network, and shutdown boundaries. |
 | Golden fixture | Protect HTML, XML, JSON, digest, and rendering contracts. |
 | Property test | Explore normalization, path, time, and state-machine inputs. |
 | NixOS virtual machine | Prove service permissions, ordering, backup, and restore. |
 
-Tests must use an injected clock for schedule behavior.
-Tests must use temporary local directories for SQLite and socket files.
+Tests must pass explicit instants for pure schedule behavior. Async timing tests
+must use Tokio's paused time when possible.
+Tests must use temporary local directories for SQLite and Unix socket files.
 Tests must not use a developer's home directory or real credentials.
 
 ### Router and transport harness
 
-`src/lib.rs` must export pure `public_router` and `admin_router` constructors.
-Each constructor must accept explicit state and return an Axum router.
+`crates/server/src/lib.rs` must export pure `public_router` and `admin_router`
+constructors. Each constructor must accept explicit state and return an Axum
+router.
 
 Router tests must call `tower::ServiceExt::oneshot` without binding a socket.
 Use these tests for routes, middleware, bodies, headers, and error contracts.
@@ -372,8 +368,9 @@ Provide one `TestServer` only for behavior that needs a transport. It must use
 `TestServer` must expose its selected address and an explicit shutdown handle.
 Its shutdown method must await listener and task completion.
 
-Use a Unix-socket process harness for socket permissions and stale-path tests.
-Do not use `TestServer` when `ServiceExt::oneshot` can prove the property.
+Use a Unix-socket process harness for permissions and stale-path tests. Use a
+Windows named-pipe harness for access-control and connection tests. Do not use
+`TestServer` when `ServiceExt::oneshot` can prove the property.
 
 ## Slice 0: Foundation and continuous integration
 
@@ -382,21 +379,23 @@ Do not use `TestServer` when `ServiceExt::oneshot` can prove the property.
 Create a reproducible crate with a tested process boundary.
 Establish checks that every later pull request must pass.
 
-### Work package 0.1: Crate and composition root
+### Work package 0.1: Workspace and composition roots
 
-Create the initial library modules and preserve the required code boundaries.
+Create the workspace crates and preserve their process boundaries.
 
 Deliverables:
 
-- A tiny async Tokio `src/main.rs` with
-  `use maincopy::startup::run_until_stop;`.
-- A `src/main.rs` that ends with `run_until_stop().await` and `}`.
-- Optional bootstrap logger setup in `src/main.rs` only.
-- Typed process-command parsing and dispatch in `src/startup.rs`.
-- A `src/startup.rs` composition root with documented startup stages.
-- A free `run_until_stop` function that builds `Application` only for `Serve`.
+- A workspace-only root `Cargo.toml` with `crates/server`, `crates/cli`, and
+  `crates/shared` members.
+- A tiny async Tokio `crates/server/src/main.rs` that calls
+  `maincopy_server::startup::run_until_stop`.
+- A server `run_until_stop` function that builds `Application` directly.
+- Typed server argument parsing in `crates/server/src/cli.rs`.
+- A `crates/server/src/startup.rs` composition root with documented stages.
 - An `Application::run_until_stop` method that supervises tasks and shutdown.
-- A `src/lib.rs` that exposes testable components.
+- A `crates/server/src/lib.rs` that exposes testable components.
+- A short-lived `maincopy` binary with its own concrete admin client.
+- A contract-only shared crate for versioned wire types and shared defaults.
 - Empty module boundaries for configuration, errors, content, web, admin,
   database, jobs, rendering, distribution, and payments.
 - A startup result that maps typed failures to a process exit code.
@@ -407,13 +406,14 @@ Deliverables:
 Tests:
 
 - Assert that `--help` exits successfully without opening runtime state.
-- Reject an unknown command without opening runtime state.
-- Dispatch an admin command without building `Application`.
+- Reject an unknown server argument without opening runtime state.
+- Run CLI help and a failed client request without constructing `Application`.
 - Verify that Tokio constructs the runtime before `run_until_stop` runs.
 - Inject an early startup failure and verify that later stages do not run.
 - Inject a termination signal and verify one ordered shutdown request.
-- Check that `src/main.rs` contains no listener, storage, scheduler, or worker
-  wiring.
+- Check that `crates/server/src/main.rs` contains no listener, storage,
+  scheduler, or worker wiring.
+- Check that `maincopy-cli` has no dependency on `maincopy-server`.
 - Verify the stable JSON names of every foundation status and version enum.
 - Parse the generated OpenAPI document and verify the same enum values.
 
@@ -439,7 +439,8 @@ Deliverables:
   request correlation with the first request middleware that consumes it.
 - Process logging reads `RUST_LOG` as one case-insensitive level. It accepts
   `trace`, `debug`, `warn`, or `error`; all other values select `info`.
-- A clock trait for time-sensitive components.
+- Explicit timestamps at pure domain boundaries and Tokio time for async retry
+  behavior.
 
 Tests:
 
@@ -492,18 +493,19 @@ Deliverables:
 - Public HTML, feed, sitemap, Markdown, code, and Mermaid fixtures.
 - Local and allowlisted external favicon, image, and file fixtures.
 - Rejected HTTP, user-information, fragment, and unlisted-origin fixtures.
-- A temporary SQLite and Unix socket process-test harness.
+- A temporary SQLite process harness and local-transport test harnesses.
 - Exported pure `public_router` and `admin_router` test constructors.
 - A transport-only `TestServer` with an injected listener.
 - Explicit `TestServer` shutdown that awaits all owned tasks.
-- Controlled clocks, DNS answers, HTTP servers, and target adapters.
+- Explicit instants, paused Tokio time, controlled DNS answers, HTTP servers,
+  and target adapters.
 - Short decision records for each resolved blocking decision.
 
 Tests:
 
 - Verify that all fixtures are hermetic.
 - Verify that network fakes reject unplanned external connections.
-- Verify that process tests clean their sockets and child processes.
+- Verify that process tests clean their local endpoints and child processes.
 - Bind `TestServer` to `127.0.0.1:0` and verify explicit shutdown.
 
 ### Slice 0 exit gate
@@ -511,8 +513,8 @@ Tests:
 - All work packages have merged through focused pull requests.
 - A clean checkout passes the four Nix commands above.
 - CI runs on `master` and pull requests.
-- `src/main.rs` remains below 20 non-blank lines.
-- `src/startup.rs` owns all current wiring and lifecycle behavior.
+- `crates/server/src/main.rs` remains below 20 non-blank lines.
+- `crates/server/src/startup.rs` owns all server wiring and lifecycle behavior.
 - No feature module performs process-wide initialization.
 
 ## Slice 1: Content model and compiler
@@ -980,9 +982,9 @@ Deliverables:
 - Dedicated first-party application and theme input roots for CSS and optional
   JavaScript. Content-repository favicons, post images, attachments, and CDN
   references do not enter this build.
-- Required `frontend/css/site.css`; V1 emits no JavaScript bundle until a
-  feature supplies a reviewed JavaScript input.
-- A custom `build.rs` that normalizes and sorts declared input paths, combines
+- Required `crates/server/frontend/css/site.css`; V1 emits no JavaScript bundle
+  until a feature supplies a reviewed JavaScript input.
+- `crates/server/build.rs` normalizes and sorts declared input paths, combines
   them in that order, minifies each output, and computes content hashes.
 - Descriptor-relative, no-follow input and output access on Linux and macOS.
   Other build hosts fail with a typed unsupported-host error.
@@ -1116,7 +1118,7 @@ Failure tests:
 
 ### Work package 2.4: Public listener lifecycle
 
-Connect the public router through `src/startup.rs`.
+Connect the public router through `crates/server/src/startup.rs`.
 
 Deliverables:
 
@@ -1312,25 +1314,27 @@ Failure tests:
 - No live database file uses a network filesystem in tests or examples.
 - The writer failure path causes controlled shutdown.
 
-## Slice 4: Unix-socket admin API and agent client
+## Slice 4: Local admin API and operator client
 
 ### Goal
 
 Expose a stable local automation contract without direct database access.
 Keep the admin plane outside the public listener.
 
-### Work package 4.1: Unix domain socket lifecycle
+### Work package 4.1: Private local transport lifecycle
 
-Bind the admin service through `src/startup.rs`.
+Bind the admin service through `crates/server/src/startup.rs`.
 
 Deliverables:
 
-- Configurable socket path with the documented production default.
-- Restricted parent-directory and socket permissions.
-- Owner or group access policy.
-- Safe stale-socket detection and cleanup.
-- Optional development-only loopback binding.
-- Graceful socket removal on shutdown.
+- `[admin].socket` and `maincopyd --admin-socket` configuration.
+- A Unix domain socket on Linux and macOS with owner-only permissions.
+- Safe Unix stale-socket detection and cleanup.
+- A canonical local Windows named pipe that rejects remote clients.
+- A Windows pipe access control list that allows only its owner and `SYSTEM`.
+- One shared Windows default of `\\.\pipe\maincopy` for server and CLI.
+- Graceful Unix socket removal and Windows pipe closure.
+- No admin TCP listener or fallback.
 
 Failure tests:
 
@@ -1338,7 +1342,8 @@ Failure tests:
 - Refuse to replace a regular file or symlink at the socket path.
 - Recover a confirmed abandoned socket.
 - Refuse to remove a socket used by a live daemon.
-- Verify that admin TCP is disabled by default.
+- Reject a remote Windows named-pipe client.
+- Verify that no admin TCP listener exists.
 
 ### Work package 4.2: API contract and middleware
 
@@ -1406,15 +1411,15 @@ Tests:
 
 ### Work package 4.4: CLI transport for people and agents
 
-Implement a client that speaks the same Unix-socket API.
+Implement a short-lived client that speaks the same local HTTP/JSON API.
 
 Deliverables:
 
 - Human output and machine JSON output.
-- Typed admin subcommands dispatched by `startup::run_until_stop` without
-  constructing the server `Application`.
+- Typed admin subcommands in the separate `maincopy-cli` crate.
+- One concrete `AdminClient` with no server-process driver abstraction.
 - Stable documented exit-code categories.
-- Configurable socket path.
+- A configurable `--socket` path or canonical named-pipe name.
 - A reload command that calls `POST /api/admin/v1/reloads`.
 - Explicit request and idempotency identifiers.
 - Actionable service-unavailable diagnostics.
@@ -1426,13 +1431,21 @@ Tests:
 - Snapshot each stable exit-code category.
 - Stop the service and verify no database file opens for writing.
 - Send concurrent read requests through cloned clients.
-- Prove server configuration and resources are not loaded for `--help` or an
-  admin-client command that fails before transport.
+- Prove server configuration and resources are not linked or loaded for
+  `--help` or a client command that fails before transport.
+- Cross-compile the CLI for Windows and run its named-pipe transport tests on a
+  Windows runner.
+
+The Windows CLI transport does not declare the complete daemon supported on
+Windows. Full content discovery is Linux-only. The native frontend build
+backend supports Linux and macOS.
 
 ### Slice 4 exit gate
 
-- The Unix socket is the canonical working admin transport.
-- Socket permissions are proven by a process test.
+- Unix domain socket and Windows named-pipe permissions are proven by transport
+  tests.
+- Both local transports carry the same versioned HTTP/JSON contract.
+- Maincopy has no admin TCP fallback.
 - OpenAPI describes all implemented admin routes.
 - Agents can consume stable JSON without parsing tables.
 - The CLI never opens SQLite for writes.
@@ -1481,7 +1494,7 @@ Tests:
 
 ### Work package 5.2: Activation coordinator and recovery
 
-Implement due publication selection with an injected clock.
+Implement due publication selection with an explicit current instant.
 
 ```mermaid
 sequenceDiagram
@@ -2322,7 +2335,7 @@ Tests:
 
 ### Work package 8.4: Admin export and deletion
 
-Add PII operations only to `admin_router` and the Unix-socket client.
+Add PII operations only to `admin_router` and the private local client.
 
 Deliverables:
 
@@ -2368,7 +2381,7 @@ Apply the privacy review before using an older production recovery point.
 Failure tests:
 
 - Exceed each rate limit and keep the anti-enumeration response generic.
-- Expire pending, token, and unsubscribed fixtures with an injected clock.
+- Expire pending, token, and unsubscribed fixtures with explicit instants.
 - Run concurrent subscribe requests and create one subscriber identity.
 - Restore a current replica and preserve consent timestamps and state.
 - Restore after deletion and verify no live email remains at that recovery point.
@@ -2522,7 +2535,7 @@ Automate the production service contract in a NixOS virtual machine.
 Deliverables:
 
 - Maincopy and Litestream service lifecycle test.
-- Unix-socket CLI and gateway checks.
+- Unix-socket CLI and gateway checks on NixOS.
 - Restart reconciliation for an activating canonical publication.
 - Restart recovery for expired job leases.
 - Development replica and restore drill.
@@ -2735,9 +2748,9 @@ A work package is done only when all applicable statements are true:
 - No public response exposes secrets or host paths.
 - No log, metric, or audit event exposes raw subscriber email or tokens.
 - No handler creates a concrete database or network dependency.
-- `src/main.rs` remains tiny.
-- `src/startup.rs` remains the only process composition root.
-- `src/lib.rs` exposes the component seams needed by tests.
+- `crates/server/src/main.rs` remains tiny.
+- `crates/server/src/startup.rs` remains the server composition root.
+- `crates/server/src/lib.rs` exposes the component seams needed by tests.
 - Formatting, Clippy, tests, and Nix checks pass.
 - Changed operator behavior has matching documentation.
 - The branch remains safe to merge into `master`.
@@ -2748,7 +2761,7 @@ V1 is ready for owner approval when all of these statements are true:
 
 - One host can serve a validated Git-backed publication.
 - Site and post assets can use local files or allowlisted HTTPS CDN origins.
-- The binary embeds deterministic content-hashed frontend bundles. Their
+- `maincopyd` embeds deterministic content-hashed frontend bundles. Their
   generated manifest, MIME types, cache headers, and snapshot identity pass the
   build contract.
 - Git content uses required offset-aware `authored_at` metadata.

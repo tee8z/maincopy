@@ -69,6 +69,8 @@
 
           maincopy = craneLib.buildPackage {
             inherit cargoArtifacts src;
+            pname = "maincopy-workspace";
+            version = "0.1.0";
             cargoExtraArgs = "--locked";
             nativeBuildInputs = commonNativeBuildInputs;
             buildInputs = commonBuildInputs;
@@ -97,13 +99,18 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${(projectFor system).maincopy}/bin/maincopy";
-          meta.description = "Run Maincopy";
+          program = "${(projectFor system).maincopy}/bin/maincopyd";
+          meta.description = "Run the Maincopy server";
         };
         maincopy = {
           type = "app";
           program = "${(projectFor system).maincopy}/bin/maincopy";
-          meta.description = "Run Maincopy";
+          meta.description = "Operate a running Maincopy server";
+        };
+        maincopyd = {
+          type = "app";
+          program = "${(projectFor system).maincopy}/bin/maincopyd";
+          meta.description = "Run the Maincopy server";
         };
       });
 

@@ -111,7 +111,7 @@ else
   cargo llvm-cov --all-targets --all-features --include-build-script \
     --locked --offline --lcov --output-path "$work_dir/coverage.lcov"
   "$knots_bin" --recursive --language rust --count-anonymous-closures \
-    --format json src tests build.rs build_support >"$work_dir/complexity.json"
+    --format json crates >"$work_dir/complexity.json"
 fi
 
 # Canonicalize LCOV source records and merge duplicate compilation contexts.
@@ -284,7 +284,7 @@ done >"$work_dir/test-scope.tsv"
           ff[i] ~ /(^|\/)test_support\.rs$/ ||
           direct[ff[i] SUBSEP first[i]] ||
           (ff[i] in module_start && first[i] >= module_start[ff[i]])) scope="test"
-      else if (ff[i] == "build.rs" || ff[i] ~ /^build_support\//) scope="build"
+      else if (ff[i] ~ /(^|\/)build\.rs$/ || ff[i] ~ /(^|\/)build_support\//) scope="build"
 
       if (executable) {
         coverage=covered/executable
@@ -332,7 +332,7 @@ coverage_percent=$(awk -v covered="$covered_lines" -v total="$executable_lines" 
   printf '    "coverage_tool": "cargo-llvm-cov 0.8.5",\n'
   printf '    "coverage_command": "cargo llvm-cov --all-targets --all-features --include-build-script --locked --offline --lcov",\n'
   printf '    "complexity_tool": "knots 1.16.0",\n'
-  printf '    "complexity_command": "knots --recursive --language rust --count-anonymous-closures --format json src tests build.rs build_support",\n'
+  printf '    "complexity_command": "knots --recursive --language rust --count-anonymous-closures --format json crates",\n'
   printf '    "lcov_raw_workspace_record_count": %d,\n' "$raw_records"
   printf '    "lcov_canonical_file_count": %d,\n' "$canonical_files"
   printf '    "lcov_executable_lines": %d,\n' "$executable_lines"

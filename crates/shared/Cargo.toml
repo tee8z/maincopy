@@ -1,0 +1,14 @@
+[package]
+name = "maincopy-shared"
+version.workspace = true
+edition.workspace = true
+
+[features]
+schema = ["dep:utoipa"]
+
+[dependencies]
+serde.workspace = true
+utoipa = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

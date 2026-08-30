@@ -1694,7 +1694,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
-name = "maincopy"
+name = "maincopy-cli"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "maincopy-shared",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "maincopy-server"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
@@ -1705,6 +1719,7 @@ dependencies = [
  "lexe",
  "lightning-invoice 0.34.1",
  "lightningcss",
+ "maincopy-shared",
  "maud",
  "pulldown-cmark",
  "rustix",
@@ -1723,7 +1738,17 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "maincopy-shared"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "utoipa",
 ]
 
 [[package]]

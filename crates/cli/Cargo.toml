@@ -1,0 +1,22 @@
+[package]
+name = "maincopy-cli"
+version.workspace = true
+edition.workspace = true
+autobins = false
+
+[dependencies]
+maincopy-shared = { path = "../shared" }
+clap.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[[bin]]
+name = "maincopy"
+path = "src/main.rs"
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
