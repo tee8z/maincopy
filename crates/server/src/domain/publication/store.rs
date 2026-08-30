@@ -662,7 +662,7 @@ async fn retain_candidate_site_revision(
             .ok()
             .filter(|version| *version > 0)
             .ok_or(StartupSnapshotMutationError::CorruptStoredState)?;
-        if current.is_none_or(|head| retained_version > head.version)
+        if !retained_revision_precedes_current(current, retained_version)
             || source_commit.is_some_and(|commit| decode_source_commit(commit).is_none())
         {
             return Err(StartupSnapshotMutationError::CorruptStoredState);
@@ -682,6 +682,10 @@ async fn retain_candidate_site_revision(
         .map_err(StartupSnapshotMutationError::Operation)?;
     }
     Ok(())
+}
+
+fn retained_revision_precedes_current(current: Option<&SiteHead>, retained_version: u64) -> bool {
+    current.is_some_and(|head| retained_version < head.version)
 }
 
 async fn advance_site_head(
@@ -1276,6 +1280,15 @@ mod tests {
         assert!(decode_source_commit(vec![0xaa; 20]).is_some());
         assert!(decode_source_commit(vec![0xbb; 32]).is_some());
         assert!(decode_source_commit(vec![0xcc; 19]).is_none());
+
+        let current = SiteHead {
+            digest: SiteSnapshotDigest::from_bytes([0xdd; 32]),
+            version: 2,
+        };
+        assert!(retained_revision_precedes_current(Some(&current), 1));
+        assert!(!retained_revision_precedes_current(Some(&current), 2));
+        assert!(!retained_revision_precedes_current(Some(&current), 3));
+        assert!(!retained_revision_precedes_current(None, 1));
     }
 
     fn uuid_bytes(value: &str) -> Vec<u8> {

@@ -733,9 +733,11 @@ name = \"Startup Tester\"\n";
             fixture_root.join("state").into_os_string(),
             OsString::from("--runtime-root"),
             fixture_root.join("run").into_os_string(),
-            OsString::from("--public-bind"),
-            OsString::from("127.0.0.1:0"),
         ];
+        if !overrides.iter().any(|(flag, _)| *flag == "--public-bind") {
+            command.push(OsString::from("--public-bind"));
+            command.push(OsString::from("127.0.0.1:0"));
+        }
         for (flag, value) in overrides {
             command.push(OsString::from(flag));
             command.push(OsString::from(value));
@@ -756,6 +758,30 @@ name = \"Startup Tester\"\n";
         fs::write(&config_path, host_source).unwrap();
         let arguments = server_arguments_for(&config_path, &content_root);
         (root, arguments, publication_path)
+    }
+
+    async fn stop_built_application(application: Application) {
+        let Application {
+            _startup: startup,
+            _database: database,
+            mut runtime,
+            public_addr: _,
+        } = application;
+        runtime.cancellation.cancel();
+        assert!(
+            drain_critical_tasks(&mut runtime.critical_tasks)
+                .await
+                .is_none()
+        );
+        runtime.database_shutdown.cancel();
+        assert!(
+            drain_database_writer(&mut runtime.database_writer)
+                .await
+                .is_none()
+        );
+        drop(database);
+        drop(startup);
+        tokio::task::yield_now().await;
     }
 
     #[test]
@@ -926,27 +952,153 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         assert!(html.contains("Pinned startup source"));
         assert!(html.contains("No posts have been published yet."));
 
-        let Application {
-            _startup: startup,
-            _database: database,
-            mut runtime,
-            public_addr: _,
-        } = application;
-        runtime.cancellation.cancel();
-        assert!(
-            drain_critical_tasks(&mut runtime.critical_tasks)
-                .await
-                .is_none()
+        stop_built_application(application).await;
+        assert!(!socket_path.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn restart_serves_the_durable_published_revision() {
+        use sqlx::{ConnectOptions as _, Connection as _};
+
+        const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const PUBLICATION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const POST: &str = "+++\n\
+id = \"11111111-1111-4111-8111-111111111111\"\n\
+title = \"Durable publication\"\n\
+slug = \"durable-publication\"\n\
+authored_at = 2026-08-29T12:00:00Z\n\
+description = \"A publication restored from SQLite.\"\n\
++++\n\
+# Durable publication\n\n\
+Durable article body.\n";
+
+        let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
+        let content_root = root.path().join("content");
+        fs::create_dir(content_root.join("posts")).unwrap();
+        fs::write(content_root.join("posts/durable-publication.md"), POST).unwrap();
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let database_path = startup._host.view().database.path.to_owned();
+
+        stop_built_application(Application::build(startup).await.unwrap()).await;
+
+        let published_at = OffsetDateTime::from_unix_timestamp(1_777_734_400).unwrap();
+        let published_at_ns = i64::try_from(published_at.unix_timestamp_nanos()).unwrap();
+        let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database_path)
+            .foreign_keys(true)
+            .connect()
+            .await
+            .unwrap();
+        let (stable_post_id, revision_digest): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT stable_post_id, revision_digest FROM post_revisions WHERE slug = ?",
+        )
+        .bind("durable-publication")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            stable_post_id.as_slice(),
+            uuid::Uuid::parse_str(POST_ID)
+                .unwrap()
+                .as_bytes()
+                .as_slice()
         );
-        runtime.database_shutdown.cancel();
-        assert!(
-            drain_database_writer(&mut runtime.database_writer)
-                .await
-                .is_none()
+        let publication_id = uuid::Uuid::parse_str(PUBLICATION_ID).unwrap().into_bytes();
+        sqlx::query(
+            "INSERT INTO canonical_publications (\
+                publication_id, stable_post_id, pinned_post_digest, state, version, \
+                scheduled_at_ns, activation_at_ns, published_at_ns, current_published_digest\
+             ) VALUES (?, ?, ?, 'published', 3, ?, ?, ?, ?)",
+        )
+        .bind(publication_id.as_slice())
+        .bind(&stable_post_id)
+        .bind(&revision_digest)
+        .bind(published_at_ns - 1)
+        .bind(published_at_ns)
+        .bind(published_at_ns)
+        .bind(&revision_digest)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+
+        let arguments = server_arguments_for(
+            &root.path().join("maincopy.toml"),
+            &root.path().join("content"),
         );
-        drop(database);
-        drop(startup);
-        tokio::task::yield_now().await;
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let application = Application::build(startup).await.unwrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!(
+                "http://{}/posts/durable-publication",
+                application.public_addr
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let html = response.text().await.unwrap();
+        assert!(html.contains("Durable article body."));
+        assert!(html.contains(&published_at.to_string()));
+
+        stop_built_application(application).await;
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn listener_failure_releases_the_public_port_and_database_ownership() {
+        let (root, _, _) = startup_fixture("", VALID_PUBLICATION);
+        let config_path = root.path().join("maincopy.toml");
+        let content_root = root.path().join("content");
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_addr = reserved.local_addr().unwrap();
+        let public_bind = public_addr.to_string();
+        let arguments = server_arguments_for_with(
+            &config_path,
+            &content_root,
+            &[("--public-bind", public_bind.as_str())],
+        );
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let socket_path = root.path().join("run/admin.sock");
+        fs::write(&socket_path, "occupied by a non-socket test fixture").unwrap();
+        drop(reserved);
+
+        let error = match Application::build(startup).await {
+            Ok(_) => panic!("an occupied admin path must fail after the public listener binds"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ProcessError::Application(ApplicationError::Startup {
+                stage: StartupStage::Listeners
+            })
+        ));
+        let rebound = tokio::net::TcpListener::bind(public_addr).await.unwrap();
+        drop(rebound);
+
+        fs::remove_file(&socket_path).unwrap();
+        let arguments = server_arguments_for_with(
+            &config_path,
+            &content_root,
+            &[("--public-bind", public_bind.as_str())],
+        );
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let application = Application::build(startup).await.unwrap();
+        assert_eq!(application.public_addr, public_addr);
+        assert!(socket_path.exists());
+
+        stop_built_application(application).await;
         assert!(!socket_path.exists());
     }
 
