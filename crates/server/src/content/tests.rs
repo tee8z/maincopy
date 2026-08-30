@@ -56,9 +56,9 @@ fn error_contract(
         .into_iter()
         .map(|error| {
             (
-                error.path().as_str().to_owned(),
-                error.field().as_str().to_owned(),
-                error.code(),
+                error.path.as_str().to_owned(),
+                error.field.as_str().to_owned(),
+                error.code,
             )
         })
         .collect()
@@ -92,46 +92,43 @@ fn checked_in_full_minimal_and_crlf_fixtures_form_one_valid_catalog() {
     )
     .unwrap();
 
-    assert_eq!(content.posts().len(), 3);
-    assert_eq!(content.posts()[0].path().as_str(), "posts/crlf.md");
-    assert_eq!(content.posts()[1].path().as_str(), "posts/full.md");
-    assert_eq!(content.posts()[2].path().as_str(), "posts/minimal.md");
+    assert_eq!(content.posts.len(), 3);
+    assert_eq!(content.posts[0].path.as_str(), "posts/crlf.md");
+    assert_eq!(content.posts[1].path.as_str(), "posts/full.md");
+    assert_eq!(content.posts[2].path.as_str(), "posts/minimal.md");
 
-    let full = &content.posts()[1];
+    let full = &content.posts[1];
     assert_eq!(
-        full.metadata().title().as_str(),
+        full.metadata.title.as_str(),
         "SQLite Does Not Need a Network"
     );
     assert_eq!(
-        full.metadata().authored_at().offset(),
+        full.metadata.authored_at.offset(),
         UtcOffset::from_hms(-4, 0, 0).unwrap()
     );
     assert_eq!(
-        full.metadata()
-            .tags()
+        full.metadata
+            .tags
             .iter()
             .map(PostTag::as_str)
             .collect::<Vec<_>>(),
         ["rust", "sqlite"]
     );
-    assert_eq!(full.metadata().tips(), PostTipPolicy::Enabled);
+    assert_eq!(full.metadata.tips, PostTipPolicy::Enabled);
+    assert_eq!(full.metadata.distribution.x.mode, DistributionMode::Enabled);
     assert_eq!(
-        full.metadata().distribution().x().mode(),
-        DistributionMode::Enabled
-    );
-    assert_eq!(
-        content.publication().site().favicon().unwrap().as_str(),
+        content.publication.site.favicon.as_ref().unwrap().as_str(),
         "https://cdn.example.com/site/favicon-v1.png"
     );
     assert_eq!(
-        content.publication().assets.allowed_https_origins[0].as_str(),
+        content.publication.assets.allowed_https_origins[0].as_str(),
         "https://cdn.example.com"
     );
     assert_eq!(
-        full.metadata().image().unwrap().as_str(),
+        full.metadata.image.as_ref().unwrap().as_str(),
         "https://cdn.example.com/posts/sqlite/cover-v1.webp"
     );
-    assert!(full.markdown().as_str().starts_with("\n# SQLite"));
+    assert!(full.markdown.as_str().starts_with("\n# SQLite"));
 
     let serialized = serde_json::to_value(&content).unwrap();
     assert_eq!(
@@ -151,22 +148,22 @@ fn checked_in_full_minimal_and_crlf_fixtures_form_one_valid_catalog() {
 #[test]
 fn minimal_documents_apply_every_documented_default() {
     let content = validate(MINIMAL_PUBLICATION, &[("posts/minimal.md", MINIMAL_POST)]).unwrap();
-    let publication = content.publication();
+    let publication = &content.publication;
     assert_eq!(
-        publication.site().base_url().as_str(),
+        publication.site.base_url.as_str(),
         "https://minimal.example.test/"
     );
-    assert_eq!(publication.subscriptions(), &SubscriptionSettings::Disabled);
-    assert_eq!(publication.tips(), PublicationTipSettings::Unconfigured);
+    assert_eq!(publication.subscriptions, SubscriptionSettings::Disabled);
+    assert_eq!(publication.tips, PublicationTipSettings::Unconfigured);
 
-    let post = content.posts()[0].metadata();
-    assert_eq!(post.updated_at(), None);
-    assert!(post.tags().is_empty());
-    assert!(post.aliases().is_empty());
-    assert_eq!(post.draft(), DraftStatus::Publishable);
-    assert_eq!(post.tips(), PostTipPolicy::InheritPublication);
-    assert_eq!(post.distribution().x().mode(), DistributionMode::Disabled);
-    assert!(post.distribution().x().copy().is_none());
+    let post = &content.posts[0].metadata;
+    assert_eq!(post.updated_at, None);
+    assert!(post.tags.is_empty());
+    assert!(post.aliases.is_empty());
+    assert_eq!(post.draft, DraftStatus::Publishable);
+    assert_eq!(post.tips, PostTipPolicy::InheritPublication);
+    assert_eq!(post.distribution.x.mode, DistributionMode::Disabled);
+    assert!(post.distribution.x.copy.is_none());
 }
 
 #[test]
@@ -176,7 +173,7 @@ fn draft_collection_is_typed_and_cannot_be_overridden_publishable() {
         [PostSource::in_drafts("drafts/minimal.md", MINIMAL_POST)],
     )
     .unwrap();
-    assert_eq!(drafted.posts()[0].metadata().draft(), DraftStatus::Draft);
+    assert_eq!(drafted.posts[0].metadata.draft, DraftStatus::Draft);
 
     let explicit_true = MINIMAL_POST.replace(
         "description = \"Only the required post fields are present.\"",
@@ -187,7 +184,7 @@ fn draft_collection_is_typed_and_cannot_be_overridden_publishable() {
         [PostSource::in_drafts("drafts/explicit.md", &explicit_true)],
     )
     .unwrap();
-    assert_eq!(drafted.posts()[0].metadata().draft(), DraftStatus::Draft);
+    assert_eq!(drafted.posts[0].metadata.draft, DraftStatus::Draft);
 
     let explicit_false = MINIMAL_POST.replace(
         "description = \"Only the required post fields are present.\"",
@@ -199,7 +196,7 @@ fn draft_collection_is_typed_and_cannot_be_overridden_publishable() {
     )
     .unwrap_err();
     assert_eq!(
-        error.errors()[0].code(),
+        error.errors()[0].code,
         ContentValidationCode::DraftDirectoryConflict
     );
 }
@@ -281,19 +278,13 @@ fn authored_plain_text_is_trimmed_and_offsets_are_preserved() {
         .replace("2026-08-29T12:00:00Z", "2026-08-29T12:00:00+03:00");
     let content = validate(&publication, &[("posts/post.md", &post)]).unwrap();
     assert_eq!(
-        content.publication().site().title().as_str(),
+        content.publication.site.title.as_str(),
         "Minimal Publication"
     );
+    assert_eq!(content.publication.author.name.as_str(), "Minimal Author");
+    assert_eq!(content.posts[0].metadata.title.as_str(), "A Minimal Post");
     assert_eq!(
-        content.publication().author().name().as_str(),
-        "Minimal Author"
-    );
-    assert_eq!(
-        content.posts()[0].metadata().title().as_str(),
-        "A Minimal Post"
-    );
-    assert_eq!(
-        content.posts()[0].metadata().authored_at().offset(),
+        content.posts[0].metadata.authored_at.offset(),
         UtcOffset::from_hms(3, 0, 0).unwrap()
     );
 }
@@ -309,11 +300,11 @@ fn authored_order_is_preserved_and_authored_time_does_not_create_visibility() {
              aliases = [\"second-route\", \"first-route\"]",
         );
     let content = validate(MINIMAL_PUBLICATION, &[("posts/post.md", &post)]).unwrap();
-    let metadata = content.posts()[0].metadata();
+    let metadata = &content.posts[0].metadata;
 
     assert_eq!(
         metadata
-            .tags()
+            .tags
             .iter()
             .map(PostTag::as_str)
             .collect::<Vec<_>>(),
@@ -321,13 +312,13 @@ fn authored_order_is_preserved_and_authored_time_does_not_create_visibility() {
     );
     assert_eq!(
         metadata
-            .aliases()
+            .aliases
             .iter()
             .map(PostAlias::as_str)
             .collect::<Vec<_>>(),
         ["second-route", "first-route"]
     );
-    assert_eq!(metadata.draft(), DraftStatus::Publishable);
+    assert_eq!(metadata.draft, DraftStatus::Publishable);
 
     let serialized = serde_json::to_value(metadata).unwrap();
     assert!(serialized.get("published_at").is_none());
@@ -435,8 +426,8 @@ fn subscriptions_are_typed_and_enabled_requires_a_revision() {
     );
     let content = validate(&disabled_with_revision, &[("posts/post.md", MINIMAL_POST)]).unwrap();
     assert_eq!(
-        content.publication().subscriptions(),
-        &SubscriptionSettings::Disabled
+        content.publication.subscriptions,
+        SubscriptionSettings::Disabled
     );
 }
 
@@ -458,11 +449,11 @@ fn post_tip_override_requires_a_configured_range() {
     let publication = configured_disabled_tips_publication();
     let content = validate(&publication, &[("posts/post.md", &enabled_post)]).unwrap();
     assert_eq!(
-        content.publication().tips().default_policy(),
+        content.publication.tips.default_policy(),
         DefaultPostTipPolicy::Disabled
     );
-    assert!(content.publication().tips().range().is_some());
-    assert_eq!(content.posts()[0].metadata().tips(), PostTipPolicy::Enabled);
+    assert!(content.publication.tips.range().is_some());
+    assert_eq!(content.posts[0].metadata.tips, PostTipPolicy::Enabled);
 }
 
 #[test]

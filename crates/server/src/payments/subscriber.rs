@@ -107,7 +107,9 @@ impl PaymentUpdateSubscriber {
                 return;
             }
 
-            let request = NextPaymentUpdatesRequest::new(self.cursor.clone());
+            let request = NextPaymentUpdatesRequest {
+                cursor: self.cursor.clone(),
+            };
             let response = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return,
@@ -566,10 +568,10 @@ mod tests {
         let updates = cursors
             .into_iter()
             .map(|cursor| {
-                ProviderPaymentUpdate::Ignored(IgnoredProviderPaymentUpdate::new(
-                    update_cursor(cursor),
-                    IgnoredPaymentUpdateReason::MissingMarker,
-                ))
+                ProviderPaymentUpdate::Ignored(IgnoredProviderPaymentUpdate {
+                    next_cursor: update_cursor(cursor),
+                    reason: IgnoredPaymentUpdateReason::MissingMarker,
+                })
             })
             .collect();
         ProviderPaymentUpdatePoll::Updates(ProviderPaymentUpdateBatch::new(updates).unwrap())

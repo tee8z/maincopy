@@ -1,6 +1,7 @@
 use std::{str::FromStr, sync::Arc};
 
 use axum::{
+    Router,
     body::{Body, Bytes},
     extract::{Path, State, rejection::PathRejection},
     http::{
@@ -8,29 +9,42 @@ use axum::{
         header::{CACHE_CONTROL, CONTENT_TYPE, ETAG},
     },
     response::Response,
+    routing::get,
 };
 
 use crate::{
     content::{PostSlug, PostTag},
     frontend_assets::{FrontendAssetName, FrontendBundleDigest, IMMUTABLE_CACHE_CONTROL},
-    render::SiteSnapshot,
-    web::PublicState,
+    render::{SiteSnapshot, SiteSnapshotReader},
 };
 
 const HTML_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("text/html; charset=utf-8");
 const HTML_CACHE_POLICY: HeaderValue = HeaderValue::from_static("no-cache");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 
-pub(super) async fn index(State(state): State<PublicState>) -> Response {
-    let snapshot = state.snapshots.load_full();
+/// Builds the publication-specific portion of the public HTTP API.
+pub(crate) fn router(snapshots: SiteSnapshotReader) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/posts/{slug}", get(post))
+        .route("/tags/{tag}", get(tag))
+        .route("/archive", get(archive))
+        .route("/app-assets/{digest}/{name}", get(application_asset))
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .with_state(snapshots)
+}
+
+async fn index(State(snapshots): State<SiteSnapshotReader>) -> Response {
+    let snapshot = snapshots.load_full();
     html_response(StatusCode::OK, snapshot.index_page())
 }
 
-pub(super) async fn post(
-    State(state): State<PublicState>,
+async fn post(
+    State(snapshots): State<SiteSnapshotReader>,
     path: Result<Path<String>, PathRejection>,
 ) -> Response {
-    let snapshot = state.snapshots.load_full();
+    let snapshot = snapshots.load_full();
     let Ok(Path(value)) = path else {
         return not_found_response(&snapshot);
     };
@@ -43,11 +57,11 @@ pub(super) async fn post(
     )
 }
 
-pub(super) async fn tag(
-    State(state): State<PublicState>,
+async fn tag(
+    State(snapshots): State<SiteSnapshotReader>,
     path: Result<Path<String>, PathRejection>,
 ) -> Response {
-    let snapshot = state.snapshots.load_full();
+    let snapshot = snapshots.load_full();
     let Ok(Path(value)) = path else {
         return not_found_response(&snapshot);
     };
@@ -63,16 +77,16 @@ pub(super) async fn tag(
     )
 }
 
-pub(super) async fn archive(State(state): State<PublicState>) -> Response {
-    let snapshot = state.snapshots.load_full();
+async fn archive(State(snapshots): State<SiteSnapshotReader>) -> Response {
+    let snapshot = snapshots.load_full();
     html_response(StatusCode::OK, snapshot.archive_page())
 }
 
-pub(super) async fn application_asset(
-    State(state): State<PublicState>,
+async fn application_asset(
+    State(snapshots): State<SiteSnapshotReader>,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Response {
-    let snapshot = state.snapshots.load_full();
+    let snapshot = snapshots.load_full();
     let Ok(Path((digest, name))) = path else {
         return not_found_response(&snapshot);
     };
@@ -82,7 +96,7 @@ pub(super) async fn application_asset(
     let Ok(name) = FrontendAssetName::parse(&name) else {
         return not_found_response(&snapshot);
     };
-    let manifest = snapshot.frontend();
+    let manifest = snapshot.frontend;
     let Some(asset) = manifest.lookup(&digest, name) else {
         return not_found_response(&snapshot);
     };
@@ -90,7 +104,7 @@ pub(super) async fn application_asset(
     let Ok(etag) = HeaderValue::from_str(&asset.etag()) else {
         return internal_error_response();
     };
-    let mut response = Response::new(Body::from(asset.bytes()));
+    let mut response = Response::new(Body::from(asset.bytes));
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(asset.mime()));
@@ -103,13 +117,13 @@ pub(super) async fn application_asset(
     response
 }
 
-pub(super) async fn not_found(State(state): State<PublicState>) -> Response {
-    let snapshot = state.snapshots.load_full();
+async fn not_found(State(snapshots): State<SiteSnapshotReader>) -> Response {
+    let snapshot = snapshots.load_full();
     not_found_response(&snapshot)
 }
 
-pub(super) async fn method_not_allowed(State(state): State<PublicState>) -> Response {
-    let snapshot = state.snapshots.load_full();
+async fn method_not_allowed(State(snapshots): State<SiteSnapshotReader>) -> Response {
+    let snapshot = snapshots.load_full();
     html_response(
         StatusCode::METHOD_NOT_ALLOWED,
         snapshot.method_not_allowed_page(),
@@ -179,16 +193,16 @@ mod tests {
         let tree = discover_content_tree(&root, ContentTreeLimits::default()).unwrap();
         let content = tree.validate().unwrap();
         let assets = resolve_content_assets(&tree, &content).unwrap();
-        let document = content.posts().first().unwrap();
+        let document = content.posts.first().unwrap();
         let rendered = render_markdown(
             document,
             assets.assets_for(document).unwrap(),
-            assets.site_assets_for(content.publication()).unwrap(),
+            assets.site_assets_for(&content.publication).unwrap(),
         )
         .unwrap();
         let ledger = PublicLedgerProjection::try_from_exact_entries([PublishedPostRevision::new(
-            rendered.post_id().clone(),
-            rendered.revision().clone(),
+            rendered.document.metadata.id.clone(),
+            rendered.revision.clone(),
             OffsetDateTime::from_unix_timestamp(2_000).unwrap(),
         )])
         .unwrap();

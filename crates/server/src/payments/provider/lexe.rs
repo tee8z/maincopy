@@ -84,10 +84,6 @@ impl LexeProvider {
         )
     }
 
-    pub(super) const fn kind(&self) -> ProviderKind {
-        ProviderKind::Lexe
-    }
-
     pub(super) async fn create_tip_invoice(
         &self,
         request: CreateTipInvoiceRequest,
@@ -818,7 +814,10 @@ fn ignored_payment_update(
     next_cursor: ProviderUpdateCursor,
     reason: IgnoredPaymentUpdateReason,
 ) -> ProviderPaymentUpdate {
-    ProviderPaymentUpdate::Ignored(IgnoredProviderPaymentUpdate::new(next_cursor, reason))
+    ProviderPaymentUpdate::Ignored(IgnoredProviderPaymentUpdate {
+        next_cursor,
+        reason,
+    })
 }
 
 fn conflicted_tip_update(
@@ -831,10 +830,10 @@ fn conflicted_tip_update(
         next_cursor,
         intent_id,
         observed_invoice,
-        ProviderPaymentStatus::new(
+        ProviderPaymentStatus {
             payment,
-            ProviderPaymentState::RecoveryRequired(TipRecoveryReason::ProviderConflict),
-        ),
+            status: ProviderPaymentState::RecoveryRequired(TipRecoveryReason::ProviderConflict),
+        },
     ))
 }
 
@@ -849,13 +848,13 @@ fn observed_payment_request(
     }
     let amount = invoice.amount().ok()?;
     let payment_hash = invoice.payment_hash();
-    Some(ReconcilePaymentRequest::new(
-        reference,
+    Some(ReconcilePaymentRequest {
+        payment: reference,
         intent_id,
-        invoice.clone(),
+        invoice: invoice.clone(),
         amount,
         payment_hash,
-    ))
+    })
 }
 
 fn parse_correlation_marker(value: &str) -> Option<TipIntentId> {
@@ -897,7 +896,10 @@ fn payment_status(
         PaymentStatus::Completed => completed_payment_state(&request, &payment),
     };
 
-    Ok(ProviderPaymentStatus::new(request.payment.clone(), status))
+    Ok(ProviderPaymentStatus {
+        payment: request.payment.clone(),
+        status,
+    })
 }
 
 fn validate_provider_payment_envelope(
@@ -2338,11 +2340,11 @@ mod tests {
     }
 
     fn create_request() -> CreateTipInvoiceRequest {
-        CreateTipInvoiceRequest::new(
-            TipIntentId::parse("2e776d7d-7d5f-4ab7-8c63-434c66a262aa").unwrap(),
-            SatoshiAmount::new(21).unwrap(),
-            TipInvoiceDescription::tip(),
-        )
+        CreateTipInvoiceRequest {
+            intent_id: TipIntentId::parse("2e776d7d-7d5f-4ab7-8c63-434c66a262aa").unwrap(),
+            amount: SatoshiAmount::new(21).unwrap(),
+            description: TipInvoiceDescription::tip(),
+        }
     }
 
     fn deadline(value: Duration) -> PaymentResponseDeadline {

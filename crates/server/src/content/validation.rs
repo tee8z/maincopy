@@ -131,8 +131,8 @@ pub enum ContentValidationCode {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct ValidationLocation {
-    path: LogicalContentPath,
-    field: FieldPath,
+    pub(crate) path: LogicalContentPath,
+    pub(crate) field: FieldPath,
 }
 
 impl ValidationLocation {
@@ -144,12 +144,12 @@ impl ValidationLocation {
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize)]
 #[error("{path}: {field}: {message}")]
 pub struct ContentValidationError {
-    path: LogicalContentPath,
-    field: FieldPath,
-    code: ContentValidationCode,
-    message: String,
+    pub path: LogicalContentPath,
+    pub field: FieldPath,
+    pub code: ContentValidationCode,
+    pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    related: Option<ValidationLocation>,
+    pub(crate) related: Option<ValidationLocation>,
 }
 
 impl ContentValidationError {
@@ -171,22 +171,6 @@ impl ContentValidationError {
     pub(crate) fn with_related(mut self, related: ValidationLocation) -> Self {
         self.related = Some(related);
         self
-    }
-
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub const fn field(&self) -> &FieldPath {
-        &self.field
-    }
-
-    pub const fn code(&self) -> ContentValidationCode {
-        self.code
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
     }
 
     fn sort_key(

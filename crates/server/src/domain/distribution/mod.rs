@@ -46,6 +46,7 @@ pub struct TargetPayload {
 /// Stable identity of one versioned target payload.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TargetPayloadDigest {
+    bytes: [u8; 32],
     encoded: Box<str>,
 }
 
@@ -54,32 +55,42 @@ impl TargetPayloadDigest {
         let hex = value
             .strip_prefix(TARGET_PAYLOAD_PREFIX)
             .ok_or(TargetPayloadDigestParseError)?;
-        if hex.len() != DIGEST_HEX_LENGTH
-            || !hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if hex.len() != DIGEST_HEX_LENGTH {
             return Err(TargetPayloadDigestParseError);
         }
 
-        Ok(Self {
-            encoded: value.into(),
-        })
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let high = decode_nibble(pair[0]).ok_or(TargetPayloadDigestParseError)?;
+            let low = decode_nibble(pair[1]).ok_or(TargetPayloadDigestParseError)?;
+            bytes[index] = high << 4 | low;
+        }
+
+        Ok(Self::from_bytes(bytes))
     }
 
     pub fn as_str(&self) -> &str {
         &self.encoded
     }
 
-    fn for_payload(payload: &TargetPayload) -> Self {
-        let mut transcript = blake3::Hasher::new_derive_key(TARGET_PAYLOAD_CONTEXT);
-        transcript.update(&payload.version.to_be_bytes());
-        transcript.update(&(payload.body.len() as u64).to_be_bytes());
-        transcript.update(payload.body.as_bytes());
-        let hash = transcript.finalize();
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
+    }
+
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        let hash = blake3::Hash::from_bytes(bytes);
         Self {
+            bytes,
             encoded: format!("{TARGET_PAYLOAD_PREFIX}{}", hash.to_hex()).into_boxed_str(),
         }
+    }
+}
+
+const fn decode_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -170,7 +181,11 @@ impl TargetPayload {
     }
 
     pub fn digest(&self) -> TargetPayloadDigest {
-        TargetPayloadDigest::for_payload(self)
+        let mut transcript = blake3::Hasher::new_derive_key(TARGET_PAYLOAD_CONTEXT);
+        transcript.update(&self.version.to_be_bytes());
+        transcript.update(&(self.body.len() as u64).to_be_bytes());
+        transcript.update(self.body.as_bytes());
+        TargetPayloadDigest::from_bytes(*transcript.finalize().as_bytes())
     }
 }
 
@@ -274,6 +289,7 @@ mod tests {
             "target-payload-b3-v1-149abb216bf262f3259b06dd1e16e590\
              c49d208657753fe83b892adcab70c73c"
         );
+        assert_eq!(TargetPayloadDigest::from_bytes(*digest.as_bytes()), digest);
         assert_eq!(TargetPayloadDigest::parse(digest.as_str()).unwrap(), digest);
         assert_eq!(
             serde_json::from_value::<TargetPayloadDigest>(serde_json::to_value(&digest).unwrap())

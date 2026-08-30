@@ -4,48 +4,48 @@ use serde::Serialize;
 use thiserror::Error;
 
 #[cfg(test)]
-use super::super::LogicalAssetPath;
-use super::super::{
+use super::GeneratedPostAsset;
+use super::{MarkdownRenderError, RenderedPost, render_markdown};
+#[cfg(test)]
+use crate::content::LogicalAssetPath;
+use crate::content::{
     LogicalContentPath, PostId, PostRevisionDigest, PublicationSettings, ResolvedContentAssets,
     ResolvedLocalAssetStore, ResolvedPostAssetLookupError, ResolvedSiteAssets, ValidatedContent,
 };
-#[cfg(test)]
-use super::GeneratedPostAsset;
-use super::{MarkdownRenderError, RenderedPost, render_markdown};
 
 /// Compile one validated candidate into a self-contained immutable catalog.
 pub fn compile_content_catalog(
     content: &ValidatedContent,
     assets: &ResolvedContentAssets,
 ) -> Result<ContentCatalog, CatalogBuildError> {
-    if assets.posts().len() != content.posts().len() {
+    if assets.posts.len() != content.posts.len() {
         return Err(CatalogBuildError::candidate_source_mismatch());
     }
     let site_assets = assets
-        .site_assets_for(content.publication())
+        .site_assets_for(&content.publication)
         .map_err(|error| CatalogBuildError::publication_assets(error.to_string()))?;
     let mut revisions = BTreeMap::new();
 
-    for document in content.posts() {
+    for document in &content.posts {
         let post_assets = assets
             .assets_for(document)
-            .map_err(|error| CatalogBuildError::post_assets(document.path().clone(), error))?;
+            .map_err(|error| CatalogBuildError::post_assets(document.path.clone(), error))?;
         let rendered = render_markdown(document, post_assets, site_assets)
             .map_err(CatalogBuildError::render)?;
-        let key = CatalogKey {
-            post_id: rendered.post_id().clone(),
-            revision: rendered.revision().clone(),
-        };
+        let key = (
+            rendered.document.metadata.id.clone(),
+            rendered.revision.clone(),
+        );
         if revisions.insert(key.clone(), Arc::new(rendered)).is_some() {
             return Err(CatalogBuildError::duplicate(key));
         }
     }
-    validate_catalog_generated_assets(assets.local_assets(), revisions.values().map(Arc::as_ref))?;
+    validate_catalog_generated_assets(&assets.local_assets, revisions.values().map(Arc::as_ref))?;
 
     Ok(ContentCatalog {
-        publication: content.publication().clone(),
+        publication: content.publication.clone(),
         site_assets: site_assets.clone(),
-        local_assets: assets.local_assets().clone(),
+        local_assets: assets.local_assets.clone(),
         revisions,
     })
 }
@@ -56,58 +56,15 @@ pub struct ContentCatalog {
     pub(super) publication: PublicationSettings,
     pub(super) site_assets: ResolvedSiteAssets,
     pub(super) local_assets: ResolvedLocalAssetStore,
-    revisions: BTreeMap<CatalogKey, Arc<RenderedPost>>,
+    revisions: BTreeMap<(PostId, PostRevisionDigest), Arc<RenderedPost>>,
 }
 
 impl ContentCatalog {
-    pub(super) const fn projection_scope(&self) -> CatalogProjectionScope<'_> {
-        CatalogProjectionScope {
-            site_assets: &self.site_assets,
-            local_assets: &self.local_assets,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.revisions.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.revisions.is_empty()
-    }
-
     pub fn get(&self, post_id: &PostId, revision: &PostRevisionDigest) -> Option<&RenderedPost> {
         self.revisions
-            .get(&CatalogKey {
-                post_id: post_id.clone(),
-                revision: revision.clone(),
-            })
+            .get(&(post_id.clone(), revision.clone()))
             .map(Arc::as_ref)
     }
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct CatalogProjectionScope<'catalog> {
-    pub(super) site_assets: &'catalog ResolvedSiteAssets,
-    pub(super) local_assets: &'catalog ResolvedLocalAssetStore,
-}
-
-impl<'catalog> CatalogProjectionScope<'catalog> {
-    #[cfg(test)]
-    pub(super) const fn for_test(
-        site_assets: &'catalog ResolvedSiteAssets,
-        local_assets: &'catalog ResolvedLocalAssetStore,
-    ) -> Self {
-        Self {
-            site_assets,
-            local_assets,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct CatalogKey {
-    post_id: PostId,
-    revision: PostRevisionDigest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -124,24 +81,12 @@ pub enum CatalogBuildErrorCode {
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize)]
 #[error("{path}: {code:?}: {message}")]
 pub struct CatalogBuildError {
-    path: LogicalContentPath,
-    code: CatalogBuildErrorCode,
-    message: Box<str>,
+    pub path: LogicalContentPath,
+    pub code: CatalogBuildErrorCode,
+    pub message: Box<str>,
 }
 
 impl CatalogBuildError {
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub const fn code(&self) -> CatalogBuildErrorCode {
-        self.code
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
     fn post_assets(path: LogicalContentPath, error: ResolvedPostAssetLookupError) -> Self {
         Self {
             path,
@@ -169,19 +114,19 @@ impl CatalogBuildError {
 
     fn render(error: MarkdownRenderError) -> Self {
         Self {
-            path: error.path().clone(),
+            path: error.path.clone(),
             code: CatalogBuildErrorCode::PostRenderFailed,
             message: error.to_string().into_boxed_str(),
         }
     }
 
-    fn duplicate(key: CatalogKey) -> Self {
+    fn duplicate(key: (PostId, PostRevisionDigest)) -> Self {
         Self {
             path: LogicalContentPath::new("<content-catalog>"),
             code: CatalogBuildErrorCode::DuplicateRevision,
             message: format!(
                 "post {} contains duplicate rendered revision {}",
-                key.post_id, key.revision
+                key.0, key.1
             )
             .into_boxed_str(),
         }
@@ -204,18 +149,18 @@ fn validate_catalog_generated_assets<'post>(
     rendered_posts: impl Iterator<Item = &'post RenderedPost>,
 ) -> Result<(), CatalogBuildError> {
     let mut paths = BTreeMap::new();
-    for path in local_assets.paths() {
+    for path in local_assets.assets.keys() {
         paths.insert(path.as_str().to_ascii_lowercase(), path.as_str().to_owned());
     }
     for rendered in rendered_posts {
-        for generated in rendered.generated_assets() {
-            let path = generated.asset().path.as_str();
+        for generated in &*rendered.generated_assets {
+            let path = generated.asset.path.as_str();
             if paths
                 .insert(path.to_ascii_lowercase(), path.to_owned())
                 .is_some()
             {
                 return Err(CatalogBuildError::generated_asset_collision(
-                    rendered.document().path().clone(),
+                    rendered.document.path.clone(),
                     path,
                 ));
             }
@@ -234,7 +179,7 @@ fn validate_generated_path_sets<'asset, 'path>(
         paths.insert(path.as_str().to_ascii_lowercase(), path.as_str().to_owned());
     }
     for (post_path, asset) in generated {
-        let path = asset.asset().path.as_str();
+        let path = asset.asset.path.as_str();
         if paths
             .insert(path.to_ascii_lowercase(), path.to_owned())
             .is_some()
@@ -338,27 +283,36 @@ mod tests {
     #[test]
     fn catalog_owns_drafts_rendered_revisions_and_exact_local_bytes() {
         let catalog = compile("Catalog", &[]);
-        assert_eq!(catalog.len(), 1);
-        assert!(!catalog.is_empty());
-        assert_eq!(catalog.publication.site().title().as_str(), "Catalog");
-        assert!(catalog.site_assets.allowed_origins().is_empty());
+        assert_eq!(catalog.revisions.len(), 1);
+        assert!(!catalog.revisions.is_empty());
+        assert_eq!(catalog.publication.site.title.as_str(), "Catalog");
+        assert!(catalog.site_assets.allowed_origins.is_empty());
         let path = LogicalAssetPath::parse("assets/cover.png").unwrap();
-        assert_eq!(catalog.local_assets.get(&path).unwrap().bytes(), b"cover");
+        assert_eq!(
+            catalog
+                .local_assets
+                .assets
+                .get(&path)
+                .unwrap()
+                .bytes
+                .as_ref(),
+            b"cover"
+        );
 
         let (key, rendered) = catalog.revisions.iter().next().unwrap();
         assert_eq!(
-            rendered.document().metadata().draft(),
+            rendered.document.metadata.draft,
             crate::content::DraftStatus::Draft
         );
         assert!(
             catalog
-                .get(rendered.post_id(), rendered.revision())
+                .get(&rendered.document.metadata.id, &rendered.revision)
                 .is_some()
         );
         let wrong = PostRevisionDigest::parse(&format!("post-b3-v1-{}", "22".repeat(32))).unwrap();
-        assert!(catalog.get(&key.post_id, &wrong).is_none());
+        assert!(catalog.get(&key.0, &wrong).is_none());
         let wrong_id = PostId::parse(SECOND_ID).unwrap();
-        assert!(catalog.get(&wrong_id, &key.revision).is_none());
+        assert!(catalog.get(&wrong_id, &key.1).is_none());
     }
 
     #[test]
@@ -371,7 +325,7 @@ mod tests {
 
         let error = compile_content_catalog(&other_content, &source_assets).unwrap_err();
         assert_eq!(
-            error.code(),
+            error.code,
             CatalogBuildErrorCode::PublicationAssetsUnavailable
         );
     }
@@ -383,17 +337,17 @@ mod tests {
         let full_assets = resolve_content_assets(&source, &full_content).unwrap();
         assert!(
             full_assets
-                .local_assets()
-                .get(&LogicalAssetPath::parse("assets/second.pdf").unwrap())
-                .is_some()
+                .local_assets
+                .assets
+                .contains_key(&LogicalAssetPath::parse("assets/second.pdf").unwrap())
         );
         let subset = ValidatedContent::new(
-            full_content.publication().clone(),
-            vec![full_content.posts()[0].clone()],
+            full_content.publication.clone(),
+            vec![full_content.posts[0].clone()],
         );
 
         let error = compile_content_catalog(&subset, &full_assets).unwrap_err();
-        assert_eq!(error.code(), CatalogBuildErrorCode::CandidateSourceMismatch);
+        assert_eq!(error.code, CatalogBuildErrorCode::CandidateSourceMismatch);
     }
 
     #[test]
@@ -414,7 +368,7 @@ mod tests {
         );
         let changed_content = changed.validate().unwrap();
         let error = compile_content_catalog(&changed_content, &source_assets).unwrap_err();
-        assert_eq!(error.code(), CatalogBuildErrorCode::PostAssetsUnavailable);
+        assert_eq!(error.code, CatalogBuildErrorCode::PostAssetsUnavailable);
     }
 
     #[test]
@@ -426,19 +380,19 @@ mod tests {
         let current = compile("Catalog", &["https://cdn.example.com"]);
         let old_post = old.revisions.values().next().unwrap();
         let current_post = current.revisions.values().next().unwrap();
-        assert_eq!(old_post.revision(), current_post.revision());
+        assert_eq!(old_post.revision, current_post.revision);
 
         let snapshot =
             SiteSnapshotDigest::parse(&format!("site-b3-v1-{}", "11".repeat(32))).unwrap();
         let error = old_post
-            .project_for_snapshot(&snapshot, current.projection_scope())
+            .project_for_snapshot(&snapshot, &current.site_assets, &current.local_assets)
             .unwrap_err();
         assert_eq!(
-            error.code(),
+            error.code,
             super::super::MarkdownRenderErrorCode::AssetPolicyMismatch
         );
         current_post
-            .project_for_snapshot(&snapshot, current.projection_scope())
+            .project_for_snapshot(&snapshot, &current.site_assets, &current.local_assets)
             .unwrap();
     }
 
@@ -448,8 +402,8 @@ mod tests {
         let full_content = source.validate().unwrap();
         let full_assets = resolve_content_assets(&source, &full_content).unwrap();
         let subset = ValidatedContent::new(
-            full_content.publication().clone(),
-            vec![full_content.posts()[0].clone()],
+            full_content.publication.clone(),
+            vec![full_content.posts[0].clone()],
         );
         let error = compile_content_catalog(&subset, &full_assets).unwrap_err();
         assert_eq!(
@@ -476,7 +430,7 @@ mod tests {
             std::iter::once((&first_path, &authored_collision)),
         )
         .unwrap_err();
-        assert_eq!(error.code(), CatalogBuildErrorCode::GeneratedAssetCollision);
+        assert_eq!(error.code, CatalogBuildErrorCode::GeneratedAssetCollision);
 
         let first = GeneratedPostAsset::from_owned_bytes(
             LogicalAssetPath::parse("assets/generated.svg").unwrap(),
@@ -491,7 +445,7 @@ mod tests {
             [(&first_path, &first), (&second_path, &second)].into_iter(),
         )
         .unwrap_err();
-        assert_eq!(error.code(), CatalogBuildErrorCode::GeneratedAssetCollision);
+        assert_eq!(error.code, CatalogBuildErrorCode::GeneratedAssetCollision);
     }
 
     #[test]

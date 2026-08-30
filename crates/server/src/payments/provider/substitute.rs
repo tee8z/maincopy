@@ -2,7 +2,7 @@ use std::{collections::VecDeque, sync::Mutex};
 
 use super::super::{
     CreateTipInvoiceRequest, CreateTipInvoiceResult, InvoiceCreationReconciliation,
-    NextPaymentUpdatesRequest, PaymentProviderResult, ProviderKind, ProviderPaymentStatus,
+    NextPaymentUpdatesRequest, PaymentProviderResult, ProviderPaymentStatus,
     ProviderPaymentUpdatePoll, ReconcilePaymentRequest,
 };
 
@@ -35,10 +35,6 @@ impl ProviderSubstitute {
 
     pub fn calls(&self) -> Vec<SubstituteCall> {
         self.calls.lock().unwrap().clone()
-    }
-
-    pub(super) const fn kind(&self) -> ProviderKind {
-        ProviderKind::Lexe
     }
 
     pub(super) async fn create_tip_invoice(

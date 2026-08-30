@@ -7,7 +7,7 @@ use std::{
 };
 
 use clap::{Parser, error::ErrorKind};
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
@@ -19,7 +19,7 @@ use crate::{
         ContentTreeLimits, ContentValidationErrors, DiscoveredContentTree, ValidatedContent,
         discover_content_tree,
     },
-    database::{self, BootstrappedDatabase},
+    database::{self, BootstrappedDatabase, DatabaseStore},
     error::{ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal},
     observability::{initialize_logging, task_span},
     process_lock::{ProcessLock, ProcessLockError},
@@ -38,15 +38,17 @@ type CriticalTaskFailure = Box<dyn std::error::Error + Send + Sync>;
 /// ordered shutdown belong in [`Application::run_until_stop`].
 pub(crate) struct Application {
     _startup: StartupConfiguration,
-    _database: BootstrappedDatabase,
+    _database: DatabaseStore,
     runtime: ApplicationRuntime,
 }
 
 struct ApplicationRuntime {
     readiness: Readiness,
     cancellation: CancellationToken,
+    database_shutdown: CancellationToken,
     shutdown: ShutdownFuture,
     critical_tasks: JoinSet<(CriticalTaskName, CriticalTaskCompletion)>,
+    database_writer: Option<JoinHandle<(CriticalTaskName, CriticalTaskCompletion)>>,
 }
 
 struct StartupConfiguration {
@@ -57,10 +59,6 @@ struct StartupConfiguration {
 }
 
 impl StartupConfiguration {
-    fn load(arguments: ServerArguments) -> Result<Self, ProcessError> {
-        Self::load_with_discovery(arguments, discover_content_tree)
-    }
-
     fn load_with_discovery<Discover>(
         arguments: ServerArguments,
         discover: Discover,
@@ -88,7 +86,7 @@ impl StartupConfiguration {
         };
         let content_tree = discover(host_view.content_root, host_view.content_limits)?;
         let validated_content = content_tree.validate()?;
-        if validated_content.publication().tips().is_configured() && host_view.lightning.is_none() {
+        if validated_content.publication.tips.is_configured() && host_view.lightning.is_none() {
             return Err(tip_provider_required().into());
         }
 
@@ -104,20 +102,21 @@ impl StartupConfiguration {
 /// Parses the server arguments and runs the daemon to completion.
 pub async fn run_until_stop() -> ProcessExit {
     initialize_logging();
-    run_with(std::env::args_os()).await
-}
-
-async fn run_with<I, T>(arguments: I) -> ProcessExit
-where
-    I: IntoIterator<Item = T>,
-    T: Into<std::ffi::OsString> + Clone,
-{
-    let arguments = match ServerArguments::try_parse_from(arguments) {
+    let arguments = match ServerArguments::try_parse_from(std::env::args_os()) {
         Ok(arguments) => arguments,
         Err(error) => return report_command_error(error),
     };
+    let result: Result<(), ProcessError> = async {
+        let startup = StartupConfiguration::load_with_discovery(arguments, discover_content_tree)?;
+        let application = Application::build(startup).await?;
+        application
+            .run_until_stop()
+            .await
+            .map_err(ProcessError::from)
+    }
+    .await;
 
-    match run_server(arguments).await {
+    match result {
         Ok(()) => ProcessExit::Success,
         Err(error) => {
             let exit = error.exit();
@@ -130,15 +129,6 @@ where
             exit
         }
     }
-}
-
-async fn run_server(arguments: ServerArguments) -> Result<(), ProcessError> {
-    let startup = StartupConfiguration::load(arguments)?;
-    let application = Application::build(startup).await?;
-    application
-        .run_until_stop()
-        .await
-        .map_err(ProcessError::from)
 }
 
 fn report_command_error(error: clap::Error) -> ProcessExit {
@@ -161,7 +151,9 @@ fn report_command_error(error: clap::Error) -> ProcessExit {
 impl Application {
     async fn build(startup: StartupConfiguration) -> Result<Self, ProcessError> {
         let cancellation = CancellationToken::new();
-        let database = match database::bootstrap(startup._host.view().database).await {
+        let host = startup._host.view();
+        let database_queue_capacity = host.database.writer_queue_capacity.get();
+        let database = match database::bootstrap(host.database).await {
             Ok(database) => database,
             Err(database::DatabaseStartupError::AlreadyOwned) => {
                 return Err(ProcessError::AlreadyRunning);
@@ -174,13 +166,19 @@ impl Application {
                 .into());
             }
         };
-        let shutdown = match prepare_shutdown(install_termination_signal) {
+        let shutdown = match crate::frontend_assets::embedded_manifest()
+            .validate()
+            .map_err(|_| ApplicationError::Startup {
+                stage: crate::error::StartupStage::FrontendAssets,
+            })
+            .and_then(|()| install_termination_signal())
+        {
             Ok(shutdown) => shutdown,
             Err(error) => {
                 return Err(close_database_after_startup_failure(database, error.into()).await);
             }
         };
-        let admin_socket = match AdminSocket::bind(startup._host.view().admin_socket) {
+        let admin_socket = match AdminSocket::bind(host.admin_socket) {
             Ok(admin_socket) => admin_socket,
             Err(error) => {
                 let process_error = if error.is_conflict() {
@@ -201,15 +199,26 @@ impl Application {
                 .await
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
+        let (database_store, database_writer) = database.into_store(database_queue_capacity);
+        let database_shutdown = CancellationToken::new();
+        let writer_shutdown = database_shutdown.clone();
+        let database_task = CriticalTask::new(CriticalTaskName::DatabaseWriter, async move {
+            database_writer
+                .run(writer_shutdown)
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
 
         Ok(Self {
             _startup: startup,
-            _database: database,
-            runtime: ApplicationRuntime::with_parts(
+            _database: database_store,
+            runtime: ApplicationRuntime::with_database_writer(
                 Readiness::default(),
                 cancellation,
+                database_shutdown,
                 shutdown,
                 vec![admin_task],
+                database_task,
             ),
         })
     }
@@ -221,12 +230,9 @@ impl Application {
             runtime,
         } = self;
         let runtime_result = runtime.run_until_stop().await;
-        let close_result = database
-            .close()
-            .await
-            .map_err(|_| ApplicationError::DatabaseClose);
+        drop(database);
         drop(startup);
-        runtime_result.and(close_result)
+        runtime_result
     }
 }
 
@@ -236,18 +242,6 @@ async fn close_database_after_startup_failure(
 ) -> ProcessError {
     let _ = database.close().await;
     process_error
-}
-
-fn prepare_shutdown<Install>(install_signal: Install) -> Result<ShutdownFuture, ApplicationError>
-where
-    Install: FnOnce() -> Result<ShutdownFuture, ApplicationError>,
-{
-    crate::frontend_assets::embedded_manifest()
-        .validate()
-        .map_err(|_| ApplicationError::Startup {
-            stage: crate::error::StartupStage::FrontendAssets,
-        })?;
-    install_signal()
 }
 
 impl ApplicationRuntime {
@@ -266,22 +260,43 @@ impl ApplicationRuntime {
         Self {
             readiness,
             cancellation,
+            database_shutdown: CancellationToken::new(),
             shutdown,
             critical_tasks: supervisor,
+            database_writer: None,
         }
+    }
+
+    fn with_database_writer(
+        readiness: Readiness,
+        cancellation: CancellationToken,
+        database_shutdown: CancellationToken,
+        shutdown: ShutdownFuture,
+        critical_tasks: Vec<CriticalTask>,
+        database_writer: CriticalTask,
+    ) -> Self {
+        let mut runtime = Self::with_parts(readiness, cancellation, shutdown, critical_tasks);
+        let span = task_span(database_writer.name);
+        runtime.database_shutdown = database_shutdown;
+        runtime.database_writer = Some(tokio::spawn(database_writer.instrument(span)));
+        runtime
     }
 
     async fn run_until_stop(mut self) -> Result<(), ApplicationError> {
         self.readiness.mark_ready();
 
-        let failure = if self.critical_tasks.is_empty() {
+        let failure = if self.critical_tasks.is_empty() && self.database_writer.is_none() {
             self.shutdown.await.err()
         } else {
             tokio::select! {
                 biased;
                 shutdown = &mut self.shutdown => shutdown.err(),
-                completion = self.critical_tasks.join_next() => {
+                completion = self.critical_tasks.join_next(), if !self.critical_tasks.is_empty() => {
                     Some(unexpected_task_failure(completion))
+                }
+                completion = wait_for_database_writer(&mut self.database_writer) => {
+                    self.database_writer.take();
+                    Some(unexpected_task_failure(Some(completion)))
                 }
             }
         };
@@ -290,11 +305,38 @@ impl ApplicationRuntime {
         self.cancellation.cancel();
 
         let drain_failure = drain_critical_tasks(&mut self.critical_tasks).await;
-        match failure.or(drain_failure) {
+        self.database_shutdown.cancel();
+        let database_failure = drain_database_writer(&mut self.database_writer).await;
+        match first_shutdown_failure([failure, drain_failure, database_failure]) {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
+}
+
+fn first_shutdown_failure(failures: [Option<ApplicationError>; 3]) -> Option<ApplicationError> {
+    let mut failures = failures.into_iter().flatten();
+    let first = failures.next();
+    for failure in failures {
+        tracing::error!(error = %failure, "additional failure during shutdown");
+    }
+    first
+}
+
+async fn wait_for_database_writer(
+    writer: &mut Option<JoinHandle<(CriticalTaskName, CriticalTaskCompletion)>>,
+) -> Result<(CriticalTaskName, CriticalTaskCompletion), JoinError> {
+    match writer.as_mut() {
+        Some(writer) => writer.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn drain_database_writer(
+    writer: &mut Option<JoinHandle<(CriticalTaskName, CriticalTaskCompletion)>>,
+) -> Option<ApplicationError> {
+    let writer = writer.take()?;
+    drained_task_failure(writer.await)
 }
 
 async fn drain_critical_tasks(
@@ -303,9 +345,12 @@ async fn drain_critical_tasks(
     let mut first_failure = None;
 
     while let Some(completion) = critical_tasks.join_next().await {
-        let failure = drained_task_failure(completion);
-        if first_failure.is_none() {
-            first_failure = failure;
+        if let Some(failure) = drained_task_failure(completion) {
+            if first_failure.is_none() {
+                first_failure = Some(failure);
+            } else {
+                tracing::error!(error = %failure, "additional critical task failure during shutdown");
+            }
         }
     }
 
@@ -578,27 +623,22 @@ path_bytes = 512\n";
 
         assert_eq!(discovery_calls.get(), 1);
         let limits = observed_limits.get().unwrap();
-        assert_eq!(limits.publication_file_bytes().get(), 512);
-        assert_eq!(limits.post_file_bytes().get(), 1536);
-        assert_eq!(limits.asset_file_bytes().get(), 2560);
-        assert_eq!(limits.total_tree_bytes().get(), 3584);
-        assert_eq!(limits.entries().get(), 90);
-        assert_eq!(limits.depth().get(), 7);
-        assert_eq!(limits.path_bytes().get(), 400);
+        assert_eq!(limits.publication_file_bytes.get(), 512);
+        assert_eq!(limits.post_file_bytes.get(), 1536);
+        assert_eq!(limits.asset_file_bytes.get(), 2560);
+        assert_eq!(limits.total_tree_bytes.get(), 3584);
+        assert_eq!(limits.entries.get(), 90);
+        assert_eq!(limits.depth.get(), 7);
+        assert_eq!(limits.path_bytes.get(), 400);
         assert!(
             startup
                 ._content_tree
-                .publication()
-                .source()
+                .publication
+                .source
                 .contains("Pinned startup source")
         );
         assert_eq!(
-            startup
-                ._validated_content
-                .publication()
-                .site()
-                .title()
-                .as_str(),
+            startup._validated_content.publication.site.title.as_str(),
             "Pinned startup source"
         );
     }
@@ -662,7 +702,7 @@ path_bytes = 512\n";
         };
         assert_eq!(errors.diagnostics().len(), 1);
         assert_eq!(
-            errors.diagnostics()[0].code(),
+            errors.diagnostics()[0].code,
             crate::config::ConfigurationValidationCode::TipProviderRequired
         );
     }
@@ -696,14 +736,26 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
 
         assert!(socket_path.exists());
         assert_eq!(application.runtime.critical_tasks.len(), 1);
+        assert!(application.runtime.database_writer.is_some());
 
         let Application {
             _startup: startup,
             _database: database,
-            runtime,
+            mut runtime,
         } = application;
-        drop(runtime);
-        database.close().await.unwrap();
+        runtime.cancellation.cancel();
+        assert!(
+            drain_critical_tasks(&mut runtime.critical_tasks)
+                .await
+                .is_none()
+        );
+        runtime.database_shutdown.cancel();
+        assert!(
+            drain_database_writer(&mut runtime.database_writer)
+                .await
+                .is_none()
+        );
+        drop(database);
         drop(startup);
         tokio::task::yield_now().await;
         assert!(!socket_path.exists());
@@ -752,28 +804,6 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         assert!(!socket_path.exists());
     }
 
-    #[test]
-    fn signal_registration_failure_prevents_listener_preparation() {
-        let mut installation_attempted = false;
-
-        let result = prepare_shutdown(|| {
-            installation_attempted = true;
-            Err(ApplicationError::SignalRegistration {
-                signal: ShutdownSignal::Terminate,
-                source: std::io::Error::other("signal registration failed"),
-            })
-        });
-
-        assert!(installation_attempted);
-        assert!(matches!(
-            result,
-            Err(ApplicationError::SignalRegistration {
-                signal: ShutdownSignal::Terminate,
-                ..
-            })
-        ));
-    }
-
     #[tokio::test]
     async fn shutdown_signal_marks_unready_cancels_and_drains_every_task() {
         let readiness = Readiness::default();
@@ -808,7 +838,9 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         );
 
         let running = tokio::spawn(application.run_until_stop());
-        tokio::task::yield_now().await;
+        while !readiness.is_ready() {
+            tokio::task::yield_now().await;
+        }
         assert!(readiness.is_ready());
 
         assert!(shutdown_tx.send(()).is_ok());
@@ -817,6 +849,98 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         assert!(cancellation.is_cancelled());
         assert_eq!(drained.load(Ordering::SeqCst), 2);
         assert_eq!(observed_order.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_database_writer_to_close() {
+        let readiness = Readiness::default();
+        let cancellation = CancellationToken::new();
+        let database_shutdown = CancellationToken::new();
+        let writer_shutdown = database_shutdown.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (writer_started_tx, writer_started_rx) = oneshot::channel();
+        let (writer_release_tx, writer_release_rx) = oneshot::channel();
+        let writer = CriticalTask::new(CriticalTaskName::DatabaseWriter, async move {
+            writer_shutdown.cancelled().await;
+            let _ = writer_started_tx.send(());
+            let _ = writer_release_rx.await;
+            Ok(())
+        });
+        let application = ApplicationRuntime::with_database_writer(
+            readiness.clone(),
+            cancellation,
+            database_shutdown,
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }),
+            Vec::new(),
+            writer,
+        );
+
+        let running = tokio::spawn(application.run_until_stop());
+        while !readiness.is_ready() {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(shutdown_tx.send(()).is_ok());
+        assert!(writer_started_rx.await.is_ok());
+        tokio::task::yield_now().await;
+        assert!(!running.is_finished());
+
+        assert!(writer_release_tx.send(()).is_ok());
+        assert!(running.await.unwrap().is_ok());
+        assert!(!readiness.is_ready());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_producers_before_stopping_the_database_writer() {
+        let readiness = Readiness::default();
+        let cancellation = CancellationToken::new();
+        let producer_shutdown = cancellation.clone();
+        let database_shutdown = CancellationToken::new();
+        let writer_shutdown = database_shutdown.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (producer_cancelled_tx, producer_cancelled_rx) = oneshot::channel();
+        let (producer_release_tx, producer_release_rx) = oneshot::channel();
+        let (writer_cancelled_tx, mut writer_cancelled_rx) = oneshot::channel();
+        let producer = CriticalTask::new(CriticalTaskName::Worker, async move {
+            producer_shutdown.cancelled().await;
+            let _ = producer_cancelled_tx.send(());
+            let _ = producer_release_rx.await;
+            Ok(())
+        });
+        let writer = CriticalTask::new(CriticalTaskName::DatabaseWriter, async move {
+            writer_shutdown.cancelled().await;
+            let _ = writer_cancelled_tx.send(());
+            Ok(())
+        });
+        let application = ApplicationRuntime::with_database_writer(
+            readiness.clone(),
+            cancellation,
+            database_shutdown,
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }),
+            vec![producer],
+            writer,
+        );
+
+        let running = tokio::spawn(application.run_until_stop());
+        while !readiness.is_ready() {
+            tokio::task::yield_now().await;
+        }
+        assert!(shutdown_tx.send(()).is_ok());
+        assert!(producer_cancelled_rx.await.is_ok());
+        assert!(matches!(
+            writer_cancelled_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        assert!(producer_release_tx.send(()).is_ok());
+        assert!(writer_cancelled_rx.await.is_ok());
+        assert!(running.await.unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -869,6 +993,48 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             })
         ));
         assert_shutdown_state(readiness, cancellation, companion_drained);
+    }
+
+    #[tokio::test]
+    async fn database_writer_failure_marks_unready_and_drains_producers() {
+        let readiness = Readiness::default();
+        let cancellation = CancellationToken::new();
+        let database_shutdown = CancellationToken::new();
+        let companion_drained = Arc::new(AtomicBool::new(false));
+        let companion = {
+            let cancellation = cancellation.clone();
+            let companion_drained = Arc::clone(&companion_drained);
+            CriticalTask::new(CriticalTaskName::Worker, async move {
+                cancellation.cancelled().await;
+                companion_drained.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+        let writer = CriticalTask::new(CriticalTaskName::DatabaseWriter, async {
+            Err(Box::new(std::io::Error::other("writer stopped")) as CriticalTaskFailure)
+        });
+        let application = ApplicationRuntime::with_database_writer(
+            readiness.clone(),
+            cancellation.clone(),
+            database_shutdown.clone(),
+            Box::pin(std::future::pending()),
+            vec![companion],
+            writer,
+        );
+
+        let result = application.run_until_stop().await;
+
+        assert!(matches!(
+            result,
+            Err(ApplicationError::CriticalTaskFailed {
+                task: CriticalTaskName::DatabaseWriter,
+                ..
+            })
+        ));
+        assert!(!readiness.is_ready());
+        assert!(cancellation.is_cancelled());
+        assert!(database_shutdown.is_cancelled());
+        assert!(companion_drained.load(Ordering::SeqCst));
     }
 
     async fn run_with_unexpected_task<Future>(

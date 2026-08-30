@@ -53,13 +53,14 @@ impl fmt::Display for ConfigurationValidationCode {
 
 /// One redaction-safe host configuration diagnostic.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[non_exhaustive]
 pub struct ConfigurationDiagnostic {
-    authority: &'static str,
-    field: Box<str>,
-    code: ConfigurationValidationCode,
-    message: &'static str,
-    line: Option<usize>,
-    column: Option<usize>,
+    pub authority: &'static str,
+    pub field: Box<str>,
+    pub code: ConfigurationValidationCode,
+    pub message: &'static str,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
 }
 
 impl ConfigurationDiagnostic {
@@ -82,18 +83,6 @@ impl ConfigurationDiagnostic {
         self.line = Some(line);
         self.column = Some(column);
         self
-    }
-
-    pub fn field(&self) -> &str {
-        &self.field
-    }
-
-    pub const fn code(&self) -> ConfigurationValidationCode {
-        self.code
-    }
-
-    pub const fn message(&self) -> &'static str {
-        self.message
     }
 }
 
@@ -258,7 +247,7 @@ mod tests {
             .at(2, 3),
         ]);
 
-        assert_eq!(errors.diagnostics()[0].field(), "$document");
+        assert_eq!(errors.diagnostics()[0].field.as_ref(), "$document");
         let rendered = format!("{errors:?}");
         assert!(!rendered.contains("credential-value"));
         assert!(!rendered.contains("source ="));

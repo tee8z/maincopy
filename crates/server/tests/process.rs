@@ -288,11 +288,8 @@ fn production_binary_retains_the_complete_embedded_frontend_manifest() {
     let manifest = embedded_manifest();
     manifest.validate().unwrap();
 
-    assert!(contains_bytes(&binary, manifest.css().bytes()));
-    assert!(contains_bytes(
-        &binary,
-        manifest.css().public_path().as_str().as_bytes()
-    ));
-    assert!(contains_bytes(&binary, manifest.bundle_digest().as_bytes()));
-    assert!(contains_bytes(&binary, manifest.css().digest().as_bytes()));
+    assert!(contains_bytes(&binary, manifest.css.bytes));
+    assert!(contains_bytes(&binary, manifest.css.public_path.as_bytes()));
+    assert!(contains_bytes(&binary, manifest.bundle_digest.as_bytes()));
+    assert!(contains_bytes(&binary, manifest.css.digest.as_bytes()));
 }

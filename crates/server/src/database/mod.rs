@@ -1,4 +1,9 @@
-//! SQLite schema bootstrap and ownership of the future writer connection.
+//! SQLite schema bootstrap and single-writer ownership.
+
+pub(crate) mod store;
+mod writer;
+
+pub(crate) use store::DatabaseStore;
 
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
@@ -13,7 +18,7 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use sqlx::{
     ConnectOptions as _, Connection as _, SqliteConnection,
     migrate::{MigrateError, Migrator},
-    sqlite::SqliteConnectOptions,
+    sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
 };
 use thiserror::Error;
 
@@ -27,9 +32,10 @@ const MINIMUM_SAFE_SQLITE_VERSION: (u64, u64, u64) = (3, 51, 3);
 
 static MIGRATOR: Migrator = sqlx::migrate!();
 
-/// Owns the single connection that WP3.2 will move into the writer task.
+/// Owns the connection and database lock until startup creates the writer task.
 pub(crate) struct BootstrappedDatabase {
     _writer: SqliteConnection,
+    _readers: SqlitePool,
     _ownership_lock: File,
 }
 
@@ -37,8 +43,10 @@ impl BootstrappedDatabase {
     pub(crate) async fn close(self) -> Result<(), sqlx::Error> {
         let Self {
             _writer,
+            _readers,
             _ownership_lock,
         } = self;
+        _readers.close().await;
         let result = _writer.close().await;
         if result.is_err() {
             tracing::error!("database writer close failed");
@@ -77,20 +85,89 @@ pub(crate) async fn bootstrap(
             .run(&mut writer)
             .await
             .map_err(map_migration_error)?;
-        verify_foreign_keys(&mut writer).await
+        verify_foreign_keys(&mut writer).await?;
+        open_read_pool(configuration).await
     }
     .await;
-    if let Err(error) = initialization {
-        if writer.close().await.is_err() {
-            tracing::error!("database writer close failed during bootstrap rollback");
+    let readers = match initialization {
+        Ok(readers) => readers,
+        Err(error) => {
+            if writer.close().await.is_err() {
+                tracing::error!("database writer close failed during bootstrap rollback");
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
 
     Ok(BootstrappedDatabase {
         _writer: writer,
+        _readers: readers,
         _ownership_lock: ownership_lock,
     })
+}
+
+async fn open_read_pool(
+    configuration: DatabaseConfigurationView<'_>,
+) -> Result<SqlitePool, DatabaseStartupError> {
+    let max_connections = u32::try_from(configuration.read_pool_size.get()).map_err(|_| {
+        DatabaseStartupError::ConfigurationMismatch {
+            setting: "read_pool_size",
+        }
+    })?;
+    let options = SqliteConnectOptions::new()
+        .filename(configuration.path)
+        .create_if_missing(false)
+        .read_only(true)
+        .foreign_keys(true)
+        .busy_timeout(configuration.busy_timeout.get())
+        .pragma("trusted_schema", "OFF")
+        .pragma("ignore_check_constraints", "OFF")
+        .pragma("query_only", "ON")
+        .pragma("cell_size_check", "ON")
+        .pragma("locking_mode", "NORMAL");
+    let pool = SqlitePoolOptions::new()
+        .min_connections(1)
+        .max_connections(max_connections)
+        .connect_with(options)
+        .await
+        .map_err(|source| DatabaseStartupError::OpenReaders { source })?;
+
+    let verification = async {
+        let mut reader = pool
+            .acquire()
+            .await
+            .map_err(|source| DatabaseStartupError::OpenReaders { source })?;
+        verify_integer_pragma(&mut reader, "PRAGMA foreign_keys", 1, "foreign_keys").await?;
+        verify_integer_pragma(&mut reader, "PRAGMA trusted_schema", 0, "trusted_schema").await?;
+        verify_integer_pragma(
+            &mut reader,
+            "PRAGMA ignore_check_constraints",
+            0,
+            "ignore_check_constraints",
+        )
+        .await?;
+        verify_integer_pragma(&mut reader, "PRAGMA query_only", 1, "query_only").await?;
+        verify_integer_pragma(&mut reader, "PRAGMA cell_size_check", 1, "cell_size_check").await?;
+        verify_text_pragma(&mut reader, "PRAGMA locking_mode", "normal", "locking_mode").await?;
+        let expected_timeout = i64::try_from(configuration.busy_timeout.get().as_millis())
+            .map_err(|_| DatabaseStartupError::ConfigurationMismatch {
+                setting: "busy_timeout",
+            })?;
+        verify_integer_pragma(
+            &mut reader,
+            "PRAGMA busy_timeout",
+            expected_timeout,
+            "busy_timeout",
+        )
+        .await
+    }
+    .await;
+
+    if let Err(error) = verification {
+        pool.close().await;
+        return Err(error);
+    }
+    Ok(pool)
 }
 
 fn prepare_database_parent(path: &Path) -> Result<(), DatabaseStartupError> {
@@ -398,7 +475,6 @@ async fn configure_connection(
         "PRAGMA ignore_check_constraints = OFF",
         "PRAGMA query_only = OFF",
         "PRAGMA cell_size_check = ON",
-        "PRAGMA recursive_triggers = ON",
     ] {
         sqlx::query(statement)
             .execute(&mut *connection)
@@ -418,13 +494,6 @@ async fn configure_connection(
     .await?;
     verify_integer_pragma(connection, "PRAGMA query_only", 0, "query_only").await?;
     verify_integer_pragma(connection, "PRAGMA cell_size_check", 1, "cell_size_check").await?;
-    verify_integer_pragma(
-        connection,
-        "PRAGMA recursive_triggers",
-        1,
-        "recursive_triggers",
-    )
-    .await?;
     verify_text_pragma(
         connection,
         "PRAGMA locking_mode = NORMAL",
@@ -536,6 +605,11 @@ pub(crate) enum DatabaseStartupError {
     },
     #[error("database writer connection could not be opened")]
     OpenWriter {
+        #[source]
+        source: sqlx::Error,
+    },
+    #[error("database read pool could not be opened")]
+    OpenReaders {
         #[source]
         source: sqlx::Error,
     },

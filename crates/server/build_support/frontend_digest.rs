@@ -86,14 +86,8 @@ pub struct FrontendAssetNameParseError;
 
 #[derive(Clone, Copy)]
 pub(crate) struct FrontendDigestInput<'bytes> {
-    kind: FrontendAssetKind,
-    bytes: &'bytes [u8],
-}
-
-impl<'bytes> FrontendDigestInput<'bytes> {
-    pub(crate) const fn new(kind: FrontendAssetKind, bytes: &'bytes [u8]) -> Self {
-        Self { kind, bytes }
-    }
+    pub(crate) kind: FrontendAssetKind,
+    pub(crate) bytes: &'bytes [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -173,12 +167,16 @@ mod tests {
         let javascript = frontend_asset_digest(FrontendAssetKind::JavaScript, b"a{color:red}");
         assert_ne!(css, javascript);
 
-        let one =
-            frontend_bundle_digest(&[FrontendDigestInput::new(FrontendAssetKind::Css, b"ab")])
-                .unwrap();
-        let another =
-            frontend_bundle_digest(&[FrontendDigestInput::new(FrontendAssetKind::Css, b"a")])
-                .unwrap();
+        let one = frontend_bundle_digest(&[FrontendDigestInput {
+            kind: FrontendAssetKind::Css,
+            bytes: b"ab",
+        }])
+        .unwrap();
+        let another = frontend_bundle_digest(&[FrontendDigestInput {
+            kind: FrontendAssetKind::Css,
+            bytes: b"a",
+        }])
+        .unwrap();
         assert_ne!(one, another);
     }
 
@@ -189,16 +187,22 @@ mod tests {
             Err(FrontendDigestContractError::EmptyBundle)
         );
         assert_eq!(
-            frontend_bundle_digest(&[FrontendDigestInput::new(
-                FrontendAssetKind::JavaScript,
-                b"js",
-            )]),
+            frontend_bundle_digest(&[FrontendDigestInput {
+                kind: FrontendAssetKind::JavaScript,
+                bytes: b"js",
+            }]),
             Err(FrontendDigestContractError::MissingStylesheet)
         );
         assert_eq!(
             frontend_bundle_digest(&[
-                FrontendDigestInput::new(FrontendAssetKind::Css, b"one"),
-                FrontendDigestInput::new(FrontendAssetKind::Css, b"two"),
+                FrontendDigestInput {
+                    kind: FrontendAssetKind::Css,
+                    bytes: b"one",
+                },
+                FrontendDigestInput {
+                    kind: FrontendAssetKind::Css,
+                    bytes: b"two",
+                },
             ]),
             Err(FrontendDigestContractError::AssetOrder)
         );

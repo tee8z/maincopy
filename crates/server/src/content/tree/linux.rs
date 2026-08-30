@@ -107,7 +107,7 @@ impl Discovery {
     }
 
     fn discover_root(&mut self) {
-        let remaining = self.limits.entries().get().saturating_sub(self.entry_count);
+        let remaining = self.limits.entries.get().saturating_sub(self.entry_count);
         let entries = match read_bounded_sorted_entries(&self.root_fd, remaining, |name| {
             std::str::from_utf8(name)
                 .ok()
@@ -260,7 +260,7 @@ impl Discovery {
             self.push_changed(logical_directory);
             return;
         }
-        let remaining = self.limits.entries().get().saturating_sub(self.entry_count);
+        let remaining = self.limits.entries.get().saturating_sub(self.entry_count);
         let entries = match read_bounded_sorted_entries(&directory_fd, remaining, |_| true) {
             Ok(entries) => entries,
             Err(ReadEntriesError::LimitExceeded) => {
@@ -290,7 +290,7 @@ impl Discovery {
             let raw_path = format!("{raw_directory}/{name}");
             let logical_text = format!("{logical_directory}/{name}");
             let logical =
-                match PortableLogicalPath::parse(&logical_text, self.limits.path_bytes().get()) {
+                match PortableLogicalPath::parse(&logical_text, self.limits.path_bytes.get()) {
                     Ok(logical) => logical,
                     Err(super::LogicalTreePathError::TooLong) => {
                         self.diagnostics.push(tree_error(
@@ -311,7 +311,7 @@ impl Discovery {
                 };
 
             let entry_depth = depth.saturating_add(1);
-            if entry_depth > self.limits.depth().get() {
+            if entry_depth > self.limits.depth.get() {
                 self.diagnostics.push(tree_error(
                     logical.as_str(),
                     ContentValidationCode::ContentDepthLimitExceeded,
@@ -398,7 +398,7 @@ impl Discovery {
     }
 
     fn root_path_within_limit(&mut self, logical: &PortableLogicalPath) -> bool {
-        if logical.as_str().len() <= self.limits.path_bytes().get() {
+        if logical.as_str().len() <= self.limits.path_bytes.get() {
             true
         } else {
             self.diagnostics.push(tree_error(
@@ -518,9 +518,9 @@ impl Discovery {
             }
         }
         self.posts
-            .sort_by(|left, right| left.path().as_str().cmp(right.path().as_str()));
+            .sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
         self.assets
-            .sort_by(|left, right| left.path().as_str().cmp(right.path().as_str()));
+            .sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
     }
 
     fn read_file(
@@ -588,7 +588,7 @@ impl Discovery {
             self.push_tree_too_large(discovered.logical.as_str());
             return None;
         };
-        if next_total > self.limits.total_tree_bytes().get() {
+        if next_total > self.limits.total_tree_bytes.get() {
             self.push_tree_too_large(discovered.logical.as_str());
             return None;
         }
@@ -672,7 +672,7 @@ impl Discovery {
             return;
         }
         self.entry_limit_reported = true;
-        self.entry_count = self.limits.entries().get();
+        self.entry_count = self.limits.entries.get();
         self.diagnostics.push(tree_error(
             path,
             ContentValidationCode::ContentEntryLimitExceeded,

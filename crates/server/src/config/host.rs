@@ -620,8 +620,8 @@ fn validate_content_limits(
         overrides
             .content_publication_file_bytes
             .or(candidate.publication_file_bytes)
-            .unwrap_or(defaults.publication_file_bytes().get()),
-        defaults.publication_file_bytes().get(),
+            .unwrap_or(defaults.publication_file_bytes.get()),
+        defaults.publication_file_bytes.get(),
         "content.publication_file_bytes",
         diagnostics,
     );
@@ -629,8 +629,8 @@ fn validate_content_limits(
         overrides
             .content_post_file_bytes
             .or(candidate.post_file_bytes)
-            .unwrap_or(defaults.post_file_bytes().get()),
-        defaults.post_file_bytes().get(),
+            .unwrap_or(defaults.post_file_bytes.get()),
+        defaults.post_file_bytes.get(),
         "content.post_file_bytes",
         diagnostics,
     );
@@ -638,8 +638,8 @@ fn validate_content_limits(
         overrides
             .content_asset_file_bytes
             .or(candidate.asset_file_bytes)
-            .unwrap_or(defaults.asset_file_bytes().get()),
-        defaults.asset_file_bytes().get(),
+            .unwrap_or(defaults.asset_file_bytes.get()),
+        defaults.asset_file_bytes.get(),
         "content.asset_file_bytes",
         diagnostics,
     );
@@ -647,8 +647,8 @@ fn validate_content_limits(
         overrides
             .content_total_tree_bytes
             .or(candidate.total_tree_bytes)
-            .unwrap_or(defaults.total_tree_bytes().get()),
-        defaults.total_tree_bytes().get(),
+            .unwrap_or(defaults.total_tree_bytes.get()),
+        defaults.total_tree_bytes.get(),
         "content.total_tree_bytes",
         diagnostics,
     );
@@ -656,11 +656,11 @@ fn validate_content_limits(
         overrides
             .content_entries
             .or(candidate.entries)
-            .unwrap_or(defaults.entries().get() as u64),
+            .unwrap_or(defaults.entries.get() as u64),
         "content.entries",
         ConfigurationValidationCode::LimitOutOfRange,
         |value| {
-            if value <= defaults.entries().get() {
+            if value <= defaults.entries.get() {
                 ContentEntryLimit::new(value)
             } else {
                 None
@@ -672,11 +672,11 @@ fn validate_content_limits(
         overrides
             .content_depth
             .or(candidate.depth)
-            .unwrap_or(defaults.depth().get() as u64),
+            .unwrap_or(defaults.depth.get() as u64),
         "content.depth",
         ConfigurationValidationCode::LimitOutOfRange,
         |value| {
-            if value <= defaults.depth().get() {
+            if value <= defaults.depth.get() {
                 ContentDepthLimit::new(value)
             } else {
                 None
@@ -688,11 +688,11 @@ fn validate_content_limits(
         overrides
             .content_path_bytes
             .or(candidate.path_bytes)
-            .unwrap_or(defaults.path_bytes().get() as u64),
+            .unwrap_or(defaults.path_bytes.get() as u64),
         "content.path_bytes",
         ConfigurationValidationCode::LimitOutOfRange,
         |value| {
-            if value <= defaults.path_bytes().get() {
+            if value <= defaults.path_bytes.get() {
                 ContentPathByteLimit::new(value)
             } else {
                 None
@@ -1078,13 +1078,13 @@ mod tests {
             .unwrap();
         let limits = config.view().content_limits;
 
-        assert_eq!(limits.publication_file_bytes().get(), 10);
-        assert_eq!(limits.post_file_bytes().get(), 20);
-        assert_eq!(limits.asset_file_bytes().get(), 30);
-        assert_eq!(limits.total_tree_bytes().get(), 40);
-        assert_eq!(limits.entries().get(), 50);
-        assert_eq!(limits.depth().get(), 7);
-        assert_eq!(limits.path_bytes().get(), 70);
+        assert_eq!(limits.publication_file_bytes.get(), 10);
+        assert_eq!(limits.post_file_bytes.get(), 20);
+        assert_eq!(limits.asset_file_bytes.get(), 30);
+        assert_eq!(limits.total_tree_bytes.get(), 40);
+        assert_eq!(limits.entries.get(), 50);
+        assert_eq!(limits.depth.get(), 7);
+        assert_eq!(limits.path_bytes.get(), 70);
     }
 
     #[test]
@@ -1108,13 +1108,13 @@ mod tests {
             .unwrap();
         let limits = config.view().content_limits;
 
-        assert_eq!(limits.publication_file_bytes().get(), 11);
-        assert_eq!(limits.post_file_bytes().get(), 12);
-        assert_eq!(limits.asset_file_bytes().get(), 13);
-        assert_eq!(limits.total_tree_bytes().get(), 14);
-        assert_eq!(limits.entries().get(), 15);
-        assert_eq!(limits.depth().get(), 8);
-        assert_eq!(limits.path_bytes().get(), 16);
+        assert_eq!(limits.publication_file_bytes.get(), 11);
+        assert_eq!(limits.post_file_bytes.get(), 12);
+        assert_eq!(limits.asset_file_bytes.get(), 13);
+        assert_eq!(limits.total_tree_bytes.get(), 14);
+        assert_eq!(limits.entries.get(), 15);
+        assert_eq!(limits.depth.get(), 8);
+        assert_eq!(limits.path_bytes.get(), 16);
     }
 
     #[test]
@@ -1133,13 +1133,13 @@ mod tests {
                  entries = {}\n\
                  depth = {}\n\
                  path_bytes = {}\n",
-                caps.publication_file_bytes().get(),
-                caps.post_file_bytes().get(),
-                caps.asset_file_bytes().get(),
-                caps.total_tree_bytes().get(),
-                caps.entries().get(),
-                caps.depth().get(),
-                caps.path_bytes().get(),
+                caps.publication_file_bytes.get(),
+                caps.post_file_bytes.get(),
+                caps.asset_file_bytes.get(),
+                caps.total_tree_bytes.get(),
+                caps.entries.get(),
+                caps.depth.get(),
+                caps.path_bytes.get(),
             ),
         );
 
@@ -1158,14 +1158,14 @@ mod tests {
         let cases = [
             (
                 "publication_file_bytes",
-                caps.publication_file_bytes().get() + 1,
+                caps.publication_file_bytes.get() + 1,
             ),
-            ("post_file_bytes", caps.post_file_bytes().get() + 1),
-            ("asset_file_bytes", caps.asset_file_bytes().get() + 1),
-            ("total_tree_bytes", caps.total_tree_bytes().get() + 1),
-            ("entries", caps.entries().get() as u64 + 1),
-            ("depth", caps.depth().get() as u64 + 1),
-            ("path_bytes", caps.path_bytes().get() as u64 + 1),
+            ("post_file_bytes", caps.post_file_bytes.get() + 1),
+            ("asset_file_bytes", caps.asset_file_bytes.get() + 1),
+            ("total_tree_bytes", caps.total_tree_bytes.get() + 1),
+            ("entries", caps.entries.get() as u64 + 1),
+            ("depth", caps.depth.get() as u64 + 1),
+            ("path_bytes", caps.path_bytes.get() as u64 + 1),
         ];
 
         for (index, (field, above_cap)) in cases.into_iter().enumerate() {
@@ -1180,9 +1180,12 @@ mod tests {
 
                 assert_eq!(errors.diagnostics().len(), 1);
                 let expected_field = format!("content.{field}");
-                assert_eq!(errors.diagnostics()[0].field(), expected_field.as_str());
                 assert_eq!(
-                    errors.diagnostics()[0].code(),
+                    errors.diagnostics()[0].field.as_ref(),
+                    expected_field.as_str()
+                );
+                assert_eq!(
+                    errors.diagnostics()[0].code,
                     ConfigurationValidationCode::LimitOutOfRange
                 );
             }
@@ -1210,9 +1213,12 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(errors.diagnostics().len(), 1);
-        assert_eq!(errors.diagnostics()[0].field(), "content.total_tree_bytes");
         assert_eq!(
-            errors.diagnostics()[0].code(),
+            errors.diagnostics()[0].field.as_ref(),
+            "content.total_tree_bytes"
+        );
+        assert_eq!(
+            errors.diagnostics()[0].code,
             ConfigurationValidationCode::ContentLimitRelationshipInvalid
         );
     }
@@ -1381,7 +1387,7 @@ mod tests {
             write_config(root.path(), &name, source);
             let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
             assert_eq!(
-                errors.diagnostics()[0].code(),
+                errors.diagnostics()[0].code,
                 ConfigurationValidationCode::HostTomlInvalid
             );
         }
@@ -1417,7 +1423,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            errors.diagnostics()[0].code(),
+            errors.diagnostics()[0].code,
             ConfigurationValidationCode::LexeCredentialsMustUseFile
         );
         assert_eq!(
@@ -1447,7 +1453,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            errors.diagnostics()[0].code(),
+            errors.diagnostics()[0].code,
             ConfigurationValidationCode::SecretReferenceInvalid
         );
         let rendered = format!("{errors:?}");
@@ -1474,7 +1480,7 @@ mod tests {
             write_config(root.path(), &name, source);
             let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
             assert_eq!(
-                errors.diagnostics()[0].code(),
+                errors.diagnostics()[0].code,
                 ConfigurationValidationCode::HostTomlInvalid,
                 "source unexpectedly accepted: {source}"
             );
@@ -1499,7 +1505,7 @@ mod tests {
             let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
 
             assert_eq!(
-                errors.diagnostics()[0].code(),
+                errors.diagnostics()[0].code,
                 ConfigurationValidationCode::HostTomlInvalid,
                 "source unexpectedly accepted: {source}"
             );
@@ -1535,7 +1541,7 @@ mod tests {
         let codes = errors
             .diagnostics()
             .iter()
-            .map(ConfigurationDiagnostic::code)
+            .map(|diagnostic| diagnostic.code)
             .collect::<Vec<_>>();
 
         assert!(codes.contains(&ConfigurationValidationCode::LexeConcurrencyInvalid));
@@ -1583,7 +1589,7 @@ mod tests {
         let errors = HostConfigurationLoader::new(PathBuf::from("relative")).unwrap_err();
 
         assert_eq!(
-            errors.diagnostics()[0].code(),
+            errors.diagnostics()[0].code,
             ConfigurationValidationCode::WorkingDirectoryUnavailable
         );
     }
@@ -1606,11 +1612,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            too_large.diagnostics()[0].code(),
+            too_large.diagnostics()[0].code,
             ConfigurationValidationCode::HostDocumentTooLarge
         );
         assert_eq!(
-            not_utf8.diagnostics()[0].code(),
+            not_utf8.diagnostics()[0].code,
             ConfigurationValidationCode::HostTextInvalidUtf8
         );
     }

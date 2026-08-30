@@ -13,25 +13,29 @@ use maincopy_server::payments::{
 
 #[tokio::test]
 async fn external_tests_can_use_the_provider_substitute() {
-    let create_request = CreateTipInvoiceRequest::new(
-        TipIntentId::parse("2e776d7d-7d5f-4ab7-8c63-434c66a262aa").unwrap(),
-        SatoshiAmount::new(21).unwrap(),
-        TipInvoiceDescription::tip(),
-    );
-    let reconcile_request = ReconcilePaymentRequest::new(
-        ProviderPaymentReference::lexe(ProviderPaymentLocator::new("opaque-lexe-index").unwrap()),
-        TipIntentId::parse("2e776d7d-7d5f-4ab7-8c63-434c66a262aa").unwrap(),
-        Bolt11Invoice::parse("lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh").unwrap(),
-        SatoshiAmount::new(21).unwrap(),
-        PaymentHash::from_bytes([1; 32]),
-    );
-    let update_request = NextPaymentUpdatesRequest::new(Some(update_cursor(1)));
+    let create_request = CreateTipInvoiceRequest {
+        intent_id: TipIntentId::parse("2e776d7d-7d5f-4ab7-8c63-434c66a262aa").unwrap(),
+        amount: SatoshiAmount::new(21).unwrap(),
+        description: TipInvoiceDescription::tip(),
+    };
+    let reconcile_request = ReconcilePaymentRequest {
+        payment: ProviderPaymentReference::lexe(
+            ProviderPaymentLocator::new("opaque-lexe-index").unwrap(),
+        ),
+        intent_id: TipIntentId::parse("2e776d7d-7d5f-4ab7-8c63-434c66a262aa").unwrap(),
+        invoice: Bolt11Invoice::parse("lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh").unwrap(),
+        amount: SatoshiAmount::new(21).unwrap(),
+        payment_hash: PaymentHash::from_bytes([1; 32]),
+    };
+    let update_request = NextPaymentUpdatesRequest {
+        cursor: Some(update_cursor(1)),
+    };
     let update_response = ProviderPaymentUpdatePoll::Updates(
         ProviderPaymentUpdateBatch::new(vec![ProviderPaymentUpdate::Ignored(
-            IgnoredProviderPaymentUpdate::new(
-                update_cursor(2),
-                IgnoredPaymentUpdateReason::MissingMarker,
-            ),
+            IgnoredProviderPaymentUpdate {
+                next_cursor: update_cursor(2),
+                reason: IgnoredPaymentUpdateReason::MissingMarker,
+            },
         )])
         .unwrap(),
     );

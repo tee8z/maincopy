@@ -171,6 +171,36 @@ The CLI depends on `maincopy-shared`. It does not depend on
 `maincopy-server`. The server and publication content use separate
 repositories at deployment time.
 
+The server uses vertical domain slices. A domain directory owns its business
+models and its concrete boundary adapters. For example, the publication slice
+owns its state machines, SQLite queries, and public or admin route handlers.
+
+```text
+crates/server/src/
+|-- domain/
+|   |-- distribution/       # target payload and distribution rules
+|   `-- publication/
+|       |-- mod.rs          # publication and job state machines
+|       |-- store.rs        # publication-specific SQL and row mapping
+|       `-- web.rs          # public publication route handlers
+|-- database/               # SQLite lifecycle, read pool, and sole writer
+|-- admin/                  # private transport and admin router composition
+`-- web/                    # public listener mechanics and router composition
+```
+
+Add `admin.rs` or `web.rs` to a domain only when that domain has a real
+endpoint. Do not add empty adapter modules for planned work.
+
+The top-level `database`, `admin`, and `web` modules provide shared mechanisms.
+They do not own business queries or business route behavior. `DatabaseStore`
+aggregates concrete domain stores. The admin and public routers compose
+concrete domain routes with cross-cutting health, OpenAPI, middleware, and
+transport behavior.
+
+The CLI calls the admin API. It does not depend on a domain store and does not
+open SQLite. A request can therefore be traced from a domain route, through a
+domain store operation, to its SQL in one domain directory.
+
 ```text
 /srv/maincopy/
 |-- engine/                 # Maincopy checkout or Nix store path
@@ -1118,9 +1148,18 @@ then runs the embedded migrations and checks foreign-key integrity.
 
 The writer verifies WAL mode, `synchronous=NORMAL`, foreign keys, the configured
 busy timeout, `trusted_schema=OFF`, enabled check constraints,
-`query_only=OFF`, `locking_mode=NORMAL`, `cell_size_check=ON`, and
-`recursive_triggers=ON`. Recursive triggers make immutable-ledger delete
-guards apply to `INSERT OR REPLACE` operations.
+`query_only=OFF`, `locking_mode=NORMAL`, and `cell_size_check=ON`.
+
+The schema uses `STRICT` tables, required columns, foreign keys, and ordinary
+uniqueness constraints. UUID values use 16-byte `BLOB` storage. BLAKE3 digests
+use 32-byte `BLOB` storage. Git object IDs use their raw 20-byte or 32-byte form.
+
+Small `CHECK` constraints enforce fixed binary widths and the `site_state`
+singleton. The application validates the Git object algorithm and width.
+
+The schema has no application triggers or state-dependent indexes. The writer
+validates domain encodings, state transitions, versions, and cross-table policy.
+Read adapters validate all persisted values before they construct domain types.
 
 Each migration uses SQLx's transaction boundary. Migration files must not use
 the `-- no-transaction` directive.
@@ -1130,7 +1169,7 @@ the `-- no-transaction` directive.
 ```mermaid
 sequenceDiagram
     participant C as Admin client or worker
-    participant H as Write handle
+    participant H as Domain store
     participant Q as Bounded MPSC channel
     participant W as Writer task
     participant D as SQLite WAL
@@ -1147,8 +1186,8 @@ sequenceDiagram
 Exactly one Tokio task owns exactly one SQLx write connection. Every runtime
 write uses one bounded `mpsc` channel.
 
-Cloning the database handle clones only the channel sender and read pool. A
-clone never creates another writer task.
+Cloning `DatabaseStore` or one of its domain stores clones only the channel
+sender and read pool. A clone never creates another writer task.
 
 The writer uses typed commands. It does not accept arbitrary SQL closures. One
 command contains one complete transaction.

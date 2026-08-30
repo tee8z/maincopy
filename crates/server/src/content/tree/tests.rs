@@ -102,8 +102,8 @@ fn validation_error_contract(errors: ContentValidationErrors) -> Vec<ErrorContra
         .into_errors()
         .into_iter()
         .map(|error| ErrorContract {
-            path: error.path().as_str().to_owned(),
-            code: error.code(),
+            path: error.path.as_str().to_owned(),
+            code: error.code,
         })
         .collect()
 }
@@ -134,9 +134,9 @@ fn discovers_nested_tree_in_order_owns_bytes_and_validates() {
         .expect("valid nested tree must load");
 
     assert_eq!(
-        tree.posts()
+        tree.posts
             .iter()
-            .map(|post| post.path().as_str())
+            .map(|post| post.path.as_str())
             .collect::<Vec<_>>(),
         [
             "drafts/notes/later.md",
@@ -145,14 +145,14 @@ fn discovers_nested_tree_in_order_owns_bytes_and_validates() {
         ]
     );
     assert_eq!(
-        tree.assets()
+        tree.assets
             .iter()
-            .map(|asset| asset.path().as_str())
+            .map(|asset| asset.path.as_str())
             .collect::<Vec<_>>(),
         ["assets/nested/a.bin", "assets/z-last.bin"]
     );
-    assert_eq!(tree.assets()[0].bytes(), opaque);
-    assert_eq!(tree.total_bytes(), expected_total as u64);
+    assert_eq!(tree.assets[0].bytes.as_ref(), opaque);
+    assert_eq!(tree.total_bytes, expected_total as u64);
 
     write(
         root.path(),
@@ -161,17 +161,17 @@ fn discovers_nested_tree_in_order_owns_bytes_and_validates() {
     );
     write(root.path(), "posts/alpha.md", b"not valid Markdown");
     write(root.path(), "publication.toml", b"not valid TOML");
-    assert_eq!(tree.assets()[0].bytes(), opaque);
+    assert_eq!(tree.assets[0].bytes.as_ref(), opaque);
 
     let validated = tree
         .validate()
         .expect("owned source snapshot must validate");
     let loaded_draft = validated
-        .posts()
+        .posts
         .iter()
-        .find(|post| post.path().as_str() == "drafts/notes/later.md")
+        .find(|post| post.path.as_str() == "drafts/notes/later.md")
         .expect("draft-directory post must be present");
-    assert_eq!(loaded_draft.metadata().draft(), DraftStatus::Draft);
+    assert_eq!(loaded_draft.metadata.draft, DraftStatus::Draft);
 }
 
 #[test]
@@ -184,9 +184,9 @@ fn publication_only_tree_ignores_unmanaged_root_entries() {
 
     let tree = discover_content_tree(root.path(), ContentTreeLimits::default())
         .expect("unmanaged root entries must not enter content discovery");
-    assert!(tree.posts().is_empty());
-    assert!(tree.assets().is_empty());
-    assert_eq!(tree.total_bytes(), PUBLICATION.len() as u64);
+    assert!(tree.posts.is_empty());
+    assert!(tree.assets.is_empty());
+    assert_eq!(tree.total_bytes, PUBLICATION.len() as u64);
 
     let strict_tree = discover_content_tree(
         root.path(),
@@ -201,7 +201,7 @@ fn publication_only_tree_ignores_unmanaged_root_entries() {
         ),
     )
     .expect("unmanaged root entries must not consume the managed-entry limit");
-    assert_eq!(strict_tree.total_bytes(), PUBLICATION.len() as u64);
+    assert_eq!(strict_tree.total_bytes, PUBLICATION.len() as u64);
 }
 
 #[test]
@@ -336,7 +336,7 @@ fn exact_file_tree_entry_depth_and_path_limits_are_inclusive() {
     );
     let tree = discover_content_tree(root.path(), exact)
         .expect("values exactly equal to every limit must be accepted");
-    assert_eq!(tree.total_bytes(), total as u64);
+    assert_eq!(tree.total_bytes, total as u64);
 }
 
 #[test]
@@ -361,13 +361,13 @@ fn limit_types_reject_zero_overflow_sentinels_and_invalid_relationships() {
     assert_eq!(result, Err(ContentTreeLimitsError));
 
     let defaults = ContentTreeLimits::default();
-    assert_eq!(defaults.publication_file_bytes().get(), 256 * 1024);
-    assert_eq!(defaults.post_file_bytes().get(), 4 * 1024 * 1024);
-    assert_eq!(defaults.asset_file_bytes().get(), 32 * 1024 * 1024);
-    assert_eq!(defaults.total_tree_bytes().get(), 256 * 1024 * 1024);
-    assert_eq!(defaults.entries().get(), 10_000);
-    assert_eq!(defaults.depth().get(), 16);
-    assert_eq!(defaults.path_bytes().get(), 1_024);
+    assert_eq!(defaults.publication_file_bytes.get(), 256 * 1024);
+    assert_eq!(defaults.post_file_bytes.get(), 4 * 1024 * 1024);
+    assert_eq!(defaults.asset_file_bytes.get(), 32 * 1024 * 1024);
+    assert_eq!(defaults.total_tree_bytes.get(), 256 * 1024 * 1024);
+    assert_eq!(defaults.entries.get(), 10_000);
+    assert_eq!(defaults.depth.get(), 16);
+    assert_eq!(defaults.path_bytes.get(), 1_024);
 }
 
 #[test]
@@ -493,7 +493,7 @@ fn configured_path_limit_above_the_default_is_used_end_to_end() {
         ),
     )
     .expect("the configured path limit must govern discovery and asset construction");
-    assert_eq!(tree.assets()[0].path().as_str(), logical_path);
+    assert_eq!(tree.assets[0].path.as_str(), logical_path);
 }
 
 #[test]
@@ -700,12 +700,12 @@ fn drafts_missing_or_true_are_forced_draft_and_false_is_rejected() {
     let tree = discover_content_tree(accepted.path(), ContentTreeLimits::default())
         .expect("valid drafts must be discovered");
     let validated = tree.validate().expect("valid drafts must validate");
-    assert_eq!(validated.posts().len(), 2);
+    assert_eq!(validated.posts.len(), 2);
     assert!(
         validated
-            .posts()
+            .posts
             .iter()
-            .all(|post| post.metadata().draft() == DraftStatus::Draft)
+            .all(|post| post.metadata.draft == DraftStatus::Draft)
     );
 
     let rejected = new_root();
@@ -735,7 +735,7 @@ fn drafts_missing_or_true_are_forced_draft_and_false_is_rejected() {
         .expect("post-tree draft must be discovered")
         .validate()
         .expect("draft=true below posts must be valid");
-    assert_eq!(validated.posts()[0].metadata().draft(), DraftStatus::Draft);
+    assert_eq!(validated.posts[0].metadata.draft, DraftStatus::Draft);
 }
 
 #[test]
@@ -780,14 +780,14 @@ fn root_symlink_swap_after_open_remains_pinned_to_one_tree() {
     })
     .expect("an opened root descriptor must pin the original deployment");
 
-    assert_eq!(tree.assets()[0].bytes(), b"first");
+    assert_eq!(tree.assets[0].bytes.as_ref(), b"first");
     assert_eq!(
         fs::read(current.join("assets/version.bin")).expect("current deployment must be readable"),
         b"second"
     );
     let next = discover_content_tree(&current, ContentTreeLimits::default())
         .expect("the next discovery must use the new root-link target");
-    assert_eq!(next.assets()[0].bytes(), b"second");
+    assert_eq!(next.assets[0].bytes.as_ref(), b"second");
 }
 
 #[test]
@@ -888,13 +888,13 @@ fn discovered_tree_remains_owned_after_the_source_tree_is_removed() {
 
     drop(root);
 
-    assert_eq!(tree.assets()[0].bytes(), b"owned bytes");
+    assert_eq!(tree.assets[0].bytes.as_ref(), b"owned bytes");
     assert_eq!(
         tree.validate()
             .expect("owned source must validate after removal")
-            .posts()[0]
-            .metadata()
-            .slug()
+            .posts[0]
+            .metadata
+            .slug
             .as_str(),
         "owned"
     );
@@ -1013,26 +1013,26 @@ fn valid_output_order_is_independent_of_filesystem_creation_order() {
 
     assert_eq!(
         forward
-            .posts()
+            .posts
             .iter()
-            .map(|post| post.path().as_str())
+            .map(|post| post.path.as_str())
             .collect::<Vec<_>>(),
         reverse
-            .posts()
+            .posts
             .iter()
-            .map(|post| post.path().as_str())
+            .map(|post| post.path.as_str())
             .collect::<Vec<_>>()
     );
     assert_eq!(
         forward
-            .assets()
+            .assets
             .iter()
-            .map(|asset| asset.path().as_str())
+            .map(|asset| asset.path.as_str())
             .collect::<Vec<_>>(),
         reverse
-            .assets()
+            .assets
             .iter()
-            .map(|asset| asset.path().as_str())
+            .map(|asset| asset.path.as_str())
             .collect::<Vec<_>>()
     );
 }

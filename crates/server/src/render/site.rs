@@ -8,9 +8,10 @@ use time::OffsetDateTime;
 
 use crate::frontend_assets::FrontendAssetManifest;
 
-use super::super::identity::{SiteShellOutputDigest, SiteShellOutputHasher};
-use super::catalog::CatalogProjectionScope;
 use super::{ContentCatalog, GeneratedPostAsset, RenderedPost};
+use crate::content::identity::{
+    SiteShellOutputDigest, SiteShellOutputHasher, finalize_site_snapshot,
+};
 use crate::content::{
     AssetRevisionReference, DigestedAsset, DraftStatus, LogicalAssetPath, PostDescription, PostId,
     PostRevisionDigest, PostSlug, PostTag, PostTitle, PublicationBaseUrl, PublicationSettings,
@@ -58,21 +59,17 @@ impl PublicLedgerProjection {
         entries: impl IntoIterator<Item = PublishedPostRevision>,
     ) -> Result<Self, PublicLedgerProjectionError> {
         let mut entries: Vec<_> = entries.into_iter().collect();
-        entries.sort_by(|left, right| left.post_id().cmp(right.post_id()));
+        entries.sort_by(|left, right| left.post_id.cmp(&right.post_id));
         for pair in entries.windows(2) {
-            if pair[0].post_id() == pair[1].post_id() {
+            if pair[0].post_id == pair[1].post_id {
                 return Err(PublicLedgerProjectionError {
-                    post_id: pair[0].post_id().clone(),
+                    post_id: pair[0].post_id.clone(),
                 });
             }
         }
         Ok(Self {
             entries: entries.into(),
         })
-    }
-
-    fn entries(&self) -> &[PublishedPostRevision] {
-        &self.entries
     }
 }
 
@@ -152,19 +149,19 @@ impl PublicPostView {
         entry: &PublishedPostRevision,
         publication: &PublicationSettings,
     ) -> Self {
-        let metadata = rendered.document().metadata();
-        let path = PublicPagePath::post(metadata.slug());
+        let metadata = &rendered.document.metadata;
+        let path = PublicPagePath::post(&metadata.slug);
         Self {
-            post_id: metadata.id().clone(),
-            revision: rendered.revision().clone(),
-            title: metadata.title().clone(),
-            slug: metadata.slug().clone(),
-            description: metadata.description().clone(),
-            tags: Arc::from(metadata.tags()),
-            authored_at: metadata.authored_at(),
-            updated_at: metadata.updated_at(),
-            published_at: entry.published_at(),
-            canonical_url: CanonicalSiteUrl::for_path(publication.site().base_url(), &path),
+            post_id: metadata.id.clone(),
+            revision: rendered.revision.clone(),
+            title: metadata.title.clone(),
+            slug: metadata.slug.clone(),
+            description: metadata.description.clone(),
+            tags: Arc::from(metadata.tags.as_slice()),
+            authored_at: metadata.authored_at,
+            updated_at: metadata.updated_at,
+            published_at: entry.published_at,
+            canonical_url: CanonicalSiteUrl::for_path(&publication.site.base_url, &path),
         }
     }
 
@@ -192,7 +189,7 @@ impl fmt::Debug for RenderedSiteShell {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RenderedSiteShell")
-            .field("ledger_entries", &self.ledger.len())
+            .field("ledger_entries", &self.ledger.entries.len())
             .field("posts", &self.posts.len())
             .field("tags", &self.tags.len())
             .finish_non_exhaustive()
@@ -212,7 +209,7 @@ pub fn render_site_shell(
     let tags = tag_index(&posts, &chronology);
     validate_route_count(posts.len(), tags.len())?;
 
-    let renderer = SiteShellRendererIdentity::new(*frontend.bundle_digest());
+    let renderer = SiteShellRendererIdentity::new(frontend.bundle_digest);
     let pre_injection_output =
         render_pre_injection_shell(&catalog.publication, frontend, &posts, &chronology, &tags)?;
 
@@ -232,19 +229,19 @@ fn select_public_posts(
     catalog: &ContentCatalog,
     ledger: &PublicLedgerProjection,
 ) -> Result<Vec<PublicPostView>, SiteSnapshotBuildError> {
-    let mut posts = Vec::with_capacity(ledger.len());
-    for entry in ledger.entries() {
-        let Some(rendered) = catalog.get(entry.post_id(), entry.revision()) else {
+    let mut posts = Vec::with_capacity(ledger.entries.len());
+    for entry in &*ledger.entries {
+        let Some(rendered) = catalog.get(&entry.post_id, &entry.revision) else {
             return Err(SiteSnapshotBuildError::post(
                 SiteSnapshotBuildErrorCode::RevisionUnavailable,
-                entry.post_id().clone(),
+                entry.post_id.clone(),
                 "the exact public-ledger revision is not available in this catalog",
             ));
         };
-        if rendered.document().metadata().draft() == DraftStatus::Draft {
+        if rendered.document.metadata.draft == DraftStatus::Draft {
             return Err(SiteSnapshotBuildError::post(
                 SiteSnapshotBuildErrorCode::DraftSelected,
-                entry.post_id().clone(),
+                entry.post_id.clone(),
                 "the public ledger selected a draft revision",
             ));
         }
@@ -363,12 +360,12 @@ pub fn build_site_snapshot(
     ledger: &PublicLedgerProjection,
 ) -> Result<SiteSnapshot, SiteSnapshotBuildError> {
     validate_snapshot_shell(&shell, ledger)?;
-    let digest = super::super::identity::finalize_site_snapshot(
+    let digest = finalize_site_snapshot(
         &shell.catalog.publication,
         &shell.catalog.site_assets,
         &shell.renderer,
         &shell.pre_injection_output,
-        ledger.entries(),
+        &ledger.entries,
     )
     .map_err(SiteSnapshotBuildError::identity)?;
 
@@ -415,7 +412,7 @@ fn validate_snapshot_shell(
         .frontend
         .validate()
         .map_err(|error| SiteSnapshotBuildError::frontend(error.to_string()))?;
-    if shell.renderer.frontend_bundle() != shell.frontend.bundle_digest() {
+    if shell.renderer.frontend_bundle != shell.frontend.bundle_digest {
         return Err(SiteSnapshotBuildError::new(
             SiteSnapshotBuildErrorCode::FrontendMismatch,
             None,
@@ -469,7 +466,11 @@ fn render_snapshot_pages(
                 )
             })?;
         let article = rendered
-            .project_for_snapshot(digest, shell.catalog.projection_scope())
+            .project_for_snapshot(
+                digest,
+                &shell.catalog.site_assets,
+                &shell.catalog.local_assets,
+            )
             .map(ProjectedArticleHtml::new)
             .map_err(|error| {
                 SiteSnapshotBuildError::post(
@@ -516,7 +517,7 @@ fn insert_page(
     let path = route.public_path();
     let page = RenderedPage {
         html: html.into(),
-        canonical_url: CanonicalSiteUrl::for_path(publication.site().base_url(), &path),
+        canonical_url: CanonicalSiteUrl::for_path(&publication.site.base_url, &path),
     };
     if pages.insert(route, page).is_some() {
         return Err(SiteSnapshotBuildError::new(
@@ -540,7 +541,7 @@ fn rendered_error_page(
     Ok(RenderedPage {
         html: html.into(),
         canonical_url: CanonicalSiteUrl::for_path(
-            publication.site().base_url(),
+            &publication.site.base_url,
             &PublicPagePath::index(),
         ),
     })
@@ -582,9 +583,12 @@ fn collect_public_assets(
     shell: &RenderedSiteShell,
     digest: &SiteSnapshotDigest,
 ) -> Result<BTreeMap<SnapshotAssetPath, SnapshotPublicAsset>, SiteSnapshotBuildError> {
-    let scope = shell.catalog.projection_scope();
     let mut selected: BTreeMap<LogicalAssetPath, SelectedAsset> = BTreeMap::new();
-    collect_site_global_assets(&mut selected, scope)?;
+    collect_site_global_assets(
+        &mut selected,
+        &shell.catalog.site_assets,
+        &shell.catalog.local_assets,
+    )?;
 
     for post in &*shell.posts {
         let rendered = shell
@@ -599,9 +603,9 @@ fn collect_public_assets(
             })?;
         collect_selected_post_assets(
             &mut selected,
-            rendered.assets(),
-            rendered.generated_assets(),
-            scope.local_assets,
+            &rendered.assets,
+            &rendered.generated_assets,
+            &shell.catalog.local_assets,
         )?;
     }
 
@@ -610,14 +614,15 @@ fn collect_public_assets(
 
 fn collect_site_global_assets(
     selected: &mut BTreeMap<LogicalAssetPath, SelectedAsset>,
-    scope: CatalogProjectionScope<'_>,
+    site_assets: &crate::content::ResolvedSiteAssets,
+    local_assets: &ResolvedLocalAssetStore,
 ) -> Result<(), SiteSnapshotBuildError> {
-    if let Some(AssetRevisionReference::Local(asset)) = scope.site_assets.favicon() {
-        insert_authored_asset(selected, asset, scope.local_assets)?;
+    if let Some(AssetRevisionReference::Local(asset)) = &site_assets.favicon {
+        insert_authored_asset(selected, asset, local_assets)?;
     }
-    for reference in scope.site_assets.references() {
+    for reference in &site_assets.references {
         if let AssetRevisionReference::Local(asset) = reference {
-            insert_authored_asset(selected, asset, scope.local_assets)?;
+            insert_authored_asset(selected, asset, local_assets)?;
         }
     }
     Ok(())
@@ -629,10 +634,10 @@ fn collect_selected_post_assets(
     generated_assets: &[GeneratedPostAsset],
     store: &ResolvedLocalAssetStore,
 ) -> Result<(), SiteSnapshotBuildError> {
-    if let Some(AssetRevisionReference::Local(asset)) = assets.image() {
+    if let Some(AssetRevisionReference::Local(asset)) = &assets.image {
         insert_authored_asset(selected, asset, store)?;
     }
-    for reference in assets.references() {
+    for reference in &assets.references {
         if let AssetRevisionReference::Local(asset) = reference {
             insert_authored_asset(selected, asset, store)?;
         }
@@ -640,8 +645,8 @@ fn collect_selected_post_assets(
     for generated in generated_assets {
         insert_selected_asset(
             selected,
-            generated.asset().clone(),
-            Arc::from(generated.bytes()),
+            generated.asset.clone(),
+            Arc::clone(&generated.bytes),
         )?;
     }
     Ok(())
@@ -693,7 +698,7 @@ fn insert_authored_asset(
             error.to_string(),
         )
     })?;
-    insert_selected_asset(selected, asset.clone(), Arc::from(resolved.bytes()))
+    insert_selected_asset(selected, asset.clone(), Arc::clone(&resolved.bytes))
 }
 
 fn insert_selected_asset(
@@ -742,33 +747,19 @@ struct RenderedPage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotPublicAsset {
-    path: SnapshotAssetPath,
-    asset: DigestedAsset,
-    bytes: Arc<[u8]>,
-}
-
-impl SnapshotPublicAsset {
-    pub const fn path(&self) -> &SnapshotAssetPath {
-        &self.path
-    }
-
-    pub const fn asset(&self) -> &DigestedAsset {
-        &self.asset
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
+    pub path: SnapshotAssetPath,
+    pub asset: DigestedAsset,
+    pub bytes: Arc<[u8]>,
 }
 
 /// Complete immutable request-facing state for one canonical publication.
 pub struct SiteSnapshot {
-    digest: SiteSnapshotDigest,
+    pub(crate) digest: SiteSnapshotDigest,
     pages: BTreeMap<PageRoute, RenderedPage>,
     not_found: RenderedPage,
     method_not_allowed: RenderedPage,
     assets: BTreeMap<SnapshotAssetPath, SnapshotPublicAsset>,
-    frontend: &'static FrontendAssetManifest,
+    pub(crate) frontend: &'static FrontendAssetManifest,
     retained_html_bytes: usize,
 }
 
@@ -785,10 +776,6 @@ impl fmt::Debug for SiteSnapshot {
 }
 
 impl SiteSnapshot {
-    pub const fn digest(&self) -> &SiteSnapshotDigest {
-        &self.digest
-    }
-
     pub fn post_canonical_url(&self, slug: &PostSlug) -> Option<&CanonicalSiteUrl> {
         self.pages
             .get(&PageRoute::Post(slug.clone()))
@@ -829,10 +816,6 @@ impl SiteSnapshot {
 
     pub(crate) fn method_not_allowed_page(&self) -> Arc<str> {
         Arc::clone(&self.method_not_allowed.html)
-    }
-
-    pub(crate) const fn frontend(&self) -> &'static FrontendAssetManifest {
-        self.frontend
     }
 }
 
@@ -904,13 +887,13 @@ impl SiteSnapshotActivator {
         next: SiteSnapshot,
     ) -> Result<SnapshotActivationOutcome, SnapshotActivationError> {
         let current = self.active.load_full();
-        if current.digest() != expected {
+        if &current.digest != expected {
             return Err(SnapshotActivationError {
                 expected: expected.clone(),
-                actual: current.digest().clone(),
+                actual: current.digest.clone(),
             });
         }
-        if current.digest() == next.digest() {
+        if current.digest == next.digest {
             return Ok(SnapshotActivationOutcome::AlreadyActive);
         }
         self.active.store(Arc::new(next));
@@ -954,24 +937,12 @@ pub enum SiteSnapshotBuildErrorCode {
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("{code:?}: {message}")]
 pub struct SiteSnapshotBuildError {
-    code: SiteSnapshotBuildErrorCode,
-    post_id: Option<PostId>,
-    message: Box<str>,
+    pub code: SiteSnapshotBuildErrorCode,
+    pub post_id: Option<PostId>,
+    pub message: Box<str>,
 }
 
 impl SiteSnapshotBuildError {
-    pub const fn code(&self) -> SiteSnapshotBuildErrorCode {
-        self.code
-    }
-
-    pub const fn post_id(&self) -> Option<&PostId> {
-        self.post_id.as_ref()
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
     fn new(
         code: SiteSnapshotBuildErrorCode,
         post_id: Option<PostId>,
@@ -1046,7 +1017,7 @@ fn render_index(
     render_layout(
         publication,
         frontend,
-        publication.site().title().as_str(),
+        publication.site.title.as_str(),
         content,
     )
 }
@@ -1199,11 +1170,11 @@ fn render_layout(
     page_title: &str,
     content: Markup,
 ) -> Markup {
-    let site = publication.site();
-    let full_title = if page_title == site.title().as_str() {
+    let site = &publication.site;
+    let full_title = if page_title == site.title.as_str() {
         page_title.to_owned()
     } else {
-        format!("{page_title} — {}", site.title().as_str())
+        format!("{page_title} — {}", site.title.as_str())
     };
     html! {
         (DOCTYPE)
@@ -1211,13 +1182,13 @@ fn render_layout(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                meta name="description" content=(site.description().as_str());
+                meta name="description" content=(site.description.as_str());
                 title { (full_title) }
-                link rel="stylesheet" href=(frontend.css().public_path().as_str());
+                link rel="stylesheet" href=(frontend.css.public_path);
             }
             body {
                 header class="site-header" {
-                    a class="site-title" href="/" { (site.title().as_str()) }
+                    a class="site-title" href="/" { (site.title.as_str()) }
                     nav aria-label="Primary navigation" {
                         ul {
                             li { a href="/" { "Home" } }
@@ -1227,7 +1198,7 @@ fn render_layout(
                 }
                 main { (content) }
                 footer {
-                    p { "Written by " (publication.author().name().as_str()) }
+                    p { "Written by " (publication.author.name.as_str()) }
                 }
             }
         }
@@ -1240,15 +1211,11 @@ impl ProjectedArticleHtml {
     fn new(value: String) -> Self {
         Self(value.into_boxed_str())
     }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// The sole trusted-HTML sink for rendered Markdown in the Maud shell.
 fn trusted_article_markup(article: &ProjectedArticleHtml) -> Markup {
-    PreEscaped(article.as_str().to_owned())
+    PreEscaped(article.0.to_string())
 }
 
 #[cfg(test)]
@@ -1392,14 +1359,17 @@ mod tests {
         let content = tree.validate().unwrap();
         let assets = resolve_content_assets(&tree, &content).unwrap();
         let mut revisions = BTreeMap::new();
-        for document in content.posts() {
+        for document in &content.posts {
             let rendered = render_markdown(
                 document,
                 assets.assets_for(document).unwrap(),
-                assets.site_assets_for(content.publication()).unwrap(),
+                assets.site_assets_for(&content.publication).unwrap(),
             )
             .unwrap();
-            revisions.insert(rendered.post_id().clone(), rendered.revision().clone());
+            revisions.insert(
+                rendered.document.metadata.id.clone(),
+                rendered.revision.clone(),
+            );
         }
         let catalog = Arc::new(compile_content_catalog(&content, &assets).unwrap());
         Fixture { catalog, revisions }
@@ -1436,9 +1406,10 @@ mod tests {
         fixture
             .catalog
             .local_assets
+            .assets
             .get(&LogicalAssetPath::parse(path).unwrap())
             .unwrap()
-            .asset()
+            .asset
             .clone()
     }
 
@@ -1449,7 +1420,7 @@ mod tests {
         let error =
             PublicLedgerProjection::try_from_exact_entries([first.clone(), first]).unwrap_err();
         assert_eq!(error.post_id.as_str(), FIRST_ID);
-        assert!(PublicLedgerProjection::empty().is_empty());
+        assert!(PublicLedgerProjection::empty().entries.is_empty());
     }
 
     #[test]
@@ -1485,7 +1456,7 @@ mod tests {
 
         let paths: Vec<_> = snapshot
             .public_assets()
-            .map(|asset| asset.asset().path.as_str())
+            .map(|asset| asset.asset.path.as_str())
             .collect();
         assert_eq!(
             paths,
@@ -1510,9 +1481,9 @@ mod tests {
             Vec::new(),
             vec![AssetRevisionReference::local(shared_reference.clone())],
         );
-        let scope = CatalogProjectionScope::for_test(&site_assets, &fixture.catalog.local_assets);
         let mut selected = BTreeMap::new();
-        collect_site_global_assets(&mut selected, scope).unwrap();
+        collect_site_global_assets(&mut selected, &site_assets, &fixture.catalog.local_assets)
+            .unwrap();
 
         let first_id = PostId::parse(FIRST_ID).unwrap();
         let first = fixture
@@ -1521,7 +1492,7 @@ mod tests {
             .unwrap();
         let first_cover = catalog_asset(&fixture, "assets/first-cover.png");
         let post_assets = ResolvedPostAssets::new(
-            first.document(),
+            &first.document,
             Some(AssetRevisionReference::local(first_cover)),
             vec![AssetRevisionReference::local(shared_reference)],
         );
@@ -1542,7 +1513,7 @@ mod tests {
         let public = materialize_public_assets(selected, &digest).unwrap();
         let paths: Vec<_> = public
             .values()
-            .map(|asset| asset.asset().path.as_str())
+            .map(|asset| asset.asset.path.as_str())
             .collect();
         assert_eq!(
             paths,
@@ -1553,9 +1524,11 @@ mod tests {
                 "assets/public.png",
             ]
         );
-        assert!(public.values().any(|asset| {
-            asset.asset() == generated.asset() && asset.bytes() == generated.bytes()
-        }));
+        assert!(
+            public
+                .values()
+                .any(|asset| asset.asset == generated.asset && asset.bytes == generated.bytes)
+        );
 
         let missing = DigestedAsset::new(
             LogicalAssetPath::parse("assets/missing.png").unwrap(),
@@ -1567,8 +1540,8 @@ mod tests {
             &fixture.catalog.local_assets,
         )
         .unwrap_err();
-        assert_eq!(error.code(), SiteSnapshotBuildErrorCode::AssetUnavailable);
-        assert!(error.message().contains("not present"));
+        assert_eq!(error.code, SiteSnapshotBuildErrorCode::AssetUnavailable);
+        assert!(error.message.contains("not present"));
 
         let mismatched = DigestedAsset::new(favicon.path.clone(), digest_asset(b"changed"));
         let error = insert_authored_asset(
@@ -1577,22 +1550,22 @@ mod tests {
             &fixture.catalog.local_assets,
         )
         .unwrap_err();
-        assert_eq!(error.code(), SiteSnapshotBuildErrorCode::AssetUnavailable);
-        assert!(error.message().contains("does not match"));
+        assert_eq!(error.code, SiteSnapshotBuildErrorCode::AssetUnavailable);
+        assert!(error.message.contains("does not match"));
 
         let mut collision = BTreeMap::new();
         insert_selected_asset(
             &mut collision,
-            generated.asset().clone(),
-            Arc::from(generated.bytes()),
+            generated.asset.clone(),
+            Arc::clone(&generated.bytes),
         )
         .unwrap();
         let conflicting =
-            DigestedAsset::new(generated.asset().path.clone(), digest_asset(b"conflicting"));
+            DigestedAsset::new(generated.asset.path.clone(), digest_asset(b"conflicting"));
         let error =
             insert_selected_asset(&mut collision, conflicting, Arc::from(&b"conflicting"[..]))
                 .unwrap_err();
-        assert_eq!(error.code(), SiteSnapshotBuildErrorCode::AssetCollision);
+        assert_eq!(error.code, SiteSnapshotBuildErrorCode::AssetCollision);
     }
 
     #[test]
@@ -1611,7 +1584,7 @@ mod tests {
             entry(&fixture, FIRST_ID, 1_000),
         ]);
         let rebuilt = build_snapshot(&fixture, &reversed).unwrap();
-        assert_eq!(snapshot.digest(), rebuilt.digest());
+        assert_eq!(snapshot.digest, rebuilt.digest);
         assert_eq!(snapshot.index_page(), rebuilt.index_page());
     }
 
@@ -1627,7 +1600,7 @@ mod tests {
         assert_eq!(
             render_site_shell(Arc::clone(&fixture.catalog), embedded_manifest(), &missing)
                 .unwrap_err()
-                .code(),
+                .code,
             SiteSnapshotBuildErrorCode::RevisionUnavailable
         );
 
@@ -1635,7 +1608,7 @@ mod tests {
         assert_eq!(
             render_site_shell(Arc::clone(&fixture.catalog), embedded_manifest(), &draft)
                 .unwrap_err()
-                .code(),
+                .code,
             SiteSnapshotBuildErrorCode::DraftSelected
         );
     }
@@ -1648,27 +1621,27 @@ mod tests {
         let shell =
             render_site_shell(Arc::clone(&fixture.catalog), embedded_manifest(), &first).unwrap();
         let error = build_site_snapshot(shell, &second).unwrap_err();
-        assert_eq!(error.code(), SiteSnapshotBuildErrorCode::LedgerMismatch);
+        assert_eq!(error.code, SiteSnapshotBuildErrorCode::LedgerMismatch);
     }
 
     #[test]
     fn shell_and_snapshot_limits_are_inclusive() {
         assert!(validate_page_size(MAX_PAGE_BYTES).is_ok());
         assert_eq!(
-            validate_page_size(MAX_PAGE_BYTES + 1).unwrap_err().code(),
+            validate_page_size(MAX_PAGE_BYTES + 1).unwrap_err().code,
             SiteSnapshotBuildErrorCode::PageLimitExceeded
         );
         assert!(validate_route_count(MAX_PUBLIC_ROUTES - 4, 0).is_ok());
         assert_eq!(
             validate_route_count(MAX_PUBLIC_ROUTES - 3, 0)
                 .unwrap_err()
-                .code(),
+                .code,
             SiteSnapshotBuildErrorCode::RouteLimitExceeded
         );
         let mut retained = RetainedHtmlBudget::new();
         retained.add(MAX_RETAINED_HTML_BYTES).unwrap();
         assert_eq!(
-            retained.add(1).unwrap_err().code(),
+            retained.add(1).unwrap_err().code,
             SiteSnapshotBuildErrorCode::RetainedHtmlLimitExceeded
         );
     }
@@ -1678,10 +1651,10 @@ mod tests {
         let fixture = fixture();
         let empty = PublicLedgerProjection::empty();
         let old = build_snapshot(&fixture, &empty).unwrap();
-        let old_digest = old.digest().clone();
+        let old_digest = old.digest.clone();
         let first = projection([entry(&fixture, FIRST_ID, 1_000)]);
         let new = build_snapshot(&fixture, &first).unwrap();
-        let new_digest = new.digest().clone();
+        let new_digest = new.digest.clone();
         let (reader, mut activator) = snapshot_store(old);
 
         let wrong = SiteSnapshotDigest::parse(&format!("site-b3-v1-{}", "77".repeat(32))).unwrap();
@@ -1689,7 +1662,7 @@ mod tests {
         let error = activator.activate(&wrong, replacement).unwrap_err();
         assert_eq!(error.expected, wrong);
         assert_eq!(error.actual, old_digest);
-        assert_eq!(reader.load_full().digest(), &old_digest);
+        assert_eq!(&reader.load_full().digest, &old_digest);
 
         let barrier = Arc::new(Barrier::new(5));
         let mut readers = Vec::new();
@@ -1702,13 +1675,13 @@ mod tests {
                 barrier.wait();
                 for _ in 0..2_000 {
                     let observed = reader.load_full();
-                    if observed.digest() == &old_digest {
+                    if observed.digest == old_digest {
                         assert!(
                             observed
                                 .post_page(&PostSlug::parse("first-post").unwrap())
                                 .is_none()
                         );
-                    } else if observed.digest() == &new_digest {
+                    } else if observed.digest == new_digest {
                         assert!(
                             observed
                                 .post_page(&PostSlug::parse("first-post").unwrap())
@@ -1728,7 +1701,7 @@ mod tests {
         for reader in readers {
             reader.join().unwrap();
         }
-        assert_eq!(reader.load_full().digest(), &new_digest);
+        assert_eq!(&reader.load_full().digest, &new_digest);
         let same = build_snapshot(&fixture, &first).unwrap();
         assert_eq!(
             activator.activate(&new_digest, same).unwrap(),

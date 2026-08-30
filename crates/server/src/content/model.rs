@@ -377,21 +377,13 @@ pub enum DistributionMode {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct XDistributionSettings {
-    mode: DistributionMode,
-    copy: Option<DistributionCopy>,
+    pub(crate) mode: DistributionMode,
+    pub(crate) copy: Option<DistributionCopy>,
 }
 
 impl XDistributionSettings {
     pub(crate) const fn new(mode: DistributionMode, copy: Option<DistributionCopy>) -> Self {
         Self { mode, copy }
-    }
-
-    pub const fn mode(&self) -> DistributionMode {
-        self.mode
-    }
-
-    pub const fn copy(&self) -> Option<&DistributionCopy> {
-        self.copy.as_ref()
     }
 }
 
@@ -403,16 +395,12 @@ impl Default for XDistributionSettings {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DistributionSettings {
-    x: XDistributionSettings,
+    pub(crate) x: XDistributionSettings,
 }
 
 impl DistributionSettings {
     pub(crate) const fn new(x: XDistributionSettings) -> Self {
         Self { x }
-    }
-
-    pub const fn x(&self) -> &XDistributionSettings {
-        &self.x
     }
 }
 
@@ -498,10 +486,10 @@ pub enum SubscriptionSettings {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SiteSettings {
-    title: SiteTitle,
-    base_url: PublicationBaseUrl,
-    description: SiteDescription,
-    favicon: Option<UnresolvedAssetReference>,
+    pub(crate) title: SiteTitle,
+    pub(crate) base_url: PublicationBaseUrl,
+    pub(crate) description: SiteDescription,
+    pub(crate) favicon: Option<UnresolvedAssetReference>,
 }
 
 impl SiteSettings {
@@ -518,36 +506,16 @@ impl SiteSettings {
             favicon,
         }
     }
-
-    pub const fn title(&self) -> &SiteTitle {
-        &self.title
-    }
-
-    pub const fn base_url(&self) -> &PublicationBaseUrl {
-        &self.base_url
-    }
-
-    pub const fn description(&self) -> &SiteDescription {
-        &self.description
-    }
-
-    pub(crate) const fn favicon(&self) -> Option<&UnresolvedAssetReference> {
-        self.favicon.as_ref()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AuthorSettings {
-    name: AuthorName,
+    pub(crate) name: AuthorName,
 }
 
 impl AuthorSettings {
     pub(crate) const fn new(name: AuthorName) -> Self {
         Self { name }
-    }
-
-    pub const fn name(&self) -> &AuthorName {
-        &self.name
     }
 }
 
@@ -558,11 +526,11 @@ pub(crate) struct PublicationAssetSettings {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PublicationSettings {
-    site: SiteSettings,
-    author: AuthorSettings,
+    pub(crate) site: SiteSettings,
+    pub(crate) author: AuthorSettings,
     pub(crate) assets: PublicationAssetSettings,
-    subscriptions: SubscriptionSettings,
-    tips: PublicationTipSettings,
+    pub(crate) subscriptions: SubscriptionSettings,
+    pub(crate) tips: PublicationTipSettings,
 }
 
 impl PublicationSettings {
@@ -580,22 +548,6 @@ impl PublicationSettings {
             subscriptions,
             tips,
         }
-    }
-
-    pub const fn site(&self) -> &SiteSettings {
-        &self.site
-    }
-
-    pub const fn author(&self) -> &AuthorSettings {
-        &self.author
-    }
-
-    pub const fn subscriptions(&self) -> &SubscriptionSettings {
-        &self.subscriptions
-    }
-
-    pub const fn tips(&self) -> PublicationTipSettings {
-        self.tips
     }
 }
 
@@ -617,61 +569,11 @@ pub struct PostMetadata {
     pub(crate) distribution: DistributionSettings,
 }
 
-impl PostMetadata {
-    pub const fn id(&self) -> &PostId {
-        &self.id
-    }
-
-    pub const fn title(&self) -> &PostTitle {
-        &self.title
-    }
-
-    pub const fn slug(&self) -> &PostSlug {
-        &self.slug
-    }
-
-    pub const fn authored_at(&self) -> OffsetDateTime {
-        self.authored_at
-    }
-
-    pub const fn updated_at(&self) -> Option<OffsetDateTime> {
-        self.updated_at
-    }
-
-    pub const fn description(&self) -> &PostDescription {
-        &self.description
-    }
-
-    pub(crate) const fn image(&self) -> Option<&UnresolvedAssetReference> {
-        self.image.as_ref()
-    }
-
-    pub fn tags(&self) -> &[PostTag] {
-        &self.tags
-    }
-
-    pub fn aliases(&self) -> &[PostAlias] {
-        &self.aliases
-    }
-
-    pub const fn draft(&self) -> DraftStatus {
-        self.draft
-    }
-
-    pub const fn tips(&self) -> PostTipPolicy {
-        self.tips
-    }
-
-    pub const fn distribution(&self) -> &DistributionSettings {
-        &self.distribution
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PostDocument {
-    path: LogicalContentPath,
-    metadata: PostMetadata,
-    markdown: MarkdownSource,
+    pub(crate) path: LogicalContentPath,
+    pub(crate) metadata: PostMetadata,
+    pub(crate) markdown: MarkdownSource,
 }
 
 impl PostDocument {
@@ -686,36 +588,16 @@ impl PostDocument {
             markdown,
         }
     }
-
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub const fn metadata(&self) -> &PostMetadata {
-        &self.metadata
-    }
-
-    pub const fn markdown(&self) -> &MarkdownSource {
-        &self.markdown
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ValidatedContent {
-    publication: PublicationSettings,
-    posts: Vec<PostDocument>,
+    pub(crate) publication: PublicationSettings,
+    pub(crate) posts: Vec<PostDocument>,
 }
 
 impl ValidatedContent {
     pub(crate) const fn new(publication: PublicationSettings, posts: Vec<PostDocument>) -> Self {
         Self { publication, posts }
-    }
-
-    pub const fn publication(&self) -> &PublicationSettings {
-        &self.publication
-    }
-
-    pub fn posts(&self) -> &[PostDocument] {
-        &self.posts
     }
 }

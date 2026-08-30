@@ -13,15 +13,12 @@ const TASK_NAME_FIELD: &str = "task_name";
 /// Installs the process-wide structured log subscriber when the embedding
 /// process has not already installed one.
 pub(crate) fn initialize_logging() {
+    let log_level = env::var("RUST_LOG").map_or(LevelFilter::INFO, |value| parse_log_level(&value));
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(get_log_level())
+        .with_max_level(log_level)
         .with_writer(std::io::stderr)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
-}
-
-pub(crate) fn get_log_level() -> LevelFilter {
-    env::var("RUST_LOG").map_or(LevelFilter::INFO, |value| parse_log_level(&value))
 }
 
 fn parse_log_level(value: &str) -> LevelFilter {

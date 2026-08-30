@@ -1,14 +1,13 @@
 //! Git-owned content types and compilation.
 
 mod assets;
-mod identity;
+pub(crate) mod identity;
 mod model;
 mod parser;
 mod path;
 mod provenance;
-pub(crate) mod render;
 mod resolver;
-mod tree;
+pub(crate) mod tree;
 mod validation;
 
 pub use assets::{

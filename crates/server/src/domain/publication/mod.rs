@@ -1,4 +1,7 @@
-//! Canonical-publication and target-job state machines.
+//! Publication models, persistence operations, and public HTTP handlers.
+
+pub(crate) mod store;
+pub(crate) mod web;
 
 use std::marker::PhantomData;
 
@@ -8,7 +11,7 @@ use time::{OffsetDateTime, UtcOffset};
 
 use crate::{
     content::{PostId, PostRevisionDigest, SourceCommit},
-    distribution::{
+    domain::distribution::{
         DistributionTarget, TargetIdempotencyKey, TargetPayload, TargetPayloadDigest,
         target_idempotency_key,
     },
@@ -74,7 +77,7 @@ state_markers! {
 /// example, a scheduled publication cannot be committed as published:
 ///
 /// ```compile_fail
-/// use maincopy_server::jobs::{CanonicalPublication, canonical};
+/// use maincopy_server::domain::publication::{CanonicalPublication, canonical};
 ///
 /// fn publish_without_activation(publication: CanonicalPublication<canonical::Scheduled>) {
 ///     let _ = publication.commit_published(1);
@@ -349,7 +352,7 @@ cancellable_publications!(canonical::Scheduled, canonical::Blocked);
 /// Completed jobs do not expose retry transitions:
 ///
 /// ```compile_fail
-/// use maincopy_server::jobs::{TargetJob, target};
+/// use maincopy_server::domain::publication::{TargetJob, target};
 ///
 /// fn retry_completed(job: TargetJob<target::Succeeded>) {
 ///     let _ = job.retry(1);

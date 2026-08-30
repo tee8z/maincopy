@@ -53,9 +53,9 @@ async fn public_router_uses_snapshot_backed_error_pages() {
 async fn application_assets_require_an_exact_typed_manifest_lookup() {
     let app = public_router(public_state(Readiness::new(true)));
     let manifest = embedded_manifest();
-    let stylesheet = manifest.css();
+    let stylesheet = &manifest.css;
 
-    let response = get(app.clone(), stylesheet.public_path().as_str()).await;
+    let response = get(app.clone(), stylesheet.public_path).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -78,9 +78,9 @@ async fn application_assets_require_an_exact_typed_manifest_lookup() {
         response.headers().get("x-content-type-options").unwrap(),
         "nosniff"
     );
-    assert_eq!(body_bytes(response).await.as_ref(), stylesheet.bytes());
+    assert_eq!(body_bytes(response).await.as_ref(), stylesheet.bytes);
 
-    let digest = manifest.bundle_digest();
+    let digest = &manifest.bundle_digest;
     for path in [
         format!("/app-assets/{digest}/SITE.CSS"),
         format!("/app-assets/{digest}/unknown.css"),

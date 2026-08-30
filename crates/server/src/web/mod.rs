@@ -3,15 +3,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use axum::{Router, routing::get};
+use axum::Router;
 
 mod health;
-mod site;
 
-use health::{live, ready};
-use site::{application_asset, archive, index, method_not_allowed, not_found, post, tag};
-
-use crate::render::SiteSnapshotReader;
+use crate::{domain::publication::web::router as publication_router, render::SiteSnapshotReader};
+use health::router as health_router;
 
 /// Shared readiness state for the public health endpoint.
 ///
@@ -52,14 +49,6 @@ pub struct PublicState {
 /// Builds the public router without binding a listener.
 pub fn public_router(state: PublicState) -> Router {
     Router::new()
-        .route("/", get(index))
-        .route("/posts/{slug}", get(post))
-        .route("/tags/{tag}", get(tag))
-        .route("/archive", get(archive))
-        .route("/app-assets/{digest}/{name}", get(application_asset))
-        .route("/health/live", get(live))
-        .route("/health/ready", get(ready))
-        .fallback(not_found)
-        .method_not_allowed_fallback(method_not_allowed)
-        .with_state(state)
+        .merge(publication_router(state.snapshots))
+        .merge(health_router(state.readiness))
 }

@@ -76,6 +76,28 @@ and exits. It never constructs server state or opens SQLite.
 `crates/shared` contains wire contracts and shared transport defaults. It does
 not contain runtime wiring or application-domain behavior.
 
+Organize server business features as vertical slices under
+`crates/server/src/domain`. A domain slice contains its models, concrete store
+operations, and domain-specific public or admin handlers. Keep SQL next to the
+business operation that owns its invariant. Do not create table-shaped
+repository traits or a global query catalog.
+
+The top-level infrastructure modules have narrow responsibilities:
+
+- `database` owns SQLite startup, the query-only pool, the bounded mutation
+  channel, and the sole writer lifecycle.
+- `web` owns public listener state, health endpoints, and router composition.
+- `admin` owns the private local transport, OpenAPI assembly, and admin router
+  composition.
+- A domain `store.rs`, `web.rs`, or `admin.rs` owns domain-specific SQL and
+  endpoint behavior.
+
+`DatabaseStore` is a concrete aggregate of concrete domain stores. It is not a
+service locator and it does not expose SQLx connections. Domain reads use the
+private query-only pool. Domain mutations enqueue a closed mutation command to
+the sole writer. The CLI reaches these operations only through typed admin API
+requests.
+
 Startup can call component constructors. No handler can construct a database,
 network client, scheduler, or renderer.
 
@@ -1220,10 +1242,18 @@ Deliverables:
   head from insertion order or the greatest version.
 - Target-job linkage and a `WaitingForCanonical` state.
 - `TargetPayloadDigest` validation for the immutable payload version and body.
-- Foreign keys, uniqueness constraints, and schema versioning.
+- UUID identifiers stored as 16-byte `BLOB` values.
+- BLAKE3 digests stored as 32-byte `BLOB` values.
+- Git object IDs stored as raw 20-byte or 32-byte `BLOB` values.
+- `STRICT` tables, required columns, foreign keys, ordinary uniqueness
+  constraints, and schema versioning.
+- No application triggers or state-dependent indexes.
+- `CHECK` constraints only for fixed binary widths and the `site_state`
+  singleton. The writer owns domain and workflow validation.
 - Embedded transactional SQLx migrations. Reject any migration that uses
   `-- no-transaction`.
-- SQLx 0.9.0 with `macros`, `migrate`, and `sqlite-bundled` only.
+- SQLx 0.9.0 with `macros`, `migrate`, `runtime-tokio`, and
+  `sqlite-bundled` only.
 - An exact `libsqlite3-sys` 0.37.0 pin and a SQLite 3.51.3 runtime floor.
 - A database-identity ownership lock acquired before database inspection. Hold
   it until the writer connection closes.
@@ -1246,19 +1276,29 @@ Tests:
   during read-only preflight.
 - Reject a migration file that disables its transaction.
 - Reject a second owner for one database, including with another runtime root.
-- Verify WAL, synchronous mode, foreign keys, busy timeout, defensive schema
-  pragmas, and recursive immutable-ledger triggers.
+- Verify WAL, synchronous mode, foreign keys, busy timeout, and defensive
+  schema pragmas.
+- Verify that the application schema contains no triggers or speculative query
+  indexes.
+- Verify 16-byte UUID and 32-byte BLAKE3 storage.
+- Reject fixed-width binary values with another width.
 - Verify that migrations cannot run after listeners bind.
 - Verify that incompatible startup does not create a listener endpoint.
-- Reject two live canonical publication records for one post.
-- Reject a canonical schedule for a draft revision.
-- Reject a target-job release while its canonical record is not published.
+- Through typed writer commands, reject two live canonical publication records
+  for one post.
+- Through typed writer commands, reject a canonical schedule for a draft
+  revision.
+- Through typed writer commands, reject a target-job release while its
+  canonical record is not published.
 - Reject a target payload view when its body and digest differ.
-- Keep canonical `published_at` absent before activation commits.
-- Advance the current published digest only to a publishable revision for the
-  same stable post.
-- Permit blocked retry without changing the pinned revision.
-- Require cancel and replacement to select a different revision.
+- Through typed writer commands, keep canonical `published_at` absent before
+  activation commits.
+- Through typed writer commands, advance the current published digest only to
+  a publishable revision for the same stable post.
+- Through typed writer commands, permit blocked retry without changing the
+  pinned revision.
+- Through typed writer commands, require cancel and replacement to select a
+  different revision.
 
 ### Work package 3.2: Typed writer task
 

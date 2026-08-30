@@ -114,9 +114,6 @@ pub enum ApplicationError {
     #[error("the critical task supervisor became empty unexpectedly")]
     TaskSupervisorEmpty,
 
-    #[error("database writer failed to close")]
-    DatabaseClose,
-
     #[error("application construction failed during {stage}")]
     Startup { stage: StartupStage },
 }
@@ -261,7 +258,6 @@ mod tests {
         assert_display! {
             ProcessError::AlreadyRunning =>
                 "another process already owns a required Maincopy resource",
-            ApplicationError::DatabaseClose => "database writer failed to close",
             ShutdownSignal::Interrupt => "interrupt",
             ShutdownSignal::Terminate => "terminate",
             CriticalTaskName::PublicServer => "public server",

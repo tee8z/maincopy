@@ -22,7 +22,9 @@ async fn substitute_variant_delegates_every_operation_exhaustively() {
     let invoice = tip_invoice(&create, payment_reference("created-locator"));
     let reconcile = reconcile_request("known-locator");
     let status = payment_status(reconcile.payment.clone(), ProviderPaymentState::InvoiceOpen);
-    let update_request = NextPaymentUpdatesRequest::new(Some(update_cursor("cursor-before")));
+    let update_request = NextPaymentUpdatesRequest {
+        cursor: Some(update_cursor("cursor-before")),
+    };
     let updates = update_batch("cursor-after");
     let substitute = Arc::new(ProviderSubstitute::new(SubstituteResponses {
         create_tip_invoice: Ok(invoice.clone()),
@@ -96,11 +98,11 @@ async fn create_rejects_a_valid_invoice_for_another_intent() {
 #[tokio::test]
 async fn create_rejects_an_invoice_with_another_public_description() {
     let requested = create_request(TEST_INTENT_ID);
-    let other_request = CreateTipInvoiceRequest::new(
-        TipIntentId::parse(TEST_INTENT_ID).unwrap(),
-        SatoshiAmount::new(21).unwrap(),
-        TipInvoiceDescription::new("Another purpose").unwrap(),
-    );
+    let other_request = CreateTipInvoiceRequest {
+        intent_id: TipIntentId::parse(TEST_INTENT_ID).unwrap(),
+        amount: SatoshiAmount::new(21).unwrap(),
+        description: TipInvoiceDescription::new("Another purpose").unwrap(),
+    };
     let provider = substitute_provider(SubstituteResponses {
         create_tip_invoice: Ok(tip_invoice(
             &other_request,
@@ -199,7 +201,7 @@ async fn provider_boundary_rejects_a_regressing_substitute_update_page() {
 
     assert_eq!(
         provider
-            .next_payment_updates(NextPaymentUpdatesRequest::new(None))
+            .next_payment_updates(NextPaymentUpdatesRequest { cursor: None })
             .await
             .unwrap_err(),
         PaymentProviderError::Operation(PaymentOperationError::InvalidProviderResponse)
@@ -211,11 +213,11 @@ fn substitute_provider(responses: SubstituteResponses) -> LightningProvider {
 }
 
 fn create_request(intent_id: &str) -> CreateTipInvoiceRequest {
-    CreateTipInvoiceRequest::new(
-        TipIntentId::parse(intent_id).unwrap(),
-        SatoshiAmount::new(21).unwrap(),
-        TipInvoiceDescription::tip(),
-    )
+    CreateTipInvoiceRequest {
+        intent_id: TipIntentId::parse(intent_id).unwrap(),
+        amount: SatoshiAmount::new(21).unwrap(),
+        description: TipInvoiceDescription::tip(),
+    }
 }
 
 fn payment_reference(locator: &str) -> ProviderPaymentReference {
@@ -227,20 +229,20 @@ fn reconcile_request(locator: &str) -> ReconcilePaymentRequest {
 }
 
 fn reconcile_request_for(payment: ProviderPaymentReference) -> ReconcilePaymentRequest {
-    ReconcilePaymentRequest::new(
+    ReconcilePaymentRequest {
         payment,
-        TipIntentId::parse(TEST_INTENT_ID).unwrap(),
-        signed_direct_invoice("Tip", 21),
-        SatoshiAmount::new(21).unwrap(),
-        PaymentHash::from_bytes([1; 32]),
-    )
+        intent_id: TipIntentId::parse(TEST_INTENT_ID).unwrap(),
+        invoice: signed_direct_invoice("Tip", 21),
+        amount: SatoshiAmount::new(21).unwrap(),
+        payment_hash: PaymentHash::from_bytes([1; 32]),
+    }
 }
 
 fn payment_status(
     payment: ProviderPaymentReference,
     status: ProviderPaymentState,
 ) -> ProviderPaymentStatus {
-    ProviderPaymentStatus::new(payment, status)
+    ProviderPaymentStatus { payment, status }
 }
 
 fn update_cursor(value: &str) -> ProviderUpdateCursor {
@@ -259,10 +261,10 @@ fn update_batch(cursor: &str) -> ProviderPaymentUpdatePoll {
 }
 
 fn ignored_update(cursor: &str) -> ProviderPaymentUpdate {
-    ProviderPaymentUpdate::Ignored(IgnoredProviderPaymentUpdate::new(
-        update_cursor(cursor),
-        IgnoredPaymentUpdateReason::MissingMarker,
-    ))
+    ProviderPaymentUpdate::Ignored(IgnoredProviderPaymentUpdate {
+        next_cursor: update_cursor(cursor),
+        reason: IgnoredPaymentUpdateReason::MissingMarker,
+    })
 }
 
 fn tip_invoice(request: &CreateTipInvoiceRequest, payment: ProviderPaymentReference) -> TipInvoice {

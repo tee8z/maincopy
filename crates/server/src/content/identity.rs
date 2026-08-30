@@ -82,10 +82,7 @@ macro_rules! public_digest_type {
         impl $name {
             pub fn parse(value: &str) -> Result<Self, DigestParseError> {
                 let bytes = parse_digest(value, $kind)?;
-                Ok(Self {
-                    bytes,
-                    encoded: value.into(),
-                })
+                Ok(Self::from_bytes(bytes))
             }
 
             pub fn as_str(&self) -> &str {
@@ -96,10 +93,14 @@ macro_rules! public_digest_type {
                 &self.bytes
             }
 
-            fn from_hash(hash: blake3::Hash) -> Self {
-                let bytes = *hash.as_bytes();
+            pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+                let hash = blake3::Hash::from_bytes(bytes);
                 let encoded = format!("{}{}", $kind.prefix(), hash.to_hex()).into_boxed_str();
                 Self { bytes, encoded }
+            }
+
+            fn from_hash(hash: blake3::Hash) -> Self {
+                Self::from_bytes(*hash.as_bytes())
             }
         }
 
@@ -183,47 +184,43 @@ impl<'bytes> PreInjectionRenderedArticle<'bytes> {
 }
 
 impl PostRendererIdentity {
-    pub(super) const fn baseline() -> Self {
+    pub(crate) const fn baseline() -> Self {
         Self(())
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SiteShellRendererIdentity {
-    frontend_bundle: FrontendBundleDigest,
+    pub(crate) frontend_bundle: FrontendBundleDigest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct SiteShellOutputDigest([u8; 32]);
+pub(crate) struct SiteShellOutputDigest([u8; 32]);
 
 /// Streaming, domain-separated identity for sorted pre-injection shell pages.
-pub(super) struct SiteShellOutputHasher(Transcript);
+pub(crate) struct SiteShellOutputHasher(Transcript);
 
 impl SiteShellOutputHasher {
-    pub(super) fn new(page_count: usize) -> Self {
+    pub(crate) fn new(page_count: usize) -> Self {
         let mut transcript =
             Transcript::new(SITE_SHELL_OUTPUT_CONTEXT, b"maincopy-site-shell-output", 1);
         transcript.sequence_len(page_count);
         Self(transcript)
     }
 
-    pub(super) fn page(&mut self, route: &str, bytes: &[u8]) {
+    pub(crate) fn page(&mut self, route: &str, bytes: &[u8]) {
         self.0.string(route);
         self.0.bytes(bytes);
     }
 
-    pub(super) fn finish(self) -> SiteShellOutputDigest {
+    pub(crate) fn finish(self) -> SiteShellOutputDigest {
         SiteShellOutputDigest(*self.0.finish().as_bytes())
     }
 }
 
 impl SiteShellRendererIdentity {
-    pub(super) const fn new(frontend_bundle: FrontendBundleDigest) -> Self {
+    pub(crate) const fn new(frontend_bundle: FrontendBundleDigest) -> Self {
         Self { frontend_bundle }
-    }
-
-    pub(crate) const fn frontend_bundle(&self) -> &FrontendBundleDigest {
-        &self.frontend_bundle
     }
 }
 
@@ -282,9 +279,9 @@ impl<'input> PostRevisionInput<'input> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedPostRevision {
-    post_id: PostId,
-    revision: PostRevisionDigest,
-    published_at: OffsetDateTime,
+    pub(crate) post_id: PostId,
+    pub(crate) revision: PostRevisionDigest,
+    pub(crate) published_at: OffsetDateTime,
 }
 
 impl PublishedPostRevision {
@@ -298,18 +295,6 @@ impl PublishedPostRevision {
             revision,
             published_at: published_at.to_offset(UtcOffset::UTC),
         }
-    }
-
-    pub const fn post_id(&self) -> &PostId {
-        &self.post_id
-    }
-
-    pub const fn revision(&self) -> &PostRevisionDigest {
-        &self.revision
-    }
-
-    pub const fn published_at(&self) -> OffsetDateTime {
-        self.published_at
     }
 }
 
@@ -395,7 +380,7 @@ pub(super) fn bind_post_asset_source(document: &PostDocument) -> PostAssetSource
         1,
     );
     transcript.fixed_bytes(&canonical_content.0);
-    transcript.optional(document.metadata().image(), |transcript, image| {
+    transcript.optional(document.metadata.image.as_ref(), |transcript, image| {
         transcript.string(image.as_str());
     });
     PostAssetSourceBinding(*transcript.finish().as_bytes())
@@ -411,7 +396,7 @@ pub(super) fn bind_publication_asset_source(
         1,
     );
     transcript.fixed_bytes(&canonical_content.0);
-    transcript.optional(publication.site().favicon(), |transcript, favicon| {
+    transcript.optional(publication.site.favicon.as_ref(), |transcript, favicon| {
         transcript.string(favicon.as_str());
     });
     let authored_origins = &publication.assets.allowed_https_origins;
@@ -442,23 +427,23 @@ pub(super) fn bind_asset_resolution_policy(
 fn digest_post_revision(
     input: &PostRevisionInput<'_>,
 ) -> Result<PostRevisionDigest, RevisionIdentityError> {
-    let referenced_assets = sorted_asset_references(input.assets.references())?;
+    let referenced_assets = sorted_asset_references(&input.assets.references)?;
     let generated_assets = sorted_generated_assets(input.generated_assets)?;
     let content = digest_post_content(input.document);
-    if input.assets.source_binding() != &bind_post_asset_source(input.document) {
+    if input.assets.source_binding != bind_post_asset_source(input.document) {
         return Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
             target: AssetBindingTarget::Post,
         });
     }
     if input
         .site_assets
-        .is_some_and(|site_assets| input.assets.policy_binding() != site_assets.policy_binding())
+        .is_some_and(|site_assets| input.assets.policy_binding != site_assets.policy_binding)
     {
         return Err(RevisionIdentityError::ResolvedAssetPolicyMismatch);
     }
     let mut transcript = Transcript::new(POST_REVISION_CONTEXT, b"maincopy-post-revision", 1);
     transcript.fixed_bytes(&content.0);
-    transcript.optional(input.assets.image(), encode_asset_reference);
+    transcript.optional(input.assets.image.as_ref(), encode_asset_reference);
     encode_asset_references(&mut transcript, &referenced_assets);
     encode_post_renderer(&mut transcript, input.renderer);
     transcript.bytes(input.pre_injection_article.as_bytes());
@@ -472,7 +457,7 @@ fn digest_post_revision(
 /// This is the only production seam that can construct the pre-injection
 /// wrapper. The content compiler's renderer is the sole production caller;
 /// public callers cannot compose a revision from arbitrary bytes.
-pub(super) fn finalize_post_revision(
+pub(crate) fn finalize_post_revision(
     document: &PostDocument,
     assets: &ResolvedPostAssets,
     site_assets: &ResolvedSiteAssets,
@@ -495,18 +480,18 @@ pub(super) fn finalize_post_revision(
 fn digest_site_snapshot(
     input: &SiteSnapshotInput<'_>,
 ) -> Result<SiteSnapshotDigest, RevisionIdentityError> {
-    let site_assets = sorted_asset_references(input.assets.references())?;
-    let allowed_origins = sorted_allowed_origins(input.assets.allowed_origins())?;
+    let site_assets = sorted_asset_references(&input.assets.references)?;
+    let allowed_origins = sorted_allowed_origins(&input.assets.allowed_origins)?;
     let public_posts = sorted_public_posts(input.public_posts)?;
     let publication_content = digest_publication_content(input.publication);
-    if input.assets.source_binding() != &bind_publication_asset_source(input.publication) {
+    if input.assets.source_binding != bind_publication_asset_source(input.publication) {
         return Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
             target: AssetBindingTarget::Publication,
         });
     }
     let mut transcript = Transcript::new(SITE_SNAPSHOT_CONTEXT, b"maincopy-site-snapshot", 1);
     transcript.fixed_bytes(&publication_content.0);
-    transcript.optional(input.assets.favicon(), encode_asset_reference);
+    transcript.optional(input.assets.favicon.as_ref(), encode_asset_reference);
     transcript.sequence_len(allowed_origins.len());
     for origin in allowed_origins {
         transcript.string(origin.as_str());
@@ -528,7 +513,7 @@ fn digest_site_snapshot(
 /// The site renderer is the sole production caller. Public callers cannot
 /// combine arbitrary shell bytes, frontend identity, or publication-ledger
 /// entries into a snapshot digest.
-pub(super) fn finalize_site_snapshot(
+pub(crate) fn finalize_site_snapshot(
     publication: &PublicationSettings,
     assets: &ResolvedSiteAssets,
     renderer: &SiteShellRendererIdentity,
@@ -553,12 +538,6 @@ fn parse_digest(value: &str, kind: DigestKind) -> Result<[u8; 32], DigestParseEr
     };
     if hex.len() != DIGEST_HEX_LENGTH {
         return Err(DigestParseError::InvalidLength { kind });
-    }
-    if !hex
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(DigestParseError::InvalidEncoding { kind });
     }
     let mut bytes = [0_u8; 32];
     for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
@@ -637,43 +616,43 @@ impl Transcript {
 }
 
 fn encode_post_document(transcript: &mut Transcript, document: &PostDocument) {
-    let metadata = document.metadata();
-    transcript.fixed_bytes(metadata.id().as_uuid().as_bytes());
-    transcript.string(metadata.title().as_str());
-    transcript.string(metadata.slug().as_str());
-    transcript.authored_timestamp(metadata.authored_at());
-    transcript.optional(metadata.updated_at(), Transcript::authored_timestamp);
-    transcript.string(metadata.description().as_str());
+    let metadata = &document.metadata;
+    transcript.fixed_bytes(metadata.id.as_uuid().as_bytes());
+    transcript.string(metadata.title.as_str());
+    transcript.string(metadata.slug.as_str());
+    transcript.authored_timestamp(metadata.authored_at);
+    transcript.optional(metadata.updated_at, Transcript::authored_timestamp);
+    transcript.string(metadata.description.as_str());
     // Asset-valued fields are excluded here. The final revision transcript
     // requires resolver-owned normalized asset inputs separately.
-    transcript.sequence_len(metadata.tags().len());
-    for tag in metadata.tags() {
+    transcript.sequence_len(metadata.tags.len());
+    for tag in &metadata.tags {
         transcript.string(tag.as_str());
     }
-    transcript.sequence_len(metadata.aliases().len());
-    for alias in metadata.aliases() {
+    transcript.sequence_len(metadata.aliases.len());
+    for alias in &metadata.aliases {
         transcript.string(alias.as_str());
     }
-    transcript.tag(match metadata.draft() {
+    transcript.tag(match metadata.draft {
         DraftStatus::Publishable => 0,
         DraftStatus::Draft => 1,
     });
-    transcript.tag(match metadata.tips() {
+    transcript.tag(match metadata.tips {
         PostTipPolicy::InheritPublication => 0,
         PostTipPolicy::Enabled => 1,
         PostTipPolicy::Disabled => 2,
     });
-    encode_distribution(transcript, metadata.distribution());
-    transcript.bytes(document.markdown().as_str().as_bytes());
+    encode_distribution(transcript, &metadata.distribution);
+    transcript.bytes(document.markdown.as_str().as_bytes());
 }
 
 fn encode_distribution(transcript: &mut Transcript, distribution: &DistributionSettings) {
-    let x = distribution.x();
-    transcript.tag(match x.mode() {
+    let x = &distribution.x;
+    transcript.tag(match x.mode {
         DistributionMode::Disabled => 0,
         DistributionMode::Enabled => 1,
     });
-    transcript.optional(x.copy(), |transcript, copy| {
+    transcript.optional(x.copy.as_ref(), |transcript, copy| {
         transcript.string(copy.as_str());
     });
 }
@@ -697,15 +676,15 @@ fn encode_site_renderer(transcript: &mut Transcript, renderer: &SiteShellRendere
 }
 
 fn encode_publication(transcript: &mut Transcript, publication: &PublicationSettings) {
-    let site = publication.site();
-    transcript.string(site.title().as_str());
-    transcript.string(site.base_url().as_str());
-    transcript.string(site.description().as_str());
+    let site = &publication.site;
+    transcript.string(site.title.as_str());
+    transcript.string(site.base_url.as_str());
+    transcript.string(site.description.as_str());
     // Asset-valued fields are excluded here. The final site transcript
     // requires resolver-owned favicon, allowlist, and reference inputs.
-    transcript.string(publication.author().name().as_str());
+    transcript.string(publication.author.name.as_str());
 
-    match publication.subscriptions() {
+    match &publication.subscriptions {
         SubscriptionSettings::Disabled => transcript.tag(0),
         SubscriptionSettings::Enabled {
             privacy_policy_revision,
@@ -715,7 +694,7 @@ fn encode_publication(transcript: &mut Transcript, publication: &PublicationSett
         }
     }
 
-    match publication.tips() {
+    match publication.tips {
         PublicationTipSettings::Unconfigured => transcript.tag(0),
         PublicationTipSettings::Configured { default, range } => {
             transcript.tag(1);
@@ -842,7 +821,7 @@ name = "Example Author"
             [PostSource::in_posts("posts/example.md", &source)],
         )
         .expect("fixture content must validate");
-        (content.publication().clone(), content.posts()[0].clone())
+        (content.publication.clone(), content.posts[0].clone())
     }
 
     fn validate_publication(source: &str) -> PublicationSettings {
@@ -851,7 +830,7 @@ name = "Example Author"
             std::iter::empty::<PostSource<'_>>(),
         )
         .expect("fixture publication must validate")
-        .publication()
+        .publication
         .clone()
     }
 
@@ -923,6 +902,7 @@ name = "Example Author"
 
         let value = format!("post-b3-v1-{}", "12".repeat(32));
         let digest = PostRevisionDigest::parse(&value).unwrap();
+        assert_eq!(PostRevisionDigest::from_bytes(*digest.as_bytes()), digest);
         assert_eq!(serde_json::to_value(&digest).unwrap(), value);
         assert_eq!(
             serde_json::from_value::<PostRevisionDigest>(serde_json::json!(value)).unwrap(),
@@ -1080,7 +1060,7 @@ name = "Example Author"
             &renderer,
             PreInjectionRenderedArticle::new(b"<h1>Body</h1>"),
             &generated,
-            post.metadata().distribution(),
+            &post.metadata.distribution,
         ))
         .unwrap();
         let changed = digest_post_revision(&PostRevisionInput::new_unchecked(
@@ -1089,7 +1069,7 @@ name = "Example Author"
             &renderer,
             PreInjectionRenderedArticle::new(b"<h1>Changed</h1>"),
             &generated,
-            post.metadata().distribution(),
+            &post.metadata.distribution,
         ))
         .unwrap();
         assert_ne!(baseline, changed);
@@ -1109,7 +1089,7 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                post.metadata().distribution(),
+                &post.metadata.distribution,
             )),
             Err(RevisionIdentityError::DuplicateAssetReference { .. })
         ));
@@ -1137,7 +1117,7 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                post.metadata().distribution(),
+                &post.metadata.distribution,
             ))
             .unwrap()
         };
@@ -1173,14 +1153,14 @@ name = "Example Author"
         };
         let baseline = digest(
             &[first.clone(), second.clone()],
-            post.metadata().distribution(),
+            &post.metadata.distribution,
         )
         .unwrap();
         assert_eq!(
             baseline,
             digest(
                 &[second.clone(), first.clone()],
-                post.metadata().distribution()
+                &post.metadata.distribution
             )
             .unwrap()
         );
@@ -1191,7 +1171,7 @@ name = "Example Author"
                     DigestedAsset::new(first.path.clone(), digest_asset(b"changed")),
                     second.clone()
                 ],
-                post.metadata().distribution()
+                &post.metadata.distribution
             )
             .unwrap()
         );
@@ -1206,7 +1186,7 @@ name = "Example Author"
                     ),
                     second.clone(),
                 ],
-                post.metadata().distribution()
+                &post.metadata.distribution
             )
             .unwrap()
         );
@@ -1214,22 +1194,19 @@ name = "Example Author"
             baseline,
             digest(
                 &[first.clone(), second.clone()],
-                distributed.metadata().distribution()
+                &distributed.metadata.distribution
             )
             .unwrap()
         );
         assert!(matches!(
-            digest(
-                &[first.clone(), first.clone()],
-                post.metadata().distribution()
-            ),
+            digest(&[first.clone(), first.clone()], &post.metadata.distribution),
             Err(RevisionIdentityError::DuplicateGeneratedAsset { .. })
         ));
 
         let digest_with_unreferenced_catalog_asset = |_asset: &AssetDigest| {
             digest(
                 &[first.clone(), second.clone()],
-                post.metadata().distribution(),
+                &post.metadata.distribution,
             )
             .unwrap()
         };
@@ -1250,7 +1227,7 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                post.metadata().distribution(),
+                &post.metadata.distribution,
             ))
             .unwrap()
         };
@@ -1301,7 +1278,7 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                post.metadata().distribution(),
+                &post.metadata.distribution,
             ))
             .unwrap()
         };
@@ -1343,7 +1320,7 @@ name = "Example Author"
             &renderer,
             PreInjectionRenderedArticle::new(b"rendered"),
             &[],
-            post.metadata().distribution(),
+            &post.metadata.distribution,
         ))
         .unwrap();
         let first = PublishedPostRevision::new(
@@ -1400,7 +1377,7 @@ name = "Example Author"
             &post_renderer,
             PreInjectionRenderedArticle::new(b"rendered"),
             &[],
-            post.metadata().distribution(),
+            &post.metadata.distribution,
         ))
         .unwrap();
         let post_id = PostId::parse("11111111-1111-4111-8111-111111111111").unwrap();
@@ -1574,7 +1551,7 @@ name = "Example Author"
                 &post_renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                changed_post.metadata().distribution(),
+                &changed_post.metadata.distribution,
             )),
             Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
                 target: AssetBindingTarget::Post
@@ -1601,7 +1578,7 @@ name = "Example Author"
                 &post_renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                changed_image_post.metadata().distribution(),
+                &changed_image_post.metadata.distribution,
             )),
             Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
                 target: AssetBindingTarget::Post
@@ -1724,7 +1701,7 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                post.metadata().distribution(),
+                &post.metadata.distribution,
             ))
         };
 
@@ -1811,7 +1788,7 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                post.metadata().distribution(),
+                &post.metadata.distribution,
             ))
             .unwrap()
         };

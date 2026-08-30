@@ -86,13 +86,13 @@ content_usize_limit!(ContentPathByteLimit);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ContentTreeLimits {
-    publication_file_bytes: ContentFileByteLimit,
-    post_file_bytes: ContentFileByteLimit,
-    asset_file_bytes: ContentFileByteLimit,
-    total_tree_bytes: ContentTreeByteLimit,
-    entries: ContentEntryLimit,
-    depth: ContentDepthLimit,
-    path_bytes: ContentPathByteLimit,
+    pub(crate) publication_file_bytes: ContentFileByteLimit,
+    pub(crate) post_file_bytes: ContentFileByteLimit,
+    pub(crate) asset_file_bytes: ContentFileByteLimit,
+    pub(crate) total_tree_bytes: ContentTreeByteLimit,
+    pub(crate) entries: ContentEntryLimit,
+    pub(crate) depth: ContentDepthLimit,
+    pub(crate) path_bytes: ContentPathByteLimit,
 }
 
 impl ContentTreeLimits {
@@ -120,34 +120,6 @@ impl ContentTreeLimits {
             depth,
             path_bytes,
         })
-    }
-
-    pub const fn publication_file_bytes(self) -> ContentFileByteLimit {
-        self.publication_file_bytes
-    }
-
-    pub const fn post_file_bytes(self) -> ContentFileByteLimit {
-        self.post_file_bytes
-    }
-
-    pub const fn asset_file_bytes(self) -> ContentFileByteLimit {
-        self.asset_file_bytes
-    }
-
-    pub const fn total_tree_bytes(self) -> ContentTreeByteLimit {
-        self.total_tree_bytes
-    }
-
-    pub const fn entries(self) -> ContentEntryLimit {
-        self.entries
-    }
-
-    pub const fn depth(self) -> ContentDepthLimit {
-        self.depth
-    }
-
-    pub const fn path_bytes(self) -> ContentPathByteLimit {
-        self.path_bytes
     }
 
     pub(crate) const fn file_limit(self, kind: ContentFileKind) -> ContentFileByteLimit {
@@ -179,98 +151,40 @@ pub struct ContentTreeLimitsError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredPublication {
-    path: LogicalContentPath,
-    source: Box<str>,
-}
-
-impl DiscoveredPublication {
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub fn source(&self) -> &str {
-        &self.source
-    }
+    pub(crate) path: LogicalContentPath,
+    pub(crate) source: Box<str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredPost {
-    path: LogicalContentPath,
-    collection: PostCollection,
-    source: Box<str>,
-}
-
-impl DiscoveredPost {
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub const fn collection(&self) -> PostCollection {
-        self.collection
-    }
-
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-
-    fn as_post_source(&self) -> PostSource<'_> {
-        PostSource {
-            path: self.path.clone(),
-            contents: self.source(),
-            collection: self.collection,
-        }
-    }
+    pub(crate) path: LogicalContentPath,
+    pub(crate) collection: PostCollection,
+    pub(crate) source: Box<str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredAsset {
-    path: LogicalAssetPath,
-    bytes: Arc<[u8]>,
-}
-
-impl DiscoveredAsset {
-    pub const fn path(&self) -> &LogicalAssetPath {
-        &self.path
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    pub(crate) fn owned_bytes(&self) -> Arc<[u8]> {
-        Arc::clone(&self.bytes)
-    }
+    pub(crate) path: LogicalAssetPath,
+    pub(crate) bytes: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredContentTree {
-    publication: DiscoveredPublication,
-    posts: Vec<DiscoveredPost>,
-    assets: Vec<DiscoveredAsset>,
-    total_bytes: u64,
+    pub(crate) publication: DiscoveredPublication,
+    pub(crate) posts: Vec<DiscoveredPost>,
+    pub(crate) assets: Vec<DiscoveredAsset>,
+    pub(crate) total_bytes: u64,
 }
 
 impl DiscoveredContentTree {
-    pub const fn publication(&self) -> &DiscoveredPublication {
-        &self.publication
-    }
-
-    pub fn posts(&self) -> &[DiscoveredPost] {
-        &self.posts
-    }
-
-    pub fn assets(&self) -> &[DiscoveredAsset] {
-        &self.assets
-    }
-
-    pub const fn total_bytes(&self) -> u64 {
-        self.total_bytes
-    }
-
     pub fn validate(&self) -> Result<ValidatedContent, ContentValidationErrors> {
         validate_content(
-            PublicationSource::new(self.publication.path.as_str(), self.publication.source()),
-            self.posts.iter().map(DiscoveredPost::as_post_source),
+            PublicationSource::new(self.publication.path.as_str(), &self.publication.source),
+            self.posts.iter().map(|post| PostSource {
+                path: post.path.clone(),
+                contents: &post.source,
+                collection: post.collection,
+            }),
         )
     }
 

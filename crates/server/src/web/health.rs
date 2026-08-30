@@ -1,8 +1,8 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use super::PublicState;
+use super::Readiness;
 
 #[derive(Debug, Serialize, ToSchema)]
 struct Health {
@@ -17,14 +17,21 @@ enum HealthStatus {
     NotReady,
 }
 
-pub(super) async fn live() -> impl IntoResponse {
+pub(super) fn router(readiness: Readiness) -> Router {
+    Router::new()
+        .route("/health/live", get(live))
+        .route("/health/ready", get(ready))
+        .with_state(readiness)
+}
+
+async fn live() -> impl IntoResponse {
     Json(Health {
         status: HealthStatus::Live,
     })
 }
 
-pub(super) async fn ready(State(state): State<PublicState>) -> impl IntoResponse {
-    let (status_code, status) = if state.readiness.is_ready() {
+async fn ready(State(readiness): State<Readiness>) -> impl IntoResponse {
+    let (status_code, status) = if readiness.is_ready() {
         (StatusCode::OK, HealthStatus::Ready)
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, HealthStatus::NotReady)

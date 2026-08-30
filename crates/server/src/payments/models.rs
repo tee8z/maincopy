@@ -501,18 +501,6 @@ pub struct CreateTipInvoiceRequest {
 }
 
 impl CreateTipInvoiceRequest {
-    pub fn new(
-        intent_id: TipIntentId,
-        amount: SatoshiAmount,
-        description: TipInvoiceDescription,
-    ) -> Self {
-        Self {
-            intent_id,
-            amount,
-            description,
-        }
-    }
-
     pub(crate) fn correlation_marker(&self) -> TipCorrelationMarker {
         TipCorrelationMarker::for_intent(self.intent_id)
     }
@@ -648,7 +636,11 @@ impl<'de> Deserialize<'de> for TipInvoice {
 
         let wire = WireInvoice::deserialize(deserializer)?;
         let description = invoice_description(&wire.invoice).map_err(de::Error::custom)?;
-        let request = CreateTipInvoiceRequest::new(wire.intent_id, wire.amount, description);
+        let request = CreateTipInvoiceRequest {
+            intent_id: wire.intent_id,
+            amount: wire.amount,
+            description,
+        };
         let invoice = Self::from_invoice_fields(wire.invoice, request, wire.payment)
             .map_err(de::Error::custom)?;
         if invoice.network != wire.network
@@ -693,22 +685,6 @@ pub struct ReconcilePaymentRequest {
 }
 
 impl ReconcilePaymentRequest {
-    pub const fn new(
-        payment: ProviderPaymentReference,
-        intent_id: TipIntentId,
-        invoice: Bolt11Invoice,
-        amount: SatoshiAmount,
-        payment_hash: PaymentHash,
-    ) -> Self {
-        Self {
-            payment,
-            intent_id,
-            invoice,
-            amount,
-            payment_hash,
-        }
-    }
-
     pub(crate) fn correlation_marker(&self) -> TipCorrelationMarker {
         TipCorrelationMarker::for_intent(self.intent_id)
     }
@@ -719,12 +695,6 @@ impl ReconcilePaymentRequest {
 /// cursor. `None` means a full oldest-first bootstrap.
 pub struct NextPaymentUpdatesRequest {
     pub cursor: Option<ProviderUpdateCursor>,
-}
-
-impl NextPaymentUpdatesRequest {
-    pub const fn new(cursor: Option<ProviderUpdateCursor>) -> Self {
-        Self { cursor }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -782,18 +752,6 @@ impl ProviderPaymentUpdate {
 pub struct IgnoredProviderPaymentUpdate {
     pub next_cursor: ProviderUpdateCursor,
     pub reason: IgnoredPaymentUpdateReason,
-}
-
-impl IgnoredProviderPaymentUpdate {
-    pub const fn new(
-        next_cursor: ProviderUpdateCursor,
-        reason: IgnoredPaymentUpdateReason,
-    ) -> Self {
-        Self {
-            next_cursor,
-            reason,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -971,12 +929,6 @@ pub enum ProviderPaymentState {
 pub struct ProviderPaymentStatus {
     pub payment: ProviderPaymentReference,
     pub status: ProviderPaymentState,
-}
-
-impl ProviderPaymentStatus {
-    pub const fn new(payment: ProviderPaymentReference, status: ProviderPaymentState) -> Self {
-        Self { payment, status }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -1387,11 +1339,11 @@ mod tests {
     }
 
     fn create_request() -> CreateTipInvoiceRequest {
-        CreateTipInvoiceRequest::new(
-            intent_id(),
-            SatoshiAmount::new(250_000).unwrap(),
-            TipInvoiceDescription::tip(),
-        )
+        CreateTipInvoiceRequest {
+            intent_id: intent_id(),
+            amount: SatoshiAmount::new(250_000).unwrap(),
+            description: TipInvoiceDescription::tip(),
+        }
     }
 
     fn payment_reference() -> ProviderPaymentReference {

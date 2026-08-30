@@ -35,9 +35,9 @@ pub enum LightningProvider {
 impl LightningProvider {
     pub fn kind(&self) -> ProviderKind {
         match self {
-            Self::Lexe(provider) => provider.kind(),
+            Self::Lexe(_) => ProviderKind::Lexe,
             #[cfg(any(test, feature = "test-utils"))]
-            Self::Substitute(provider) => provider.kind(),
+            Self::Substitute(_) => ProviderKind::Lexe,
         }
     }
 

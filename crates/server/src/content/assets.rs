@@ -187,7 +187,7 @@ impl MarkdownDestinationOrdinal {
         self.0.get()
     }
 
-    pub(super) const fn new(value: NonZeroUsize) -> Self {
+    pub(crate) const fn new(value: NonZeroUsize) -> Self {
         Self(value)
     }
 }
@@ -195,19 +195,11 @@ impl MarkdownDestinationOrdinal {
 /// A half-open byte range in the exact Markdown source bound to a resolution.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct MarkdownSourceRange {
-    start: usize,
-    end: usize,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 impl MarkdownSourceRange {
-    pub const fn start(self) -> usize {
-        self.start
-    }
-
-    pub const fn end(self) -> usize {
-        self.end
-    }
-
     pub fn as_range(self) -> Range<usize> {
         self.start..self.end
     }
@@ -245,34 +237,14 @@ impl AuthoredMarkdownDestination {
 /// One resolver-approved Markdown asset destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedMarkdownDestination {
-    ordinal: MarkdownDestinationOrdinal,
-    source_range: MarkdownSourceRange,
-    kind: MarkdownDestinationKind,
-    authored: AuthoredMarkdownDestination,
-    target: AssetRevisionReference,
+    pub(crate) ordinal: MarkdownDestinationOrdinal,
+    pub(crate) source_range: MarkdownSourceRange,
+    pub(crate) kind: MarkdownDestinationKind,
+    pub(crate) authored: AuthoredMarkdownDestination,
+    pub(crate) target: AssetRevisionReference,
 }
 
 impl ResolvedMarkdownDestination {
-    pub const fn ordinal(&self) -> MarkdownDestinationOrdinal {
-        self.ordinal
-    }
-
-    pub const fn source_range(&self) -> MarkdownSourceRange {
-        self.source_range
-    }
-
-    pub const fn kind(&self) -> MarkdownDestinationKind {
-        self.kind
-    }
-
-    pub const fn authored(&self) -> &AuthoredMarkdownDestination {
-        &self.authored
-    }
-
-    pub const fn target(&self) -> &AssetRevisionReference {
-        &self.target
-    }
-
     pub(super) fn new(
         ordinal: MarkdownDestinationOrdinal,
         source_range: MarkdownSourceRange,
@@ -293,16 +265,16 @@ impl ResolvedMarkdownDestination {
 /// Resolver-owned, complete asset inputs for one post revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedPostAssets {
-    source_binding: PostAssetSourceBinding,
-    policy_binding: AssetResolutionPolicyBinding,
-    image: Option<AssetRevisionReference>,
-    references: Vec<AssetRevisionReference>,
-    markdown_destinations: Vec<ResolvedMarkdownDestination>,
+    pub(super) source_binding: PostAssetSourceBinding,
+    pub(super) policy_binding: AssetResolutionPolicyBinding,
+    pub(crate) image: Option<AssetRevisionReference>,
+    pub(crate) references: Vec<AssetRevisionReference>,
+    pub(crate) markdown_destinations: Vec<ResolvedMarkdownDestination>,
 }
 
 impl ResolvedPostAssets {
     #[cfg(test)]
-    pub(super) fn new(
+    pub(crate) fn new(
         document: &PostDocument,
         image: Option<AssetRevisionReference>,
         references: Vec<AssetRevisionReference>,
@@ -326,39 +298,23 @@ impl ResolvedPostAssets {
         }
     }
 
-    pub(super) const fn source_binding(&self) -> &PostAssetSourceBinding {
-        &self.source_binding
-    }
-
-    pub(super) const fn policy_binding(&self) -> &AssetResolutionPolicyBinding {
-        &self.policy_binding
-    }
-
-    pub const fn image(&self) -> Option<&AssetRevisionReference> {
-        self.image.as_ref()
-    }
-
-    pub fn references(&self) -> &[AssetRevisionReference] {
-        &self.references
-    }
-
-    pub fn markdown_destinations(&self) -> &[ResolvedMarkdownDestination] {
-        &self.markdown_destinations
+    pub(crate) fn shares_policy_with(&self, site_assets: &ResolvedSiteAssets) -> bool {
+        self.policy_binding == site_assets.policy_binding
     }
 }
 
 /// Resolver-owned, complete asset inputs for one site snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedSiteAssets {
-    source_binding: PublicationAssetSourceBinding,
-    policy_binding: AssetResolutionPolicyBinding,
-    favicon: Option<AssetRevisionReference>,
-    allowed_origins: Vec<ExternalAssetOrigin>,
-    references: Vec<AssetRevisionReference>,
+    pub(super) source_binding: PublicationAssetSourceBinding,
+    pub(super) policy_binding: AssetResolutionPolicyBinding,
+    pub(crate) favicon: Option<AssetRevisionReference>,
+    pub(crate) allowed_origins: Vec<ExternalAssetOrigin>,
+    pub(crate) references: Vec<AssetRevisionReference>,
 }
 
 impl ResolvedSiteAssets {
-    pub(super) fn new(
+    pub(crate) fn new(
         publication: &PublicationSettings,
         favicon: Option<AssetRevisionReference>,
         allowed_origins: Vec<ExternalAssetOrigin>,
@@ -372,26 +328,6 @@ impl ResolvedSiteAssets {
             references,
         }
     }
-
-    pub(super) const fn source_binding(&self) -> &PublicationAssetSourceBinding {
-        &self.source_binding
-    }
-
-    pub(super) const fn policy_binding(&self) -> &AssetResolutionPolicyBinding {
-        &self.policy_binding
-    }
-
-    pub const fn favicon(&self) -> Option<&AssetRevisionReference> {
-        self.favicon.as_ref()
-    }
-
-    pub fn allowed_origins(&self) -> &[ExternalAssetOrigin] {
-        &self.allowed_origins
-    }
-
-    pub fn references(&self) -> &[AssetRevisionReference] {
-        &self.references
-    }
 }
 
 /// The public, immutable path of a content asset in one site snapshot.
@@ -402,7 +338,7 @@ pub struct SnapshotAssetPath {
 }
 
 impl SnapshotAssetPath {
-    pub(super) fn new(
+    pub(crate) fn new(
         snapshot: &SiteSnapshotDigest,
         asset: &LogicalAssetPath,
     ) -> Result<Self, SnapshotAssetPathError> {

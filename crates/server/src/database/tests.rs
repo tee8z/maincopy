@@ -3,25 +3,10 @@ use std::path::Path;
 use sqlx::{ConnectOptions as _, Connection as _, Executor as _, SqliteConnection};
 
 use super::*;
-use crate::{
-    config::{DatabaseBusyTimeout, DatabaseReadPoolSize, DatabaseWriterQueueCapacity},
-    distribution::TargetPayload,
-};
+use crate::config::{DatabaseBusyTimeout, DatabaseReadPoolSize, DatabaseWriterQueueCapacity};
 
-const POST_A: &str = "11111111-1111-4111-8111-111111111111";
-const POST_B: &str = "22222222-2222-4222-8222-222222222222";
-const REVISION_A: &str =
-    "post-b3-v1-1111111111111111111111111111111111111111111111111111111111111111";
-const REVISION_B: &str =
-    "post-b3-v1-2222222222222222222222222222222222222222222222222222222222222222";
-const REVISION_OTHER_POST: &str =
-    "post-b3-v1-3333333333333333333333333333333333333333333333333333333333333333";
-const SITE_A: &str = "site-b3-v1-1111111111111111111111111111111111111111111111111111111111111111";
-const SITE_B: &str = "site-b3-v1-2222222222222222222222222222222222222222222222222222222222222222";
-const CANONICAL_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-const CANONICAL_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-const JOB_A: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-const RELOAD_A: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const SITE_A: [u8; 32] = [0x11; 32];
+const REVISION_A: [u8; 32] = [0x22; 32];
 
 fn configuration(path: &Path) -> DatabaseConfigurationView<'_> {
     DatabaseConfigurationView {
@@ -49,141 +34,17 @@ async fn bootstrap_error(path: &Path) -> DatabaseStartupError {
     }
 }
 
-async fn insert_post(connection: &mut SqliteConnection, post_id: &str, digest: &str, slug: &str) {
-    insert_post_with_status(connection, post_id, digest, slug, "publishable").await;
-}
-
-async fn insert_post_with_status(
-    connection: &mut SqliteConnection,
-    post_id: &str,
-    digest: &str,
-    slug: &str,
-    publication_status: &str,
-) {
-    sqlx::query(
-        "INSERT INTO post_revisions (\
-            stable_post_id, revision_digest, slug, publication_status, first_observed_at_ns\
-        ) VALUES (?, ?, ?, ?, 1)",
-    )
-    .bind(post_id)
-    .bind(digest)
-    .bind(slug)
-    .bind(publication_status)
-    .execute(connection)
-    .await
-    .unwrap();
-}
-
-async fn insert_site_revision(connection: &mut SqliteConnection, digest: &str, version: i64) {
+async fn insert_site_revision(connection: &mut SqliteConnection, digest: &[u8; 32], version: i64) {
     sqlx::query(
         "INSERT INTO site_revisions (site_revision_digest, activated_at_ns, version) \
          VALUES (?, ?, ?)",
     )
-    .bind(digest)
+    .bind(digest.as_slice())
     .bind(version * 10)
     .bind(version)
     .execute(connection)
     .await
     .unwrap();
-}
-
-async fn insert_initial_site(connection: &mut SqliteConnection, digest: &str) {
-    insert_site_revision(connection, digest, 1).await;
-    sqlx::query(
-        "INSERT INTO site_state (singleton, current_site_digest, version) \
-         VALUES (1, ?, 1)",
-    )
-    .bind(digest)
-    .execute(connection)
-    .await
-    .unwrap();
-}
-
-async fn insert_scheduled_canonical(
-    connection: &mut SqliteConnection,
-    id: &str,
-    post_id: &str,
-    digest: &str,
-) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO canonical_publications (\
-            canonical_publication_id, stable_post_id, pinned_post_digest, state, \
-            scheduled_at_ns, version\
-        ) VALUES (?, ?, ?, 'scheduled', 10, 1)",
-    )
-    .bind(id)
-    .bind(post_id)
-    .bind(digest)
-    .execute(connection)
-    .await
-}
-
-async fn publish_canonical(connection: &mut SqliteConnection, id: &str, digest: &str) {
-    sqlx::query(
-        "UPDATE canonical_publications \
-         SET state = 'activating', activation_at_ns = 11, version = 2 \
-         WHERE canonical_publication_id = ?",
-    )
-    .bind(id)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE canonical_publications \
-         SET state = 'published', published_at_ns = activation_at_ns, \
-             current_published_digest = ?, version = 3 \
-         WHERE canonical_publication_id = ?",
-    )
-    .bind(digest)
-    .bind(id)
-    .execute(connection)
-    .await
-    .unwrap();
-}
-
-async fn install_reload_candidate(connection: &mut SqliteConnection) {
-    insert_site_revision(connection, SITE_B, 2).await;
-    sqlx::query(
-        "UPDATE canonical_publications \
-         SET current_published_digest = ?, version = 4 \
-         WHERE canonical_publication_id = ?",
-    )
-    .bind(REVISION_B)
-    .bind(CANONICAL_A)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE site_state SET current_site_digest = ?, version = 2 \
-         WHERE singleton = 1",
-    )
-    .bind(SITE_B)
-    .execute(connection)
-    .await
-    .unwrap();
-}
-
-async fn insert_waiting_job(
-    connection: &mut SqliteConnection,
-    canonical_id: &str,
-) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
-    let payload = TargetPayload::new("copy").unwrap();
-    sqlx::query(
-        "INSERT INTO publication_jobs (\
-            publication_job_id, canonical_publication_id, state, target, stable_post_id, \
-            pinned_post_digest, scheduled_at_ns, payload_version, payload_body, \
-            payload_digest, version\
-        ) VALUES (?, ?, 'waiting_for_canonical', 'x', ?, ?, 10, ?, ?, ?, 1)",
-    )
-    .bind(JOB_A)
-    .bind(canonical_id)
-    .bind(POST_A)
-    .bind(REVISION_A)
-    .bind(i64::from(payload.version()))
-    .bind(payload.body())
-    .bind(payload.digest().as_str())
-    .execute(connection)
-    .await
 }
 
 #[tokio::test]
@@ -219,7 +80,7 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             .fetch_one(&mut database._writer)
             .await
             .unwrap();
-    assert_eq!(migrations, 3);
+    assert_eq!(migrations, latest_schema_version());
 
     database.close().await.unwrap();
     assert!(path.is_file());
@@ -311,7 +172,6 @@ async fn connection_pragmas_and_foreign_keys_are_verified() {
         ("PRAGMA ignore_check_constraints", 0),
         ("PRAGMA query_only", 0),
         ("PRAGMA cell_size_check", 1),
-        ("PRAGMA recursive_triggers", 1),
         ("PRAGMA application_id", APPLICATION_ID),
     ] {
         assert_eq!(
@@ -332,7 +192,7 @@ async fn connection_pragmas_and_foreign_keys_are_verified() {
         "INSERT INTO site_state (singleton, current_site_digest, version) \
          VALUES (1, ?, 1)",
     )
-    .bind(SITE_A)
+    .bind(SITE_A.as_slice())
     .execute(&mut *connection)
     .await
     .unwrap_err();
@@ -342,75 +202,63 @@ async fn connection_pragmas_and_foreign_keys_are_verified() {
             .is_some_and(|error| error.is_foreign_key_violation())
     );
 
-    insert_post(connection, POST_A, REVISION_A, "first").await;
-    insert_scheduled_canonical(connection, CANONICAL_A, POST_A, REVISION_A)
-        .await
-        .unwrap();
-    publish_canonical(connection, CANONICAL_A, REVISION_A).await;
+    insert_site_revision(connection, &SITE_A, 1).await;
     sqlx::query(
-        "INSERT INTO published_routes (\
-            route, kind, stable_post_id, revision_digest, claimed_at_ns\
-        ) VALUES ('/posts/first', 'slug', ?, ?, 1)",
+        "INSERT INTO site_state (singleton, current_site_digest, version) \
+         VALUES (1, ?, 1)",
     )
-    .bind(POST_A)
-    .bind(REVISION_A)
+    .bind(SITE_A.as_slice())
     .execute(&mut *connection)
     .await
     .unwrap();
-    let maximum_route = format!("/posts/{}", "a".repeat(1024));
-    sqlx::query(
-        "INSERT INTO published_routes (\
-            route, kind, stable_post_id, revision_digest, claimed_at_ns\
-        ) VALUES (?, 'alias', ?, ?, 1)",
-    )
-    .bind(maximum_route)
-    .bind(POST_A)
-    .bind(REVISION_A)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    let oversized_route = format!("/posts/{}", "a".repeat(1025));
-    assert!(
-        sqlx::query(
-            "INSERT INTO published_routes (\
-                route, kind, stable_post_id, revision_digest, claimed_at_ns\
-            ) VALUES (?, 'alias', ?, ?, 1)",
+    assert_eq!(
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT current_site_digest FROM site_state WHERE singleton = 1",
         )
-        .bind(oversized_route)
-        .bind(POST_A)
-        .bind(REVISION_A)
-        .execute(&mut *connection)
+        .fetch_one(&mut *connection)
         .await
-        .is_err()
+        .unwrap(),
+        SITE_A
     );
-    assert!(
-        sqlx::query(
-            "INSERT INTO published_routes (\
-                route, kind, stable_post_id, revision_digest, claimed_at_ns\
-            ) VALUES (?, 'alias', ?, ?, 1)",
-        )
-        .bind("/posts/first\0hidden")
-        .bind(POST_A)
-        .bind(REVISION_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-    for invalid_route in ["/", "/admin", "/posts/../admin", "/posts/bad--alias"] {
-        assert!(
-            sqlx::query(
-                "INSERT INTO published_routes (\
-                    route, kind, stable_post_id, revision_digest, claimed_at_ns\
-                ) VALUES (?, 'alias', ?, ?, 1)",
-            )
-            .bind(invalid_route)
-            .bind(POST_A)
-            .bind(REVISION_A)
-            .execute(&mut *connection)
-            .await
-            .is_err()
+
+    let mut reader = database._readers.acquire().await.unwrap();
+    for (query, expected) in [
+        ("PRAGMA foreign_keys", 1_i64),
+        ("PRAGMA busy_timeout", 4_321),
+        ("PRAGMA trusted_schema", 0),
+        ("PRAGMA ignore_check_constraints", 0),
+        ("PRAGMA query_only", 1),
+        ("PRAGMA cell_size_check", 1),
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(query)
+                .fetch_one(&mut *reader)
+                .await
+                .unwrap(),
+            expected
         );
     }
+    assert_eq!(
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT current_site_digest FROM site_state WHERE singleton = 1",
+        )
+        .fetch_one(&mut *reader)
+        .await
+        .unwrap(),
+        SITE_A
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO site_revisions (site_revision_digest, activated_at_ns, version) \
+             VALUES (?, 20, 2)",
+        )
+        .bind(REVISION_A.as_slice())
+        .execute(&mut *reader)
+        .await
+        .is_err()
+    );
+    drop(reader);
+    database.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -509,6 +357,7 @@ async fn newer_modified_missing_and_dirty_migration_history_are_distinct() {
     }
 
     let (_root, path) = prepared().await;
+    let future_version = latest_schema_version() + 1;
     let mut connection = SqliteConnectOptions::new()
         .filename(&path)
         .connect()
@@ -517,18 +366,17 @@ async fn newer_modified_missing_and_dirty_migration_history_are_distinct() {
     sqlx::query(
         "INSERT INTO _sqlx_migrations (\
             version, description, success, checksum, execution_time\
-        ) VALUES (4, 'future', TRUE, x'00', 0)",
+        ) VALUES (?, 'future', TRUE, x'00', 0)",
     )
+    .bind(future_version)
     .execute(&mut connection)
     .await
     .unwrap();
     connection.close().await.unwrap();
     assert!(matches!(
         bootstrap_error(&path).await,
-        DatabaseStartupError::SchemaTooNew {
-            database: 4,
-            binary: 3
-        }
+        DatabaseStartupError::SchemaTooNew { database, binary }
+            if database == future_version && binary == latest_schema_version()
     ));
 
     let (_root, path) = prepared().await;
@@ -611,514 +459,163 @@ async fn a_gap_in_retained_migration_history_is_rejected() {
 }
 
 #[tokio::test]
-async fn canonical_shapes_uniqueness_retry_and_replacement_are_enforced() {
+async fn application_schema_has_no_triggers_or_explicit_indexes() {
     let (_root, mut database) = open_database().await;
     let connection = &mut database._writer;
-    insert_post(connection, POST_A, REVISION_A, "first").await;
-    insert_post(connection, POST_A, REVISION_B, "second").await;
 
-    insert_scheduled_canonical(connection, CANONICAL_A, POST_A, REVISION_A)
-        .await
-        .unwrap();
-    assert!(
-        insert_scheduled_canonical(connection, CANONICAL_B, POST_A, REVISION_B)
+    let triggers: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
+            .fetch_all(&mut *connection)
             .await
-            .is_err()
-    );
-    assert!(
-        sqlx::query(
-            "UPDATE canonical_publications \
-             SET published_at_ns = 10, version = 2 \
-             WHERE canonical_publication_id = ?",
-        )
-        .bind(CANONICAL_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-    assert!(
-        sqlx::query(
-            "UPDATE canonical_publications \
-             SET state = 'cancelled', activation_at_ns = 10, \
-                 block_reason = 'revision_unavailable', version = 2 \
-             WHERE canonical_publication_id = ?",
-        )
-        .bind(CANONICAL_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
+            .unwrap();
+    assert!(triggers.is_empty());
 
-    sqlx::query(
-        "UPDATE canonical_publications \
-         SET state = 'activating', activation_at_ns = 10, version = 2 \
-         WHERE canonical_publication_id = ?",
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_schema \
+         WHERE type = 'index' AND sql IS NOT NULL ORDER BY name",
     )
-    .bind(CANONICAL_A)
-    .execute(&mut *connection)
+    .fetch_all(&mut *connection)
     .await
     .unwrap();
-    for statement in [
-        "UPDATE canonical_publications \
-         SET state = 'blocked', block_reason = NULL, version = 3 \
-         WHERE canonical_publication_id = ?",
-        "UPDATE canonical_publications \
-         SET state = 'blocked', activation_at_ns = 11, \
-             block_reason = 'revision_unavailable', version = 3 \
-         WHERE canonical_publication_id = ?",
-        "UPDATE canonical_publications \
-         SET state = 'published', published_at_ns = NULL, \
-             current_published_digest = 'post-b3-v1-1111111111111111111111111111111111111111111111111111111111111111', \
-             version = 3 \
-         WHERE canonical_publication_id = ?",
-        "UPDATE canonical_publications \
-         SET state = 'published', published_at_ns = activation_at_ns, \
-             current_published_digest = 'post-b3-v1-2222222222222222222222222222222222222222222222222222222222222222', \
-             version = 3 \
-         WHERE canonical_publication_id = ?",
-    ] {
-        assert!(
-            sqlx::query(statement)
-                .bind(CANONICAL_A)
-                .execute(&mut *connection)
-                .await
-                .is_err()
-        );
-    }
-    sqlx::query(
-        "UPDATE canonical_publications \
-         SET state = 'blocked', block_reason = 'revision_unavailable', version = 3 \
-         WHERE canonical_publication_id = ?",
-    )
-    .bind(CANONICAL_A)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    assert!(
-        sqlx::query(
-            "UPDATE canonical_publications \
-             SET state = 'cancelled', activation_at_ns = NULL, block_reason = NULL, \
-                 version = 4 \
-             WHERE canonical_publication_id = ?",
-        )
-        .bind(CANONICAL_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-    assert!(
-        sqlx::query(
-            "UPDATE canonical_publications \
-             SET state = 'activating', pinned_post_digest = ?, block_reason = NULL, \
-                 activation_at_ns = 12, version = 4 \
-             WHERE canonical_publication_id = ?",
-        )
-        .bind(REVISION_B)
-        .bind(CANONICAL_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-    sqlx::query(
-        "UPDATE canonical_publications \
-         SET state = 'activating', block_reason = NULL, activation_at_ns = 12, version = 4 \
-         WHERE canonical_publication_id = ?",
-    )
-    .bind(CANONICAL_A)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    assert_eq!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT pinned_post_digest FROM canonical_publications \
-             WHERE canonical_publication_id = ?",
-        )
-        .bind(CANONICAL_A)
-        .fetch_one(&mut *connection)
-        .await
-        .unwrap(),
-        REVISION_A
-    );
-
-    sqlx::query(
-        "UPDATE canonical_publications \
-         SET state = 'blocked', block_reason = 'revision_unavailable', version = 5 \
-         WHERE canonical_publication_id = ?",
-    )
-    .bind(CANONICAL_A)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE canonical_publications SET state = 'cancelled', version = 6 \
-         WHERE canonical_publication_id = ?",
-    )
-    .bind(CANONICAL_A)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    assert!(
-        insert_scheduled_canonical(connection, CANONICAL_B, POST_A, REVISION_A)
-            .await
-            .is_err()
-    );
-    insert_scheduled_canonical(connection, CANONICAL_B, POST_A, REVISION_B)
-        .await
-        .unwrap();
+    assert!(indexes.is_empty());
 }
 
 #[tokio::test]
-async fn immutable_identity_text_rejects_embedded_nul_and_replace() {
+async fn identifiers_and_hashes_use_blob_storage() {
     let (_root, mut database) = open_database().await;
     let connection = &mut database._writer;
-    insert_post(connection, POST_A, REVISION_A, "first").await;
 
-    assert!(
-        sqlx::query(
-            "INSERT OR REPLACE INTO post_revisions (\
-                stable_post_id, revision_digest, slug, publication_status, \
-                first_observed_at_ns\
-            ) VALUES (?, ?, 'replacement', 'publishable', 2)",
-        )
-        .bind(POST_A)
-        .bind(REVISION_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT schema.name || '.' || column_info.name || ':' || column_info.type \
+         FROM sqlite_schema AS schema \
+         JOIN pragma_table_info(schema.name) AS column_info \
+         WHERE schema.type = 'table' \
+           AND schema.name <> '_sqlx_migrations' \
+           AND column_info.type = 'BLOB' \
+         ORDER BY 1",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
     assert_eq!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT slug FROM post_revisions \
-             WHERE stable_post_id = ? AND revision_digest = ?",
-        )
-        .bind(POST_A)
-        .bind(REVISION_A)
-        .fetch_one(&mut *connection)
-        .await
-        .unwrap(),
-        "first"
+        columns,
+        [
+            "canonical_publications.current_published_digest:BLOB",
+            "canonical_publications.pinned_post_digest:BLOB",
+            "canonical_publications.publication_id:BLOB",
+            "canonical_publications.source_commit:BLOB",
+            "canonical_publications.stable_post_id:BLOB",
+            "post_revisions.revision_digest:BLOB",
+            "post_revisions.source_commit:BLOB",
+            "post_revisions.stable_post_id:BLOB",
+            "publication_jobs.idempotency_key:BLOB",
+            "publication_jobs.payload_digest:BLOB",
+            "publication_jobs.publication_id:BLOB",
+            "publication_jobs.publication_job_id:BLOB",
+            "published_routes.revision_digest:BLOB",
+            "published_routes.stable_post_id:BLOB",
+            "reload_operations.candidate_site_digest:BLOB",
+            "reload_operations.expected_site_digest:BLOB",
+            "reload_operations.reload_operation_id:BLOB",
+            "reload_post_changes.candidate_post_digest:BLOB",
+            "reload_post_changes.expected_post_digest:BLOB",
+            "reload_post_changes.reload_operation_id:BLOB",
+            "reload_post_changes.stable_post_id:BLOB",
+            "site_revisions.site_revision_digest:BLOB",
+            "site_revisions.source_commit:BLOB",
+            "site_state.current_site_digest:BLOB",
+        ]
     );
 
-    for (post_id, digest, slug, source_commit) in [
-        (
-            format!("{POST_B}\0hidden"),
-            REVISION_OTHER_POST.into(),
-            "safe",
-            None,
-        ),
-        (
-            POST_B.into(),
-            format!("{REVISION_OTHER_POST}\0hidden"),
-            "safe",
-            None,
-        ),
-        (
-            POST_B.into(),
-            REVISION_OTHER_POST.into(),
-            "safe\0hidden",
-            None,
-        ),
-        (
-            POST_B.into(),
-            REVISION_OTHER_POST.into(),
-            "safe",
-            Some(format!("git-sha1:{}\0hidden", "a".repeat(40))),
-        ),
+    let definitions: String = sqlx::query_scalar(
+        "SELECT group_concat(sql, '') FROM sqlite_schema \
+         WHERE type = 'table' \
+           AND name NOT LIKE 'sqlite_%' \
+           AND name <> '_sqlx_migrations'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let compact_definitions: String = definitions
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    assert_eq!(compact_definitions.matches("check(").count(), 10);
+    for constraint in [
+        "check(singleton=1)",
+        "check(length(site_revision_digest)=32)",
+        "check(length(revision_digest)=32)",
+        "check(length(candidate_site_digest)=32)",
+        "check(length(payload_digest)=32)",
+        "check(length(publication_id)=16)",
+        "check(length(stable_post_id)=16)",
+        "check(length(idempotency_key)=16)",
+        "check(length(publication_job_id)=16)",
+        "check(length(reload_operation_id)=16)",
+    ] {
+        assert!(
+            compact_definitions.contains(constraint),
+            "missing storage constraint: {constraint}"
+        );
+    }
+
+    let valid_id = vec![7_u8; 16];
+    sqlx::query(
+        "INSERT INTO post_revisions (\
+            stable_post_id, revision_digest, slug, publication_status, first_observed_at_ns\
+        ) VALUES (?, ?, 'valid', 'publishable', 1)",
+    )
+    .bind(&valid_id)
+    .bind(REVISION_A.as_slice())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    let stored: (String, i64, String, i64) = sqlx::query_as(
+        "SELECT typeof(stable_post_id), length(stable_post_id), \
+                typeof(revision_digest), length(revision_digest) \
+         FROM post_revisions WHERE stable_post_id = ?",
+    )
+    .bind(&valid_id)
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(stored, ("blob".into(), 16, "blob".into(), 32));
+
+    for invalid_id in [vec![8_u8; 15], vec![9_u8; 17]] {
+        assert!(
+            sqlx::query(
+                "INSERT INTO post_revisions (\
+                    stable_post_id, revision_digest, slug, publication_status, \
+                    first_observed_at_ns\
+                ) VALUES (?, ?, 'invalid', 'publishable', 2)",
+            )
+            .bind(invalid_id)
+            .bind(REVISION_A.as_slice())
+            .execute(&mut *connection)
+            .await
+            .is_err()
+        );
+    }
+
+    for (stable_post_id, invalid_digest) in [
+        (vec![10_u8; 16], vec![3_u8; 31]),
+        (vec![11_u8; 16], vec![4_u8; 33]),
     ] {
         assert!(
             sqlx::query(
                 "INSERT INTO post_revisions (\
-                    stable_post_id, revision_digest, slug, publication_status, source_commit, \
+                    stable_post_id, revision_digest, slug, publication_status, \
                     first_observed_at_ns\
-                ) VALUES (?, ?, ?, 'publishable', ?, 1)",
+                ) VALUES (?, ?, 'invalid-digest', 'publishable', 3)",
             )
-            .bind(post_id)
-            .bind(digest)
-            .bind(slug)
-            .bind(source_commit)
+            .bind(stable_post_id)
+            .bind(invalid_digest)
             .execute(&mut *connection)
             .await
             .is_err()
         );
     }
-}
-
-#[tokio::test]
-async fn draft_post_revisions_cannot_be_scheduled_for_publication() {
-    let (_root, mut database) = open_database().await;
-    let connection = &mut database._writer;
-    insert_post_with_status(connection, POST_A, REVISION_A, "draft", "draft").await;
-
-    assert!(
-        insert_scheduled_canonical(connection, CANONICAL_A, POST_A, REVISION_A)
-            .await
-            .is_err()
-    );
-    assert!(
-        sqlx::query(
-            "INSERT INTO published_routes (\
-                route, kind, stable_post_id, revision_digest, claimed_at_ns\
-            ) VALUES ('/posts/draft', 'slug', ?, ?, 1)",
-        )
-        .bind(POST_A)
-        .bind(REVISION_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-}
-
-#[tokio::test]
-async fn target_release_requires_the_matching_published_canonical_revision() {
-    let (_root, mut database) = open_database().await;
-    let connection = &mut database._writer;
-    insert_post(connection, POST_A, REVISION_A, "first").await;
-    insert_scheduled_canonical(connection, CANONICAL_A, POST_A, REVISION_A)
-        .await
-        .unwrap();
-    insert_waiting_job(connection, CANONICAL_A).await.unwrap();
-
-    assert!(
-        sqlx::query(
-            "UPDATE publication_jobs SET state = 'ready', version = 2 \
-             WHERE publication_job_id = ?",
-        )
-        .bind(JOB_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-    sqlx::query(
-        "UPDATE canonical_publications \
-         SET state = 'activating', activation_at_ns = 11, version = 2 \
-         WHERE canonical_publication_id = ?",
-    )
-    .bind(CANONICAL_A)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    let mut transaction = connection.begin().await.unwrap();
-    sqlx::query(
-        "UPDATE canonical_publications \
-         SET state = 'published', published_at_ns = activation_at_ns, \
-             current_published_digest = ?, version = 3 \
-         WHERE canonical_publication_id = ?",
-    )
-    .bind(REVISION_A)
-    .bind(CANONICAL_A)
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE publication_jobs SET state = 'ready', version = 2 \
-         WHERE publication_job_id = ?",
-    )
-    .bind(JOB_A)
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
-    transaction.commit().await.unwrap();
-}
-
-#[tokio::test]
-async fn published_digest_requires_its_applying_reload_and_same_post() {
-    let (_root, mut database) = open_database().await;
-    let connection = &mut database._writer;
-    insert_post(connection, POST_A, REVISION_A, "first").await;
-    insert_post(connection, POST_A, REVISION_B, "second").await;
-    insert_post(connection, POST_B, REVISION_OTHER_POST, "other").await;
-    insert_scheduled_canonical(connection, CANONICAL_A, POST_A, REVISION_A)
-        .await
-        .unwrap();
-    publish_canonical(connection, CANONICAL_A, REVISION_A).await;
-
-    assert!(
-        sqlx::query(
-            "UPDATE canonical_publications \
-             SET current_published_digest = ?, version = 4 \
-             WHERE canonical_publication_id = ?",
-        )
-        .bind(REVISION_B)
-        .bind(CANONICAL_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-    assert!(
-        sqlx::query(
-            "UPDATE canonical_publications \
-             SET current_published_digest = ?, version = 4 \
-             WHERE canonical_publication_id = ?",
-        )
-        .bind(REVISION_OTHER_POST)
-        .bind(CANONICAL_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-}
-
-#[tokio::test]
-async fn applying_reload_is_unique_and_requires_its_activated_candidate() {
-    let (_root, mut database) = open_database().await;
-    let connection = &mut database._writer;
-    insert_initial_site(connection, SITE_A).await;
-    insert_post(connection, POST_A, REVISION_A, "first").await;
-    insert_post(connection, POST_A, REVISION_B, "second").await;
-    insert_scheduled_canonical(connection, CANONICAL_A, POST_A, REVISION_A)
-        .await
-        .unwrap();
-    publish_canonical(connection, CANONICAL_A, REVISION_A).await;
-
-    for (id, state, finished_at, failure_code, version) in [
-        (
-            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-            "applied",
-            Some(11_i64),
-            None,
-            2_i64,
-        ),
-        (
-            "aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff",
-            "failed",
-            Some(11),
-            Some("rejected"),
-            2,
-        ),
-        (
-            "aaaaaaaa-bbbb-4ccc-8ddd-000000000000",
-            "applying",
-            None,
-            None,
-            2,
-        ),
-    ] {
-        assert!(
-            sqlx::query(
-                "INSERT INTO reload_operations (\
-                    reload_operation_id, state, expected_site_digest, candidate_site_digest, \
-                    started_at_ns, finished_at_ns, failure_code, version\
-                ) VALUES (?, ?, ?, ?, 10, ?, ?, ?)",
-            )
-            .bind(id)
-            .bind(state)
-            .bind(SITE_A)
-            .bind(SITE_B)
-            .bind(finished_at)
-            .bind(failure_code)
-            .bind(version)
-            .execute(&mut *connection)
-            .await
-            .is_err()
-        );
-    }
-
-    sqlx::query(
-        "INSERT INTO reload_operations (\
-            reload_operation_id, state, expected_site_digest, candidate_site_digest, \
-            started_at_ns, version\
-        ) VALUES (?, 'applying', ?, ?, 10, 1)",
-    )
-    .bind(RELOAD_A)
-    .bind(SITE_A)
-    .bind(SITE_B)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    assert!(
-        sqlx::query(
-            "UPDATE reload_operations \
-             SET state = 'failed', finished_at_ns = 11, version = 2 \
-             WHERE reload_operation_id = ?",
-        )
-        .bind(RELOAD_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-    sqlx::query(
-        "INSERT INTO reload_post_changes (\
-            reload_operation_id, stable_post_id, expected_post_digest, candidate_post_digest\
-        ) VALUES (?, ?, ?, ?)",
-    )
-    .bind(RELOAD_A)
-    .bind(POST_A)
-    .bind(REVISION_A)
-    .bind(REVISION_B)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    assert!(
-        sqlx::query(
-            "INSERT INTO reload_operations (\
-                reload_operation_id, state, expected_site_digest, candidate_site_digest, \
-                started_at_ns, version\
-            ) VALUES ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', 'applying', ?, ?, 11, 1)",
-        )
-        .bind(SITE_A)
-        .bind(SITE_B)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-    assert!(
-        sqlx::query(
-            "UPDATE reload_operations \
-             SET state = 'applied', finished_at_ns = 12, version = 2 \
-             WHERE reload_operation_id = ?",
-        )
-        .bind(RELOAD_A)
-        .execute(&mut *connection)
-        .await
-        .is_err()
-    );
-    let mut rolled_back = connection.begin().await.unwrap();
-    install_reload_candidate(&mut rolled_back).await;
-    rolled_back.rollback().await.unwrap();
-    let unchanged: (String, String, i64) = sqlx::query_as(
-        "SELECT site_state.current_site_digest, \
-                canonical_publications.current_published_digest, \
-                EXISTS(SELECT 1 FROM site_revisions WHERE site_revision_digest = ?) \
-         FROM site_state \
-         JOIN canonical_publications ON canonical_publications.stable_post_id = ?",
-    )
-    .bind(SITE_B)
-    .bind(POST_A)
-    .fetch_one(&mut *connection)
-    .await
-    .unwrap();
-    assert_eq!(unchanged, (SITE_A.into(), REVISION_A.into(), 0));
-
-    let mut transaction = connection.begin().await.unwrap();
-    install_reload_candidate(&mut transaction).await;
-    sqlx::query(
-        "UPDATE reload_operations \
-         SET state = 'applied', finished_at_ns = 12, version = 2 \
-         WHERE reload_operation_id = ?",
-    )
-    .bind(RELOAD_A)
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
-    transaction.commit().await.unwrap();
-
-    let applied: (String, String, String) = sqlx::query_as(
-        "SELECT reload_operations.state, site_state.current_site_digest, \
-                canonical_publications.current_published_digest \
-         FROM reload_operations \
-         CROSS JOIN site_state \
-         JOIN canonical_publications ON canonical_publications.stable_post_id = ? \
-         WHERE reload_operations.reload_operation_id = ?",
-    )
-    .bind(POST_A)
-    .bind(RELOAD_A)
-    .fetch_one(&mut *connection)
-    .await
-    .unwrap();
-    assert_eq!(
-        applied,
-        ("applied".into(), SITE_B.into(), REVISION_B.into())
-    );
 }
 
 #[test]

@@ -49,40 +49,21 @@ pub enum ResolveContentAssetsError {
 /// Resolver output that keeps typed references and their exact local bytes together.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedContentAssets {
-    site: ResolvedSiteAssets,
-    posts: Vec<ResolvedPostAssetSet>,
-    local_assets: ResolvedLocalAssetStore,
-    warnings: AssetResolutionWarnings,
+    pub(crate) site: ResolvedSiteAssets,
+    pub(crate) posts: Vec<ResolvedPostAssetSet>,
+    pub(crate) local_assets: ResolvedLocalAssetStore,
+    pub(crate) warnings: AssetResolutionWarnings,
 }
 
 impl ResolvedContentAssets {
-    #[cfg(test)]
-    pub(crate) const fn site(&self) -> &ResolvedSiteAssets {
-        &self.site
-    }
-
     pub fn site_assets_for(
         &self,
         publication: &super::PublicationSettings,
     ) -> Result<&ResolvedSiteAssets, ResolvedSiteAssetLookupError> {
-        if self.site.source_binding()
-            != &super::identity::bind_publication_asset_source(publication)
-        {
+        if self.site.source_binding != super::identity::bind_publication_asset_source(publication) {
             return Err(ResolvedSiteAssetLookupError::SourceBindingMismatch);
         }
         Ok(&self.site)
-    }
-
-    pub(crate) fn posts(&self) -> &[ResolvedPostAssetSet] {
-        &self.posts
-    }
-
-    pub const fn local_assets(&self) -> &ResolvedLocalAssetStore {
-        &self.local_assets
-    }
-
-    pub const fn warnings(&self) -> &AssetResolutionWarnings {
-        &self.warnings
     }
 
     pub fn assets_for(
@@ -92,12 +73,12 @@ impl ResolvedContentAssets {
         let Some(entry) = self
             .posts
             .iter()
-            .find(|entry| entry.post_id == *document.metadata().id())
+            .find(|entry| entry.post_id == document.metadata.id)
         else {
             return Err(ResolvedPostAssetLookupError::UnknownPost);
         };
-        if entry.path != *document.path()
-            || entry.assets.source_binding() != &super::identity::bind_post_asset_source(document)
+        if entry.path != document.path
+            || entry.assets.source_binding != super::identity::bind_post_asset_source(document)
         {
             return Err(ResolvedPostAssetLookupError::SourceBindingMismatch);
         }
@@ -114,10 +95,10 @@ pub enum ResolvedSiteAssetLookupError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedPostAssetSet {
-    post_id: PostId,
-    path: LogicalContentPath,
-    draft: DraftStatus,
-    assets: ResolvedPostAssets,
+    pub(crate) post_id: PostId,
+    pub(crate) path: LogicalContentPath,
+    pub(crate) draft: DraftStatus,
+    pub(crate) assets: ResolvedPostAssets,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize)]
@@ -132,43 +113,17 @@ pub enum ResolvedPostAssetLookupError {
 /// Exact discovered bytes paired with the resolver-calculated identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedLocalAsset {
-    asset: DigestedAsset,
-    bytes: Arc<[u8]>,
-}
-
-impl ResolvedLocalAsset {
-    pub const fn asset(&self) -> &DigestedAsset {
-        &self.asset
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
+    pub(crate) asset: DigestedAsset,
+    pub(crate) bytes: Arc<[u8]>,
 }
 
 /// Immutable local bytes keyed by their portable logical path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedLocalAssetStore {
-    assets: BTreeMap<LogicalAssetPath, ResolvedLocalAsset>,
+    pub(crate) assets: BTreeMap<LogicalAssetPath, ResolvedLocalAsset>,
 }
 
 impl ResolvedLocalAssetStore {
-    pub fn len(&self) -> usize {
-        self.assets.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.assets.is_empty()
-    }
-
-    pub fn get(&self, path: &LogicalAssetPath) -> Option<&ResolvedLocalAsset> {
-        self.assets.get(path)
-    }
-
-    pub(super) fn paths(&self) -> impl ExactSizeIterator<Item = &LogicalAssetPath> {
-        self.assets.keys()
-    }
-
     pub fn resolve(
         &self,
         reference: &DigestedAsset,
@@ -240,10 +195,10 @@ pub enum AssetResolutionCode {
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize)]
 #[error("{path}: {location:?}: {message}")]
 pub struct AssetResolutionError {
-    path: LogicalContentPath,
-    location: AssetReferenceLocation,
-    code: AssetResolutionCode,
-    message: Box<str>,
+    pub path: LogicalContentPath,
+    pub location: AssetReferenceLocation,
+    pub code: AssetResolutionCode,
+    pub message: Box<str>,
 }
 
 impl AssetResolutionError {
@@ -259,22 +214,6 @@ impl AssetResolutionError {
             code,
             message: message.into(),
         }
-    }
-
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub const fn location(&self) -> AssetReferenceLocation {
-        self.location
-    }
-
-    pub const fn code(&self) -> AssetResolutionCode {
-        self.code
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
     }
 
     fn sort_key(&self) -> (&str, AssetReferenceLocation, AssetResolutionCode, &str) {
@@ -308,25 +247,13 @@ pub enum AssetResolutionWarningCode {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AssetResolutionWarning {
-    path: LogicalContentPath,
-    location: AssetReferenceLocation,
-    code: AssetResolutionWarningCode,
-    url: ExternalAssetUrl,
+    pub path: LogicalContentPath,
+    pub location: AssetReferenceLocation,
+    pub code: AssetResolutionWarningCode,
+    pub url: ExternalAssetUrl,
 }
 
 impl AssetResolutionWarning {
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub const fn location(&self) -> AssetReferenceLocation {
-        self.location
-    }
-
-    pub const fn code(&self) -> AssetResolutionWarningCode {
-        self.code
-    }
-
     fn sort_key(
         &self,
     ) -> (
@@ -384,12 +311,13 @@ impl<'input> Resolver<'input> {
         self.index_local_assets();
         self.resolve_allowed_origins();
 
-        let publication_path = self.tree.publication().path().clone();
+        let publication_path = self.tree.publication.path.clone();
         let favicon = self
             .content
-            .publication()
-            .site()
-            .favicon()
+            .publication
+            .site
+            .favicon
+            .as_ref()
             .and_then(|favicon| {
                 self.resolve_reference(
                     &publication_path,
@@ -399,14 +327,14 @@ impl<'input> Resolver<'input> {
             });
 
         let site = ResolvedSiteAssets::new(
-            self.content.publication(),
+            &self.content.publication,
             favicon,
             self.allowed_origins.clone(),
             Vec::new(),
         );
 
-        let mut posts = Vec::with_capacity(self.content.posts().len());
-        for document in self.content.posts() {
+        let mut posts = Vec::with_capacity(self.content.posts.len());
+        for document in &self.content.posts {
             posts.push(self.resolve_post(document));
         }
         posts.sort_by(|left, right| left.path.cmp(&right.path));
@@ -434,8 +362,8 @@ impl<'input> Resolver<'input> {
     }
 
     fn index_local_assets(&mut self) {
-        for asset in self.tree.assets() {
-            let path = asset.path().clone();
+        for asset in &self.tree.assets {
+            let path = asset.path.clone();
             if self.discovered_assets.contains_key(&path) {
                 self.errors.push(AssetResolutionError::new(
                     LogicalContentPath::new(path.as_str()),
@@ -445,16 +373,17 @@ impl<'input> Resolver<'input> {
                 ));
                 continue;
             }
-            self.discovered_assets.insert(path, asset.owned_bytes());
+            self.discovered_assets
+                .insert(path, Arc::clone(&asset.bytes));
         }
     }
 
     fn resolve_allowed_origins(&mut self) {
-        let path = self.tree.publication().path().clone();
+        let path = self.tree.publication.path.clone();
         let mut canonical_origins = BTreeSet::new();
         for (index, authored) in self
             .content
-            .publication()
+            .publication
             .assets
             .allowed_https_origins
             .iter()
@@ -502,8 +431,8 @@ impl<'input> Resolver<'input> {
     }
 
     fn resolve_post(&mut self, document: &PostDocument) -> ResolvedPostAssetSet {
-        let path = document.path().clone();
-        let image = document.metadata().image().and_then(|image| {
+        let path = document.path.clone();
+        let image = document.metadata.image.as_ref().and_then(|image| {
             self.resolve_reference(
                 &path,
                 AssetReferenceLocation::PostPreviewImage,
@@ -515,7 +444,7 @@ impl<'input> Resolver<'input> {
         let mut markdown_destinations = Vec::new();
         let mut destination_count = 0_usize;
         for (event, range) in
-            Parser::new_ext(document.markdown().as_str(), Options::empty()).into_offset_iter()
+            Parser::new_ext(document.markdown.as_str(), Options::empty()).into_offset_iter()
         {
             let (kind, authored, is_asset) = match event {
                 Event::Start(Tag::Image { dest_url, .. }) => {
@@ -566,9 +495,9 @@ impl<'input> Resolver<'input> {
         }
 
         ResolvedPostAssetSet {
-            post_id: document.metadata().id().clone(),
+            post_id: document.metadata.id.clone(),
             path,
-            draft: document.metadata().draft(),
+            draft: document.metadata.draft,
             assets: ResolvedPostAssets::from_resolution(
                 document,
                 &self.allowed_origins,
@@ -889,55 +818,53 @@ mod tests {
         );
 
         let resolved = resolve(&tree);
-        assert!(resolved.warnings().is_empty());
+        assert!(resolved.warnings.is_empty());
         assert_eq!(
-            resolved.site.allowed_origins()[0].as_str(),
+            resolved.site.allowed_origins[0].as_str(),
             "https://cdn.example.com/"
         );
-        let Some(AssetRevisionReference::Local(favicon)) = resolved.site.favicon() else {
+        let Some(AssetRevisionReference::Local(favicon)) = resolved.site.favicon.as_ref() else {
             panic!("favicon must resolve to a local asset")
         };
         assert_eq!(favicon.path.as_str(), "assets/site/favicon.png");
         assert_eq!(
             resolved
-                .local_assets()
+                .local_assets
                 .resolve(favicon)
                 .expect("favicon bytes must be retained")
-                .bytes(),
+                .bytes
+                .as_ref(),
             b"favicon"
         );
 
-        let post = &resolved.posts()[0];
-        let Some(AssetRevisionReference::External(image)) = post.assets.image() else {
+        let post = &resolved.posts[0];
+        let Some(AssetRevisionReference::External(image)) = post.assets.image.as_ref() else {
             panic!("preview must resolve to an external URL")
         };
         assert_eq!(
             image.as_str(),
             "https://cdn.example.com/posts/cover-v1.webp"
         );
-        assert_eq!(post.assets.references().len(), 3);
+        assert_eq!(post.assets.references.len(), 3);
 
-        let occurrences = post.assets.markdown_destinations();
+        let occurrences = &post.assets.markdown_destinations;
         assert_eq!(occurrences.len(), 4);
         assert_eq!(
             occurrences
                 .iter()
-                .map(|occurrence| occurrence.ordinal().get())
+                .map(|occurrence| occurrence.ordinal.get())
                 .collect::<Vec<_>>(),
             vec![2, 3, 4, 5]
         );
-        assert_eq!(occurrences[0].kind(), MarkdownDestinationKind::Image);
-        assert_eq!(occurrences[1].kind(), MarkdownDestinationKind::Download);
+        assert_eq!(occurrences[0].kind, MarkdownDestinationKind::Image);
+        assert_eq!(occurrences[1].kind, MarkdownDestinationKind::Download);
+        assert_eq!(occurrences[1].authored.as_str(), "assets/files/manual.pdf");
+        assert!(document_range(&tree, occurrences[0].source_range).starts_with("![diagram]"));
         assert_eq!(
-            occurrences[1].authored().as_str(),
-            "assets/files/manual.pdf"
+            reference_key(&occurrences[1].target),
+            reference_key(&occurrences[2].target)
         );
-        assert!(document_range(&tree, occurrences[0].source_range()).starts_with("![diagram]"));
-        assert_eq!(
-            reference_key(occurrences[1].target()),
-            reference_key(occurrences[2].target())
-        );
-        assert_eq!(resolved.local_assets().len(), 3);
+        assert_eq!(resolved.local_assets.assets.len(), 3);
     }
 
     #[test]
@@ -971,7 +898,7 @@ mod tests {
         let ResolveContentAssetsError::Resolution(errors) = error else {
             panic!("resolution diagnostics were expected")
         };
-        let codes: BTreeSet<_> = errors.errors().iter().map(|error| error.code()).collect();
+        let codes: BTreeSet<_> = errors.errors().iter().map(|error| error.code).collect();
         assert_eq!(
             codes,
             BTreeSet::from([
@@ -1016,7 +943,7 @@ mod tests {
             };
             assert_eq!(errors.errors().len(), 1, "invalid value: {invalid}");
             assert_eq!(
-                errors.errors()[0].code(),
+                errors.errors()[0].code,
                 AssetResolutionCode::ExternalAssetUrlInvalid,
                 "invalid value: {invalid}"
             );
@@ -1050,9 +977,9 @@ mod tests {
         };
         assert_eq!(errors.errors().len(), 4);
         assert!(errors.errors().iter().all(|error| {
-            error.code() == AssetResolutionCode::ExternalAssetUrlInvalid
-                && !error.message().contains("token")
-                && !error.message().contains("user")
+            error.code == AssetResolutionCode::ExternalAssetUrlInvalid
+                && !error.message.contains("token")
+                && !error.message.contains("user")
         }));
     }
 
@@ -1087,7 +1014,7 @@ mod tests {
             errors
                 .errors()
                 .iter()
-                .all(|error| { error.code() == AssetResolutionCode::ExternalAssetUrlInvalid })
+                .all(|error| error.code == AssetResolutionCode::ExternalAssetUrlInvalid)
         );
     }
 
@@ -1111,12 +1038,7 @@ mod tests {
             Vec::new(),
         );
         let ordinary = resolve(&ordinary_tree);
-        assert!(
-            ordinary.posts()[0]
-                .assets
-                .markdown_destinations()
-                .is_empty()
-        );
+        assert!(ordinary.posts[0].assets.markdown_destinations.is_empty());
 
         for invalid in [
             "assets/../private.txt",
@@ -1146,7 +1068,7 @@ mod tests {
                 panic!("resolution diagnostics were expected")
             };
             assert_eq!(
-                errors.errors()[0].code(),
+                errors.errors()[0].code,
                 AssetResolutionCode::LocalAssetPathInvalid,
                 "invalid value: {invalid}"
             );
@@ -1192,32 +1114,27 @@ mod tests {
                 &["https://cdn.example.com"],
             ),
             first
-                .posts()
+                .posts
                 .iter()
                 .rev()
-                .map(|post| {
-                    (
-                        post.path().as_str(),
-                        post.collection(),
-                        post.source().to_owned(),
-                    )
-                })
+                .map(|post| (post.path.as_str(), post.collection, post.source.to_string()))
                 .collect(),
             Vec::new(),
         );
 
         let first = resolve(&first);
         let second = resolve(&second);
-        assert_eq!(first.warnings(), second.warnings());
-        assert_eq!(first.warnings().warnings().len(), 3);
-        assert!(first.warnings().warnings().iter().all(|warning| {
-            warning.code() == AssetResolutionWarningCode::ExternalUrlMayBeMutable
+        assert_eq!(first.warnings, second.warnings);
+        assert_eq!(first.warnings.warnings().len(), 3);
+        assert!(first.warnings.warnings().iter().all(|warning| {
+            warning.code == AssetResolutionWarningCode::ExternalUrlMayBeMutable
         }));
         assert!(
-            first.warnings().warnings().iter().any(|warning| matches!(
-                warning.location(),
-                AssetReferenceLocation::Markdown { .. }
-            ))
+            first
+                .warnings
+                .warnings()
+                .iter()
+                .any(|warning| matches!(warning.location, AssetReferenceLocation::Markdown { .. }))
         );
     }
 
@@ -1236,23 +1153,25 @@ mod tests {
         };
         let first = resolve(&make_tree(b"first"));
         let second = resolve(&make_tree(b"second"));
-        let Some(AssetRevisionReference::Local(first_favicon)) = first.site.favicon() else {
+        let Some(AssetRevisionReference::Local(first_favicon)) = first.site.favicon.as_ref() else {
             panic!("local favicon was expected")
         };
-        let Some(AssetRevisionReference::Local(second_favicon)) = second.site.favicon() else {
+        let Some(AssetRevisionReference::Local(second_favicon)) = second.site.favicon.as_ref()
+        else {
             panic!("local favicon was expected")
         };
         assert_ne!(first_favicon.digest, second_favicon.digest);
         assert_eq!(
             first
-                .local_assets()
+                .local_assets
                 .resolve(first_favicon)
                 .expect("matching reference must resolve")
-                .bytes(),
+                .bytes
+                .as_ref(),
             b"first"
         );
         assert_eq!(
-            second.local_assets().resolve(first_favicon),
+            second.local_assets.resolve(first_favicon),
             Err(ResolvedLocalAssetLookupError::DigestMismatch)
         );
     }
@@ -1289,14 +1208,14 @@ mod tests {
             panic!("resolution diagnostics were expected")
         };
         assert_eq!(
-            errors.errors()[0].code(),
+            errors.errors()[0].code,
             AssetResolutionCode::ContentSourceMismatch
         );
 
         let resolved = resolve_content_assets(&first_tree, &first_content)
             .expect("matching tree and model must resolve");
         assert_eq!(
-            resolved.assets_for(&second_content.posts()[0]),
+            resolved.assets_for(&second_content.posts[0]),
             Err(ResolvedPostAssetLookupError::SourceBindingMismatch)
         );
     }
@@ -1333,7 +1252,7 @@ mod tests {
             errors
                 .errors()
                 .iter()
-                .any(|error| { error.code() == AssetResolutionCode::LocalAssetDuplicated })
+                .any(|error| error.code == AssetResolutionCode::LocalAssetDuplicated)
         );
     }
 
@@ -1371,27 +1290,27 @@ mod tests {
             ],
         );
         let resolved = resolve(&tree);
-        assert!(resolved.site.references().is_empty());
+        assert!(resolved.site.references.is_empty());
         let public = resolved
-            .posts()
+            .posts
             .iter()
             .find(|post| post.draft == DraftStatus::Publishable)
             .expect("publishable post must be present");
         let draft = resolved
-            .posts()
+            .posts
             .iter()
             .find(|post| post.draft == DraftStatus::Draft)
             .expect("draft post must be present");
-        assert_eq!(public.assets.references().len(), 1);
-        assert_eq!(draft.assets.references().len(), 1);
+        assert_eq!(public.assets.references.len(), 1);
+        assert_eq!(draft.assets.references.len(), 1);
         assert_ne!(
-            reference_key(&public.assets.references()[0]),
-            reference_key(&draft.assets.references()[0])
+            reference_key(&public.assets.references[0]),
+            reference_key(&draft.assets.references[0])
         );
     }
 
     fn document_range(tree: &DiscoveredContentTree, range: MarkdownSourceRange) -> &str {
-        let source = tree.posts()[0].source();
+        let source = &tree.posts[0].source;
         let (_, markdown) = source
             .split_once("+++\n")
             .and_then(|(_, rest)| rest.split_once("+++\n"))
@@ -1408,7 +1327,7 @@ mod tests {
             [PostSource::in_posts("posts/direct.md", &post)],
         )
         .expect("direct content must validate");
-        assert_eq!(content.posts().len(), 1);
+        assert_eq!(content.posts.len(), 1);
     }
 
     #[test]
