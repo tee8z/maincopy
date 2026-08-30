@@ -5,6 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::frontend_assets::FrontendBundleDigest;
+
 use super::{
     AssetRevisionReference, CodeRenderingMode, DefaultPostTipPolicy, DigestedAsset,
     DistributionMode, DistributionSettings, DraftStatus, ExternalAssetOrigin, MarkdownDialect,
@@ -21,7 +23,7 @@ const PUBLICATION_ASSET_SOURCE_BINDING_CONTEXT: &str =
     "maincopy publication asset source binding v1";
 const ASSET_RESOLUTION_POLICY_BINDING_CONTEXT: &str = "maincopy asset resolution policy binding v1";
 const POST_REVISION_CONTEXT: &str = "maincopy post revision digest v1";
-const FRONTEND_BUNDLE_CONTEXT: &str = "maincopy frontend bundle digest v1";
+const SITE_SHELL_OUTPUT_CONTEXT: &str = "maincopy site shell output digest v1";
 const SITE_SNAPSHOT_CONTEXT: &str = "maincopy site snapshot digest v1";
 
 const ASSET_PREFIX: &str = "asset-b3-v1-";
@@ -155,9 +157,6 @@ pub(super) struct PublicationAssetSourceBinding([u8; 32]);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AssetResolutionPolicyBinding([u8; 32]);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FrontendBundleDigest([u8; 32]);
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PostRendererVersion {
@@ -228,28 +227,32 @@ pub struct SiteShellRendererIdentity {
     frontend_bundle: FrontendBundleDigest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PreInjectionSiteShell<'bytes>(&'bytes [u8]);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SiteShellOutputDigest([u8; 32]);
 
-impl<'bytes> PreInjectionSiteShell<'bytes> {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the site renderer becomes the sole constructor in WP 1.4"
-        )
-    )]
-    pub(super) const fn new(bytes: &'bytes [u8]) -> Self {
-        Self(bytes)
+/// Streaming, domain-separated identity for sorted pre-injection shell pages.
+pub(super) struct SiteShellOutputHasher(Transcript);
+
+impl SiteShellOutputHasher {
+    pub(super) fn new(page_count: usize) -> Self {
+        let mut transcript =
+            Transcript::new(SITE_SHELL_OUTPUT_CONTEXT, b"maincopy-site-shell-output", 1);
+        transcript.sequence_len(page_count);
+        Self(transcript)
     }
 
-    pub const fn as_bytes(self) -> &'bytes [u8] {
-        self.0
+    pub(super) fn page(&mut self, route: &str, bytes: &[u8]) {
+        self.0.string(route);
+        self.0.bytes(bytes);
+    }
+
+    pub(super) fn finish(self) -> SiteShellOutputDigest {
+        SiteShellOutputDigest(*self.0.finish().as_bytes())
     }
 }
 
 impl SiteShellRendererIdentity {
-    pub const fn new(
+    pub(super) const fn new(
         renderer: SiteShellRendererVersion,
         frontend_bundle: FrontendBundleDigest,
     ) -> Self {
@@ -257,6 +260,14 @@ impl SiteShellRendererIdentity {
             renderer,
             frontend_bundle,
         }
+    }
+
+    pub const fn renderer_version(&self) -> SiteShellRendererVersion {
+        self.renderer
+    }
+
+    pub const fn frontend_bundle(&self) -> &FrontendBundleDigest {
+        &self.frontend_bundle
     }
 }
 
@@ -347,20 +358,20 @@ impl PublishedPostRevision {
 }
 
 /// Every component is required, including the public publication-ledger view.
-pub struct SiteSnapshotInput<'input> {
+struct SiteSnapshotInput<'input> {
     publication: &'input PublicationSettings,
     assets: &'input ResolvedSiteAssets,
     renderer: &'input SiteShellRendererIdentity,
-    pre_injection_shell: PreInjectionSiteShell<'input>,
+    pre_injection_shell: &'input SiteShellOutputDigest,
     public_posts: &'input [PublishedPostRevision],
 }
 
 impl<'input> SiteSnapshotInput<'input> {
-    pub const fn new(
+    const fn new(
         publication: &'input PublicationSettings,
         assets: &'input ResolvedSiteAssets,
         renderer: &'input SiteShellRendererIdentity,
-        pre_injection_shell: PreInjectionSiteShell<'input>,
+        pre_injection_shell: &'input SiteShellOutputDigest,
         public_posts: &'input [PublishedPostRevision],
     ) -> Self {
         Self {
@@ -472,12 +483,6 @@ pub(super) fn bind_asset_resolution_policy(
     AssetResolutionPolicyBinding(*transcript.finish().as_bytes())
 }
 
-pub fn digest_frontend_bundle(bytes: &[u8]) -> FrontendBundleDigest {
-    let mut transcript = Transcript::new(FRONTEND_BUNDLE_CONTEXT, b"maincopy-frontend-bundle", 1);
-    transcript.bytes(bytes);
-    FrontendBundleDigest(*transcript.finish().as_bytes())
-}
-
 fn digest_post_revision(
     input: &PostRevisionInput<'_>,
 ) -> Result<PostRevisionDigest, RevisionIdentityError> {
@@ -531,7 +536,7 @@ pub(super) fn finalize_post_revision(
     ))
 }
 
-pub fn digest_site_snapshot(
+fn digest_site_snapshot(
     input: &SiteSnapshotInput<'_>,
 ) -> Result<SiteSnapshotDigest, RevisionIdentityError> {
     let site_assets = sorted_asset_references(input.assets.references())?;
@@ -552,7 +557,7 @@ pub fn digest_site_snapshot(
     }
     encode_asset_references(&mut transcript, &site_assets);
     encode_site_renderer(&mut transcript, input.renderer);
-    transcript.bytes(input.pre_injection_shell.as_bytes());
+    transcript.fixed_bytes(&input.pre_injection_shell.0);
     transcript.sequence_len(public_posts.len());
     for post in public_posts {
         transcript.fixed_bytes(post.post_id.as_uuid().as_bytes());
@@ -560,6 +565,27 @@ pub fn digest_site_snapshot(
         transcript.utc_timestamp(post.published_at);
     }
     Ok(SiteSnapshotDigest::from_hash(transcript.finish()))
+}
+
+/// Close the site-rendering capability into its public snapshot identity.
+///
+/// The site renderer is the sole production caller. Public callers cannot
+/// combine arbitrary shell bytes, frontend identity, or publication-ledger
+/// entries into a snapshot digest.
+pub(super) fn finalize_site_snapshot(
+    publication: &PublicationSettings,
+    assets: &ResolvedSiteAssets,
+    renderer: &SiteShellRendererIdentity,
+    pre_injection_shell: &SiteShellOutputDigest,
+    public_posts: &[PublishedPostRevision],
+) -> Result<SiteSnapshotDigest, RevisionIdentityError> {
+    digest_site_snapshot(&SiteSnapshotInput::new(
+        publication,
+        assets,
+        renderer,
+        pre_injection_shell,
+        public_posts,
+    ))
 }
 
 fn parse_digest(value: &str, kind: DigestKind) -> Result<[u8; 32], DigestParseError> {
@@ -725,7 +751,7 @@ fn encode_site_renderer(transcript: &mut Transcript, renderer: &SiteShellRendere
     transcript.tag(match renderer.renderer {
         SiteShellRendererVersion::V1 => 0,
     });
-    transcript.fixed_bytes(&renderer.frontend_bundle.0);
+    transcript.fixed_bytes(renderer.frontend_bundle.as_bytes());
 }
 
 fn encode_publication(transcript: &mut Transcript, publication: &PublicationSettings) {
@@ -904,6 +930,20 @@ name = "Example Author"
             PostRendererVersion::V1,
             SanitizerVersion::V1,
         )
+    }
+
+    fn frontend_bundle(byte: u8) -> FrontendBundleDigest {
+        FrontendBundleDigest::parse(&format!(
+            "frontend-b3-v1-{}",
+            format!("{byte:02x}").repeat(32)
+        ))
+        .expect("test frontend digest must be valid")
+    }
+
+    fn shell_output(bytes: &[u8]) -> SiteShellOutputDigest {
+        let mut output = SiteShellOutputHasher::new(1);
+        output.page("/", bytes);
+        output.finish()
     }
 
     #[test]
@@ -1386,10 +1426,8 @@ name = "Example Author"
             revision,
             OffsetDateTime::from_unix_timestamp(1_777_734_400).unwrap(),
         );
-        let site_renderer = SiteShellRendererIdentity::new(
-            SiteShellRendererVersion::V1,
-            digest_frontend_bundle(b"bundle"),
-        );
+        let site_renderer =
+            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
         let forward = [first.clone(), second.clone()];
         let reverse = [second, first.clone()];
         let digest = |posts: &[PublishedPostRevision]| {
@@ -1397,7 +1435,7 @@ name = "Example Author"
                 &publication,
                 &ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new()),
                 &site_renderer,
-                PreInjectionSiteShell::new(b"shell"),
+                &shell_output(b"shell"),
                 posts,
             ))
             .unwrap()
@@ -1405,7 +1443,7 @@ name = "Example Author"
         assert_eq!(digest(&forward), digest(&reverse));
         assert_eq!(
             digest(&forward).as_str(),
-            "site-b3-v1-449c3916eb79c184424c8b7dde4b4bfe3836703a1e75175e9003cc1a70973cb9"
+            "site-b3-v1-22b9b4e6c0dc366a5caee1db553be66da15a9998467a594d6c8354122bbf0815"
         );
 
         let duplicate = [first.clone(), first];
@@ -1414,7 +1452,7 @@ name = "Example Author"
                 &publication,
                 &ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new()),
                 &site_renderer,
-                PreInjectionSiteShell::new(b"shell"),
+                &shell_output(b"shell"),
                 &duplicate,
             )),
             Err(RevisionIdentityError::DuplicatePublicPost { .. })
@@ -1445,14 +1483,10 @@ name = "Example Author"
         );
         let changed_activation =
             PublishedPostRevision::new(post_id, revision, published_at + time::Duration::SECOND);
-        let baseline_renderer = SiteShellRendererIdentity::new(
-            SiteShellRendererVersion::V1,
-            digest_frontend_bundle(b"bundle-a"),
-        );
-        let changed_renderer = SiteShellRendererIdentity::new(
-            SiteShellRendererVersion::V1,
-            digest_frontend_bundle(b"bundle-b"),
-        );
+        let baseline_renderer =
+            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
+        let changed_renderer =
+            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x22));
         let digest = |renderer: &SiteShellRendererIdentity,
                       shell: &'static [u8],
                       posts: &[PublishedPostRevision]| {
@@ -1460,7 +1494,7 @@ name = "Example Author"
                 &publication,
                 &ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new()),
                 renderer,
-                PreInjectionSiteShell::new(shell),
+                &shell_output(shell),
                 posts,
             ))
             .unwrap()
@@ -1507,17 +1541,15 @@ name = "Example Author"
 
     #[test]
     fn publication_favicon_and_site_references_are_required_site_components() {
-        let renderer = SiteShellRendererIdentity::new(
-            SiteShellRendererVersion::V1,
-            digest_frontend_bundle(b"bundle"),
-        );
+        let renderer =
+            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
         let baseline_publication = validate_publication(PUBLICATION);
         let digest = |publication: &PublicationSettings, assets: &ResolvedSiteAssets| {
             digest_site_snapshot(&SiteSnapshotInput::new(
                 publication,
                 assets,
                 &renderer,
-                PreInjectionSiteShell::new(b"shell"),
+                &shell_output(b"shell"),
                 &[],
             ))
             .unwrap()
@@ -1653,16 +1685,14 @@ name = "Example Author"
             &PUBLICATION.replace("title = \"Example\"", "title = \"Changed\""),
         );
         let site_assets = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
-        let site_renderer = SiteShellRendererIdentity::new(
-            SiteShellRendererVersion::V1,
-            digest_frontend_bundle(b"bundle"),
-        );
+        let site_renderer =
+            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
         assert!(matches!(
             digest_site_snapshot(&SiteSnapshotInput::new(
                 &changed_publication,
                 &site_assets,
                 &site_renderer,
-                PreInjectionSiteShell::new(b"shell"),
+                &shell_output(b"shell"),
                 &[],
             )),
             Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
@@ -1691,7 +1721,7 @@ name = "Example Author"
                 &changed_favicon_publication,
                 &favicon_assets,
                 &site_renderer,
-                PreInjectionSiteShell::new(b"shell"),
+                &shell_output(b"shell"),
                 &[],
             )),
             Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
@@ -1717,7 +1747,7 @@ name = "Example Author"
                 &equivalent_origin_publication,
                 &origin_assets,
                 &site_renderer,
-                PreInjectionSiteShell::new(b"shell"),
+                &shell_output(b"shell"),
                 &[],
             )),
             Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
@@ -1792,10 +1822,8 @@ name = "Example Author"
             format!("{PUBLICATION}\n[assets]\nallowed_https_origins = [\"https://a.example/\"]\n");
         let publication = validate_publication(&authored_first);
         let equivalent_publication = validate_publication(&authored_equivalent);
-        let renderer = SiteShellRendererIdentity::new(
-            SiteShellRendererVersion::V1,
-            digest_frontend_bundle(b"bundle"),
-        );
+        let renderer =
+            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
         let first = ExternalAssetOrigin::parse("https://a.example").unwrap();
         let second = ExternalAssetOrigin::parse("HTTPS://B.EXAMPLE:443/").unwrap();
         let changed = ExternalAssetOrigin::parse("https://c.example/").unwrap();
@@ -1804,7 +1832,7 @@ name = "Example Author"
                 publication,
                 &ResolvedSiteAssets::new(publication, None, origins, Vec::new()),
                 &renderer,
-                PreInjectionSiteShell::new(b"shell"),
+                &shell_output(b"shell"),
                 &[],
             ))
             .unwrap()
@@ -1839,7 +1867,7 @@ name = "Example Author"
                     Vec::new(),
                 ),
                 &renderer,
-                PreInjectionSiteShell::new(b"shell"),
+                &shell_output(b"shell"),
                 &[],
             )),
             Err(RevisionIdentityError::DuplicateAllowedOrigin { .. })
@@ -1878,6 +1906,6 @@ name = "Example Author"
             asset.as_str(),
             "asset-b3-v1-20b8cb3fe0a1f1eae595a39939aef0e08660b7117e462d4d0b4f9510075681ae"
         );
-        assert_ne!(asset.as_bytes(), &digest_frontend_bundle(b"maincopy").0);
+        assert_ne!(asset.as_bytes(), frontend_bundle(0x33).as_bytes());
     }
 }

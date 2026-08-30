@@ -186,6 +186,7 @@ pub enum StartupStage {
     ProcessLock,
     Database,
     Content,
+    FrontendAssets,
     Payments,
     Listeners,
 }
@@ -197,6 +198,7 @@ impl fmt::Display for StartupStage {
             Self::ProcessLock => formatter.write_str("process lock"),
             Self::Database => formatter.write_str("database startup"),
             Self::Content => formatter.write_str("content compilation"),
+            Self::FrontendAssets => formatter.write_str("frontend asset validation"),
             Self::Payments => formatter.write_str("payment startup"),
             Self::Listeners => formatter.write_str("listener binding"),
         }

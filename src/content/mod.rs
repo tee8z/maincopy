@@ -18,11 +18,10 @@ pub use assets::{
     ResolvedPostAssets, ResolvedSiteAssets, SnapshotAssetPath, SnapshotAssetPathError,
 };
 pub use identity::{
-    AssetBindingTarget, AssetDigest, DigestKind, DigestParseError, FrontendBundleDigest,
-    PostContentDigest, PostRendererIdentity, PostRendererVersion, PostRevisionDigest,
-    PreInjectionSiteShell, PublishedPostRevision, RevisionIdentityError, SanitizerVersion,
-    SiteShellRendererIdentity, SiteShellRendererVersion, SiteSnapshotDigest, SiteSnapshotInput,
-    digest_asset, digest_frontend_bundle, digest_post_content, digest_site_snapshot,
+    AssetBindingTarget, AssetDigest, DigestKind, DigestParseError, PostContentDigest,
+    PostRendererIdentity, PostRendererVersion, PostRevisionDigest, PublishedPostRevision,
+    RevisionIdentityError, SanitizerVersion, SiteShellRendererIdentity, SiteShellRendererVersion,
+    SiteSnapshotDigest, digest_asset, digest_post_content,
 };
 
 pub use model::{

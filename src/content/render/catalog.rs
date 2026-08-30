@@ -62,18 +62,10 @@ pub struct ContentCatalog {
 }
 
 impl ContentCatalog {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "WP 2.1 consumes candidate metadata inside the content compiler boundary"
-        )
-    )]
     pub(super) const fn publication(&self) -> &PublicationSettings {
         &self.publication
     }
 
-    #[cfg(test)]
     pub(super) const fn site_assets(&self) -> &ResolvedSiteAssets {
         &self.site_assets
     }
@@ -83,13 +75,6 @@ impl ContentCatalog {
         &self.local_assets
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "WP 2.1 consumes the candidate-owned scope during snapshot construction"
-        )
-    )]
     pub(super) const fn projection_scope(&self) -> CatalogProjectionScope<'_> {
         CatalogProjectionScope {
             site_assets: &self.site_assets,

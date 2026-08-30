@@ -1,0 +1,89 @@
+:root {
+  color-scheme: light dark;
+  --page-background: #f8f6f1;
+  --page-foreground: #24231f;
+  --muted-foreground: #68645b;
+  --accent: #9b3f26;
+  --surface: #ffffff;
+  --border: #d9d4c9;
+  font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif;
+  line-height: 1.6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--page-background);
+  color: var(--page-foreground);
+  margin: 0;
+}
+
+body > header,
+body > main,
+body > footer {
+  margin-inline: auto;
+  max-width: 48rem;
+  padding-inline: 1.25rem;
+}
+
+body > header,
+body > footer {
+  padding-block: 1.5rem;
+}
+
+main {
+  min-height: 60vh;
+  padding-block: 2rem 4rem;
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: 0.18em;
+}
+
+img,
+svg {
+  height: auto;
+  max-width: 100%;
+}
+
+pre {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  overflow-x: auto;
+  padding: 1rem;
+}
+
+code,
+pre {
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+}
+
+small,
+time {
+  color: var(--muted-foreground);
+}
+
+.visually-hidden {
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  height: 1px;
+  overflow: hidden;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page-background: #1d1c19;
+    --page-foreground: #ece8de;
+    --muted-foreground: #b4aea2;
+    --accent: #e28a6b;
+    --surface: #292722;
+    --border: #48443b;
+  }
+}

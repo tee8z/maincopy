@@ -122,13 +122,6 @@ impl RenderedPost {
         &self.revision
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "WP 2.1 will consume the typed projection during snapshot construction"
-        )
-    )]
     pub(super) fn project_for_snapshot(
         &self,
         snapshot: &SiteSnapshotDigest,

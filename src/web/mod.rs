@@ -3,11 +3,15 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use axum::{Router, routing::get};
+use axum::{Router, extract::FromRef, routing::get};
 
 mod health;
+mod site;
 
 use health::{live, ready};
+use site::{application_asset, archive, index, method_not_allowed, not_found, post, tag};
+
+use crate::render::SiteSnapshotReader;
 
 /// Shared readiness state for the public health endpoint.
 ///
@@ -44,10 +48,53 @@ impl Default for Readiness {
     }
 }
 
+/// Explicit request-facing dependencies for the public listener.
+#[derive(Clone, Debug)]
+pub struct PublicState {
+    snapshots: SiteSnapshotReader,
+    readiness: Readiness,
+}
+
+impl PublicState {
+    pub const fn new(snapshots: SiteSnapshotReader, readiness: Readiness) -> Self {
+        Self {
+            snapshots,
+            readiness,
+        }
+    }
+
+    pub const fn snapshots(&self) -> &SiteSnapshotReader {
+        &self.snapshots
+    }
+
+    pub const fn readiness(&self) -> &Readiness {
+        &self.readiness
+    }
+}
+
+impl FromRef<PublicState> for SiteSnapshotReader {
+    fn from_ref(state: &PublicState) -> Self {
+        state.snapshots.clone()
+    }
+}
+
+impl FromRef<PublicState> for Readiness {
+    fn from_ref(state: &PublicState) -> Self {
+        state.readiness.clone()
+    }
+}
+
 /// Builds the public router without binding a listener.
-pub fn public_router(readiness: Readiness) -> Router {
+pub fn public_router(state: PublicState) -> Router {
     Router::new()
+        .route("/", get(index))
+        .route("/posts/{slug}", get(post))
+        .route("/tags/{tag}", get(tag))
+        .route("/archive", get(archive))
+        .route("/app-assets/{digest}/{name}", get(application_asset))
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
-        .with_state(readiness)
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .with_state(state)
 }

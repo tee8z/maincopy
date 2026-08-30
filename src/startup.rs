@@ -142,6 +142,11 @@ impl Application {
     where
         Install: FnOnce() -> Result<ShutdownFuture, ApplicationError>,
     {
+        crate::frontend_assets::embedded_manifest()
+            .validate()
+            .map_err(|_| ApplicationError::Startup {
+                stage: crate::error::StartupStage::FrontendAssets,
+            })?;
         let shutdown = install_signal()?;
         Ok(Self::with_parts(
             readiness,

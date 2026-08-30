@@ -1,6 +1,13 @@
-use std::process::Command;
+use std::{fs, process::Command};
 
-use maincopy::error::ProcessExit;
+use maincopy::{error::ProcessExit, frontend_assets::embedded_manifest};
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
 
 #[test]
 fn help_exits_successfully_from_the_real_binary() {
@@ -70,4 +77,19 @@ fn process_entry_point_stays_a_tiny_runtime_boundary() {
     for forbidden in ["TcpListener", "UnixListener", "Sqlite", "spawn(", "Router"] {
         assert!(!source.contains(forbidden), "main.rs contains {forbidden}");
     }
+}
+
+#[test]
+fn production_binary_retains_the_complete_embedded_frontend_manifest() {
+    let binary = fs::read(env!("CARGO_BIN_EXE_maincopy")).unwrap();
+    let manifest = embedded_manifest();
+    manifest.validate().unwrap();
+
+    assert!(contains_bytes(&binary, manifest.css().bytes()));
+    assert!(contains_bytes(
+        &binary,
+        manifest.css().public_path().as_str().as_bytes()
+    ));
+    assert!(contains_bytes(&binary, manifest.bundle_digest().as_bytes()));
+    assert!(contains_bytes(&binary, manifest.css().digest().as_bytes()));
 }

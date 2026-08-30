@@ -477,15 +477,44 @@ a favicon, post image, content attachment, or CDN reference as a compile-time
 application asset.
 
 Maud templates remain Rust modules. A custom `build.rs` processes only
-first-party CSS and optional JavaScript pieces. It discovers declared inputs,
-normalizes and sorts their paths, combines them in that order, minifies the
-result, and calculates a content digest. A read, minification, or write error
-fails the build. The script does not skip an input or serve an unminified
+first-party CSS and optional JavaScript pieces. V1 requires
+`frontend/css/site.css` and does not include JavaScript until a feature needs
+it. The script discovers the required file and any additional declared CSS
+pieces, normalizes and sorts their paths, combines them in that order,
+minifies the complete output with a parser-backed minifier, and calculates a
+content digest. A traversal, read, minification, metadata, or write error fails
+the build. The script rejects links, special files, non-portable names, and
+case-colliding paths. It does not skip an input or serve an unminified
 fallback.
 
 The script writes bundles and generated Rust metadata to `OUT_DIR`. It does not
 write generated files into the source tree. It emits `cargo:rerun-if-changed`
 directives for the input roots, files, and build logic that affect output.
+
+The build supports Linux and macOS hosts. It pins source and output directories
+with `rustix` directory descriptors. Each descendant lookup is relative to a
+pinned descriptor and does not follow links. Input opens use nonblocking mode
+before the build verifies the regular-file type.
+
+The build compares each input fingerprint at discovery, open, read completion,
+and output commit. The fingerprint includes device, inode, mode, link count,
+size, modification time, and change time. A mismatch fails the build. Other
+host operating systems fail with a typed unsupported-host error.
+
+Each output uses an exclusive temporary file in its pinned output directory.
+The build synchronizes the temporary file and atomically renames it over the
+destination. The build never opens an existing destination for writing. It
+rejects linked, special, replaced, and multiply hard-linked output paths.
+
+| Frontend build limit | Inclusive maximum |
+| --- | ---: |
+| Discovered files and directories | 256 entries |
+| Path depth below `frontend/css` | 16 segments |
+| One CSS input | 4 MiB |
+| Combined parser stream, including one inserted newline per file | 8 MiB |
+| Emitted CSS bundle | 8 MiB |
+| Normalized logical path | 1,024 bytes |
+| One path segment | 255 bytes |
 
 The generated `FrontendAssetManifest` contains typed `CssAsset` and optional
 `JavaScriptAsset` values. Each value contains typed asset identity, MIME type,
@@ -493,14 +522,18 @@ content digest, immutable public path, and embedded bytes. Runtime code uses
 the manifest instead of constructing filenames or MIME types from strings.
 
 The binary embeds the generated bundles and serves them from
-`/app-assets/{digest}/{name}`. The route uses exact manifest lookup. It never
-maps an untrusted path to the host filesystem. Valid assets use their exact
-CSS or JavaScript MIME type, ETag, and immutable cache headers. Unknown,
-malformed, and traversal-like paths return `404`.
+`/app-assets/{bundle-digest}/{name}`. The bundle digest uses the full
+`frontend-b3-v1-` encoding. The route parses the digest and typed asset name,
+then uses exact manifest lookup. It never maps an untrusted path to the host
+filesystem. Valid assets use their exact CSS or JavaScript MIME type,
+per-asset content ETag, and immutable cache headers. Unknown, malformed, and
+traversal-like paths return `404`.
 
 `FrontendBundleDigest` is part of `SiteShellRendererIdentity` and every
-`SiteSnapshot` digest. A CSS or JavaScript byte change therefore changes the
-renderer identity, snapshot identity, and immutable application-asset URL.
+`SiteSnapshot` digest. A change in emitted CSS or JavaScript bytes therefore
+changes the renderer identity, snapshot identity, and immutable application-
+asset URL. A source-only change that minifies to the same emitted bytes does
+not change these identities.
 
 ### Revision identity
 
@@ -538,6 +571,8 @@ and 64 lowercase hexadecimal characters:
 | Asset content | `asset-b3-v1-` |
 | Post revision | `post-b3-v1-` |
 | Site snapshot | `site-b3-v1-` |
+| Frontend asset | `frontend-asset-b3-v1-` |
+| Frontend bundle | `frontend-b3-v1-` |
 
 Parsing rejects an abbreviated value, uppercase text, an unknown algorithm or
 schema version, a wrong identity kind, and non-hexadecimal text. A digest type
@@ -733,6 +768,9 @@ V1 applies these inclusive renderer limits:
 | Rendered article HTML | 32 MiB |
 | One Mermaid source block | 256 KiB |
 | Mermaid blocks in one post | 64 |
+| One complete public HTML page | 40 MiB |
+| Public routes in one snapshot | 50,000 |
+| Retained public HTML in one snapshot | 512 MiB |
 
 The existing content-tree limit keeps one Markdown source at or below 4 MiB.
 The renderer uses checked output writes and returns a typed limit error.
@@ -741,10 +779,15 @@ The Markdown renderer returns one opaque render product. The product binds the
 rendered bytes, generated outputs, renderer identity, source document, and
 resolved assets. A digest calculator rejects a product for different inputs.
 
-The site-shell renderer returns an equivalent opaque product. The public
-snapshot builder requires that product and cannot substitute empty shell bytes
-or an invented frontend identity. WP2.1 supplies the production Maud shell and
-frontend bundle.
+The site-shell renderer returns an equivalent opaque product. It binds the
+publication, resolved site assets, frontend manifest, exact candidate catalog,
+and an explicit public-ledger projection. The projection contains no default
+"publish all" state and no authored publication time. The future SQLite reader
+supplies durable `Published` entries. At the atomic visibility point, the
+transition coordinator can supply its one claimed activation through the same
+private projection boundary. The public snapshot builder requires the opaque
+shell product and cannot substitute empty shell bytes or an invented frontend
+identity. WP2.1 supplies the production Maud shell and frontend bundle.
 
 Asset URL injection uses typed render slots. Identity calculation and final
 snapshot rendering project those slots through different typed scopes. The

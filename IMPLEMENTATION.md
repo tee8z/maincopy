@@ -269,7 +269,7 @@ Rust toolchain and the project license.
 | Snapshot activation | Pin `arc-swap` 1.9.2 without optional features | 2 |
 | HTTP service | Axum and Tower | 0 and 2 |
 | HTML templates | Maud | 2 |
-| Frontend asset build | A custom deterministic `build.rs` with reviewed CSS and JavaScript minifiers | 2 |
+| Frontend asset build | A custom deterministic `build.rs`; Lightning CSS 1.0.0-alpha.72 for V1 CSS; add a reviewed JavaScript minifier only with the first JavaScript input | 2 |
 | SQLite | SQLx with SQLite and embedded migrations | 3 |
 | Process lock | Select a cross-process file-lock implementation | 3 |
 | OpenAPI | `utoipa` and `utoipa-axum` with stable path/schema ordering | 0 and 4 |
@@ -287,6 +287,26 @@ Rust toolchain and the project license.
 
 Do not add a library only because a later slice might need it.
 Record the license and feature flags for each direct dependency.
+
+The frontend selection uses these direct dependencies. License values come
+from upstream crate metadata. They do not select a Maincopy package license.
+
+| Dependency | Exact selected version | Features | Upstream license expression | Declared MSRV |
+| --- | --- | --- | --- | --- |
+| `arc-swap` | 1.9.2 | Default features disabled; no optional features | `MIT OR Apache-2.0` | Not declared |
+| `maud` | 0.27.0 | Default features disabled; no optional features | `MIT OR Apache-2.0` | Not declared |
+| `blake3` build edge | 1.8.7 | Default features disabled; `std` | `CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception` | Not declared |
+| `lightningcss` | 1.0.0-alpha.72 | Default features disabled | `MPL-2.0` | Not declared |
+| `rustix` build and test edge | 1.1.4 | Default features disabled; `fs`, `std`; Linux and macOS only | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 1.63 |
+
+`walkdir` is not part of the frontend build. Its path-based iterator cannot
+provide the required descriptor-relative traversal boundary.
+
+The locked Nix toolchain is Rust 1.98. The Lexe 0.1.22 crates declare Rust
+1.90. Several direct dependencies do not declare a minimum supported Rust
+version (MSRV). Therefore, `Cargo.toml` does not declare `rust-version` yet.
+Set that field only after one complete locked dependency graph establishes the
+package MSRV. Keep the package-license decision separate from this work.
 
 ## Implementation decisions and remaining gates
 
@@ -937,8 +957,18 @@ Deliverables:
 - Dedicated first-party application and theme input roots for CSS and optional
   JavaScript. Content-repository favicons, post images, attachments, and CDN
   references do not enter this build.
+- Required `frontend/css/site.css`; V1 emits no JavaScript bundle until a
+  feature supplies a reviewed JavaScript input.
 - A custom `build.rs` that normalizes and sorts declared input paths, combines
   them in that order, minifies each output, and computes content hashes.
+- Descriptor-relative, no-follow input and output access on Linux and macOS.
+  Other build hosts fail with a typed unsupported-host error.
+- Fingerprint checks at discovery, open, read completion, and output commit.
+  The checks reject input replacement, growth, and in-place mutation.
+- Nonblocking input opens before regular-file verification. FIFO and device
+  replacements cannot block a build read.
+- Exclusive same-directory temporary outputs, file synchronization, and atomic
+  replacement. Existing hard-linked output files fail the build.
 - Build failure on every input read, minification, metadata generation, or
   output write error. There is no silent skip or unminified fallback.
 - Bundles and generated Rust metadata written only under `OUT_DIR`. A build
@@ -948,6 +978,13 @@ Deliverables:
 - A generated `FrontendAssetManifest` with typed `CssAsset` and optional
   `JavaScriptAsset` values. Runtime code does not assemble asset paths, MIME
   types, or cache policy from raw strings.
+- Full `frontend-b3-v1-<64 lowercase hex>` bundle identities and distinct
+  typed per-asset content identities. The application route uses the bundle
+  identity; the strong ETag uses the selected asset identity.
+- Inclusive frontend limits: 256 discovered entries, 16 path segments, 4 MiB
+  per input, and 8 MiB emitted CSS. The combined parser stream is also 8 MiB.
+  That stream includes one inserted newline for each input file.
+- Portable path limits: 1,024 bytes per logical path and 255 bytes per segment.
 - Embedded bundle bytes and exact manifest lookup through the application
   asset handler.
 - One opaque rendered-site-shell capability bound to publication settings,
@@ -958,6 +995,8 @@ Deliverables:
   explicit publication-ledger projection.
 - Complete route, chronology, tag, and public-asset indexes in one immutable
   `SiteSnapshot`.
+- Inclusive limits of 40 MiB for one complete page, 50,000 public routes, and
+  512 MiB of retained public HTML in one snapshot.
 - One `Arc<ArcSwap<SiteSnapshot>>` with separate reader and activation
   capabilities. Public handlers receive only the reader capability.
 - Canonical URLs from validated publication configuration.
@@ -966,6 +1005,13 @@ Deliverables:
 - Accessible navigation and error pages.
 - Snapshot injection through explicit router state.
 
+WP2.1 accepts a typed, database-neutral public-ledger projection. It has no
+default and cannot infer visibility from the catalog. This library layer can
+be tested before the SQLx adapter exists. Slice 3 supplies durable `Published`
+rows, and the later transition coordinator supplies its one claimed activation
+only at the atomic visibility point. Production listener integration remains
+blocked on those owners.
+
 Tests:
 
 - Call every route with `ServiceExt::oneshot` and no socket.
@@ -973,8 +1019,9 @@ Tests:
 - Escape titles, descriptions, tags, and route parameters.
 - Randomize frontend input discovery order and require identical combined
   bytes, manifest metadata, and digest.
-- Change one CSS or JavaScript byte and require a new bundle digest, immutable
-  URL, renderer identity, and site snapshot digest.
+- Change emitted CSS or JavaScript bytes and require a new bundle digest,
+  immutable URL, renderer identity, and site snapshot digest. Permit a source
+  edit that minifies to identical emitted bytes to retain the same identities.
 - Remove or corrupt an input and require a failed build.
 - Build from a clean checkout through Cargo and Nix. Require every generated
   bundle in the binary closure and no generated source-tree changes.

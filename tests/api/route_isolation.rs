@@ -4,12 +4,12 @@ use maincopy::{
     web::{Readiness, public_router},
 };
 
-use crate::helpers::get;
+use crate::helpers::{get, public_state};
 
 #[tokio::test]
 async fn public_router_does_not_expose_admin_routes() {
     let response = get(
-        public_router(Readiness::new(true)),
+        public_router(public_state(Readiness::new(true))),
         "/api/admin/v1/capabilities",
     )
     .await;
@@ -20,7 +20,7 @@ async fn public_router_does_not_expose_admin_routes() {
 #[tokio::test]
 async fn public_router_does_not_expose_admin_openapi() {
     let response = get(
-        public_router(Readiness::new(true)),
+        public_router(public_state(Readiness::new(true))),
         "/api/admin/v1/openapi.json",
     )
     .await;

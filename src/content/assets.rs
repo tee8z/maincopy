@@ -432,13 +432,6 @@ pub struct SnapshotAssetPath {
 }
 
 impl SnapshotAssetPath {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the public snapshot manifest becomes the sole caller in WP 1.4"
-        )
-    )]
     pub(super) fn new(
         snapshot: &SiteSnapshotDigest,
         asset: &LogicalAssetPath,
