@@ -64,6 +64,31 @@ impl PublicLedgerProjection {
             entries: entries.into(),
         })
     }
+
+    pub(crate) fn with_published(
+        &self,
+        published: PublishedPostRevision,
+    ) -> Result<Self, PublicLedgerProjectionError> {
+        let insert_at = match self
+            .entries
+            .binary_search_by(|entry| entry.post_id.cmp(&published.post_id))
+        {
+            Ok(_) => {
+                return Err(PublicLedgerProjectionError {
+                    post_id: published.post_id,
+                });
+            }
+            Err(insert_at) => insert_at,
+        };
+
+        let mut entries = Vec::with_capacity(self.entries.len() + 1);
+        entries.extend_from_slice(&self.entries[..insert_at]);
+        entries.push(published);
+        entries.extend_from_slice(&self.entries[insert_at..]);
+        Ok(Self {
+            entries: entries.into(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -1414,6 +1439,46 @@ mod tests {
             PublicLedgerProjection::try_from_exact_entries([first.clone(), first]).unwrap_err();
         assert_eq!(error.post_id.as_str(), FIRST_ID);
         assert!(PublicLedgerProjection::empty().entries.is_empty());
+    }
+
+    #[test]
+    fn published_entry_is_inserted_in_exact_post_id_order() {
+        let fixture = fixture();
+        let original = projection([
+            entry(&fixture, DRAFT_ID, 3_000),
+            entry(&fixture, FIRST_ID, 1_000),
+        ]);
+
+        let published = original
+            .with_published(entry(&fixture, SECOND_ID, 2_000))
+            .unwrap();
+
+        let post_ids: Vec<_> = published
+            .entries
+            .iter()
+            .map(|entry| entry.post_id.as_str())
+            .collect();
+        assert_eq!(post_ids, [FIRST_ID, SECOND_ID, DRAFT_ID]);
+        assert_eq!(
+            original
+                .entries
+                .iter()
+                .map(|entry| entry.post_id.as_str())
+                .collect::<Vec<_>>(),
+            [FIRST_ID, DRAFT_ID]
+        );
+    }
+
+    #[test]
+    fn publishing_rejects_an_existing_post_id() {
+        let fixture = fixture();
+        let ledger = projection([entry(&fixture, FIRST_ID, 1_000)]);
+
+        let error = ledger
+            .with_published(entry(&fixture, FIRST_ID, 2_000))
+            .unwrap_err();
+
+        assert_eq!(error.post_id.as_str(), FIRST_ID);
     }
 
     #[test]
