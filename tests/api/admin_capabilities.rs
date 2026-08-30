@@ -1,16 +1,12 @@
 use axum::http::StatusCode;
-use maincopy::admin::{AdminState, admin_router};
+use maincopy::admin::admin_router;
 use serde_json::json;
 
 use crate::helpers::{get, json_body};
 
 #[tokio::test]
 async fn agents_can_discover_the_admin_api_version() {
-    let response = get(
-        admin_router(AdminState::new()),
-        "/api/admin/v1/capabilities",
-    )
-    .await;
+    let response = get(admin_router(), "/api/admin/v1/capabilities").await;
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(

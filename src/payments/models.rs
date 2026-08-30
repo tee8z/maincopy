@@ -17,6 +17,47 @@ pub const MIN_PAYMENT_CONCURRENCY_LIMIT: usize = 2;
 pub(crate) const TIP_CORRELATION_MARKER_PREFIX: &str = "maincopy-tip:";
 pub(crate) const MAX_TIP_CORRELATION_MARKER_BYTES: usize = TIP_CORRELATION_MARKER_PREFIX.len() + 36;
 
+macro_rules! validated_string_serde {
+    ($type:ty, $encoded:ident, $parse:ident) => {
+        impl Serialize for $type {
+            fn serialize<Serializer>(
+                &self,
+                serializer: Serializer,
+            ) -> Result<Serializer::Ok, Serializer::Error>
+            where
+                Serializer: serde::Serializer,
+            {
+                serializer.serialize_str(&self.$encoded())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $type {
+            fn deserialize<Deserializer>(
+                deserializer: Deserializer,
+            ) -> Result<Self, Deserializer::Error>
+            where
+                Deserializer: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::$parse(&value).map_err(de::Error::custom)
+            }
+        }
+    };
+}
+
+macro_rules! redacted_debug {
+    ($type:ty) => {
+        impl fmt::Debug for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_tuple(stringify!($type))
+                    .field(&"[REDACTED]")
+                    .finish()
+            }
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -64,33 +105,9 @@ impl TipIntentId {
         }
         Ok(Self(parsed))
     }
-
-    pub const fn as_uuid(self) -> Uuid {
-        self.0
-    }
 }
 
-impl Serialize for TipIntentId {
-    fn serialize<Serializer>(
-        &self,
-        serializer: Serializer,
-    ) -> Result<Serializer::Ok, Serializer::Error>
-    where
-        Serializer: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for TipIntentId {
-    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
-    where
-        Deserializer: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(de::Error::custom)
-    }
-}
+validated_string_serde!(TipIntentId, to_string, parse);
 
 impl fmt::Display for TipIntentId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -98,7 +115,8 @@ impl fmt::Display for TipIntentId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct TipInvoiceDescription(String);
 
 impl TipInvoiceDescription {
@@ -126,18 +144,6 @@ impl TipInvoiceDescription {
     }
 }
 
-impl Serialize for TipInvoiceDescription {
-    fn serialize<Serializer>(
-        &self,
-        serializer: Serializer,
-    ) -> Result<Serializer::Ok, Serializer::Error>
-    where
-        Serializer: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
 impl<'de> Deserialize<'de> for TipInvoiceDescription {
     fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
     where
@@ -145,12 +151,6 @@ impl<'de> Deserialize<'de> for TipInvoiceDescription {
     {
         let value = String::deserialize(deserializer)?;
         Self::new(value).map_err(de::Error::custom)
-    }
-}
-
-impl fmt::Display for TipInvoiceDescription {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
     }
 }
 
@@ -173,14 +173,7 @@ impl TipCorrelationMarker {
     }
 }
 
-impl fmt::Debug for TipCorrelationMarker {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("TipCorrelationMarker")
-            .field(&"[REDACTED]")
-            .finish()
-    }
-}
+redacted_debug!(TipCorrelationMarker);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct Bolt11Invoice(ParsedBolt11Invoice);
@@ -202,41 +195,37 @@ impl Bolt11Invoice {
         self.0.to_string()
     }
 
-    pub const fn as_inner(&self) -> &ParsedBolt11Invoice {
-        &self.0
+    pub(crate) fn amount(&self) -> Result<SatoshiAmount, PaymentModelError> {
+        let amount_msats = self
+            .0
+            .amount_milli_satoshis()
+            .ok_or(PaymentModelError::InvoiceAmountMissing)?;
+        if amount_msats % 1_000 != 0 {
+            return Err(PaymentModelError::InvoiceAmountNotWholeSatoshis);
+        }
+        SatoshiAmount::new(amount_msats / 1_000)
+    }
+
+    pub(crate) fn payment_hash(&self) -> PaymentHash {
+        let mut payment_hash = [0_u8; 32];
+        payment_hash.copy_from_slice(self.0.payment_hash().as_ref());
+        PaymentHash::from_bytes(payment_hash)
+    }
+
+    pub(crate) fn expires_at(&self) -> Result<OffsetDateTime, PaymentModelError> {
+        self.0
+            .expires_at()
+            .ok_or(PaymentModelError::InvoiceExpiryOutOfRange)
+            .and_then(expiry_timestamp)
+    }
+
+    pub(crate) fn network(&self) -> LightningNetwork {
+        LightningNetwork::from_invoice(&self.0)
     }
 }
 
-impl fmt::Debug for Bolt11Invoice {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("Bolt11Invoice")
-            .field(&"[REDACTED]")
-            .finish()
-    }
-}
-
-impl Serialize for Bolt11Invoice {
-    fn serialize<Serializer>(
-        &self,
-        serializer: Serializer,
-    ) -> Result<Serializer::Ok, Serializer::Error>
-    where
-        Serializer: serde::Serializer,
-    {
-        serializer.serialize_str(&self.encoded())
-    }
-}
-
-impl<'de> Deserialize<'de> for Bolt11Invoice {
-    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
-    where
-        Deserializer: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(de::Error::custom)
-    }
-}
+redacted_debug!(Bolt11Invoice);
+validated_string_serde!(Bolt11Invoice, encoded, parse);
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct PaymentHash([u8; 32]);
@@ -262,10 +251,6 @@ impl PaymentHash {
         Ok(Self(decoded))
     }
 
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
     pub fn encoded(&self) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut encoded = String::with_capacity(64);
@@ -277,36 +262,8 @@ impl PaymentHash {
     }
 }
 
-impl fmt::Debug for PaymentHash {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("PaymentHash")
-            .field(&"[REDACTED]")
-            .finish()
-    }
-}
-
-impl Serialize for PaymentHash {
-    fn serialize<Serializer>(
-        &self,
-        serializer: Serializer,
-    ) -> Result<Serializer::Ok, Serializer::Error>
-    where
-        Serializer: serde::Serializer,
-    {
-        serializer.serialize_str(&self.encoded())
-    }
-}
-
-impl<'de> Deserialize<'de> for PaymentHash {
-    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
-    where
-        Deserializer: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(de::Error::custom)
-    }
-}
+redacted_debug!(PaymentHash);
+validated_string_serde!(PaymentHash, encoded, parse);
 
 fn decode_hex_digit(value: u8) -> Option<u8> {
     match value {
@@ -338,14 +295,7 @@ impl ProviderPaymentLocator {
     }
 }
 
-impl fmt::Debug for ProviderPaymentLocator {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("ProviderPaymentLocator")
-            .field(&"[REDACTED]")
-            .finish()
-    }
-}
+redacted_debug!(ProviderPaymentLocator);
 
 impl<'de> Deserialize<'de> for ProviderPaymentLocator {
     fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
@@ -447,7 +397,7 @@ fn ensure_maximum_length(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct SatoshiAmount(NonZeroU64);
 
@@ -460,15 +410,6 @@ impl SatoshiAmount {
 
     pub const fn get(self) -> u64 {
         self.0.get()
-    }
-}
-
-impl<'de> Deserialize<'de> for SatoshiAmount {
-    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
-    where
-        Deserializer: serde::Deserializer<'de>,
-    {
-        Self::new(u64::deserialize(deserializer)?).map_err(de::Error::custom)
     }
 }
 
@@ -553,10 +494,10 @@ impl ProviderPaymentReference {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CreateTipInvoiceRequest {
-    intent_id: TipIntentId,
+    pub intent_id: TipIntentId,
     #[serde(rename = "amount_sats")]
-    amount: SatoshiAmount,
-    description: TipInvoiceDescription,
+    pub amount: SatoshiAmount,
+    pub description: TipInvoiceDescription,
 }
 
 impl CreateTipInvoiceRequest {
@@ -572,18 +513,6 @@ impl CreateTipInvoiceRequest {
         }
     }
 
-    pub const fn intent_id(&self) -> TipIntentId {
-        self.intent_id
-    }
-
-    pub const fn amount(&self) -> SatoshiAmount {
-        self.amount
-    }
-
-    pub const fn description(&self) -> &TipInvoiceDescription {
-        &self.description
-    }
-
     pub(crate) fn correlation_marker(&self) -> TipCorrelationMarker {
         TipCorrelationMarker::for_intent(self.intent_id)
     }
@@ -595,15 +524,15 @@ impl CreateTipInvoiceRequest {
 /// identity and opaque locator never enter a public response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TipInvoice {
-    invoice: Bolt11Invoice,
-    intent_id: TipIntentId,
-    network: LightningNetwork,
+    pub(crate) invoice: Bolt11Invoice,
+    pub(crate) intent_id: TipIntentId,
+    pub(crate) network: LightningNetwork,
     #[serde(rename = "amount_sats")]
-    amount: SatoshiAmount,
-    payment_hash: PaymentHash,
+    pub(crate) amount: SatoshiAmount,
+    pub(crate) payment_hash: PaymentHash,
     #[serde(with = "time::serde::rfc3339")]
-    expires_at: OffsetDateTime,
-    payment: ProviderPaymentReference,
+    pub(crate) expires_at: OffsetDateTime,
+    pub(crate) payment: ProviderPaymentReference,
 }
 
 impl TipInvoice {
@@ -648,36 +577,23 @@ impl TipInvoice {
         request: CreateTipInvoiceRequest,
         payment: ProviderPaymentReference,
     ) -> Result<Self, PaymentModelError> {
-        let amount_msats = invoice
-            .as_inner()
-            .amount_milli_satoshis()
-            .ok_or(PaymentModelError::InvoiceAmountMissing)?;
-        if amount_msats % 1_000 != 0 {
-            return Err(PaymentModelError::InvoiceAmountNotWholeSatoshis);
-        }
-        let amount = SatoshiAmount::new(amount_msats / 1_000)?;
-        if amount != request.amount() {
+        let amount = invoice.amount()?;
+        if amount != request.amount {
             return Err(PaymentModelError::InvoiceAmountMismatch);
         }
 
         let actual_description = invoice_description(&invoice)?;
-        if actual_description != *request.description() {
+        if actual_description != request.description {
             return Err(PaymentModelError::InvoiceDescriptionMismatch);
         }
 
-        let mut payment_hash_bytes = [0_u8; 32];
-        payment_hash_bytes.copy_from_slice(invoice.as_inner().payment_hash().as_ref());
-        let payment_hash = PaymentHash::from_bytes(payment_hash_bytes);
-        let expires_at = invoice
-            .as_inner()
-            .expires_at()
-            .ok_or(PaymentModelError::InvoiceExpiryOutOfRange)
-            .and_then(expiry_timestamp)?;
-        let network = LightningNetwork::from_invoice(invoice.as_inner());
+        let payment_hash = invoice.payment_hash();
+        let expires_at = invoice.expires_at()?;
+        let network = invoice.network();
 
         Ok(Self {
             invoice,
-            intent_id: request.intent_id(),
+            intent_id: request.intent_id,
             network,
             amount,
             payment_hash,
@@ -686,38 +602,10 @@ impl TipInvoice {
         })
     }
 
-    pub const fn invoice(&self) -> &Bolt11Invoice {
-        &self.invoice
-    }
-
-    pub const fn intent_id(&self) -> TipIntentId {
-        self.intent_id
-    }
-
-    pub const fn network(&self) -> LightningNetwork {
-        self.network
-    }
-
-    pub const fn amount(&self) -> SatoshiAmount {
-        self.amount
-    }
-
-    pub const fn payment_hash(&self) -> &PaymentHash {
-        &self.payment_hash
-    }
-
-    pub const fn expires_at(&self) -> OffsetDateTime {
-        self.expires_at
-    }
-
-    pub const fn payment(&self) -> &ProviderPaymentReference {
-        &self.payment
-    }
-
     pub(crate) fn matches_request(&self, request: &CreateTipInvoiceRequest) -> bool {
-        self.intent_id == request.intent_id()
-            && self.amount == request.amount()
-            && invoice_description(&self.invoice).as_ref() == Ok(request.description())
+        self.intent_id == request.intent_id
+            && self.amount == request.amount
+            && invoice_description(&self.invoice).as_ref() == Ok(&request.description)
     }
 
     pub fn view(&self) -> TipInvoiceView {
@@ -732,7 +620,7 @@ impl TipInvoice {
 fn invoice_description(
     invoice: &Bolt11Invoice,
 ) -> Result<TipInvoiceDescription, PaymentModelError> {
-    match invoice.as_inner().description() {
+    match invoice.0.description() {
         Bolt11InvoiceDescriptionRef::Direct(description) => {
             TipInvoiceDescription::new(description.to_string())
         }
@@ -787,35 +675,21 @@ fn expiry_timestamp(expiry: std::time::Duration) -> Result<OffsetDateTime, Payme
 /// HTTP handlers must serialize this type rather than [`TipInvoice`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TipInvoiceView {
-    invoice: Bolt11Invoice,
+    pub invoice: Bolt11Invoice,
     #[serde(rename = "amount_sats")]
-    amount: SatoshiAmount,
+    pub amount: SatoshiAmount,
     #[serde(with = "time::serde::rfc3339")]
-    expires_at: OffsetDateTime,
-}
-
-impl TipInvoiceView {
-    pub const fn invoice(&self) -> &Bolt11Invoice {
-        &self.invoice
-    }
-
-    pub const fn amount(&self) -> SatoshiAmount {
-        self.amount
-    }
-
-    pub const fn expires_at(&self) -> OffsetDateTime {
-        self.expires_at
-    }
+    pub expires_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ReconcilePaymentRequest {
-    payment: ProviderPaymentReference,
-    intent_id: TipIntentId,
-    invoice: Bolt11Invoice,
+    pub payment: ProviderPaymentReference,
+    pub intent_id: TipIntentId,
+    pub invoice: Bolt11Invoice,
     #[serde(rename = "amount_sats")]
-    amount: SatoshiAmount,
-    payment_hash: PaymentHash,
+    pub amount: SatoshiAmount,
+    pub payment_hash: PaymentHash,
 }
 
 impl ReconcilePaymentRequest {
@@ -835,36 +709,6 @@ impl ReconcilePaymentRequest {
         }
     }
 
-    pub fn for_invoice(invoice: &TipInvoice) -> Self {
-        Self::new(
-            invoice.payment().clone(),
-            invoice.intent_id(),
-            invoice.invoice().clone(),
-            invoice.amount(),
-            *invoice.payment_hash(),
-        )
-    }
-
-    pub const fn payment(&self) -> &ProviderPaymentReference {
-        &self.payment
-    }
-
-    pub const fn intent_id(&self) -> TipIntentId {
-        self.intent_id
-    }
-
-    pub const fn invoice(&self) -> &Bolt11Invoice {
-        &self.invoice
-    }
-
-    pub const fn amount(&self) -> SatoshiAmount {
-        self.amount
-    }
-
-    pub const fn payment_hash(&self) -> &PaymentHash {
-        &self.payment_hash
-    }
-
     pub(crate) fn correlation_marker(&self) -> TipCorrelationMarker {
         TipCorrelationMarker::for_intent(self.intent_id)
     }
@@ -874,16 +718,12 @@ impl ReconcilePaymentRequest {
 /// Requests the next catch-up page or live provider update after a durable
 /// cursor. `None` means a full oldest-first bootstrap.
 pub struct NextPaymentUpdatesRequest {
-    cursor: Option<ProviderUpdateCursor>,
+    pub cursor: Option<ProviderUpdateCursor>,
 }
 
 impl NextPaymentUpdatesRequest {
     pub const fn new(cursor: Option<ProviderUpdateCursor>) -> Self {
         Self { cursor }
-    }
-
-    pub const fn cursor(&self) -> Option<&ProviderUpdateCursor> {
-        self.cursor.as_ref()
     }
 }
 
@@ -933,15 +773,15 @@ impl ProviderPaymentUpdate {
         match self {
             Self::Tip(update) => update.next_cursor(),
             Self::TipRecoveryRequired(update) => update.next_cursor(),
-            Self::Ignored(update) => update.next_cursor(),
+            Self::Ignored(update) => &update.next_cursor,
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IgnoredProviderPaymentUpdate {
-    next_cursor: ProviderUpdateCursor,
-    reason: IgnoredPaymentUpdateReason,
+    pub next_cursor: ProviderUpdateCursor,
+    pub reason: IgnoredPaymentUpdateReason,
 }
 
 impl IgnoredProviderPaymentUpdate {
@@ -953,14 +793,6 @@ impl IgnoredProviderPaymentUpdate {
             next_cursor,
             reason,
         }
-    }
-
-    pub const fn next_cursor(&self) -> &ProviderUpdateCursor {
-        &self.next_cursor
-    }
-
-    pub const fn reason(&self) -> IgnoredPaymentUpdateReason {
-        self.reason
     }
 }
 
@@ -1080,12 +912,6 @@ pub enum InvoiceCreationReconciliation {
     Ambiguous,
 }
 
-impl InvoiceCreationReconciliation {
-    pub const fn requires_recovery(&self) -> bool {
-        matches!(self, Self::Missing | Self::Ambiguous)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TipSettlement {
     #[serde(rename = "amount_sats")]
@@ -1104,10 +930,6 @@ impl TipSettlement {
 
     pub const fn amount(&self) -> SatoshiAmount {
         self.amount
-    }
-
-    pub const fn settled_at(&self) -> OffsetDateTime {
-        self.settled_at
     }
 }
 
@@ -1147,21 +969,13 @@ pub enum ProviderPaymentState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderPaymentStatus {
-    payment: ProviderPaymentReference,
-    status: ProviderPaymentState,
+    pub payment: ProviderPaymentReference,
+    pub status: ProviderPaymentState,
 }
 
 impl ProviderPaymentStatus {
     pub const fn new(payment: ProviderPaymentReference, status: ProviderPaymentState) -> Self {
         Self { payment, status }
-    }
-
-    pub const fn payment(&self) -> &ProviderPaymentReference {
-        &self.payment
-    }
-
-    pub const fn status(&self) -> &ProviderPaymentState {
-        &self.status
     }
 }
 
@@ -1268,6 +1082,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::payments::test_support::{signed_direct_invoice, signed_direct_invoice_with};
 
     const TEST_INTENT_ID: &str = "2e776d7d-7d5f-4ab7-8c63-434c66a262aa";
     const TEST_INVOICE: &str = "lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh";
@@ -1324,7 +1139,7 @@ mod tests {
                 "description": "Tip"
             })
         );
-        assert_eq!(request.description().as_str(), "Tip");
+        assert_eq!(request.description.as_str(), "Tip");
         assert_eq!(
             request.correlation_marker().as_str(),
             "maincopy-tip:2e776d7d-7d5f-4ab7-8c63-434c66a262aa"
@@ -1347,7 +1162,7 @@ mod tests {
         let invoice = tip_invoice();
         let wire = serde_json::to_value(&invoice).unwrap();
 
-        assert_eq!(wire["invoice"], invoice.invoice().encoded());
+        assert_eq!(wire["invoice"], invoice.invoice.encoded());
         assert_eq!(wire["intent_id"], TEST_INTENT_ID);
         assert_eq!(wire["network"], "mainnet");
         assert_eq!(wire["amount_sats"], 250_000);
@@ -1382,16 +1197,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_ambiguous_creation_reconciliation_always_requires_recovery() {
-        assert!(InvoiceCreationReconciliation::Missing.requires_recovery());
-        assert!(InvoiceCreationReconciliation::Ambiguous.requires_recovery());
-        assert!(!InvoiceCreationReconciliation::Found(Box::new(tip_invoice())).requires_recovery());
-    }
-
-    #[test]
     fn returned_invoice_must_match_the_requested_amount() {
         let request = create_request();
-        let invoice = signed_direct_invoice(request.description().as_str(), 1);
+        let invoice = signed_direct_invoice(request.description.as_str(), 1);
 
         assert_eq!(
             validate_invoice(invoice, request).unwrap_err(),
@@ -1402,7 +1210,7 @@ mod tests {
     #[test]
     fn returned_invoice_must_contain_the_exact_public_description() {
         let request = create_request();
-        let invoice = signed_direct_invoice("wrong description", request.amount().get());
+        let invoice = signed_direct_invoice("wrong description", request.amount.get());
 
         assert_eq!(
             validate_invoice(invoice, request).unwrap_err(),
@@ -1413,7 +1221,7 @@ mod tests {
     #[test]
     fn returned_invoice_rejects_a_hashed_description() {
         let request = create_request();
-        let invoice = signed_hashed_invoice(request.amount().get());
+        let invoice = signed_hashed_invoice(request.amount.get());
 
         assert_eq!(
             validate_invoice(invoice, request).unwrap_err(),
@@ -1424,10 +1232,11 @@ mod tests {
     #[test]
     fn returned_invoice_must_match_the_expected_network() {
         let request = create_request();
-        let invoice = signed_direct_invoice_on(
+        let invoice = signed_direct_invoice_with(
             Currency::BitcoinTestnet,
-            request.description().as_str(),
-            request.amount().get(),
+            request.description.as_str(),
+            request.amount.get(),
+            Duration::from_secs(3_600),
         );
 
         assert_eq!(
@@ -1442,7 +1251,7 @@ mod tests {
     #[test]
     fn returned_invoice_must_be_unexpired_at_validation_time() {
         let request = create_request();
-        let invoice = signed_direct_invoice(request.description().as_str(), request.amount().get());
+        let invoice = signed_direct_invoice(request.description.as_str(), request.amount.get());
         let after_default_expiry = OffsetDateTime::from_unix_timestamp(1_700_003_601).unwrap();
 
         assert_eq!(
@@ -1461,7 +1270,7 @@ mod tests {
     #[test]
     fn reconciled_invoice_can_be_historical_after_its_expiry() {
         let request = create_request();
-        let invoice = signed_direct_invoice(request.description().as_str(), request.amount().get());
+        let invoice = signed_direct_invoice(request.description.as_str(), request.amount.get());
 
         assert!(
             TipInvoice::try_from_reconciled_invoice(
@@ -1594,7 +1403,7 @@ mod tests {
     fn tip_invoice() -> TipInvoice {
         let request = create_request();
         validate_invoice(
-            signed_direct_invoice(request.description().as_str(), request.amount().get()),
+            signed_direct_invoice(request.description.as_str(), request.amount.get()),
             request,
         )
         .unwrap()
@@ -1611,31 +1420,6 @@ mod tests {
             OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
             payment_reference(),
         )
-    }
-
-    fn signed_direct_invoice(description: &str, amount_sats: u64) -> Bolt11Invoice {
-        signed_direct_invoice_on(Currency::Bitcoin, description, amount_sats)
-    }
-
-    fn signed_direct_invoice_on(
-        currency: Currency,
-        description: &str,
-        amount_sats: u64,
-    ) -> Bolt11Invoice {
-        let payment_hash = sha256::Hash::from_byte_array([1; 32]);
-        let private_key = SecretKey::from_slice(&[42; 32]).unwrap();
-        let secp = Secp256k1::new();
-        let invoice = InvoiceBuilder::new(currency)
-            .amount_milli_satoshis(amount_sats * 1_000)
-            .duration_since_epoch(Duration::from_secs(1_700_000_000))
-            .description(description.to_owned())
-            .payment_hash(payment_hash)
-            .payment_secret(PaymentSecret([42; 32]))
-            .min_final_cltv_expiry_delta(18)
-            .build_signed(|message| secp.sign_ecdsa_recoverable(message, &private_key))
-            .unwrap();
-
-        Bolt11Invoice::parse(&invoice.to_string()).unwrap()
     }
 
     fn signed_hashed_invoice(amount_sats: u64) -> Bolt11Invoice {

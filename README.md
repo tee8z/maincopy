@@ -40,6 +40,8 @@ construction.
 - [DESIGN.md](DESIGN.md) defines system behavior and trust boundaries.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) defines the delivery order and exit
   criteria.
+- [QUALITY.md](QUALITY.md) defines the reproducible Bash-only CRAP measurement
+  and the required score budget.
 
 ## Development environment
 

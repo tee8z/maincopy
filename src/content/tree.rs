@@ -28,110 +28,61 @@ const DEFAULT_ENTRIES: usize = 10_000;
 const DEFAULT_DEPTH: usize = 16;
 const DEFAULT_PATH_BYTES: usize = 1_024;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct ContentFileByteLimit(NonZeroU64);
+macro_rules! content_u64_limit {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(NonZeroU64);
 
-impl ContentFileByteLimit {
-    pub const fn new(value: u64) -> Option<Self> {
-        match NonZeroU64::new(value) {
-            Some(value) if value.get() < u64::MAX => Some(Self(value)),
-            _ => None,
+        impl $name {
+            pub const fn new(value: u64) -> Option<Self> {
+                match NonZeroU64::new(value) {
+                    Some(value) if value.get() < u64::MAX => Some(Self(value)),
+                    _ => None,
+                }
+            }
+
+            pub const fn get(self) -> u64 {
+                self.0.get()
+            }
+
+            fn default_value(value: u64) -> Self {
+                Self(NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN))
+            }
         }
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
-
-    fn default_value(value: u64) -> Self {
-        Self(NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN))
-    }
+    };
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct ContentTreeByteLimit(NonZeroU64);
+macro_rules! content_usize_limit {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(NonZeroUsize);
 
-impl ContentTreeByteLimit {
-    pub const fn new(value: u64) -> Option<Self> {
-        match NonZeroU64::new(value) {
-            Some(value) if value.get() < u64::MAX => Some(Self(value)),
-            _ => None,
+        impl $name {
+            pub const fn new(value: usize) -> Option<Self> {
+                match NonZeroUsize::new(value) {
+                    Some(value) => Some(Self(value)),
+                    None => None,
+                }
+            }
+
+            pub const fn get(self) -> usize {
+                self.0.get()
+            }
+
+            fn default_value(value: usize) -> Self {
+                Self(NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN))
+            }
         }
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
-
-    fn default_value(value: u64) -> Self {
-        Self(NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN))
-    }
+    };
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct ContentEntryLimit(NonZeroUsize);
-
-impl ContentEntryLimit {
-    pub const fn new(value: usize) -> Option<Self> {
-        match NonZeroUsize::new(value) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-
-    fn default_value(value: usize) -> Self {
-        Self(NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct ContentDepthLimit(NonZeroUsize);
-
-impl ContentDepthLimit {
-    pub const fn new(value: usize) -> Option<Self> {
-        match NonZeroUsize::new(value) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-
-    fn default_value(value: usize) -> Self {
-        Self(NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct ContentPathByteLimit(NonZeroUsize);
-
-impl ContentPathByteLimit {
-    pub const fn new(value: usize) -> Option<Self> {
-        match NonZeroUsize::new(value) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-
-    fn default_value(value: usize) -> Self {
-        Self(NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN))
-    }
-}
+content_u64_limit!(ContentFileByteLimit);
+content_u64_limit!(ContentTreeByteLimit);
+content_usize_limit!(ContentEntryLimit);
+content_usize_limit!(ContentDepthLimit);
+content_usize_limit!(ContentPathByteLimit);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ContentTreeLimits {
@@ -226,16 +177,6 @@ impl Default for ContentTreeLimits {
 #[error("each file limit must not exceed the complete tree limit")]
 pub struct ContentTreeLimitsError;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct ContentByteCount(u64);
-
-impl ContentByteCount {
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredPublication {
     path: LogicalContentPath,
@@ -273,7 +214,11 @@ impl DiscoveredPost {
     }
 
     fn as_post_source(&self) -> PostSource<'_> {
-        PostSource::in_collection(self.path.as_str(), self.source(), self.collection)
+        PostSource {
+            path: self.path.clone(),
+            contents: self.source(),
+            collection: self.collection,
+        }
     }
 }
 
@@ -302,7 +247,7 @@ pub struct DiscoveredContentTree {
     publication: DiscoveredPublication,
     posts: Vec<DiscoveredPost>,
     assets: Vec<DiscoveredAsset>,
-    total_bytes: ContentByteCount,
+    total_bytes: u64,
 }
 
 impl DiscoveredContentTree {
@@ -318,7 +263,7 @@ impl DiscoveredContentTree {
         &self.assets
     }
 
-    pub const fn total_bytes(&self) -> ContentByteCount {
+    pub const fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
 
@@ -339,7 +284,7 @@ impl DiscoveredContentTree {
             publication,
             posts,
             assets,
-            total_bytes: ContentByteCount(total_bytes),
+            total_bytes,
         }
     }
 }

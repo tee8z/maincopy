@@ -1,16 +1,12 @@
 use axum::http::StatusCode;
-use maincopy::admin::{AdminState, admin_router};
+use maincopy::admin::admin_router;
 use serde_json::json;
 
 use crate::helpers::{get, json_body};
 
 #[tokio::test]
 async fn admin_openapi_is_generated_from_typed_contracts() {
-    let response = get(
-        admin_router(AdminState::new()),
-        "/api/admin/v1/openapi.json",
-    )
-    .await;
+    let response = get(admin_router(), "/api/admin/v1/openapi.json").await;
 
     assert_eq!(response.status(), StatusCode::OK);
 

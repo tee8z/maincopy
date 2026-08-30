@@ -228,9 +228,10 @@ Subscriptions and tips are disabled when their sections are absent. An enabled
 subscription requires a privacy-policy revision. Enabled tips require positive
 minimum and maximum amounts, and the minimum cannot exceed the maximum.
 
-Renderer policy is not authored configuration in v1. The compiler uses typed,
-versioned renderer settings. V1 disables raw HTML, escapes plain code blocks,
-and emits a typed Mermaid placeholder until Slice 6 selects the renderer.
+Renderer policy is not authored configuration in v1. The compiler hashes
+frozen policy and implementation-version tags into each renderer identity. V1
+disables raw HTML, escapes plain code blocks, and emits a typed Mermaid
+placeholder until Slice 6 selects the renderer.
 
 `favicon` can also be an absolute HTTPS URL from an allowed origin. A post can
 use a local asset or an absolute HTTPS URL from the same allowlist for its
@@ -308,7 +309,9 @@ line. A relative path from the host file is relative to that file's parent. A
 relative command-line path is relative to the process working directory.
 Built-in root paths are also relative to the process working directory.
 Derived admin and database paths follow the effective runtime and state roots.
-There is no general environment-variable overlay. Command-line arguments can
+There is no general environment-variable overlay. `RUST_LOG` is the only
+operational environment input and selects the process log level. Command-line
+arguments can
 override only the documented host paths, listener, database, and content-tree
 limits. Lightning provider selection and provider settings stay in the host
 file. Secrets and secret references never come from the command line.
@@ -371,12 +374,38 @@ the source of payment truth. An SDK cache can improve local queries, but it is
 non-authoritative, can be deleted, and is not part of Maincopy's Litestream
 backup contract.
 
-Generic secret-reference primitives represent tagged file and environment
-references and redact both forms. The effective v1 Lexe configuration accepts
-only `{ source = "file", path = "..." }`. The provider resolves that file
-explicitly at provider startup. It rejects an environment reference and does
-not expose the variable name or secret path in diagnostics. V1 has no ambient
-environment overlay, secret-manager adapter, or command-line secret input.
+The host parser recognizes tagged file and environment reference syntax. The
+effective v1 Lexe configuration accepts only
+`{ source = "file", path = "..." }`. A valid environment reference returns the
+stable file-only diagnostic. A malformed reference returns the stable invalid
+reference diagnostic. Neither diagnostic exposes the variable name or path.
+V1 has no environment overlay, secret-manager adapter, or command-line secret
+input.
+
+This slice stores only a redacted file reference. Provider composition does not
+open the credential file yet. Future composition code must not follow the final
+symlink. It must validate owner and mode on the opened descriptor. It then
+passes the secured reader to the crate-private loading boundary.
+
+The reader accepts at most 64 KiB. It reads into one fixed `Box<[u8]>`
+allocation. One extra byte detects oversized input. The callback receives only
+a scoped byte slice. The type has no clone, serialization, formatting,
+dereference, slice conversion, or value-extraction API.
+
+Maincopy wipes the complete allocation after normal return, callback failure,
+or panic unwinding. Read errors and oversized input use the same drop path. The
+scoped callback cannot return a borrow, but callback code can deliberately copy
+the bytes.
+
+WARNING: The guarantee applies only to the raw allocation that Maincopy owns.
+Lexe 0.1.22 creates ordinary `Vec` and `String` values during parsing. Its
+`ClientCredentials` type also implements `Clone` and `Serialize`. Maincopy
+cannot guarantee zeroization inside that SDK.
+
+Maincopy keeps the production Lexe provider constructor private. Startup cannot
+construct the provider runtime. Do not expose the constructor or connect
+startup until the SDK boundary is safe. An upstream change, a local fork, or an
+equivalent zeroizing adapter must close the boundary first.
 
 Startup loads the host file first. It then discovers and validates one pinned
 content-tree candidate with the effective content root and limits. The
@@ -392,9 +421,9 @@ configured and `[lightning]` is absent, startup returns the stable
 
 Maincopy validates the complete effective configuration before it opens a
 listener. A syntactically invalid or internally inconsistent host
-configuration fails startup. Failure to load, authenticate, or authorize an
-enabled Lexe credential fails the optional tip subsystem closed and keeps its
-readiness false; it does not prevent the core article listener from starting.
+configuration fails startup. A future safe Lexe integration must fail the
+optional tip subsystem closed after a credential failure. The core article
+listener must continue to start, and tip readiness must remain false.
 
 ## Content contract
 
@@ -637,10 +666,11 @@ rejects linked, special, replaced, and multiply hard-linked output paths.
 | Normalized logical path | 1,024 bytes |
 | One path segment | 255 bytes |
 
-The generated `FrontendAssetManifest` contains typed `CssAsset` and optional
-`JavaScriptAsset` values. Each value contains typed asset identity, MIME type,
-content digest, immutable public path, and embedded bytes. Runtime code uses
-the manifest instead of constructing filenames or MIME types from strings.
+The generated `FrontendAssetManifest` contains one required CSS
+`FrontendAsset` and one optional JavaScript `FrontendAsset`. Each opaque asset
+contains its kind, name, content digest, immutable public path, and embedded
+bytes. Runtime code uses the manifest instead of constructing filenames or
+MIME types from strings.
 
 The binary embeds the generated bundles and serves them from
 `/app-assets/{bundle-digest}/{name}`. The bundle digest uses the full
@@ -663,8 +693,8 @@ Each post revision receives a BLAKE3 digest. The digest includes:
 - normalized frontmatter;
 - the Markdown source;
 - referenced asset paths and digests;
-- effective renderer settings;
-- versioned renderer and sanitizer implementation identities;
+- frozen renderer-policy tags;
+- renderer and sanitizer implementation-version tags;
 - digests of deterministic rendered article fragments and generated asset
   bytes before snapshot-URL injection; and
 - effective distribution settings.
@@ -923,10 +953,11 @@ time, and concurrency limits. Maincopy sanitizes the resulting SVG before use.
 The Mermaid implementation remains an implementation spike. V1 cannot release
 until a representative fixture corpus passes.
 
-`PostRendererVersion::V1` identifies the exact CommonMark parser, event policy,
-and HTML serializer above. `SanitizerVersion::V1` identifies the raw-HTML and
-destination policy. An output-affecting policy change requires an explicit
-identity-version review before a golden output changes.
+The frozen renderer-policy tags identify the CommonMark, raw-HTML, code, and
+Mermaid policies. `POST_RENDERER_VERSION_TAG` identifies the exact renderer
+implementation. `SANITIZER_VERSION_TAG` identifies the raw-HTML and destination
+implementation. An output-affecting change requires review of the corresponding
+frozen tag before a golden output changes.
 
 ## Public web contract
 

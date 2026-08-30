@@ -15,7 +15,7 @@ pub enum DistributionTarget {
 }
 
 impl DistributionTarget {
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::X => "x",
         }
@@ -102,13 +102,12 @@ pub(crate) fn target_idempotency_key(
     let stable_post_id = stable_post_id.as_str();
     let revision_digest = revision_digest.as_str();
     let target = target.as_str();
-    TargetIdempotencyKey(
-        [stable_post_id, revision_digest, target]
-            .into_iter()
-            .map(|part| format!("{}:{part}", part.len()))
-            .collect::<Vec<_>>()
-            .join("|"),
-    )
+    TargetIdempotencyKey(format!(
+        "{}:{stable_post_id}|{}:{revision_digest}|{}:{target}",
+        stable_post_id.len(),
+        revision_digest.len(),
+        target.len(),
+    ))
 }
 
 #[cfg(test)]

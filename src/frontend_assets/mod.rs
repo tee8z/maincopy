@@ -14,66 +14,48 @@ pub use crate::frontend_digest_contract::{
 };
 
 const DIGEST_HEX_LENGTH: usize = 64;
+pub const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
-impl Serialize for FrontendAssetKind {
-    fn serialize<SerializerType>(
-        &self,
-        serializer: SerializerType,
-    ) -> Result<SerializerType::Ok, SerializerType::Error>
-    where
-        SerializerType: Serializer,
-    {
-        serializer.serialize_str(match self {
-            Self::Css => "css",
-            Self::JavaScript => "java_script",
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for FrontendAssetKind {
-    fn deserialize<DeserializerType>(
-        deserializer: DeserializerType,
-    ) -> Result<Self, DeserializerType::Error>
-    where
-        DeserializerType: Deserializer<'de>,
-    {
-        match String::deserialize(deserializer)?.as_str() {
-            "css" => Ok(Self::Css),
-            "java_script" => Ok(Self::JavaScript),
-            _ => Err(de::Error::custom("frontend asset kind is not recognized")),
+macro_rules! frontend_enum_serde {
+    ($enum:ident, $error:literal, { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        impl Serialize for $enum {
+            fn serialize<SerializerType>(
+                &self,
+                serializer: SerializerType,
+            ) -> Result<SerializerType::Ok, SerializerType::Error>
+            where
+                SerializerType: Serializer,
+            {
+                serializer.serialize_str(match self {
+                    $(Self::$variant => $wire),+
+                })
+            }
         }
-    }
-}
 
-impl Serialize for FrontendAssetName {
-    fn serialize<SerializerType>(
-        &self,
-        serializer: SerializerType,
-    ) -> Result<SerializerType::Ok, SerializerType::Error>
-    where
-        SerializerType: Serializer,
-    {
-        serializer.serialize_str(match self {
-            Self::Stylesheet => "stylesheet",
-            Self::JavaScript => "java_script",
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for FrontendAssetName {
-    fn deserialize<DeserializerType>(
-        deserializer: DeserializerType,
-    ) -> Result<Self, DeserializerType::Error>
-    where
-        DeserializerType: Deserializer<'de>,
-    {
-        match String::deserialize(deserializer)?.as_str() {
-            "stylesheet" => Ok(Self::Stylesheet),
-            "java_script" => Ok(Self::JavaScript),
-            _ => Err(de::Error::custom("frontend asset name is not recognized")),
+        impl<'de> Deserialize<'de> for $enum {
+            fn deserialize<DeserializerType>(
+                deserializer: DeserializerType,
+            ) -> Result<Self, DeserializerType::Error>
+            where
+                DeserializerType: Deserializer<'de>,
+            {
+                match String::deserialize(deserializer)?.as_str() {
+                    $($wire => Ok(Self::$variant)),+,
+                    _ => Err(de::Error::custom($error)),
+                }
+            }
         }
-    }
+    };
 }
+
+frontend_enum_serde!(FrontendAssetKind, "frontend asset kind is not recognized", {
+    Css => "css",
+    JavaScript => "java_script",
+});
+frontend_enum_serde!(FrontendAssetName, "frontend asset name is not recognized", {
+    Stylesheet => "stylesheet",
+    JavaScript => "java_script",
+});
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,117 +86,70 @@ pub enum FrontendDigestParseError {
     InvalidEncoding { kind: FrontendDigestKind },
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FrontendBundleDigest([u8; 32]);
+macro_rules! frontend_digest {
+    ($digest:ident, $kind:ident, $prefix:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $digest([u8; 32]);
 
-impl FrontendBundleDigest {
-    const fn from_generated(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
+        impl $digest {
+            const fn from_generated(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
 
-    pub fn parse(value: &str) -> Result<Self, FrontendDigestParseError> {
-        parse_digest(value, FrontendDigestKind::Bundle).map(Self)
-    }
+            pub fn parse(value: &str) -> Result<Self, FrontendDigestParseError> {
+                parse_digest(value, FrontendDigestKind::$kind).map(Self)
+            }
 
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
+            pub const fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $digest {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                format_digest($prefix, &self.0, formatter)
+            }
+        }
+
+        impl FromStr for $digest {
+            type Err = FrontendDigestParseError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse(value)
+            }
+        }
+
+        impl Serialize for $digest {
+            fn serialize<SerializerType>(
+                &self,
+                serializer: SerializerType,
+            ) -> Result<SerializerType::Ok, SerializerType::Error>
+            where
+                SerializerType: Serializer,
+            {
+                serializer.collect_str(self)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $digest {
+            fn deserialize<DeserializerType>(
+                deserializer: DeserializerType,
+            ) -> Result<Self, DeserializerType::Error>
+            where
+                DeserializerType: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(&value).map_err(de::Error::custom)
+            }
+        }
+    };
 }
 
-impl fmt::Display for FrontendBundleDigest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        format_digest(FRONTEND_BUNDLE_PREFIX, &self.0, formatter)
-    }
-}
+frontend_digest!(FrontendBundleDigest, Bundle, FRONTEND_BUNDLE_PREFIX);
+frontend_digest!(FrontendAssetDigest, Asset, FRONTEND_ASSET_PREFIX);
 
-impl FromStr for FrontendBundleDigest {
-    type Err = FrontendDigestParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
-impl Serialize for FrontendBundleDigest {
-    fn serialize<SerializerType>(
-        &self,
-        serializer: SerializerType,
-    ) -> Result<SerializerType::Ok, SerializerType::Error>
-    where
-        SerializerType: Serializer,
-    {
-        serializer.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for FrontendBundleDigest {
-    fn deserialize<DeserializerType>(
-        deserializer: DeserializerType,
-    ) -> Result<Self, DeserializerType::Error>
-    where
-        DeserializerType: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(de::Error::custom)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FrontendAssetDigest([u8; 32]);
-
-impl FrontendAssetDigest {
-    const fn from_generated(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn parse(value: &str) -> Result<Self, FrontendDigestParseError> {
-        parse_digest(value, FrontendDigestKind::Asset).map(Self)
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl fmt::Display for FrontendAssetDigest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        format_digest(FRONTEND_ASSET_PREFIX, &self.0, formatter)
-    }
-}
-
-impl FromStr for FrontendAssetDigest {
-    type Err = FrontendDigestParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
-impl Serialize for FrontendAssetDigest {
-    fn serialize<SerializerType>(
-        &self,
-        serializer: SerializerType,
-    ) -> Result<SerializerType::Ok, SerializerType::Error>
-    where
-        SerializerType: Serializer,
-    {
-        serializer.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for FrontendAssetDigest {
-    fn deserialize<DeserializerType>(
-        deserializer: DeserializerType,
-    ) -> Result<Self, DeserializerType::Error>
-    where
-        DeserializerType: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(de::Error::custom)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct FrontendAssetPath(&'static str);
 
 impl FrontendAssetPath {
@@ -227,89 +162,23 @@ impl FrontendAssetPath {
     }
 }
 
-impl fmt::Display for FrontendAssetPath {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.0)
-    }
-}
-
-impl Serialize for FrontendAssetPath {
-    fn serialize<SerializerType>(
-        &self,
-        serializer: SerializerType,
-    ) -> Result<SerializerType::Ok, SerializerType::Error>
-    where
-        SerializerType: Serializer,
-    {
-        serializer.serialize_str(self.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FrontendAssetMime {
-    Css,
-    JavaScript,
-}
-
-impl FrontendAssetMime {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Css => "text/css; charset=utf-8",
-            Self::JavaScript => "text/javascript; charset=utf-8",
-        }
-    }
-}
-
-impl fmt::Display for FrontendAssetMime {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FrontendCachePolicy {
-    Immutable,
-}
-
-impl FrontendCachePolicy {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Immutable => "public, max-age=31536000, immutable",
-        }
-    }
-}
-
-impl fmt::Display for FrontendCachePolicy {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FrontendAssetEtag(FrontendAssetDigest);
-
-impl fmt::Display for FrontendAssetEtag {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "\"{}\"", self.0)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CssAsset {
+pub struct FrontendAsset {
+    kind: FrontendAssetKind,
     digest: FrontendAssetDigest,
     public_path: FrontendAssetPath,
     bytes: &'static [u8],
 }
 
-impl CssAsset {
+impl FrontendAsset {
     const fn from_generated(
+        kind: FrontendAssetKind,
         digest: FrontendAssetDigest,
         public_path: FrontendAssetPath,
         bytes: &'static [u8],
     ) -> Self {
         Self {
+            kind,
             digest,
             public_path,
             bytes,
@@ -317,11 +186,14 @@ impl CssAsset {
     }
 
     pub const fn name(&self) -> FrontendAssetName {
-        FrontendAssetName::Stylesheet
+        match self.kind {
+            FrontendAssetKind::Css => FrontendAssetName::Stylesheet,
+            FrontendAssetKind::JavaScript => FrontendAssetName::JavaScript,
+        }
     }
 
     pub const fn kind(&self) -> FrontendAssetKind {
-        FrontendAssetKind::Css
+        self.kind
     }
 
     pub const fn digest(&self) -> &FrontendAssetDigest {
@@ -332,140 +204,34 @@ impl CssAsset {
         &self.public_path
     }
 
-    pub const fn mime(&self) -> FrontendAssetMime {
-        FrontendAssetMime::Css
+    pub const fn mime(&self) -> &'static str {
+        match self.kind {
+            FrontendAssetKind::Css => "text/css; charset=utf-8",
+            FrontendAssetKind::JavaScript => "text/javascript; charset=utf-8",
+        }
     }
 
-    pub const fn cache_policy(&self) -> FrontendCachePolicy {
-        FrontendCachePolicy::Immutable
-    }
-
-    pub const fn etag(&self) -> FrontendAssetEtag {
-        FrontendAssetEtag(self.digest)
+    pub fn etag(&self) -> String {
+        format!("\"{}\"", self.digest)
     }
 
     pub const fn bytes(&self) -> &'static [u8] {
         self.bytes
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct JavaScriptAsset {
-    digest: FrontendAssetDigest,
-    public_path: FrontendAssetPath,
-    bytes: &'static [u8],
-}
-
-impl JavaScriptAsset {
-    pub const fn name(&self) -> FrontendAssetName {
-        FrontendAssetName::JavaScript
-    }
-
-    pub const fn kind(&self) -> FrontendAssetKind {
-        FrontendAssetKind::JavaScript
-    }
-
-    pub const fn digest(&self) -> &FrontendAssetDigest {
-        &self.digest
-    }
-
-    pub const fn public_path(&self) -> &FrontendAssetPath {
-        &self.public_path
-    }
-
-    pub const fn mime(&self) -> FrontendAssetMime {
-        FrontendAssetMime::JavaScript
-    }
-
-    pub const fn cache_policy(&self) -> FrontendCachePolicy {
-        FrontendCachePolicy::Immutable
-    }
-
-    pub const fn etag(&self) -> FrontendAssetEtag {
-        FrontendAssetEtag(self.digest)
-    }
-
-    pub const fn bytes(&self) -> &'static [u8] {
-        self.bytes
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FrontendAsset<'asset> {
-    Css(&'asset CssAsset),
-    JavaScript(&'asset JavaScriptAsset),
-}
-
-impl<'asset> FrontendAsset<'asset> {
-    pub const fn name(self) -> FrontendAssetName {
-        match self {
-            Self::Css(asset) => asset.name(),
-            Self::JavaScript(asset) => asset.name(),
-        }
-    }
-
-    pub const fn kind(self) -> FrontendAssetKind {
-        match self {
-            Self::Css(asset) => asset.kind(),
-            Self::JavaScript(asset) => asset.kind(),
-        }
-    }
-
-    pub const fn digest(self) -> &'asset FrontendAssetDigest {
-        match self {
-            Self::Css(asset) => asset.digest(),
-            Self::JavaScript(asset) => asset.digest(),
-        }
-    }
-
-    pub const fn public_path(self) -> &'asset FrontendAssetPath {
-        match self {
-            Self::Css(asset) => asset.public_path(),
-            Self::JavaScript(asset) => asset.public_path(),
-        }
-    }
-
-    pub const fn mime(self) -> FrontendAssetMime {
-        match self {
-            Self::Css(asset) => asset.mime(),
-            Self::JavaScript(asset) => asset.mime(),
-        }
-    }
-
-    pub const fn cache_policy(self) -> FrontendCachePolicy {
-        match self {
-            Self::Css(asset) => asset.cache_policy(),
-            Self::JavaScript(asset) => asset.cache_policy(),
-        }
-    }
-
-    pub const fn etag(self) -> FrontendAssetEtag {
-        match self {
-            Self::Css(asset) => asset.etag(),
-            Self::JavaScript(asset) => asset.etag(),
-        }
-    }
-
-    pub const fn bytes(self) -> &'asset [u8] {
-        match self {
-            Self::Css(asset) => asset.bytes(),
-            Self::JavaScript(asset) => asset.bytes(),
-        }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrontendAssetManifest {
     bundle_digest: FrontendBundleDigest,
-    css: CssAsset,
-    javascript: Option<JavaScriptAsset>,
+    css: FrontendAsset,
+    javascript: Option<FrontendAsset>,
 }
 
 impl FrontendAssetManifest {
     const fn from_generated(
         bundle_digest: FrontendBundleDigest,
-        css: CssAsset,
-        javascript: Option<JavaScriptAsset>,
+        css: FrontendAsset,
+        javascript: Option<FrontendAsset>,
     ) -> Self {
         Self {
             bundle_digest,
@@ -478,11 +244,11 @@ impl FrontendAssetManifest {
         &self.bundle_digest
     }
 
-    pub const fn css(&self) -> &CssAsset {
+    pub const fn css(&self) -> &FrontendAsset {
         &self.css
     }
 
-    pub const fn javascript(&self) -> Option<&JavaScriptAsset> {
+    pub const fn javascript(&self) -> Option<&FrontendAsset> {
         self.javascript.as_ref()
     }
 
@@ -490,48 +256,29 @@ impl FrontendAssetManifest {
         &self,
         bundle: &FrontendBundleDigest,
         name: FrontendAssetName,
-    ) -> Option<FrontendAsset<'_>> {
+    ) -> Option<&FrontendAsset> {
         if bundle != &self.bundle_digest {
             return None;
         }
         match name {
-            FrontendAssetName::Stylesheet => Some(FrontendAsset::Css(&self.css)),
-            FrontendAssetName::JavaScript => {
-                self.javascript.as_ref().map(FrontendAsset::JavaScript)
-            }
+            FrontendAssetName::Stylesheet => Some(&self.css),
+            FrontendAssetName::JavaScript => self.javascript.as_ref(),
         }
     }
 
     pub fn validate(&self) -> Result<(), FrontendManifestError> {
-        validate_asset(
-            self.bundle_digest,
-            self.css.name(),
-            self.css.kind(),
-            self.css.digest,
-            self.css.public_path,
-            self.css.bytes,
-        )?;
+        validate_asset(self.bundle_digest, &self.css)?;
         if let Some(javascript) = &self.javascript {
-            validate_asset(
-                self.bundle_digest,
-                javascript.name(),
-                javascript.kind(),
-                javascript.digest,
-                javascript.public_path,
-                javascript.bytes,
-            )?;
+            validate_asset(self.bundle_digest, javascript)?;
         }
 
         let calculated = if let Some(javascript) = &self.javascript {
             frontend_bundle_digest(&[
-                FrontendDigestInput::new(FrontendAssetKind::Css, self.css.bytes),
-                FrontendDigestInput::new(FrontendAssetKind::JavaScript, javascript.bytes),
+                FrontendDigestInput::new(self.css.kind, self.css.bytes),
+                FrontendDigestInput::new(javascript.kind, javascript.bytes),
             ])
         } else {
-            frontend_bundle_digest(&[FrontendDigestInput::new(
-                FrontendAssetKind::Css,
-                self.css.bytes,
-            )])
+            frontend_bundle_digest(&[FrontendDigestInput::new(self.css.kind, self.css.bytes)])
         }
         .map_err(|error| FrontendManifestError::DigestContract {
             message: error.to_string().into_boxed_str(),
@@ -561,18 +308,14 @@ pub enum FrontendManifestError {
 
 fn validate_asset(
     bundle: FrontendBundleDigest,
-    name: FrontendAssetName,
-    kind: FrontendAssetKind,
-    digest: FrontendAssetDigest,
-    public_path: FrontendAssetPath,
-    bytes: &[u8],
+    asset: &FrontendAsset,
 ) -> Result<(), FrontendManifestError> {
-    if frontend_asset_digest(kind, bytes) != digest.0 {
-        return Err(FrontendManifestError::AssetDigestMismatch { name });
+    if frontend_asset_digest(asset.kind, asset.bytes) != asset.digest.0 {
+        return Err(FrontendManifestError::AssetDigestMismatch { name: asset.name() });
     }
-    let expected_path = format!("/app-assets/{bundle}/{name}");
-    if public_path.as_str() != expected_path {
-        return Err(FrontendManifestError::AssetPathMismatch { name });
+    let expected_path = format!("/app-assets/{bundle}/{}", asset.name());
+    if asset.public_path.as_str() != expected_path {
+        return Err(FrontendManifestError::AssetPathMismatch { name: asset.name() });
     }
     Ok(())
 }
@@ -651,10 +394,10 @@ mod tests {
     #[test]
     fn exact_manifest_lookup_never_falls_back() {
         let manifest = embedded_manifest();
-        assert!(matches!(
+        assert_eq!(
             manifest.lookup(manifest.bundle_digest(), FrontendAssetName::Stylesheet),
-            Some(FrontendAsset::Css(_))
-        ));
+            Some(manifest.css())
+        );
         assert!(
             manifest
                 .lookup(manifest.bundle_digest(), FrontendAssetName::JavaScript)
@@ -684,6 +427,22 @@ mod tests {
             FrontendAssetDigest::parse(&asset).unwrap(),
             *manifest.css().digest()
         );
+        assert_eq!(
+            serde_json::to_value(manifest.bundle_digest()).unwrap(),
+            bundle
+        );
+        assert_eq!(
+            serde_json::to_value(manifest.css().digest()).unwrap(),
+            asset
+        );
+        assert_eq!(
+            serde_json::from_value::<FrontendBundleDigest>(bundle.clone().into()).unwrap(),
+            *manifest.bundle_digest()
+        );
+        assert_eq!(
+            serde_json::from_value::<FrontendAssetDigest>(asset.clone().into()).unwrap(),
+            *manifest.css().digest()
+        );
         assert!(FrontendBundleDigest::parse(&bundle.to_ascii_uppercase()).is_err());
         assert!(FrontendBundleDigest::parse(&asset).is_err());
     }
@@ -691,14 +450,75 @@ mod tests {
     #[test]
     fn header_metadata_is_typed_and_exact() {
         let css = embedded_manifest().css();
-        assert_eq!(css.mime(), FrontendAssetMime::Css);
-        assert_eq!(css.mime().as_str(), "text/css; charset=utf-8");
-        assert_eq!(css.cache_policy(), FrontendCachePolicy::Immutable);
+        assert_eq!(css.mime(), "text/css; charset=utf-8");
         assert_eq!(
-            css.cache_policy().as_str(),
+            IMMUTABLE_CACHE_CONTROL,
             "public, max-age=31536000, immutable"
         );
-        assert_eq!(css.etag().to_string(), format!("\"{}\"", css.digest()));
+        assert_eq!(css.etag(), format!("\"{}\"", css.digest()));
+    }
+
+    #[test]
+    fn optional_javascript_manifest_keeps_javascript_semantics() {
+        let css_bytes: &'static [u8] = b"body{color:black}";
+        let javascript_bytes: &'static [u8] = b"console.log('maincopy')";
+        let bundle_digest = FrontendBundleDigest(
+            frontend_bundle_digest(&[
+                FrontendDigestInput::new(FrontendAssetKind::Css, css_bytes),
+                FrontendDigestInput::new(FrontendAssetKind::JavaScript, javascript_bytes),
+            ])
+            .unwrap(),
+        );
+        let css_path = Box::leak(format!("/app-assets/{bundle_digest}/site.css").into_boxed_str());
+        let javascript_path =
+            Box::leak(format!("/app-assets/{bundle_digest}/site.js").into_boxed_str());
+        let css = FrontendAsset::from_generated(
+            FrontendAssetKind::Css,
+            FrontendAssetDigest(frontend_asset_digest(FrontendAssetKind::Css, css_bytes)),
+            FrontendAssetPath(css_path),
+            css_bytes,
+        );
+        let javascript = FrontendAsset::from_generated(
+            FrontendAssetKind::JavaScript,
+            FrontendAssetDigest(frontend_asset_digest(
+                FrontendAssetKind::JavaScript,
+                javascript_bytes,
+            )),
+            FrontendAssetPath(javascript_path),
+            javascript_bytes,
+        );
+
+        let invalid_css =
+            FrontendAssetManifest::from_generated(bundle_digest, javascript.clone(), None);
+        assert!(matches!(
+            invalid_css.validate(),
+            Err(FrontendManifestError::DigestContract { message })
+                if message.as_ref() == "frontend bundle must start with one CSS asset"
+        ));
+        let invalid_javascript =
+            FrontendAssetManifest::from_generated(bundle_digest, css.clone(), Some(css.clone()));
+        assert!(matches!(
+            invalid_javascript.validate(),
+            Err(FrontendManifestError::DigestContract { message })
+                if message.as_ref()
+                    == "frontend bundle assets must be unique and ordered by their typed kind"
+        ));
+
+        let manifest =
+            FrontendAssetManifest::from_generated(bundle_digest, css, Some(javascript.clone()));
+
+        manifest.validate().unwrap();
+        let asset = manifest
+            .lookup(&bundle_digest, FrontendAssetName::JavaScript)
+            .unwrap();
+
+        assert_eq!(asset.name(), FrontendAssetName::JavaScript);
+        assert_eq!(asset.kind(), FrontendAssetKind::JavaScript);
+        assert_eq!(asset.digest(), javascript.digest());
+        assert_eq!(asset.public_path(), javascript.public_path());
+        assert_eq!(asset.mime(), "text/javascript; charset=utf-8");
+        assert_eq!(asset.etag(), javascript.etag());
+        assert_eq!(asset.bytes(), javascript_bytes);
     }
 
     #[test]
@@ -715,14 +535,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(FrontendAssetName::JavaScript).unwrap(),
             "java_script"
-        );
-        assert_eq!(
-            serde_json::to_value(FrontendAssetMime::JavaScript).unwrap(),
-            "java_script"
-        );
-        assert_eq!(
-            serde_json::to_value(FrontendCachePolicy::Immutable).unwrap(),
-            "immutable"
         );
         assert_eq!(
             serde_json::from_value::<FrontendAssetName>("stylesheet".into()).unwrap(),

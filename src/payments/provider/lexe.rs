@@ -7,7 +7,7 @@ use lexe::{
         command::{
             CreateInvoiceRequest as LexeCreateInvoiceRequest,
             CreateInvoiceResponse as LexeCreateInvoiceResponse, GetPaymentRequest,
-            GetUpdatedPaymentsRequest, WaitForNextPaymentRequest,
+            GetUpdatedPaymentsRequest, GetUpdatedPaymentsResponse, WaitForNextPaymentRequest,
         },
         payment::{
             Payment as LexePayment, PaymentCreatedIndex, PaymentDirection,
@@ -29,14 +29,14 @@ use crate::clock::{Clock, SystemClock};
 use super::super::{
     Bolt11Invoice, CommandNotAcceptedReason, CreateTipInvoiceError, CreateTipInvoiceRequest,
     CreateTipInvoiceResult, IgnoredPaymentUpdateReason, IgnoredProviderPaymentUpdate,
-    InvoiceCreationReconciliation, InvoiceCreationUnknownReason, InvoiceNotCreatedReason,
-    LightningNetwork, NextPaymentUpdatesRequest, ObservedTipPaymentUpdate,
-    ObservedTipRecoveryUpdate, PaymentConcurrencyLimit, PaymentOperationError,
-    PaymentProviderError, PaymentProviderResult, PaymentQueueCapacity, PaymentResponseDeadline,
-    PaymentTransportError, ProviderKind, ProviderPaymentLocator, ProviderPaymentReference,
-    ProviderPaymentState, ProviderPaymentStatus, ProviderPaymentUpdate, ProviderPaymentUpdateBatch,
-    ProviderPaymentUpdatePoll, ProviderUpdateCursor, ReconcilePaymentRequest, RetryGuidance,
-    SatoshiAmount, TipIntentId, TipInvoice, TipRecoveryReason, TipSettlement,
+    InvoiceCreationReconciliation, InvoiceCreationUnknownReason, LightningNetwork,
+    NextPaymentUpdatesRequest, ObservedTipPaymentUpdate, ObservedTipRecoveryUpdate,
+    PaymentConcurrencyLimit, PaymentOperationError, PaymentProviderError, PaymentProviderResult,
+    PaymentQueueCapacity, PaymentResponseDeadline, PaymentTransportError, ProviderKind,
+    ProviderPaymentLocator, ProviderPaymentReference, ProviderPaymentState, ProviderPaymentStatus,
+    ProviderPaymentUpdate, ProviderPaymentUpdateBatch, ProviderPaymentUpdatePoll,
+    ProviderUpdateCursor, ReconcilePaymentRequest, TipIntentId, TipInvoice, TipRecoveryReason,
+    TipSettlement,
 };
 
 const RECONCILIATION_BATCH_SIZE: usize = 100;
@@ -44,15 +44,29 @@ const RECONCILIATION_BATCH_SIZE: usize = 100;
 /// Cloneable ingress handle for the Lexe provider runtime.
 ///
 /// The handle owns no wallet state or background task. Calls are admitted with
-/// a nonblocking send to one bounded queue. [`LexeProviderRuntime`] owns the
+/// a nonblocking send to one bounded queue. `LexeProviderRuntime` owns the
 /// receiver, wallet, concurrency boundary, and shutdown lifecycle.
+///
+/// Production construction is private while Lexe SDK credentials do not
+/// zeroize on drop.
+///
+/// ```compile_fail
+/// use maincopy::payments::LexeProvider;
+///
+/// let _ = LexeProvider::bounded;
+/// ```
+#[derive(Clone)]
 pub struct LexeProvider {
     commands: mpsc::Sender<LexeCommand>,
     network: LightningNetwork,
 }
 
 impl LexeProvider {
-    pub fn bounded(
+    #[expect(
+        dead_code,
+        reason = "production construction is blocked until Lexe credentials zeroize on drop"
+    )]
+    fn bounded(
         wallet: Arc<LexeWallet>,
         response_deadline: PaymentResponseDeadline,
         concurrency_limit: PaymentConcurrencyLimit,
@@ -134,7 +148,7 @@ impl LexeProvider {
         request: ReconcilePaymentRequest,
     ) -> PaymentProviderResult<ProviderPaymentStatus> {
         let index = request
-            .payment()
+            .payment
             .locator()
             .as_str()
             .parse::<PaymentCreatedIndex>()
@@ -159,17 +173,9 @@ impl LexeProvider {
         // Application owns exactly one subscriber loop. The minimum provider
         // concurrency of two reserves capacity for ordinary operations while
         // this finite long poll occupies one JoinSet slot.
-        if let Some(cursor) = request.cursor()
-            && cursor.provider() != self.kind()
-        {
-            return Err(super::super::PaymentIdentityError::ProviderMismatch {
-                expected: self.kind(),
-                actual: cursor.provider(),
-            }
-            .into());
-        }
         let start_index = request
-            .cursor()
+            .cursor
+            .as_ref()
             .map(|cursor| cursor.as_str().parse::<PaymentUpdatedIndex>())
             .transpose()
             .map_err(|_| PaymentOperationError::InvalidProviderResponse)?;
@@ -195,15 +201,6 @@ impl LexeProvider {
     }
 }
 
-impl Clone for LexeProvider {
-    fn clone(&self) -> Self {
-        Self {
-            commands: self.commands.clone(),
-            network: self.network,
-        }
-    }
-}
-
 impl std::fmt::Debug for LexeProvider {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -221,7 +218,7 @@ impl std::fmt::Debug for LexeProvider {
 /// cancellation closes ingress and gracefully drains pending and in-flight
 /// work. Because the receiver closes, outstanding provider clones cannot
 /// admit more commands after shutdown begins.
-pub struct LexeProviderRuntime {
+struct LexeProviderRuntime {
     receiver: mpsc::Receiver<LexeCommand>,
     wallet: Arc<LexeWallet>,
     network: LightningNetwork,
@@ -231,7 +228,7 @@ pub struct LexeProviderRuntime {
 }
 
 impl LexeProviderRuntime {
-    pub async fn run_until_stop(
+    async fn run_until_stop(
         self,
         cancellation: CancellationToken,
     ) -> Result<(), LexeProviderRuntimeError> {
@@ -273,7 +270,7 @@ impl std::fmt::Debug for LexeProviderRuntime {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum LexeProviderRuntimeError {
+enum LexeProviderRuntimeError {
     #[error("a Lexe provider operation task panicked")]
     OperationPanicked,
 }
@@ -372,22 +369,28 @@ async fn execute_create(
     request: CreateTipInvoiceRequest,
     sdk_request: LexeCreateInvoiceRequest,
 ) -> CreateTipInvoiceResult {
-    let outcome = await_creation(response_deadline, async {
-        let created = wallet.create_invoice(sdk_request).await.map_err(|_| ())?;
-        let confirmed = wallet
-            .get_payment(GetPaymentRequest {
-                index: created.index,
-            })
-            .await
-            .map_err(|_| ())?;
-        Ok::<_, ()>((created, confirmed.payment))
-    })
+    let (created, confirmed) = await_creation(
+        response_deadline,
+        request_invoice_confirmation(wallet, sdk_request),
+    )
     .await?;
-
-    let (created, confirmed) = outcome;
     confirmed_creation(request, network, clock.now(), created, confirmed).map_err(|_| {
         CreateTipInvoiceError::OutcomeUnknown(InvoiceCreationUnknownReason::InvalidProviderResponse)
     })
+}
+
+async fn request_invoice_confirmation(
+    wallet: &LexeWallet,
+    request: LexeCreateInvoiceRequest,
+) -> Result<(LexeCreateInvoiceResponse, Option<LexePayment>), ()> {
+    let created = wallet.create_invoice(request).await.map_err(|_| ())?;
+    let confirmed = wallet
+        .get_payment(GetPaymentRequest {
+            index: created.index,
+        })
+        .await
+        .map_err(|_| ())?;
+    Ok((created, confirmed.payment))
 }
 
 fn confirmed_creation(
@@ -397,38 +400,27 @@ fn confirmed_creation(
     created: LexeCreateInvoiceResponse,
     confirmed: Option<LexePayment>,
 ) -> Result<TipInvoice, PaymentOperationError> {
-    if created.index.id != created.invoice.payment_id() {
-        return Err(PaymentOperationError::InvalidProviderResponse);
-    }
-    let marker = request.correlation_marker();
+    let (created_index, created_invoice) = created_invoice_parts(created)?;
     let record = confirmed.ok_or(PaymentOperationError::InvalidProviderResponse)?;
-    validate_creation_confirmation(&request, created.index, &record)?;
     let record = LexeCreationRecord::from_payment(record);
-    let created_invoice = created.invoice.to_string();
-    if record.index != created.index
-        || !record.is_inbound_invoice
-        || !record.index_matches_invoice
-        || !record.matches(marker.as_str())
-        || record.invoice.as_deref() != Some(created_invoice.as_str())
-    {
-        return Err(PaymentOperationError::InvalidProviderResponse);
-    }
+    record.validate_fresh_confirmation(&request, created_index, &created_invoice)?;
 
     tip_invoice_from_parts(
         request,
         network,
-        record.index,
+        created_index,
         created_invoice,
         InvoiceValidation::Fresh(now),
     )
 }
 
-fn validate_creation_confirmation(
-    request: &CreateTipInvoiceRequest,
-    created_index: PaymentCreatedIndex,
-    confirmed: &LexePayment,
-) -> Result<(), PaymentOperationError> {
-    validate_creation_evidence(request, created_index, confirmed.hash, confirmed.amount)
+fn created_invoice_parts(
+    created: LexeCreateInvoiceResponse,
+) -> Result<(PaymentCreatedIndex, String), PaymentOperationError> {
+    if created.index.id != created.invoice.payment_id() {
+        return Err(PaymentOperationError::InvalidProviderResponse);
+    }
+    Ok((created.index, created.invoice.to_string()))
 }
 
 fn validate_creation_evidence(
@@ -440,7 +432,7 @@ fn validate_creation_evidence(
     let indexed_hash = LexePaymentHash::try_from(created_index.id)
         .map_err(|_| PaymentOperationError::InvalidProviderResponse)?;
     let expected_msats = request
-        .amount()
+        .amount
         .get()
         .checked_mul(1_000)
         .ok_or(PaymentOperationError::InvalidProviderResponse)?;
@@ -470,24 +462,23 @@ async fn execute_creation_reconciliation(
         Err(_) => return Err(PaymentTransportError::ResponseTimedOut.into()),
     };
 
+    reconcile_creation_selection(request, network, selection)
+}
+
+fn reconcile_creation_selection(
+    request: CreateTipInvoiceRequest,
+    network: LightningNetwork,
+    selection: MarkerSelection,
+) -> PaymentProviderResult<InvoiceCreationReconciliation> {
     match selection {
         MarkerSelection::Missing => Ok(InvoiceCreationReconciliation::Missing),
         MarkerSelection::Ambiguous => Ok(InvoiceCreationReconciliation::Ambiguous),
         MarkerSelection::Found(record) => {
-            if !record.matches(marker.as_str())
-                || !record.is_inbound_invoice
-                || !record.index_matches_invoice
-            {
-                return Err(PaymentOperationError::InvalidProviderResponse.into());
-            }
-            validate_creation_evidence(&request, record.index, record.hash, record.amount)?;
-            let encoded_invoice = record
-                .invoice
-                .ok_or(PaymentOperationError::InvalidProviderResponse)?;
+            let (index, encoded_invoice) = record.into_reconciled_invoice(&request)?;
             tip_invoice_from_parts(
                 request,
                 network,
-                record.index,
+                index,
                 encoded_invoice,
                 InvoiceValidation::Historical,
             )
@@ -504,34 +495,39 @@ async fn find_creation(
     let mut cursor = None;
     let mut matches = BTreeMap::new();
 
-    loop {
-        let response = wallet
-            .get_updated_payments(GetUpdatedPaymentsRequest {
-                start_index: cursor,
-                limit: Some(RECONCILIATION_BATCH_SIZE),
-            })
-            .await
-            .map_err(|_| PaymentOperationError::TemporarilyUnavailable)?;
-
-        if response.payments.is_empty() {
-            if response.updated_index.is_some() {
-                return Err(PaymentOperationError::InvalidProviderResponse.into());
-            }
-            return Ok(select_marker_matches(matches.into_values()));
-        }
-
-        let next_cursor = response
-            .updated_index
-            .ok_or(PaymentOperationError::InvalidProviderResponse)?;
-        let page = validate_catch_up_payment_updates(response.payments, cursor, next_cursor)?;
-        for (_, payment) in page {
-            track_marker_record(
-                &mut matches,
-                marker,
-                LexeCreationRecord::from_payment(payment),
-            );
-        }
+    while let ValidatedPaymentPage::Updates {
+        next_cursor,
+        payments,
+    } = await_creation_page(wallet, cursor).await?
+    {
+        track_creation_payments(&mut matches, marker, payments);
         cursor = Some(next_cursor);
+    }
+
+    Ok(select_marker_matches(matches.into_values()))
+}
+
+async fn await_creation_page(
+    wallet: &LexeWallet,
+    cursor: Option<PaymentUpdatedIndex>,
+) -> PaymentProviderResult<ValidatedPaymentPage> {
+    let response = wallet
+        .get_updated_payments(GetUpdatedPaymentsRequest {
+            start_index: cursor,
+            limit: Some(RECONCILIATION_BATCH_SIZE),
+        })
+        .await
+        .map_err(|_| PaymentOperationError::TemporarilyUnavailable)?;
+    validate_payment_page(response, cursor)
+}
+
+fn track_creation_payments(
+    matches: &mut BTreeMap<PaymentCreatedIndex, LexeCreationRecord>,
+    marker: &str,
+    payments: Vec<(PaymentUpdatedIndex, LexePayment)>,
+) {
+    for (_, payment) in payments {
+        track_marker_record(matches, marker, LexeCreationRecord::from_payment(payment));
     }
 }
 
@@ -557,7 +553,7 @@ async fn execute_payment_reconciliation(
         .payment
         .ok_or(PaymentOperationError::PaymentNotFound)?;
 
-    payment_status(request, index, payment, network, clock.now())
+    payment_status(request, index, payment, None, network, clock.now())
 }
 
 async fn execute_next_payment_updates(
@@ -567,7 +563,18 @@ async fn execute_next_payment_updates(
     clock: Arc<dyn Clock>,
     start_index: Option<PaymentUpdatedIndex>,
 ) -> PaymentProviderResult<ProviderPaymentUpdatePoll> {
-    let catch_up = match timeout(
+    let catch_up = await_catch_up_page(wallet, response_deadline, start_index).await?;
+    let source = payment_update_source(catch_up, start_index);
+    let outcome = resolve_payment_update_source(wallet, response_deadline, source).await?;
+    provider_update_poll(outcome, network, clock.as_ref())
+}
+
+async fn await_catch_up_page(
+    wallet: &LexeWallet,
+    response_deadline: PaymentResponseDeadline,
+    start_index: Option<PaymentUpdatedIndex>,
+) -> PaymentProviderResult<ValidatedPaymentPage> {
+    let response = match timeout(
         response_deadline.get(),
         wallet.get_updated_payments(GetUpdatedPaymentsRequest {
             start_index,
@@ -580,49 +587,94 @@ async fn execute_next_payment_updates(
         Ok(Err(_)) => return Err(PaymentOperationError::TemporarilyUnavailable.into()),
         Err(_) => return Err(PaymentTransportError::ResponseTimedOut.into()),
     };
+    validate_payment_page(response, start_index)
+}
 
-    let updated_payments = if catch_up.payments.is_empty() {
-        if catch_up.updated_index.is_some() {
-            return Err(PaymentOperationError::InvalidProviderResponse.into());
+fn payment_update_source(
+    page: ValidatedPaymentPage,
+    start_index: Option<PaymentUpdatedIndex>,
+) -> PaymentUpdateSource {
+    match page {
+        ValidatedPaymentPage::Empty => {
+            PaymentUpdateSource::Live(start_index.unwrap_or(PaymentUpdatedIndex::MIN))
         }
-        let effective_start = start_index.unwrap_or(PaymentUpdatedIndex::MIN);
-        let live = match timeout(
-            response_deadline.get(),
-            wallet.wait_for_next_payment(WaitForNextPaymentRequest {
-                // `None` has cache-dependent tail semantics in Lexe. The
-                // minimum cursor preserves a full bootstrap without a race
-                // between the catch-up query and the long poll.
-                start_index: Some(effective_start),
-                timeout: None,
-            }),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => return Err(PaymentOperationError::TemporarilyUnavailable.into()),
-            Err(_) => return Ok(ProviderPaymentUpdatePoll::Idle),
-        };
-        vec![validate_live_payment_update(
-            effective_start,
-            live.next_start_index,
-            live.payment,
-        )?]
-    } else {
-        let expected_last = catch_up
-            .updated_index
-            .ok_or(PaymentOperationError::InvalidProviderResponse)?;
-        validate_catch_up_payment_updates(catch_up.payments, start_index, expected_last)?
-    };
+        ValidatedPaymentPage::Updates { payments, .. } => PaymentUpdateSource::Ready(payments),
+    }
+}
 
+async fn resolve_payment_update_source(
+    wallet: &LexeWallet,
+    response_deadline: PaymentResponseDeadline,
+    source: PaymentUpdateSource,
+) -> PaymentProviderResult<Option<Vec<(PaymentUpdatedIndex, LexePayment)>>> {
+    match source {
+        PaymentUpdateSource::Ready(payments) => Ok(Some(payments)),
+        PaymentUpdateSource::Live(effective_start) => {
+            await_live_payment_update(wallet, response_deadline, effective_start)
+                .await
+                .map(|update| update.map(|update| vec![update]))
+        }
+    }
+}
+
+async fn await_live_payment_update(
+    wallet: &LexeWallet,
+    response_deadline: PaymentResponseDeadline,
+    effective_start: PaymentUpdatedIndex,
+) -> PaymentProviderResult<Option<(PaymentUpdatedIndex, LexePayment)>> {
+    let live = match timeout(
+        response_deadline.get(),
+        wallet.wait_for_next_payment(WaitForNextPaymentRequest {
+            // `None` has cache-dependent tail semantics in Lexe. The minimum
+            // cursor preserves a full bootstrap without a race between the
+            // catch-up query and the long poll.
+            start_index: Some(effective_start),
+            timeout: None,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => return Err(PaymentOperationError::TemporarilyUnavailable.into()),
+        Err(_) => return Ok(None),
+    };
+    validate_live_payment_update(effective_start, live.next_start_index, live.payment).map(Some)
+}
+
+fn provider_update_poll(
+    updated_payments: Option<Vec<(PaymentUpdatedIndex, LexePayment)>>,
+    network: LightningNetwork,
+    clock: &dyn Clock,
+) -> PaymentProviderResult<ProviderPaymentUpdatePoll> {
+    let Some(updated_payments) = updated_payments else {
+        return Ok(ProviderPaymentUpdatePoll::Idle);
+    };
     let now = clock.now();
     let updates = updated_payments
         .into_iter()
         .map(|(cursor, payment)| provider_payment_update(cursor, payment, network, now))
         .collect();
-    Ok(ProviderPaymentUpdatePoll::Updates(
-        ProviderPaymentUpdateBatch::new(updates)
-            .map_err(|_| PaymentOperationError::InvalidProviderResponse)?,
-    ))
+    ProviderPaymentUpdateBatch::new(updates)
+        .map(ProviderPaymentUpdatePoll::Updates)
+        .map_err(|_| PaymentOperationError::InvalidProviderResponse.into())
+}
+
+fn validate_payment_page(
+    response: GetUpdatedPaymentsResponse,
+    requested_start: Option<PaymentUpdatedIndex>,
+) -> PaymentProviderResult<ValidatedPaymentPage> {
+    match (response.payments.is_empty(), response.updated_index) {
+        (true, None) => Ok(ValidatedPaymentPage::Empty),
+        (false, Some(next_cursor)) => {
+            let payments =
+                validate_catch_up_payment_updates(response.payments, requested_start, next_cursor)?;
+            Ok(ValidatedPaymentPage::Updates {
+                next_cursor,
+                payments,
+            })
+        }
+        _ => Err(PaymentOperationError::InvalidProviderResponse.into()),
+    }
 }
 
 fn validate_catch_up_payment_updates(
@@ -760,19 +812,27 @@ fn provider_payment_update(
         ProviderPaymentLocator::new(payment.index.to_string())
             .expect("Lexe payment indexes fit the provider locator bound"),
     );
-    let observed_invoice = payment
-        .invoice
-        .as_deref()
-        .and_then(|invoice| Bolt11Invoice::parse(&invoice.to_string()).ok());
-    let Some(expected) = observed_payment_request(&payment, intent_id, reference.clone()) else {
-        return conflicted_tip_update(next_cursor, intent_id, reference, observed_invoice);
+    let Ok(observed_invoice) = provider_invoice(&payment) else {
+        return conflicted_tip_update(next_cursor, intent_id, reference, None);
     };
-    let amount = expected.amount();
-    let payment_hash = *expected.payment_hash();
-    let invoice = expected.invoice().clone();
+    let Some(expected) =
+        observed_payment_request(&payment, &observed_invoice, intent_id, reference.clone())
+    else {
+        return conflicted_tip_update(next_cursor, intent_id, reference, Some(observed_invoice));
+    };
+    let amount = expected.amount;
+    let payment_hash = expected.payment_hash;
+    let invoice = expected.invoice.clone();
     let index = payment.index;
 
-    match payment_status(expected, index, payment, network, now) {
+    match payment_status(
+        expected,
+        index,
+        payment,
+        Some(&observed_invoice),
+        network,
+        now,
+    ) {
         Ok(status) => ProviderPaymentUpdate::Tip(ObservedTipPaymentUpdate::new(
             next_cursor,
             intent_id,
@@ -811,19 +871,19 @@ fn conflicted_tip_update(
 
 fn observed_payment_request(
     payment: &LexePayment,
+    invoice: &Bolt11Invoice,
     intent_id: TipIntentId,
     reference: ProviderPaymentReference,
 ) -> Option<ReconcilePaymentRequest> {
     if payment.kind != PaymentKind::Invoice || payment.direction != PaymentDirection::Inbound {
         return None;
     }
-    let invoice = Bolt11Invoice::parse(&payment.invoice.as_deref()?.to_string()).ok()?;
-    let amount = invoice_amount(&invoice)?;
-    let payment_hash = invoice_payment_hash(&invoice);
+    let amount = invoice.amount().ok()?;
+    let payment_hash = invoice.payment_hash();
     Some(ReconcilePaymentRequest::new(
         reference,
         intent_id,
-        invoice,
+        invoice.clone(),
         amount,
         payment_hash,
     ))
@@ -838,30 +898,26 @@ fn payment_status(
     request: ReconcilePaymentRequest,
     expected_index: PaymentCreatedIndex,
     payment: LexePayment,
+    observed_invoice: Option<&Bolt11Invoice>,
     network: LightningNetwork,
     now: OffsetDateTime,
 ) -> PaymentProviderResult<ProviderPaymentStatus> {
-    if payment.index != expected_index
-        || payment.kind != PaymentKind::Invoice
-        || payment.direction != PaymentDirection::Inbound
-        || payment.personal_note.as_deref() != Some(request.correlation_marker().as_str())
-    {
-        return Err(PaymentOperationError::ProviderConflict.into());
-    }
+    validate_provider_payment_envelope(&request, expected_index, &payment)?;
 
-    let provider_invoice = payment
-        .invoice
-        .as_deref()
-        .ok_or(PaymentOperationError::InvalidProviderResponse)?;
-    if expected_index.id != provider_invoice.payment_id() {
-        return Err(PaymentOperationError::ProviderConflict.into());
-    }
-    let invoice = Bolt11Invoice::parse(&provider_invoice.to_string())
+    let parsed_invoice;
+    let invoice = match observed_invoice {
+        Some(invoice) => invoice,
+        None => {
+            parsed_invoice = provider_invoice(&payment)?;
+            &parsed_invoice
+        }
+    };
+    validate_invoice_envelope(expected_index, &payment, invoice)?;
+    validate_reconciled_identity(&request, &payment, invoice, network, expected_index)?;
+
+    let expires_at = invoice
+        .expires_at()
         .map_err(|_| PaymentOperationError::InvalidProviderResponse)?;
-    validate_reconciled_identity(&request, &payment, &invoice, network, expected_index)?;
-
-    let expires_at =
-        invoice_expiry(&invoice).ok_or(PaymentOperationError::InvalidProviderResponse)?;
     let status = match payment.status {
         PaymentStatus::Pending if expires_at <= now => ProviderPaymentState::Expired,
         PaymentStatus::Pending => ProviderPaymentState::InvoiceOpen,
@@ -872,10 +928,48 @@ fn payment_status(
         PaymentStatus::Completed => completed_payment_state(&request, &payment),
     };
 
-    Ok(ProviderPaymentStatus::new(
-        request.payment().clone(),
-        status,
-    ))
+    Ok(ProviderPaymentStatus::new(request.payment.clone(), status))
+}
+
+fn validate_provider_payment_envelope(
+    request: &ReconcilePaymentRequest,
+    expected_index: PaymentCreatedIndex,
+    payment: &LexePayment,
+) -> PaymentProviderResult<()> {
+    let marker = request.correlation_marker();
+    let observed = (
+        payment.index,
+        payment.kind.clone(),
+        payment.direction,
+        payment.personal_note.as_deref(),
+    );
+    let expected = (
+        expected_index,
+        PaymentKind::Invoice,
+        PaymentDirection::Inbound,
+        Some(marker.as_str()),
+    );
+    if observed != expected {
+        return Err(PaymentOperationError::ProviderConflict.into());
+    }
+    Ok(())
+}
+
+fn validate_invoice_envelope(
+    expected_index: PaymentCreatedIndex,
+    payment: &LexePayment,
+    invoice: &Bolt11Invoice,
+) -> PaymentProviderResult<()> {
+    let provider_invoice = payment
+        .invoice
+        .as_deref()
+        .ok_or(PaymentOperationError::InvalidProviderResponse)?;
+    let envelope_matches = expected_index.id == provider_invoice.payment_id()
+        && invoice.encoded() == provider_invoice.to_string();
+    if !envelope_matches {
+        return Err(PaymentOperationError::ProviderConflict.into());
+    }
+    Ok(())
 }
 
 fn validate_reconciled_identity(
@@ -885,25 +979,61 @@ fn validate_reconciled_identity(
     network: LightningNetwork,
     expected_index: PaymentCreatedIndex,
 ) -> PaymentProviderResult<()> {
-    let indexed_hash = LexePaymentHash::try_from(expected_index.id)
-        .map_err(|_| PaymentOperationError::ProviderConflict)?;
-    let expected_msats = request
-        .amount()
-        .get()
-        .checked_mul(1_000)
-        .ok_or(PaymentOperationError::ProviderConflict)?;
-    if invoice_network(invoice) != network
-        || invoice.encoded() != request.invoice().encoded()
-        || invoice_payment_hash(invoice) != *request.payment_hash()
-        || payment.hash != Some(indexed_hash)
-        || invoice_amount(invoice) != Some(request.amount())
-        || payment
-            .amount
-            .is_some_and(|amount| amount.msat() != expected_msats)
-    {
+    validate_signed_invoice_identity(request, invoice, network)?;
+    validate_provider_payment_evidence(request, payment, expected_index)
+}
+
+fn validate_signed_invoice_identity(
+    request: &ReconcilePaymentRequest,
+    invoice: &Bolt11Invoice,
+    network: LightningNetwork,
+) -> PaymentProviderResult<()> {
+    let observed = (
+        invoice.network(),
+        invoice.encoded(),
+        invoice.payment_hash(),
+        invoice.amount().ok(),
+    );
+    let expected = (
+        network,
+        request.invoice.encoded(),
+        request.payment_hash,
+        Some(request.amount),
+    );
+    if observed != expected {
         return Err(PaymentOperationError::ProviderConflict.into());
     }
     Ok(())
+}
+
+fn validate_provider_payment_evidence(
+    request: &ReconcilePaymentRequest,
+    payment: &LexePayment,
+    expected_index: PaymentCreatedIndex,
+) -> PaymentProviderResult<()> {
+    let indexed_hash = LexePaymentHash::try_from(expected_index.id)
+        .map_err(|_| PaymentOperationError::ProviderConflict)?;
+    let expected_msats = request
+        .amount
+        .get()
+        .checked_mul(1_000)
+        .ok_or(PaymentOperationError::ProviderConflict)?;
+    let observed_amount_msats = payment.amount.map(|amount| amount.msat());
+    let expected_amount_msats = payment.amount.map(|_| expected_msats);
+    if (payment.hash, observed_amount_msats) != (Some(indexed_hash), expected_amount_msats) {
+        return Err(PaymentOperationError::ProviderConflict.into());
+    }
+    Ok(())
+}
+
+fn provider_invoice(payment: &LexePayment) -> Result<Bolt11Invoice, PaymentOperationError> {
+    let provider_invoice = payment
+        .invoice
+        .as_deref()
+        .ok_or(PaymentOperationError::InvalidProviderResponse)?;
+    let invoice = Bolt11Invoice::parse(&provider_invoice.to_string())
+        .map_err(|_| PaymentOperationError::InvalidProviderResponse)?;
+    Ok(invoice)
 }
 
 fn completed_payment_state(
@@ -917,7 +1047,7 @@ fn completed_payment_state(
         return ProviderPaymentState::RecoveryRequired(TipRecoveryReason::SettlementIncomplete);
     };
 
-    ProviderPaymentState::Received(TipSettlement::new(request.amount(), finalized_at))
+    ProviderPaymentState::Received(TipSettlement::new(request.amount, finalized_at))
 }
 
 fn tip_invoice_from_parts(
@@ -947,13 +1077,12 @@ fn tip_invoice_from_parts(
 fn create_invoice_request(
     request: &CreateTipInvoiceRequest,
 ) -> Result<LexeCreateInvoiceRequest, CreateTipInvoiceError> {
-    let amount = LexeAmount::try_from_sats_u64(request.amount().get()).map_err(|_| {
-        CreateTipInvoiceError::NotCreated(InvoiceNotCreatedReason::ProviderRejected)
-    })?;
+    let amount = LexeAmount::try_from_sats_u64(request.amount.get())
+        .map_err(|_| CreateTipInvoiceError::NotCreated)?;
     Ok(LexeCreateInvoiceRequest {
         expiration_secs: None,
         amount: Some(amount),
-        description: Some(request.description().as_str().to_owned()),
+        description: Some(request.description.as_str().to_owned()),
         personal_note: Some(request.correlation_marker().into_string()),
         partner_pk: None,
         partner_prop_fee: None,
@@ -989,9 +1118,7 @@ fn operation_admission_error(error: QueueAdmissionError) -> PaymentProviderError
 
 fn command_not_accepted(error: QueueAdmissionError) -> CommandNotAcceptedReason {
     match error {
-        QueueAdmissionError::Full => CommandNotAcceptedReason::QueueFull {
-            retry: RetryGuidance::RetryWithBackoff,
-        },
+        QueueAdmissionError::Full => CommandNotAcceptedReason::QueueFull,
         QueueAdmissionError::Closed => CommandNotAcceptedReason::ProviderUnavailable,
     }
 }
@@ -1110,6 +1237,55 @@ impl LexeCreationRecord {
     fn matches(&self, marker: &str) -> bool {
         self.personal_note.as_deref() == Some(marker)
     }
+
+    fn validate_fresh_confirmation(
+        &self,
+        request: &CreateTipInvoiceRequest,
+        created_index: PaymentCreatedIndex,
+        created_invoice: &str,
+    ) -> Result<(), PaymentOperationError> {
+        validate_creation_evidence(request, created_index, self.hash, self.amount)?;
+        let marker = request.correlation_marker();
+        let observed = (
+            self.index,
+            self.is_inbound_invoice,
+            self.index_matches_invoice,
+            self.personal_note.as_deref(),
+            self.invoice.as_deref(),
+        );
+        let expected = (
+            created_index,
+            true,
+            true,
+            Some(marker.as_str()),
+            Some(created_invoice),
+        );
+        if observed != expected {
+            return Err(PaymentOperationError::InvalidProviderResponse);
+        }
+        Ok(())
+    }
+
+    fn into_reconciled_invoice(
+        self,
+        request: &CreateTipInvoiceRequest,
+    ) -> Result<(PaymentCreatedIndex, String), PaymentOperationError> {
+        let marker = request.correlation_marker();
+        let observed = (
+            self.personal_note.as_deref(),
+            self.is_inbound_invoice,
+            self.index_matches_invoice,
+        );
+        let expected = (Some(marker.as_str()), true, true);
+        if observed != expected {
+            return Err(PaymentOperationError::InvalidProviderResponse);
+        }
+        validate_creation_evidence(request, self.index, self.hash, self.amount)?;
+        let invoice = self
+            .invoice
+            .ok_or(PaymentOperationError::InvalidProviderResponse)?;
+        Ok((self.index, invoice))
+    }
 }
 
 fn select_marker_matches(records: impl IntoIterator<Item = LexeCreationRecord>) -> MarkerSelection {
@@ -1140,44 +1316,23 @@ enum MarkerSelection {
     Ambiguous,
 }
 
+enum ValidatedPaymentPage {
+    Empty,
+    Updates {
+        next_cursor: PaymentUpdatedIndex,
+        payments: Vec<(PaymentUpdatedIndex, LexePayment)>,
+    },
+}
+
+enum PaymentUpdateSource {
+    Ready(Vec<(PaymentUpdatedIndex, LexePayment)>),
+    Live(PaymentUpdatedIndex),
+}
+
 fn lexe_timestamp(timestamp: lexe::types::util::TimestampMs) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp.to_i64()) * 1_000_000)
         .ok()
         .map(|value| value.to_offset(UtcOffset::UTC))
-}
-
-fn invoice_expiry(invoice: &Bolt11Invoice) -> Option<OffsetDateTime> {
-    let expiry = invoice.as_inner().expires_at()?;
-    let nanos = i128::try_from(expiry.as_nanos()).ok()?;
-    OffsetDateTime::from_unix_timestamp_nanos(nanos)
-        .ok()
-        .map(|value| value.to_offset(UtcOffset::UTC))
-}
-
-fn invoice_amount(invoice: &Bolt11Invoice) -> Option<SatoshiAmount> {
-    let amount_msats = invoice.as_inner().amount_milli_satoshis()?;
-    if amount_msats % 1_000 != 0 {
-        return None;
-    }
-    SatoshiAmount::new(amount_msats / 1_000).ok()
-}
-
-fn invoice_payment_hash(invoice: &Bolt11Invoice) -> super::super::PaymentHash {
-    let mut bytes = [0_u8; 32];
-    bytes.copy_from_slice(invoice.as_inner().payment_hash().as_ref());
-    super::super::PaymentHash::from_bytes(bytes)
-}
-
-fn invoice_network(invoice: &Bolt11Invoice) -> LightningNetwork {
-    use lightning_invoice::Currency;
-
-    match invoice.as_inner().currency() {
-        Currency::Bitcoin => LightningNetwork::Mainnet,
-        Currency::BitcoinTestnet => LightningNetwork::Testnet,
-        Currency::Regtest => LightningNetwork::Regtest,
-        Currency::Signet => LightningNetwork::Signet,
-        Currency::Simnet => LightningNetwork::Simnet,
-    }
 }
 
 fn lightning_network(network: LexeNetwork) -> LightningNetwork {
@@ -1200,14 +1355,13 @@ mod tests {
         time::Duration,
     };
 
-    use bitcoin::{
-        hashes::{Hash, sha256},
-        secp256k1::{Secp256k1, SecretKey},
-    };
-    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use lightning_invoice::Currency;
 
     use super::*;
-    use crate::payments::{PaymentModelError, TipIntentId, TipInvoiceDescription};
+    use crate::payments::{
+        PaymentModelError, SatoshiAmount, TipIntentId, TipInvoiceDescription,
+        test_support::{signed_direct_invoice, signed_direct_invoice_with},
+    };
 
     #[test]
     fn invoice_request_keeps_private_marker_out_of_payer_description() {
@@ -1241,7 +1395,6 @@ mod tests {
             error,
             CreateTipInvoiceError::OutcomeUnknown(InvoiceCreationUnknownReason::ResponseTimedOut)
         );
-        assert!(error.requires_reconciliation());
     }
 
     #[tokio::test]
@@ -1457,28 +1610,22 @@ mod tests {
     fn fresh_confirmation_rejects_hash_and_present_amount_conflicts() {
         let request = create_request();
         let mut payment = lexe_payment(Some(request.correlation_marker().as_str()));
-        assert_eq!(
-            validate_creation_confirmation(&request, payment.index, &payment),
-            Ok(())
-        );
+        assert_eq!(validate_fresh_payment(&request, &payment), Ok(()));
 
         payment.hash = Some(LexePaymentHash::try_from(payment_index(2).id).unwrap());
         assert_eq!(
-            validate_creation_confirmation(&request, payment.index, &payment),
+            validate_fresh_payment(&request, &payment),
             Err(PaymentOperationError::InvalidProviderResponse)
         );
         payment.hash = Some(LexePaymentHash::try_from(payment.index.id).unwrap());
         payment.amount = Some(LexeAmount::try_from_sats_u64(22).unwrap());
         assert_eq!(
-            validate_creation_confirmation(&request, payment.index, &payment),
+            validate_fresh_payment(&request, &payment),
             Err(PaymentOperationError::InvalidProviderResponse)
         );
 
         payment.amount = None;
-        assert_eq!(
-            validate_creation_confirmation(&request, payment.index, &payment),
-            Ok(())
-        );
+        assert_eq!(validate_fresh_payment(&request, &payment), Ok(()));
     }
 
     #[test]
@@ -1505,21 +1652,110 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_creation_accepts_only_consistent_provider_evidence() {
+        let request = create_request();
+        let payment = lexe_payment(Some(request.correlation_marker().as_str()));
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap();
+        let invoice = confirmed_creation(
+            request.clone(),
+            LightningNetwork::Mainnet,
+            now,
+            created_response(payment.index),
+            Some(payment.clone()),
+        )
+        .unwrap();
+        assert_eq!(invoice.intent_id, request.intent_id);
+
+        assert_eq!(
+            confirmed_creation(
+                request.clone(),
+                LightningNetwork::Mainnet,
+                now,
+                created_response(payment.index),
+                None,
+            ),
+            Err(PaymentOperationError::InvalidProviderResponse)
+        );
+
+        let mut mismatched_record = payment;
+        mismatched_record.personal_note = Some("different-marker".to_owned());
+        assert_eq!(
+            confirmed_creation(
+                request,
+                LightningNetwork::Mainnet,
+                now,
+                created_response(mismatched_record.index),
+                Some(mismatched_record),
+            ),
+            Err(PaymentOperationError::InvalidProviderResponse)
+        );
+    }
+
+    #[test]
+    fn created_invoice_envelope_must_bind_the_returned_payment_index() {
+        assert_eq!(
+            created_invoice_parts(created_response(payment_index(2))),
+            Err(PaymentOperationError::InvalidProviderResponse)
+        );
+    }
+
+    #[test]
+    fn creation_reconciliation_preserves_missing_ambiguous_and_found_outcomes() {
+        let request = create_request();
+        assert_eq!(
+            reconcile_creation_selection(
+                request.clone(),
+                LightningNetwork::Mainnet,
+                MarkerSelection::Missing,
+            ),
+            Ok(InvoiceCreationReconciliation::Missing)
+        );
+        assert_eq!(
+            reconcile_creation_selection(
+                request.clone(),
+                LightningNetwork::Mainnet,
+                MarkerSelection::Ambiguous,
+            ),
+            Ok(InvoiceCreationReconciliation::Ambiguous)
+        );
+
+        let record = LexeCreationRecord::from_payment(lexe_payment(Some(
+            request.correlation_marker().as_str(),
+        )));
+        let found = reconcile_creation_selection(
+            request.clone(),
+            LightningNetwork::Mainnet,
+            MarkerSelection::Found(record),
+        )
+        .unwrap();
+        let InvoiceCreationReconciliation::Found(invoice) = found else {
+            panic!("expected the unique valid record to be recovered");
+        };
+        assert_eq!(invoice.intent_id, request.intent_id);
+
+        let invalid_record = LexeCreationRecord::from_payment(lexe_payment(Some(
+            "maincopy-tip:00000000-0000-0000-0000-000000000000",
+        )));
+        assert_eq!(
+            reconcile_creation_selection(
+                request,
+                LightningNetwork::Mainnet,
+                MarkerSelection::Found(invalid_record),
+            ),
+            Err(PaymentOperationError::InvalidProviderResponse.into())
+        );
+    }
+
+    #[test]
     fn subscriber_and_reconciler_share_validated_state_mapping() {
         let payment = lexe_payment(Some("maincopy-tip:2e776d7d-7d5f-4ab7-8c63-434c66a262aa"));
         let cursor = payment.updated_index();
-        let expected = observed_payment_request(
-            &payment,
-            create_request().intent_id(),
-            ProviderPaymentReference::lexe(
-                ProviderPaymentLocator::new(payment.index.to_string()).unwrap(),
-            ),
-        )
-        .unwrap();
+        let expected = expected_request(&payment);
         let reconciled = payment_status(
             expected.clone(),
             payment.index,
             payment.clone(),
+            None,
             LightningNetwork::Mainnet,
             OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
         )
@@ -1534,7 +1770,7 @@ mod tests {
             panic!("expected a validated tip update");
         };
         assert_eq!(observed.status(), &reconciled);
-        assert_eq!(observed.invoice(), expected.invoice());
+        assert_eq!(observed.invoice(), &expected.invoice);
     }
 
     #[test]
@@ -1547,12 +1783,13 @@ mod tests {
                 expected.clone(),
                 pending.index,
                 pending.clone(),
+                None,
                 LightningNetwork::Mainnet,
                 OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
             )
             .unwrap()
-            .status(),
-            &ProviderPaymentState::InvoiceOpen
+            .status,
+            ProviderPaymentState::InvoiceOpen
         );
 
         pending.status = PaymentStatus::Failed;
@@ -1561,12 +1798,13 @@ mod tests {
                 expected,
                 pending.index,
                 pending,
+                None,
                 LightningNetwork::Mainnet,
                 OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
             )
             .unwrap()
-            .status(),
-            &ProviderPaymentState::RecoveryRequired(TipRecoveryReason::ProviderConflict)
+            .status,
+            ProviderPaymentState::RecoveryRequired(TipRecoveryReason::ProviderConflict)
         );
     }
 
@@ -1583,12 +1821,13 @@ mod tests {
                 expected,
                 payment.index,
                 payment,
+                None,
                 LightningNetwork::Mainnet,
                 OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
             )
             .unwrap()
-            .status(),
-            &ProviderPaymentState::RecoveryRequired(TipRecoveryReason::SettlementIncomplete)
+            .status,
+            ProviderPaymentState::RecoveryRequired(TipRecoveryReason::SettlementIncomplete)
         );
     }
 
@@ -1603,6 +1842,7 @@ mod tests {
                 expected,
                 payment.index,
                 payment,
+                None,
                 LightningNetwork::Mainnet,
                 OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
             )
@@ -1627,6 +1867,7 @@ mod tests {
                 expected,
                 payment.index,
                 payment,
+                None,
                 LightningNetwork::Mainnet,
                 OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
             )
@@ -1651,11 +1892,106 @@ mod tests {
                 expected,
                 payment.index,
                 payment,
+                None,
                 LightningNetwork::Mainnet,
                 OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
             )
             .unwrap_err(),
             PaymentProviderError::Operation(PaymentOperationError::ProviderConflict)
+        );
+    }
+
+    #[test]
+    fn pre_parsed_invoice_must_belong_to_the_payment_envelope() {
+        let payment = lexe_payment(Some("maincopy-tip:2e776d7d-7d5f-4ab7-8c63-434c66a262aa"));
+        let observed = signed_invoice_with("Different description", Duration::from_secs(3_600));
+        let expected = observed_payment_request(
+            &payment,
+            &observed,
+            create_request().intent_id,
+            ProviderPaymentReference::lexe(
+                ProviderPaymentLocator::new(payment.index.to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            payment_status(
+                expected,
+                payment.index,
+                payment,
+                Some(&observed),
+                LightningNetwork::Mainnet,
+                OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
+            )
+            .unwrap_err(),
+            PaymentProviderError::Operation(PaymentOperationError::ProviderConflict)
+        );
+    }
+
+    #[test]
+    fn payment_envelope_is_rejected_before_missing_invoice_parsing() {
+        let mut payment = lexe_payment(Some("maincopy-tip:2e776d7d-7d5f-4ab7-8c63-434c66a262aa"));
+        let expected = expected_request(&payment);
+        payment.kind = PaymentKind::Offer;
+        payment.invoice = None;
+
+        assert_eq!(
+            payment_status(
+                expected,
+                payment.index,
+                payment,
+                None,
+                LightningNetwork::Mainnet,
+                OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
+            )
+            .unwrap_err(),
+            PaymentProviderError::Operation(PaymentOperationError::ProviderConflict)
+        );
+    }
+
+    #[test]
+    fn valid_payment_envelope_with_missing_invoice_is_an_invalid_response() {
+        let mut payment = lexe_payment(Some("maincopy-tip:2e776d7d-7d5f-4ab7-8c63-434c66a262aa"));
+        let expected = expected_request(&payment);
+        payment.invoice = None;
+
+        assert_eq!(
+            payment_status(
+                expected,
+                payment.index,
+                payment,
+                None,
+                LightningNetwork::Mainnet,
+                OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
+            )
+            .unwrap_err(),
+            PaymentProviderError::Operation(PaymentOperationError::InvalidProviderResponse)
+        );
+    }
+
+    #[test]
+    fn signed_invoice_and_provider_evidence_are_validated_independently() {
+        let mut payment = lexe_payment(Some("maincopy-tip:2e776d7d-7d5f-4ab7-8c63-434c66a262aa"));
+        let expected = expected_request(&payment);
+        let invoice = provider_invoice(&payment).unwrap();
+        assert_eq!(
+            validate_signed_invoice_identity(&expected, &invoice, LightningNetwork::Mainnet),
+            Ok(())
+        );
+        assert_eq!(
+            validate_provider_payment_evidence(&expected, &payment, payment.index),
+            Ok(())
+        );
+
+        assert_eq!(
+            validate_signed_invoice_identity(&expected, &invoice, LightningNetwork::Testnet),
+            Err(PaymentOperationError::ProviderConflict.into())
+        );
+        payment.hash = Some(LexePaymentHash::try_from(payment_index(2).id).unwrap());
+        assert_eq!(
+            validate_provider_payment_evidence(&expected, &payment, payment.index),
+            Err(PaymentOperationError::ProviderConflict.into())
         );
     }
 
@@ -1674,7 +2010,7 @@ mod tests {
             panic!("expected a recovery-required tip update");
         };
         assert_eq!(
-            update.status().status(),
+            &update.status().status,
             &ProviderPaymentState::RecoveryRequired(TipRecoveryReason::ProviderConflict)
         );
         assert_eq!(update.observed_invoice(), Some(&signed_invoice()));
@@ -1703,8 +2039,99 @@ mod tests {
             ) else {
                 panic!("expected unrelated payment to be ignored");
             };
-            assert_eq!(update.next_cursor().as_str(), expected_cursor);
-            assert_eq!(update.reason(), expected_reason);
+            assert_eq!(update.next_cursor.as_str(), expected_cursor);
+            assert_eq!(update.reason, expected_reason);
+        }
+    }
+
+    #[test]
+    fn payment_page_decision_distinguishes_tail_from_catch_up() {
+        assert!(matches!(
+            validate_payment_page(
+                GetUpdatedPaymentsResponse {
+                    payments: Vec::new(),
+                    updated_index: None,
+                },
+                None,
+            ),
+            Ok(ValidatedPaymentPage::Empty)
+        ));
+
+        let payment = lexe_payment(None);
+        let next_cursor = payment.updated_index();
+        let page = validate_payment_page(
+            GetUpdatedPaymentsResponse {
+                payments: vec![payment],
+                updated_index: Some(next_cursor),
+            },
+            None,
+        )
+        .unwrap();
+        let ValidatedPaymentPage::Updates {
+            next_cursor: observed_cursor,
+            payments,
+        } = page
+        else {
+            panic!("expected a validated catch-up page");
+        };
+        assert_eq!(observed_cursor, next_cursor);
+        assert_eq!(payments.len(), 1);
+    }
+
+    #[test]
+    fn validated_pages_drive_creation_search_and_update_polling() {
+        let request = create_request();
+        let marker = request.correlation_marker();
+        let payment = lexe_payment(Some(marker.as_str()));
+        let cursor = payment.updated_index();
+        let mut matches = BTreeMap::new();
+
+        track_creation_payments(
+            &mut matches,
+            marker.as_str(),
+            vec![(cursor, payment.clone())],
+        );
+        assert_eq!(
+            select_marker_matches(matches.into_values()),
+            MarkerSelection::Found(LexeCreationRecord::from_payment(payment.clone()))
+        );
+
+        assert!(matches!(
+            payment_update_source(ValidatedPaymentPage::Empty, None),
+            PaymentUpdateSource::Live(value) if value == PaymentUpdatedIndex::MIN
+        ));
+        assert!(matches!(
+            payment_update_source(
+                ValidatedPaymentPage::Updates {
+                    next_cursor: cursor,
+                    payments: vec![(cursor, payment)],
+                },
+                None,
+            ),
+            PaymentUpdateSource::Ready(payments) if payments.len() == 1
+        ));
+    }
+
+    #[test]
+    fn payment_page_decision_rejects_cursor_without_payments_and_vice_versa() {
+        let payment = lexe_payment(None);
+        let cursor = payment.updated_index();
+        for response in [
+            GetUpdatedPaymentsResponse {
+                payments: Vec::new(),
+                updated_index: Some(cursor),
+            },
+            GetUpdatedPaymentsResponse {
+                payments: vec![payment],
+                updated_index: None,
+            },
+        ] {
+            assert!(matches!(
+                validate_payment_page(response, None),
+                Err(PaymentProviderError::Operation(
+                    PaymentOperationError::InvalidProviderResponse
+                ))
+            ));
         }
     }
 
@@ -1898,14 +2325,32 @@ mod tests {
     }
 
     fn expected_request(payment: &LexePayment) -> ReconcilePaymentRequest {
+        let invoice = provider_invoice(payment).unwrap();
         observed_payment_request(
             payment,
-            create_request().intent_id(),
+            &invoice,
+            create_request().intent_id,
             ProviderPaymentReference::lexe(
                 ProviderPaymentLocator::new(payment.index.to_string()).unwrap(),
             ),
         )
         .unwrap()
+    }
+
+    fn validate_fresh_payment(
+        request: &CreateTipInvoiceRequest,
+        payment: &LexePayment,
+    ) -> Result<(), PaymentOperationError> {
+        let encoded_invoice = payment.invoice.as_deref().unwrap().to_string();
+        LexeCreationRecord::from_payment(payment.clone()).validate_fresh_confirmation(
+            request,
+            payment.index,
+            &encoded_invoice,
+        )
+    }
+
+    fn created_response(index: PaymentCreatedIndex) -> LexeCreateInvoiceResponse {
+        LexeCreateInvoiceResponse::new(index, signed_invoice().encoded().parse().unwrap())
     }
 
     fn payment_index(index_byte: u8) -> PaymentCreatedIndex {
@@ -1916,24 +2361,11 @@ mod tests {
     }
 
     fn signed_invoice() -> Bolt11Invoice {
-        signed_invoice_with("Tip", Duration::from_secs(3_600))
+        signed_direct_invoice("Tip", 21)
     }
 
     fn signed_invoice_with(description: &str, expiry: Duration) -> Bolt11Invoice {
-        let payment_hash = sha256::Hash::from_byte_array([1; 32]);
-        let private_key = SecretKey::from_slice(&[42; 32]).unwrap();
-        let secp = Secp256k1::new();
-        let invoice = InvoiceBuilder::new(Currency::Bitcoin)
-            .amount_milli_satoshis(21_000)
-            .duration_since_epoch(Duration::from_secs(1_700_000_000))
-            .description(description.to_owned())
-            .payment_hash(payment_hash)
-            .payment_secret(PaymentSecret([42; 32]))
-            .expiry_time(expiry)
-            .min_final_cltv_expiry_delta(18)
-            .build_signed(|message| secp.sign_ecdsa_recoverable(message, &private_key))
-            .unwrap();
-        Bolt11Invoice::parse(&invoice.to_string()).unwrap()
+        signed_direct_invoice_with(Currency::Bitcoin, description, 21, expiry)
     }
 
     fn create_request() -> CreateTipInvoiceRequest {

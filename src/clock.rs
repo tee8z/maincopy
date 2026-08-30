@@ -1,13 +1,13 @@
 use time::OffsetDateTime;
 
 /// Supplies operational time without process-global clock access in domain code.
-pub trait Clock: Send + Sync {
+pub(crate) trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
 }
 
 /// Production wall clock normalized to Coordinated Universal Time (UTC).
 #[derive(Clone, Copy, Debug, Default)]
-pub struct SystemClock;
+pub(crate) struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> OffsetDateTime {

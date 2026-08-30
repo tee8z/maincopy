@@ -30,26 +30,6 @@ pub enum PaymentUpdateRetryCause {
     DurableHandlerFailure,
 }
 
-/// Durable acknowledgement returned by the update handler.
-///
-/// The cursor must exactly match the update being handled. This makes an
-/// accidental acknowledgement of a different database transaction a replay,
-/// not an in-memory cursor advance.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaymentUpdateAck {
-    cursor: ProviderUpdateCursor,
-}
-
-impl PaymentUpdateAck {
-    pub const fn new(cursor: ProviderUpdateCursor) -> Self {
-        Self { cursor }
-    }
-
-    pub const fn cursor(&self) -> &ProviderUpdateCursor {
-        &self.cursor
-    }
-}
-
 impl PaymentUpdateRetryPolicy {
     pub fn new(
         initial_delay: Duration,
@@ -66,23 +46,14 @@ impl PaymentUpdateRetryPolicy {
             maximum_delay,
         })
     }
-
-    pub const fn initial_delay(self) -> Duration {
-        self.initial_delay
-    }
-
-    pub const fn maximum_delay(self) -> Duration {
-        self.maximum_delay
-    }
 }
 
 /// Single application-owned supervisor for provider payment updates.
 ///
 /// Application startup must construct exactly one subscriber after loading its
-/// durable cursor. The handler runs updates sequentially. Returning an
-/// `Ok(PaymentUpdateAck)` for the exact update cursor is an acknowledgement
-/// that the ledger decision (or audit disposition) and cursor were committed
-/// atomically by the database writer.
+/// durable cursor. The handler runs updates sequentially. Returning the exact
+/// update cursor is an acknowledgement that the ledger decision (or audit
+/// disposition) and cursor were committed atomically by the database writer.
 /// Returning `Err(_)` leaves the cursor unchanged and replays from that cursor
 /// after backoff. The database-backed handler is a later composition step; the
 /// subscriber itself neither stores state nor creates another work queue.
@@ -128,7 +99,7 @@ impl PaymentUpdateSubscriber {
         mut observe: Observer,
     ) where
         Handler: FnMut(ProviderPaymentUpdate) -> HandlerFuture + Send,
-        HandlerFuture: Future<Output = Result<PaymentUpdateAck, HandlerError>> + Send,
+        HandlerFuture: Future<Output = Result<ProviderUpdateCursor, HandlerError>> + Send,
         Observer: FnMut(PaymentUpdateSubscriberEvent) + Send,
     {
         let mut backoff = RetryBackoff::new(self.retry_policy);
@@ -145,20 +116,12 @@ impl PaymentUpdateSubscriber {
                 response = self.provider.next_payment_updates(request) => response,
             };
 
-            match response {
-                Err(_) => {
-                    let delay = backoff.next_delay();
-                    observe(PaymentUpdateSubscriberEvent::RetryScheduled {
-                        cause: PaymentUpdateRetryCause::ProviderFailure,
-                        delay,
-                    });
-                    if wait_for_retry(self.retry_clock.as_ref(), &cancellation, delay).await {
-                        return;
-                    }
-                }
+            let retry_cause = match response {
+                Err(_) => Some(PaymentUpdateRetryCause::ProviderFailure),
                 Ok(ProviderPaymentUpdatePoll::Idle) => {
                     backoff.reset();
                     observe(PaymentUpdateSubscriberEvent::Healthy);
+                    None
                 }
                 Ok(ProviderPaymentUpdatePoll::Updates(batch)) => {
                     let mut handler_failed = false;
@@ -168,7 +131,7 @@ impl PaymentUpdateSubscriber {
                         }
                         let next_cursor = update.next_cursor().clone();
                         match handler(update).await {
-                            Ok(ack) if ack.cursor() == &next_cursor => {
+                            Ok(acknowledged_cursor) if acknowledged_cursor == next_cursor => {
                                 self.cursor = Some(next_cursor);
                                 backoff.reset();
                                 observe(PaymentUpdateSubscriberEvent::Healthy);
@@ -183,19 +146,19 @@ impl PaymentUpdateSubscriber {
                         }
                     }
 
-                    if handler_failed {
-                        if cancellation.is_cancelled() {
-                            return;
-                        }
-                        let delay = backoff.next_delay();
-                        observe(PaymentUpdateSubscriberEvent::RetryScheduled {
-                            cause: PaymentUpdateRetryCause::DurableHandlerFailure,
-                            delay,
-                        });
-                        if wait_for_retry(self.retry_clock.as_ref(), &cancellation, delay).await {
-                            return;
-                        }
+                    if handler_failed && cancellation.is_cancelled() {
+                        return;
                     }
+
+                    handler_failed.then_some(PaymentUpdateRetryCause::DurableHandlerFailure)
+                }
+            };
+
+            if let Some(cause) = retry_cause {
+                let delay = backoff.next_delay();
+                observe(PaymentUpdateSubscriberEvent::RetryScheduled { cause, delay });
+                if wait_for_retry(self.retry_clock.as_ref(), &cancellation, delay).await {
+                    return;
                 }
             }
         }
@@ -227,7 +190,7 @@ struct RetryBackoff {
 impl RetryBackoff {
     const fn new(policy: PaymentUpdateRetryPolicy) -> Self {
         Self {
-            next: policy.initial_delay(),
+            next: policy.initial_delay,
             policy,
         }
     }
@@ -237,13 +200,13 @@ impl RetryBackoff {
         self.next = self
             .next
             .checked_mul(2)
-            .unwrap_or(self.policy.maximum_delay())
-            .min(self.policy.maximum_delay());
+            .unwrap_or(self.policy.maximum_delay)
+            .min(self.policy.maximum_delay);
         current
     }
 
     fn reset(&mut self) {
-        self.next = self.policy.initial_delay();
+        self.next = self.policy.initial_delay;
     }
 }
 
@@ -286,8 +249,8 @@ mod tests {
     use super::*;
     use crate::payments::{
         CreateTipInvoiceError, IgnoredPaymentUpdateReason, IgnoredProviderPaymentUpdate,
-        InvoiceCreationReconciliation, InvoiceNotCreatedReason, PaymentOperationError,
-        ProviderPaymentUpdateBatch, ProviderSubstitute, SubstituteCall, SubstituteResponses,
+        InvoiceCreationReconciliation, PaymentOperationError, ProviderPaymentUpdateBatch,
+        ProviderSubstitute, SubstituteCall, SubstituteResponses,
     };
 
     #[test]
@@ -317,13 +280,13 @@ mod tests {
             .run_until_stop(
                 cancellation,
                 move |update| {
-                    let ack = PaymentUpdateAck::new(update.next_cursor().clone());
+                    let ack = update.next_cursor().clone();
                     handler_observed
                         .lock()
                         .unwrap()
                         .push(update.next_cursor().as_str().to_owned());
                     handler_cancellation.cancel();
-                    future::ready(Ok::<PaymentUpdateAck, ()>(ack))
+                    future::ready(Ok::<ProviderUpdateCursor, ()>(ack))
                 },
                 move |event| observed_events.lock().unwrap().push(event),
             )
@@ -358,7 +321,7 @@ mod tests {
                 cancellation,
                 move |update| {
                     let cursor = update.next_cursor().as_str().to_owned();
-                    let ack = PaymentUpdateAck::new(update.next_cursor().clone());
+                    let ack = update.next_cursor().clone();
                     handler_attempts.lock().unwrap().push(cursor.clone());
                     let should_fail = cursor == update_cursor_value(2)
                         && handler_second_attempts.fetch_add(1, Ordering::SeqCst) == 0;
@@ -412,9 +375,9 @@ mod tests {
             .run_until_stop(
                 cancellation,
                 move |update| {
-                    let ack = PaymentUpdateAck::new(update.next_cursor().clone());
+                    let ack = update.next_cursor().clone();
                     handler_cancellation.cancel();
-                    future::ready(Ok::<PaymentUpdateAck, ()>(ack))
+                    future::ready(Ok::<ProviderUpdateCursor, ()>(ack))
                 },
                 move |event| observed_events.lock().unwrap().push(event),
             )
@@ -450,12 +413,12 @@ mod tests {
                 move |update| {
                     let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
                     let ack = if attempt == 0 {
-                        PaymentUpdateAck::new(update_cursor(2))
+                        update_cursor(2)
                     } else {
                         handler_cancellation.cancel();
-                        PaymentUpdateAck::new(update.next_cursor().clone())
+                        update.next_cursor().clone()
                     };
-                    future::ready(Ok::<PaymentUpdateAck, ()>(ack))
+                    future::ready(Ok::<ProviderUpdateCursor, ()>(ack))
                 },
                 move |event| observed_events.lock().unwrap().push(event),
             )
@@ -490,13 +453,13 @@ mod tests {
             .run_until_stop(
                 cancellation,
                 move |update| {
-                    let ack = PaymentUpdateAck::new(update.next_cursor().clone());
+                    let ack = update.next_cursor().clone();
                     handler_observed
                         .lock()
                         .unwrap()
                         .push(update.next_cursor().as_str().to_owned());
                     handler_cancellation.cancel();
-                    future::ready(Ok::<PaymentUpdateAck, ()>(ack))
+                    future::ready(Ok::<ProviderUpdateCursor, ()>(ack))
                 },
                 |_| {},
             )
@@ -526,9 +489,9 @@ mod tests {
             .run_until_stop(
                 cancellation,
                 move |update| {
-                    let ack = PaymentUpdateAck::new(update.next_cursor().clone());
+                    let ack = update.next_cursor().clone();
                     handler_cancellation.cancel();
-                    future::ready(Ok::<PaymentUpdateAck, ()>(ack))
+                    future::ready(Ok::<ProviderUpdateCursor, ()>(ack))
                 },
                 move |event| observed_events.lock().unwrap().push(event),
             )
@@ -578,9 +541,7 @@ mod tests {
                 .run_until_stop(
                     task_cancellation,
                     |update| {
-                        future::ready(Ok::<PaymentUpdateAck, ()>(PaymentUpdateAck::new(
-                            update.next_cursor().clone(),
-                        )))
+                        future::ready(Ok::<ProviderUpdateCursor, ()>(update.next_cursor().clone()))
                     },
                     |_| {},
                 )
@@ -612,9 +573,7 @@ mod tests {
 
     fn substitute_provider() -> (LightningProvider, Arc<ProviderSubstitute>) {
         let substitute = Arc::new(ProviderSubstitute::new(SubstituteResponses {
-            create_tip_invoice: Err(CreateTipInvoiceError::NotCreated(
-                InvoiceNotCreatedReason::ProviderRejected,
-            )),
+            create_tip_invoice: Err(CreateTipInvoiceError::NotCreated),
             reconcile_invoice_creation: Ok(InvoiceCreationReconciliation::Missing),
             reconcile_payment: Err(PaymentOperationError::PaymentNotFound.into()),
             next_payment_updates: Ok(ProviderPaymentUpdatePoll::Idle),
@@ -652,9 +611,12 @@ mod tests {
             .calls()
             .into_iter()
             .filter_map(|call| match call {
-                SubstituteCall::NextPaymentUpdates(request) => {
-                    Some(request.cursor().map(|cursor| cursor.as_str().to_owned()))
-                }
+                SubstituteCall::NextPaymentUpdates(request) => Some(
+                    request
+                        .cursor
+                        .as_ref()
+                        .map(|cursor| cursor.as_str().to_owned()),
+                ),
                 _ => None,
             })
             .collect()

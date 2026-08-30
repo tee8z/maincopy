@@ -1,6 +1,7 @@
-use std::{error::Error, fmt};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::LogicalContentPath;
 
@@ -191,7 +192,7 @@ impl ContentValidationCode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ValidationLocation {
+pub(crate) struct ValidationLocation {
     path: LogicalContentPath,
     field: FieldPath,
 }
@@ -200,17 +201,10 @@ impl ValidationLocation {
     pub(crate) const fn new(path: LogicalContentPath, field: FieldPath) -> Self {
         Self { path, field }
     }
-
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub const fn field(&self) -> &FieldPath {
-        &self.field
-    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Error, PartialEq, Serialize)]
+#[error("{path}: {field}: {message}")]
 pub struct ContentValidationError {
     path: LogicalContentPath,
     field: FieldPath,
@@ -257,10 +251,6 @@ impl ContentValidationError {
         &self.message
     }
 
-    pub const fn related(&self) -> Option<&ValidationLocation> {
-        self.related.as_ref()
-    }
-
     fn sort_key(&self) -> (&str, u16, &str, u16, Option<(&str, &str)>, &str) {
         (
             self.path.as_str(),
@@ -275,13 +265,8 @@ impl ContentValidationError {
     }
 }
 
-impl fmt::Display for ContentValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}: {}", self.path, self.field, self.message)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("content validation failed with {} error(s)", .0.len())]
 pub struct ContentValidationErrors(Vec<ContentValidationError>);
 
 impl ContentValidationErrors {
@@ -293,18 +278,6 @@ impl ContentValidationErrors {
         self.0
     }
 }
-
-impl fmt::Display for ContentValidationErrors {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "content validation failed with {} error(s)",
-            self.0.len()
-        )
-    }
-}
-
-impl Error for ContentValidationErrors {}
 
 #[derive(Default)]
 pub(crate) struct DiagnosticCollector {

@@ -21,7 +21,10 @@ pub(crate) enum ProcessCommand {
     Serve(Box<ServeArguments>),
 
     /// Send an operation to the running server's private admin API.
-    Admin(AdminArguments),
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -97,63 +100,26 @@ pub(crate) struct ServeArguments {
 
 impl ServeArguments {
     pub(crate) fn into_configuration(self) -> (PathBuf, HostConfigurationOverrides) {
-        let mut overrides = HostConfigurationOverrides::default();
-        if let Some(value) = self.content_root {
-            overrides = overrides.with_content_root(value);
-        }
-        if let Some(value) = self.state_root {
-            overrides = overrides.with_state_root(value);
-        }
-        if let Some(value) = self.runtime_root {
-            overrides = overrides.with_runtime_root(value);
-        }
-        if let Some(value) = self.database_path {
-            overrides = overrides.with_database_path(value);
-        }
-        if let Some(value) = self.public_bind {
-            overrides = overrides.with_public_bind(value);
-        }
-        if let Some(value) = self.admin_socket {
-            overrides = overrides.with_admin_socket(value);
-        }
-        if let Some(value) = self.database_busy_timeout_ms {
-            overrides = overrides.with_database_busy_timeout_ms(value);
-        }
-        if let Some(value) = self.database_writer_queue_capacity {
-            overrides = overrides.with_database_writer_queue_capacity(value);
-        }
-        if let Some(value) = self.database_read_pool_size {
-            overrides = overrides.with_database_read_pool_size(value);
-        }
-        if let Some(value) = self.content_publication_file_bytes {
-            overrides = overrides.with_content_publication_file_bytes(value);
-        }
-        if let Some(value) = self.content_post_file_bytes {
-            overrides = overrides.with_content_post_file_bytes(value);
-        }
-        if let Some(value) = self.content_asset_file_bytes {
-            overrides = overrides.with_content_asset_file_bytes(value);
-        }
-        if let Some(value) = self.content_total_tree_bytes {
-            overrides = overrides.with_content_total_tree_bytes(value);
-        }
-        if let Some(value) = self.content_entries {
-            overrides = overrides.with_content_entries(value);
-        }
-        if let Some(value) = self.content_depth {
-            overrides = overrides.with_content_depth(value);
-        }
-        if let Some(value) = self.content_path_bytes {
-            overrides = overrides.with_content_path_bytes(value);
-        }
+        let overrides = HostConfigurationOverrides {
+            content_root: self.content_root,
+            state_root: self.state_root,
+            runtime_root: self.runtime_root,
+            database_path: self.database_path,
+            public_bind: self.public_bind,
+            admin_socket: self.admin_socket,
+            database_busy_timeout_ms: self.database_busy_timeout_ms,
+            database_writer_queue_capacity: self.database_writer_queue_capacity,
+            database_read_pool_size: self.database_read_pool_size,
+            content_publication_file_bytes: self.content_publication_file_bytes,
+            content_post_file_bytes: self.content_post_file_bytes,
+            content_asset_file_bytes: self.content_asset_file_bytes,
+            content_total_tree_bytes: self.content_total_tree_bytes,
+            content_entries: self.content_entries,
+            content_depth: self.content_depth,
+            content_path_bytes: self.content_path_bytes,
+        };
         (self.config, overrides)
     }
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct AdminArguments {
-    #[command(subcommand)]
-    pub(crate) command: AdminCommand,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
@@ -224,23 +190,24 @@ mod tests {
         assert_eq!(path, PathBuf::from("host.toml"));
         assert_eq!(
             overrides,
-            HostConfigurationOverrides::default()
-                .with_content_root(PathBuf::from("publication"))
-                .with_state_root(PathBuf::from("persistent"))
-                .with_runtime_root(PathBuf::from("ephemeral"))
-                .with_database_path(PathBuf::from("database.sqlite3"))
-                .with_public_bind("127.0.0.1:4000".parse().unwrap())
-                .with_admin_socket(PathBuf::from("admin.socket"))
-                .with_database_busy_timeout_ms(7_000)
-                .with_database_writer_queue_capacity(256)
-                .with_database_read_pool_size(8)
-                .with_content_publication_file_bytes(131_072)
-                .with_content_post_file_bytes(2_097_152)
-                .with_content_asset_file_bytes(16_777_216)
-                .with_content_total_tree_bytes(134_217_728)
-                .with_content_entries(5_000)
-                .with_content_depth(8)
-                .with_content_path_bytes(512)
+            HostConfigurationOverrides {
+                content_root: Some(PathBuf::from("publication")),
+                state_root: Some(PathBuf::from("persistent")),
+                runtime_root: Some(PathBuf::from("ephemeral")),
+                database_path: Some(PathBuf::from("database.sqlite3")),
+                public_bind: Some("127.0.0.1:4000".parse().unwrap()),
+                admin_socket: Some(PathBuf::from("admin.socket")),
+                database_busy_timeout_ms: Some(7_000),
+                database_writer_queue_capacity: Some(256),
+                database_read_pool_size: Some(8),
+                content_publication_file_bytes: Some(131_072),
+                content_post_file_bytes: Some(2_097_152),
+                content_asset_file_bytes: Some(16_777_216),
+                content_total_tree_bytes: Some(134_217_728),
+                content_entries: Some(5_000),
+                content_depth: Some(8),
+                content_path_bytes: Some(512),
+            }
         );
     }
 

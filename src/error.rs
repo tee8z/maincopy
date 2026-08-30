@@ -5,6 +5,18 @@ use thiserror::Error;
 
 use crate::{config::ConfigurationErrors, content::ContentValidationErrors};
 
+macro_rules! impl_display {
+    ($name:ty { $($pattern:pat => $value:literal),+ $(,)? }) => {
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(match self {
+                    $($pattern => $value),+
+                })
+            }
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ProcessExit {
@@ -37,14 +49,11 @@ pub enum ProcessError {
     #[error(transparent)]
     Validation(#[from] ContentValidationErrors),
 
-    #[error("{component} is unavailable: {reason}")]
-    Unavailable {
-        component: ProcessComponent,
-        reason: UnavailableReason,
-    },
+    #[error("the admin API is unavailable: the client transport is not implemented yet")]
+    AdminApiUnavailable,
 
-    #[error("the requested operation conflicts with current {resource} state")]
-    Conflict { resource: ConflictResource },
+    #[error("the requested operation conflicts with current application state")]
+    Conflict,
 
     #[error(transparent)]
     Application(#[from] ApplicationError),
@@ -58,8 +67,8 @@ impl ProcessError {
         match self {
             Self::Configuration(_) => ProcessExit::Configuration,
             Self::Validation(_) => ProcessExit::Validation,
-            Self::Unavailable { .. } => ProcessExit::Unavailable,
-            Self::Conflict { .. } => ProcessExit::Conflict,
+            Self::AdminApiUnavailable => ProcessExit::Unavailable,
+            Self::Conflict => ProcessExit::Conflict,
             Self::Application(_) | Self::Internal => ProcessExit::Internal,
         }
     }
@@ -68,8 +77,8 @@ impl ProcessError {
         match self {
             Self::Configuration(_) => ProcessErrorCategory::Configuration,
             Self::Validation(_) => ProcessErrorCategory::Validation,
-            Self::Unavailable { .. } => ProcessErrorCategory::Availability,
-            Self::Conflict { .. } => ProcessErrorCategory::Conflict,
+            Self::AdminApiUnavailable => ProcessErrorCategory::Availability,
+            Self::Conflict => ProcessErrorCategory::Conflict,
             Self::Application(_) | Self::Internal => ProcessErrorCategory::Internal,
         }
     }
@@ -83,47 +92,6 @@ pub enum ProcessErrorCategory {
     Availability,
     Conflict,
     Internal,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProcessComponent {
-    AdminApi,
-}
-
-impl fmt::Display for ProcessComponent {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AdminApi => formatter.write_str("the admin API"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UnavailableReason {
-    NotImplemented,
-}
-
-impl fmt::Display for UnavailableReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotImplemented => {
-                formatter.write_str("the client transport is not implemented yet")
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConflictResource {
-    Application,
-}
-
-impl fmt::Display for ConflictResource {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Application => formatter.write_str("application"),
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -154,7 +122,7 @@ pub enum ApplicationError {
     #[error("critical task {task} panicked: {message}")]
     CriticalTaskPanicked {
         task: CriticalTaskName,
-        message: PanicMessage,
+        message: Box<str>,
     },
 
     #[error("the critical task supervisor failed")]
@@ -176,14 +144,10 @@ pub enum ShutdownSignal {
     Terminate,
 }
 
-impl fmt::Display for ShutdownSignal {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Interrupt => formatter.write_str("interrupt"),
-            Self::Terminate => formatter.write_str("terminate"),
-        }
-    }
-}
+impl_display!(ShutdownSignal {
+    Self::Interrupt => "interrupt",
+    Self::Terminate => "terminate",
+});
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CriticalTaskName {
@@ -195,18 +159,14 @@ pub enum CriticalTaskName {
     Payments,
 }
 
-impl fmt::Display for CriticalTaskName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PublicServer => formatter.write_str("public server"),
-            Self::AdminServer => formatter.write_str("admin server"),
-            Self::DatabaseWriter => formatter.write_str("database writer"),
-            Self::Scheduler => formatter.write_str("scheduler"),
-            Self::Worker => formatter.write_str("worker"),
-            Self::Payments => formatter.write_str("payments actor"),
-        }
-    }
-}
+impl_display!(CriticalTaskName {
+    Self::PublicServer => "public server",
+    Self::AdminServer => "admin server",
+    Self::DatabaseWriter => "database writer",
+    Self::Scheduler => "scheduler",
+    Self::Worker => "worker",
+    Self::Payments => "payments actor",
+});
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupStage {
@@ -219,42 +179,15 @@ pub enum StartupStage {
     Listeners,
 }
 
-impl fmt::Display for StartupStage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Configuration => formatter.write_str("configuration"),
-            Self::ProcessLock => formatter.write_str("process lock"),
-            Self::Database => formatter.write_str("database startup"),
-            Self::Content => formatter.write_str("content compilation"),
-            Self::FrontendAssets => formatter.write_str("frontend asset validation"),
-            Self::Payments => formatter.write_str("payment startup"),
-            Self::Listeners => formatter.write_str("listener binding"),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct PanicMessage(String);
-
-impl PanicMessage {
-    pub(crate) fn from_payload(payload: &(dyn std::any::Any + Send)) -> Self {
-        if let Some(message) = payload.downcast_ref::<String>() {
-            return Self(message.clone());
-        }
-
-        if let Some(message) = payload.downcast_ref::<&'static str>() {
-            return Self((*message).to_owned());
-        }
-
-        Self("non-string panic payload".to_owned())
-    }
-}
-
-impl fmt::Display for PanicMessage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
+impl_display!(StartupStage {
+    Self::Configuration => "configuration",
+    Self::ProcessLock => "process lock",
+    Self::Database => "database startup",
+    Self::Content => "content compilation",
+    Self::FrontendAssets => "frontend asset validation",
+    Self::Payments => "payment startup",
+    Self::Listeners => "listener binding",
+});
 
 #[cfg(test)]
 mod tests {
@@ -289,19 +222,8 @@ mod tests {
                 ProcessError::Validation(validation_errors()),
                 ProcessExit::Validation,
             ),
-            (
-                ProcessError::Unavailable {
-                    component: ProcessComponent::AdminApi,
-                    reason: UnavailableReason::NotImplemented,
-                },
-                ProcessExit::Unavailable,
-            ),
-            (
-                ProcessError::Conflict {
-                    resource: ConflictResource::Application,
-                },
-                ProcessExit::Conflict,
-            ),
+            (ProcessError::AdminApiUnavailable, ProcessExit::Unavailable),
+            (ProcessError::Conflict, ProcessExit::Conflict),
             (
                 ProcessError::Application(ApplicationError::Startup {
                     stage: StartupStage::Configuration,
@@ -341,17 +263,12 @@ mod tests {
                 "validation",
             ),
             (
-                ProcessError::Unavailable {
-                    component: ProcessComponent::AdminApi,
-                    reason: UnavailableReason::NotImplemented,
-                },
+                ProcessError::AdminApiUnavailable,
                 ProcessErrorCategory::Availability,
                 "availability",
             ),
             (
-                ProcessError::Conflict {
-                    resource: ConflictResource::Application,
-                },
+                ProcessError::Conflict,
                 ProcessErrorCategory::Conflict,
                 "conflict",
             ),
@@ -365,6 +282,37 @@ mod tests {
         for (error, category, wire_name) in cases {
             assert_eq!(error.category(), category);
             assert_eq!(serde_json::to_value(category).unwrap(), wire_name);
+        }
+    }
+
+    #[test]
+    fn error_component_names_have_stable_text() {
+        macro_rules! assert_display {
+            ($($value:expr => $expected:literal),+ $(,)?) => {
+                $(assert_eq!($value.to_string(), $expected);)+
+            };
+        }
+
+        assert_display! {
+            ProcessError::AdminApiUnavailable =>
+                "the admin API is unavailable: the client transport is not implemented yet",
+            ProcessError::Conflict =>
+                "the requested operation conflicts with current application state",
+            ShutdownSignal::Interrupt => "interrupt",
+            ShutdownSignal::Terminate => "terminate",
+            CriticalTaskName::PublicServer => "public server",
+            CriticalTaskName::AdminServer => "admin server",
+            CriticalTaskName::DatabaseWriter => "database writer",
+            CriticalTaskName::Scheduler => "scheduler",
+            CriticalTaskName::Worker => "worker",
+            CriticalTaskName::Payments => "payments actor",
+            StartupStage::Configuration => "configuration",
+            StartupStage::ProcessLock => "process lock",
+            StartupStage::Database => "database startup",
+            StartupStage::Content => "content compilation",
+            StartupStage::FrontendAssets => "frontend asset validation",
+            StartupStage::Payments => "payment startup",
+            StartupStage::Listeners => "listener binding",
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -11,7 +11,7 @@ use super::super::{
 };
 #[cfg(test)]
 use super::GeneratedPostAsset;
-use super::{BaselineMarkdownRenderer, MarkdownRenderError, RenderedPost};
+use super::{MarkdownRenderError, RenderedPost, render_markdown};
 
 /// Compile one validated candidate into a self-contained immutable catalog.
 pub fn compile_content_catalog(
@@ -24,15 +24,13 @@ pub fn compile_content_catalog(
     let site_assets = assets
         .site_assets_for(content.publication())
         .map_err(|error| CatalogBuildError::publication_assets(error.to_string()))?;
-    let renderer = BaselineMarkdownRenderer;
     let mut revisions = BTreeMap::new();
 
     for document in content.posts() {
         let post_assets = assets
             .assets_for(document)
             .map_err(|error| CatalogBuildError::post_assets(document.path().clone(), error))?;
-        let rendered = renderer
-            .render(document, post_assets, site_assets)
+        let rendered = render_markdown(document, post_assets, site_assets)
             .map_err(CatalogBuildError::render)?;
         let key = CatalogKey {
             post_id: rendered.post_id().clone(),
@@ -55,26 +53,13 @@ pub fn compile_content_catalog(
 /// Candidate-scoped rendered revisions and the exact local bytes they need.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentCatalog {
-    publication: PublicationSettings,
-    site_assets: ResolvedSiteAssets,
-    local_assets: ResolvedLocalAssetStore,
+    pub(super) publication: PublicationSettings,
+    pub(super) site_assets: ResolvedSiteAssets,
+    pub(super) local_assets: ResolvedLocalAssetStore,
     revisions: BTreeMap<CatalogKey, Arc<RenderedPost>>,
 }
 
 impl ContentCatalog {
-    pub(super) const fn publication(&self) -> &PublicationSettings {
-        &self.publication
-    }
-
-    pub(super) const fn site_assets(&self) -> &ResolvedSiteAssets {
-        &self.site_assets
-    }
-
-    #[cfg(test)]
-    pub(super) const fn local_assets(&self) -> &ResolvedLocalAssetStore {
-        &self.local_assets
-    }
-
     pub(super) const fn projection_scope(&self) -> CatalogProjectionScope<'_> {
         CatalogProjectionScope {
             site_assets: &self.site_assets,
@@ -102,19 +87,11 @@ impl ContentCatalog {
 
 #[derive(Clone, Copy)]
 pub(super) struct CatalogProjectionScope<'catalog> {
-    site_assets: &'catalog ResolvedSiteAssets,
-    local_assets: &'catalog ResolvedLocalAssetStore,
+    pub(super) site_assets: &'catalog ResolvedSiteAssets,
+    pub(super) local_assets: &'catalog ResolvedLocalAssetStore,
 }
 
 impl<'catalog> CatalogProjectionScope<'catalog> {
-    pub(super) const fn site_assets(self) -> &'catalog ResolvedSiteAssets {
-        self.site_assets
-    }
-
-    pub(super) const fn local_assets(self) -> &'catalog ResolvedLocalAssetStore {
-        self.local_assets
-    }
-
     #[cfg(test)]
     pub(super) const fn for_test(
         site_assets: &'catalog ResolvedSiteAssets,
@@ -222,12 +199,6 @@ impl CatalogBuildError {
     }
 }
 
-impl fmt::Display for CatalogBuildErrorCode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
-    }
-}
-
 fn validate_catalog_generated_assets<'post>(
     local_assets: &ResolvedLocalAssetStore,
     rendered_posts: impl Iterator<Item = &'post RenderedPost>,
@@ -238,7 +209,7 @@ fn validate_catalog_generated_assets<'post>(
     }
     for rendered in rendered_posts {
         for generated in rendered.generated_assets() {
-            let path = generated.asset().path().as_str();
+            let path = generated.asset().path.as_str();
             if paths
                 .insert(path.to_ascii_lowercase(), path.to_owned())
                 .is_some()
@@ -263,7 +234,7 @@ fn validate_generated_path_sets<'asset, 'path>(
         paths.insert(path.as_str().to_ascii_lowercase(), path.as_str().to_owned());
     }
     for (post_path, asset) in generated {
-        let path = asset.asset().path().as_str();
+        let path = asset.asset().path.as_str();
         if paths
             .insert(path.to_ascii_lowercase(), path.to_owned())
             .is_some()
@@ -369,10 +340,10 @@ mod tests {
         let catalog = compile("Catalog", &[]);
         assert_eq!(catalog.len(), 1);
         assert!(!catalog.is_empty());
-        assert_eq!(catalog.publication().site().title().as_str(), "Catalog");
-        assert!(catalog.site_assets().allowed_origins().is_empty());
+        assert_eq!(catalog.publication.site().title().as_str(), "Catalog");
+        assert!(catalog.site_assets.allowed_origins().is_empty());
         let path = LogicalAssetPath::parse("assets/cover.png").unwrap();
-        assert_eq!(catalog.local_assets().get(&path).unwrap().bytes(), b"cover");
+        assert_eq!(catalog.local_assets.get(&path).unwrap().bytes(), b"cover");
 
         let (key, rendered) = catalog.revisions.iter().next().unwrap();
         assert_eq!(

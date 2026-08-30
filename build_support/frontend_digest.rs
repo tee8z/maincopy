@@ -3,7 +3,7 @@
 //! Cargo compiles this source into both the package build script and the
 //! runtime library. Keep it independent from either crate's module graph.
 
-use std::{error::Error, fmt};
+use std::fmt;
 
 use blake3::Hasher;
 
@@ -80,16 +80,9 @@ impl std::str::FromStr for FrontendAssetName {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("frontend asset name is not recognized")]
 pub struct FrontendAssetNameParseError;
-
-impl fmt::Display for FrontendAssetNameParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("frontend asset name is not recognized")
-    }
-}
-
-impl Error for FrontendAssetNameParseError {}
 
 #[derive(Clone, Copy)]
 pub(crate) struct FrontendDigestInput<'bytes> {
@@ -103,26 +96,15 @@ impl<'bytes> FrontendDigestInput<'bytes> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum FrontendDigestContractError {
+    #[error("frontend bundle must contain at least one asset")]
     EmptyBundle,
+    #[error("frontend bundle must start with one CSS asset")]
     MissingStylesheet,
+    #[error("frontend bundle assets must be unique and ordered by their typed kind")]
     AssetOrder,
 }
-
-impl fmt::Display for FrontendDigestContractError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::EmptyBundle => "frontend bundle must contain at least one asset",
-            Self::MissingStylesheet => "frontend bundle must start with one CSS asset",
-            Self::AssetOrder => {
-                "frontend bundle assets must be unique and ordered by their typed kind"
-            }
-        })
-    }
-}
-
-impl Error for FrontendDigestContractError {}
 
 pub(crate) fn frontend_asset_digest(kind: FrontendAssetKind, bytes: &[u8]) -> [u8; 32] {
     let mut transcript = Transcript::new(FRONTEND_ASSET_CONTEXT);

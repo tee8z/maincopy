@@ -1,4 +1,4 @@
-use std::{fmt, num::NonZeroUsize, ops::Range, sync::Arc};
+use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::Serialize;
@@ -9,9 +9,9 @@ use super::super::identity::finalize_post_revision;
 use super::super::{
     AssetRevisionReference, DigestedAsset, LogicalAssetPath, LogicalContentPath,
     MarkdownDestinationKind, MarkdownDestinationOrdinal, PostDocument, PostId,
-    PostRendererIdentity, PostRendererVersion, PostRevisionDigest, ResolvedLocalAssetLookupError,
+    PostRendererIdentity, PostRevisionDigest, ResolvedLocalAssetLookupError,
     ResolvedLocalAssetStore, ResolvedPostAssets, ResolvedSiteAssets, RevisionIdentityError,
-    SanitizerVersion, SiteSnapshotDigest, SnapshotAssetPath, digest_asset,
+    SiteSnapshotDigest, SnapshotAssetPath, digest_asset,
 };
 use super::catalog::CatalogProjectionScope;
 
@@ -19,61 +19,49 @@ const MAX_RENDERED_HTML_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MERMAID_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_MERMAID_BLOCKS: usize = 64;
 
-/// The closed V1 CommonMark renderer.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct BaselineMarkdownRenderer;
+/// Render one post with the closed V1 CommonMark pipeline.
+pub fn render_markdown(
+    document: &PostDocument,
+    assets: &ResolvedPostAssets,
+    site_assets: &ResolvedSiteAssets,
+) -> Result<RenderedPost, MarkdownRenderError> {
+    render_markdown_with_limits(document, assets, site_assets, RendererLimits::production())
+}
 
-impl BaselineMarkdownRenderer {
-    pub fn render(
-        self,
-        document: &PostDocument,
-        assets: &ResolvedPostAssets,
-        site_assets: &ResolvedSiteAssets,
-    ) -> Result<RenderedPost, MarkdownRenderError> {
-        self.render_with_limits(document, assets, site_assets, RendererLimits::production())
-    }
+fn render_markdown_with_limits(
+    document: &PostDocument,
+    assets: &ResolvedPostAssets,
+    site_assets: &ResolvedSiteAssets,
+    limits: RendererLimits,
+) -> Result<RenderedPost, MarkdownRenderError> {
+    let identity = PostRendererIdentity::baseline();
+    let rendered = MarkdownEventRenderer::new(document, assets, site_assets, limits).render()?;
+    let generated_assets: Vec<GeneratedPostAsset> = Vec::new();
+    validate_generated_assets(document, assets, &generated_assets)?;
+    let generated_identities = generated_assets
+        .iter()
+        .map(|generated| generated.asset.clone())
+        .collect::<Vec<_>>();
+    let revision = finalize_post_revision(
+        document,
+        assets,
+        site_assets,
+        &identity,
+        rendered.article.identity_html.as_bytes(),
+        &generated_identities,
+        document.metadata().distribution(),
+    )
+    .map_err(|error| identity_error(document, error))?;
 
-    fn render_with_limits(
-        self,
-        document: &PostDocument,
-        assets: &ResolvedPostAssets,
-        site_assets: &ResolvedSiteAssets,
-        limits: RendererLimits,
-    ) -> Result<RenderedPost, MarkdownRenderError> {
-        let identity = PostRendererIdentity::new(
-            super::super::RendererSettings::baseline(),
-            PostRendererVersion::V1,
-            SanitizerVersion::V1,
-        );
-        let rendered =
-            MarkdownEventRenderer::new(document, assets, site_assets, limits).render()?;
-        let generated_assets: Vec<GeneratedPostAsset> = Vec::new();
-        validate_generated_assets(document, assets, &generated_assets)?;
-        let generated_identities = generated_assets
-            .iter()
-            .map(|generated| generated.asset.clone())
-            .collect::<Vec<_>>();
-        let revision = finalize_post_revision(
-            document,
-            assets,
-            site_assets,
-            &identity,
-            rendered.article.identity_html.as_bytes(),
-            &generated_identities,
-            document.metadata().distribution(),
-        )
-        .map_err(|error| identity_error(document, error))?;
-
-        Ok(RenderedPost {
-            document: document.clone(),
-            assets: assets.clone(),
-            renderer: identity,
-            article: rendered.article,
-            mermaid: rendered.mermaid.into(),
-            generated_assets: generated_assets.into(),
-            revision,
-        })
-    }
+    Ok(RenderedPost {
+        document: document.clone(),
+        assets: assets.clone(),
+        renderer: identity,
+        article: rendered.article,
+        mermaid: rendered.mermaid.into(),
+        generated_assets: generated_assets.into(),
+        revision,
+    })
 }
 
 /// One fully rendered, identity-bound post revision.
@@ -101,10 +89,6 @@ impl RenderedPost {
         &self.assets
     }
 
-    pub const fn renderer_identity(&self) -> &PostRendererIdentity {
-        &self.renderer
-    }
-
     #[cfg(test)]
     fn pre_injection_html(&self) -> &str {
         &self.article.identity_html
@@ -114,7 +98,7 @@ impl RenderedPost {
         &self.mermaid
     }
 
-    pub fn generated_assets(&self) -> &[GeneratedPostAsset] {
+    pub(crate) fn generated_assets(&self) -> &[GeneratedPostAsset] {
         &self.generated_assets
     }
 
@@ -127,7 +111,7 @@ impl RenderedPost {
         snapshot: &SiteSnapshotDigest,
         scope: CatalogProjectionScope<'_>,
     ) -> Result<String, MarkdownRenderError> {
-        if self.assets.policy_binding() != scope.site_assets().policy_binding() {
+        if self.assets.policy_binding() != scope.site_assets.policy_binding() {
             return Err(MarkdownRenderError::new(
                 &self.document,
                 MarkdownRenderLocation::Document,
@@ -138,7 +122,7 @@ impl RenderedPost {
         self.article.project_for_snapshot(
             self.document.path(),
             snapshot,
-            scope.local_assets(),
+            scope.local_assets,
             MAX_RENDERED_HTML_BYTES,
         )
     }
@@ -146,7 +130,7 @@ impl RenderedPost {
 
 /// A generated post asset whose digest was calculated from its owned bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GeneratedPostAsset {
+pub(crate) struct GeneratedPostAsset {
     asset: DigestedAsset,
     bytes: Arc<[u8]>,
 }
@@ -383,7 +367,7 @@ impl RenderedArticle {
                 ArticleChunk::Literal(value) => value.as_ref(),
                 ArticleChunk::LocalAsset(asset) => {
                     let projected =
-                        SnapshotAssetPath::new(snapshot, asset.path()).map_err(|error| {
+                        SnapshotAssetPath::new(snapshot, &asset.path).map_err(|error| {
                             MarkdownRenderError {
                                 path: path.clone(),
                                 location: MarkdownRenderLocation::Document,
@@ -734,7 +718,7 @@ impl<'input> MarkdownEventRenderer<'input> {
                         range,
                         true,
                     )?;
-                    depth = depth.checked_add(1).ok_or_else(|| self.malformed())?;
+                    self.enter_image_alt_nesting(&mut depth)?;
                 }
                 Event::Start(Tag::Link { dest_url, .. }) => {
                     let _ = self.validate_destination(
@@ -744,10 +728,10 @@ impl<'input> MarkdownEventRenderer<'input> {
                         range,
                         false,
                     )?;
-                    depth = depth.checked_add(1).ok_or_else(|| self.malformed())?;
+                    self.enter_image_alt_nesting(&mut depth)?;
                 }
                 Event::Start(_) => {
-                    depth = depth.checked_add(1).ok_or_else(|| self.malformed())?;
+                    self.enter_image_alt_nesting(&mut depth)?;
                 }
                 Event::End(_) if depth > 0 => depth -= 1,
                 Event::End(_) => return Err(self.malformed()),
@@ -768,6 +752,11 @@ impl<'input> MarkdownEventRenderer<'input> {
             }
         }
         Err(self.malformed())
+    }
+
+    fn enter_image_alt_nesting(&self, depth: &mut usize) -> Result<(), MarkdownRenderError> {
+        *depth = depth.checked_add(1).ok_or_else(|| self.malformed())?;
+        Ok(())
     }
 
     fn validate_destination(
@@ -959,7 +948,7 @@ impl ArticleWriter {
     }
 
     fn write_local_asset(&mut self, asset: DigestedAsset) -> Result<(), RenderedHtmlLimit> {
-        let path = asset.path().as_str();
+        let path = asset.path.as_str();
         let path_len = path.len();
         let path_ends_newline = path.ends_with('\n');
         self.reserve(path_len)?;
@@ -1086,6 +1075,15 @@ const fn escape_entity(character: char, attribute: bool) -> Option<&'static str>
 }
 
 fn normalize_navigation(value: &str) -> Result<String, NavigationRejection> {
+    validate_navigation_text(value)?;
+    if value.starts_with('/') {
+        normalize_root_relative_navigation(value)
+    } else {
+        normalize_https_navigation(value)
+    }
+}
+
+fn validate_navigation_text(value: &str) -> Result<(), NavigationRejection> {
     if value.is_empty() {
         return Err(NavigationRejection::Empty);
     }
@@ -1098,23 +1096,41 @@ fn normalize_navigation(value: &str) -> Result<String, NavigationRejection> {
     if value.starts_with("//") {
         return Err(NavigationRejection::ProtocolRelative);
     }
+    Ok(())
+}
 
-    if value.starts_with('/') {
-        reject_traversal(raw_root_relative_path(value))?;
-        let base =
-            Url::parse("https://maincopy.invalid/").map_err(|_| NavigationRejection::Malformed)?;
-        let parsed = base
-            .join(value)
-            .map_err(|_| NavigationRejection::Malformed)?;
-        if parsed.origin() != base.origin()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-        {
-            return Err(NavigationRejection::Malformed);
-        }
-        return Ok(parsed[Position::BeforePath..].to_owned());
+fn normalize_root_relative_navigation(value: &str) -> Result<String, NavigationRejection> {
+    reject_traversal(raw_root_relative_path(value))?;
+    let base =
+        Url::parse("https://maincopy.invalid/").map_err(|_| NavigationRejection::Malformed)?;
+    let parsed = base
+        .join(value)
+        .map_err(|_| NavigationRejection::Malformed)?;
+    if parsed.origin() != base.origin()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(NavigationRejection::Malformed);
     }
+    Ok(parsed[Position::BeforePath..].to_owned())
+}
 
+fn normalize_https_navigation(value: &str) -> Result<String, NavigationRejection> {
+    validate_raw_https_navigation(value)?;
+    let parsed = Url::parse(value).map_err(|_| NavigationRejection::Malformed)?;
+    if parsed.scheme() != "https" {
+        return Err(NavigationRejection::UnsupportedScheme);
+    }
+    if parsed.host().is_none() {
+        return Err(NavigationRejection::MissingAuthority);
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(NavigationRejection::Credentials);
+    }
+    Ok(parsed.into())
+}
+
+fn validate_raw_https_navigation(value: &str) -> Result<(), NavigationRejection> {
     let Some((raw_scheme, remainder)) = value.split_once("://") else {
         return Err(NavigationRejection::NotRootRelative);
     };
@@ -1134,19 +1150,7 @@ fn normalize_navigation(value: &str) -> Result<String, NavigationRejection> {
             .split(['?', '#'])
             .next()
             .unwrap_or(""),
-    )?;
-
-    let parsed = Url::parse(value).map_err(|_| NavigationRejection::Malformed)?;
-    if parsed.scheme() != "https" {
-        return Err(NavigationRejection::UnsupportedScheme);
-    }
-    if parsed.host().is_none() {
-        return Err(NavigationRejection::MissingAuthority);
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(NavigationRejection::Credentials);
-    }
-    Ok(parsed.into())
+    )
 }
 
 fn raw_root_relative_path(value: &str) -> &str {
@@ -1213,22 +1217,22 @@ fn validate_generated_assets(
 ) -> Result<(), MarkdownRenderError> {
     let mut paths = std::collections::BTreeSet::new();
     if let Some(AssetRevisionReference::Local(asset)) = authored.image() {
-        paths.insert(asset.path());
+        paths.insert(&asset.path);
     }
     for reference in authored.references() {
         if let AssetRevisionReference::Local(asset) = reference {
-            paths.insert(asset.path());
+            paths.insert(&asset.path);
         }
     }
     for asset in generated {
-        if !paths.insert(asset.asset.path()) {
+        if !paths.insert(&asset.asset.path) {
             return Err(MarkdownRenderError::new(
                 document,
                 MarkdownRenderLocation::GeneratedAsset,
                 MarkdownRenderErrorCode::GeneratedAssetCollision,
                 format!(
                     "generated asset path collides with another post asset: {}",
-                    asset.asset.path()
+                    asset.asset.path
                 ),
             ));
         }
@@ -1271,12 +1275,6 @@ fn rendered_html_limit_error(path: &LogicalContentPath) -> MarkdownRenderError {
         code: MarkdownRenderErrorCode::RenderedHtmlTooLarge,
         navigation_rejection: None,
         message: "rendered article HTML exceeds the configured byte limit".into(),
-    }
-}
-
-impl fmt::Display for NavigationRejection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
     }
 }
 
@@ -1391,28 +1389,43 @@ mod tests {
 
     fn render(origins: &[&str], body: &str, asset_paths: &[&str]) -> RenderedPost {
         let (content, assets) = candidate("Renderer", origins, body, false, asset_paths);
-        BaselineMarkdownRenderer
-            .render(
-                &content.posts()[0],
-                assets.assets_for(&content.posts()[0]).unwrap(),
-                assets.site(),
-            )
-            .expect("fixture must render")
+        render_markdown(
+            &content.posts()[0],
+            assets.assets_for(&content.posts()[0]).unwrap(),
+            assets.site(),
+        )
+        .expect("fixture must render")
     }
 
     fn render_error(body: &str) -> MarkdownRenderError {
         let (content, assets) = candidate("Renderer", &[], body, false, &[]);
-        BaselineMarkdownRenderer
-            .render(
-                &content.posts()[0],
-                assets.assets_for(&content.posts()[0]).unwrap(),
-                assets.site(),
-            )
-            .expect_err("fixture must be rejected")
+        render_markdown(
+            &content.posts()[0],
+            assets.assets_for(&content.posts()[0]).unwrap(),
+            assets.site(),
+        )
+        .expect_err("fixture must be rejected")
     }
 
     fn snapshot() -> SiteSnapshotDigest {
         SiteSnapshotDigest::parse(&format!("site-b3-v1-{}", "11".repeat(32))).unwrap()
+    }
+
+    fn collect_and_escape_image_alt_events(
+        events: Vec<Event<'static>>,
+    ) -> Result<(String, String), MarkdownRenderError> {
+        let (content, assets) = candidate("Renderer", &[], "body", false, &[]);
+        let document = &content.posts()[0];
+        let mut renderer = MarkdownEventRenderer::new(
+            document,
+            assets.assets_for(document).unwrap(),
+            assets.site(),
+            RendererLimits::production(),
+        );
+        renderer.events = events.into_iter().map(|event| (event, 0..0)).collect();
+        let alt = renderer.collect_image_alt()?;
+        renderer.write_escaped_attribute(&alt)?;
+        Ok((alt, renderer.writer.identity_html))
     }
 
     #[test]
@@ -1479,6 +1492,78 @@ mod tests {
         assert!(!html.contains("<svg>"));
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(html.contains("alt=\"&lt;b&gt;alt&lt;/b&gt;\""));
+    }
+
+    #[test]
+    fn image_alt_collects_nested_destinations_and_all_textual_event_forms() {
+        let rendered = render(
+            &[],
+            "![outer *em* [link](/inside) ![nested](assets/nested.png) `code`<b>raw</b>  \nnext](assets/outer.png)\n",
+            &["assets/outer.png", "assets/nested.png"],
+        );
+        assert!(
+            rendered
+                .pre_injection_html()
+                .contains("alt=\"outer em link nested code&lt;b&gt;raw&lt;/b&gt; next\"")
+        );
+
+        let (alt, escaped) = collect_and_escape_image_alt_events(vec![
+            Event::Start(Tag::Emphasis),
+            Event::Text("text".into()),
+            Event::Code("code".into()),
+            Event::Html("<block>&".into()),
+            Event::InlineHtml("<inline>".into()),
+            Event::SoftBreak,
+            Event::HardBreak,
+            Event::Rule,
+            Event::InlineMath("inline-math".into()),
+            Event::DisplayMath("display-math".into()),
+            Event::FootnoteReference("note".into()),
+            Event::TaskListMarker(true),
+            Event::TaskListMarker(false),
+            Event::End(TagEnd::Emphasis),
+            Event::End(TagEnd::Image),
+        ])
+        .unwrap();
+        assert_eq!(
+            alt,
+            "textcode<block>&<inline>   inline-mathdisplay-math[note][x][ ]"
+        );
+        assert_eq!(
+            escaped,
+            "textcode&lt;block&gt;&amp;&lt;inline&gt;   inline-mathdisplay-math[note][x][ ]"
+        );
+    }
+
+    #[test]
+    fn image_alt_rejects_unbalanced_events_and_nesting_overflow() {
+        for events in [
+            vec![Event::End(TagEnd::Strong), Event::End(TagEnd::Image)],
+            vec![Event::Start(Tag::Emphasis), Event::End(TagEnd::Image)],
+            vec![Event::Text("unterminated".into())],
+        ] {
+            let error = collect_and_escape_image_alt_events(events).unwrap_err();
+            assert_eq!(
+                error.code(),
+                MarkdownRenderErrorCode::MalformedCommonMarkEvents
+            );
+        }
+
+        let (content, assets) = candidate("Renderer", &[], "body", false, &[]);
+        let document = &content.posts()[0];
+        let renderer = MarkdownEventRenderer::new(
+            document,
+            assets.assets_for(document).unwrap(),
+            assets.site(),
+            RendererLimits::production(),
+        );
+        let mut depth = usize::MAX;
+        let error = renderer.enter_image_alt_nesting(&mut depth).unwrap_err();
+        assert_eq!(
+            error.code(),
+            MarkdownRenderErrorCode::MalformedCommonMarkEvents
+        );
+        assert_eq!(depth, usize::MAX);
     }
 
     #[test]
@@ -1578,9 +1663,7 @@ mod tests {
             false,
             &["assets/image.png", "assets/file.pdf"],
         );
-        let error = BaselineMarkdownRenderer
-            .render(&reordered.posts()[0], approved, assets.site())
-            .unwrap_err();
+        let error = render_markdown(&reordered.posts()[0], approved, assets.site()).unwrap_err();
         assert_eq!(
             error.code(),
             MarkdownRenderErrorCode::AssetOccurrenceMissing
@@ -1593,18 +1676,14 @@ mod tests {
             false,
             &["assets/image.png", "assets/file.pdf"],
         );
-        let error = BaselineMarkdownRenderer
-            .render(&shifted.posts()[0], approved, assets.site())
-            .unwrap_err();
+        let error = render_markdown(&shifted.posts()[0], approved, assets.site()).unwrap_err();
         assert_eq!(
             error.code(),
             MarkdownRenderErrorCode::AssetOccurrenceMismatch
         );
 
         let (removed, _) = candidate("Renderer", &[], "[safe](/safe)\n", false, &[]);
-        let error = BaselineMarkdownRenderer
-            .render(&removed.posts()[0], approved, assets.site())
-            .unwrap_err();
+        let error = render_markdown(&removed.posts()[0], approved, assets.site()).unwrap_err();
         assert_eq!(error.code(), MarkdownRenderErrorCode::AssetOccurrenceUnused);
     }
 
@@ -1618,20 +1697,17 @@ mod tests {
             mermaid_source_bytes: 4,
             mermaid_blocks: 1,
         };
-        BaselineMarkdownRenderer
-            .render_with_limits(document, post_assets, assets.site(), base)
-            .unwrap();
-        let error = BaselineMarkdownRenderer
-            .render_with_limits(
-                document,
-                post_assets,
-                assets.site(),
-                RendererLimits {
-                    mermaid_source_bytes: 3,
-                    ..base
-                },
-            )
-            .unwrap_err();
+        render_markdown_with_limits(document, post_assets, assets.site(), base).unwrap();
+        let error = render_markdown_with_limits(
+            document,
+            post_assets,
+            assets.site(),
+            RendererLimits {
+                mermaid_source_bytes: 3,
+                ..base
+            },
+        )
+        .unwrap_err();
         assert_eq!(error.code(), MarkdownRenderErrorCode::MermaidBlockTooLarge);
 
         let (two_content, two_assets) = candidate(
@@ -1641,14 +1717,13 @@ mod tests {
             false,
             &[],
         );
-        let error = BaselineMarkdownRenderer
-            .render_with_limits(
-                &two_content.posts()[0],
-                two_assets.assets_for(&two_content.posts()[0]).unwrap(),
-                two_assets.site(),
-                base,
-            )
-            .unwrap_err();
+        let error = render_markdown_with_limits(
+            &two_content.posts()[0],
+            two_assets.assets_for(&two_content.posts()[0]).unwrap(),
+            two_assets.site(),
+            base,
+        )
+        .unwrap_err();
         assert_eq!(
             error.code(),
             MarkdownRenderErrorCode::MermaidBlockCountExceeded
@@ -1658,17 +1733,16 @@ mod tests {
         assert!(writer.write("abc").is_ok());
         assert!(writer.write("d").is_err());
         let (small_content, small_assets) = candidate("Renderer", &[], "a", false, &[]);
-        let error = BaselineMarkdownRenderer
-            .render_with_limits(
-                &small_content.posts()[0],
-                small_assets.assets_for(&small_content.posts()[0]).unwrap(),
-                small_assets.site(),
-                RendererLimits {
-                    rendered_html_bytes: 7,
-                    ..base
-                },
-            )
-            .unwrap_err();
+        let error = render_markdown_with_limits(
+            &small_content.posts()[0],
+            small_assets.assets_for(&small_content.posts()[0]).unwrap(),
+            small_assets.site(),
+            RendererLimits {
+                rendered_html_bytes: 7,
+                ..base
+            },
+        )
+        .unwrap_err();
         assert_eq!(error.code(), MarkdownRenderErrorCode::RenderedHtmlTooLarge);
     }
 
@@ -1682,22 +1756,20 @@ mod tests {
             false,
             &[],
         );
-        let old = BaselineMarkdownRenderer
-            .render(
-                &old_content.posts()[0],
-                old_assets.assets_for(&old_content.posts()[0]).unwrap(),
-                old_assets.site(),
-            )
-            .unwrap();
+        let old = render_markdown(
+            &old_content.posts()[0],
+            old_assets.assets_for(&old_content.posts()[0]).unwrap(),
+            old_assets.site(),
+        )
+        .unwrap();
         let (new_content, new_assets) =
             candidate("Renderer", &["https://cdn.example.com"], body, false, &[]);
-        let fresh = BaselineMarkdownRenderer
-            .render(
-                &new_content.posts()[0],
-                new_assets.assets_for(&new_content.posts()[0]).unwrap(),
-                new_assets.site(),
-            )
-            .unwrap();
+        let fresh = render_markdown(
+            &new_content.posts()[0],
+            new_assets.assets_for(&new_content.posts()[0]).unwrap(),
+            new_assets.site(),
+        )
+        .unwrap();
         assert_eq!(old.revision(), fresh.revision());
         let error = old
             .project_for_snapshot(
@@ -1722,13 +1794,12 @@ mod tests {
         let body = "![cover](assets/cover.png)\n";
         let (old_content, old_assets) =
             candidate_with_local_bytes(body, Some("assets/cover.png"), b"old bytes");
-        let old = BaselineMarkdownRenderer
-            .render(
-                &old_content.posts()[0],
-                old_assets.assets_for(&old_content.posts()[0]).unwrap(),
-                old_assets.site(),
-            )
-            .unwrap();
+        let old = render_markdown(
+            &old_content.posts()[0],
+            old_assets.assets_for(&old_content.posts()[0]).unwrap(),
+            old_assets.site(),
+        )
+        .unwrap();
         let (_, changed_assets) =
             candidate_with_local_bytes(body, Some("assets/cover.png"), b"changed bytes");
         let error = old
@@ -1781,7 +1852,7 @@ mod tests {
             LogicalAssetPath::parse("assets/image.png").unwrap(),
             Arc::clone(&bytes),
         );
-        assert_eq!(generated.asset().digest(), &digest_asset(&bytes));
+        assert_eq!(generated.asset().digest, digest_asset(&bytes));
         assert_eq!(generated.bytes(), bytes.as_ref());
         let error = validate_generated_assets(
             &content.posts()[0],
@@ -1815,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    fn every_renderer_enum_and_ordinal_has_a_stable_wire_contract() {
+    fn renderer_wire_types_and_ordinals_have_stable_contracts() {
         let destination_ordinal = MarkdownDestinationOrdinal::new(NonZeroUsize::new(2).unwrap());
         let code_ordinal = CodeBlockOrdinal::new(NonZeroUsize::new(3).unwrap());
         let mermaid_ordinal = MermaidBlockOrdinal::from_index(3).unwrap();

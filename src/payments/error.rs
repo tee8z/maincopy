@@ -10,23 +10,13 @@ pub enum CreateTipInvoiceError {
     #[error("the invoice creation request was not accepted: {0}")]
     NotAccepted(CommandNotAcceptedReason),
 
-    #[error("the provider conclusively did not create an invoice: {0}")]
-    NotCreated(InvoiceNotCreatedReason),
+    #[error(
+        "the provider conclusively did not create an invoice: the provider rejected invoice creation before creating an invoice"
+    )]
+    NotCreated,
 
     #[error("invoice creation may have completed; marker reconciliation is required: {0}")]
     OutcomeUnknown(InvoiceCreationUnknownReason),
-}
-
-impl CreateTipInvoiceError {
-    pub const fn requires_reconciliation(self) -> bool {
-        matches!(self, Self::OutcomeUnknown(_))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
-pub enum InvoiceNotCreatedReason {
-    #[error("the provider rejected invoice creation before creating an invoice")]
-    ProviderRejected,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -67,24 +57,11 @@ pub enum PaymentTransportError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub enum CommandNotAcceptedReason {
-    #[error("the payment provider queue is full; {retry}")]
-    QueueFull { retry: RetryGuidance },
+    #[error("the payment provider queue is full; retry with backoff")]
+    QueueFull,
 
     #[error("the payment provider is unavailable")]
     ProviderUnavailable,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RetryGuidance {
-    RetryWithBackoff,
-}
-
-impl std::fmt::Display for RetryGuidance {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RetryWithBackoff => formatter.write_str("retry with backoff"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]

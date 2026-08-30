@@ -211,43 +211,55 @@ mod supported {
                         source,
                     })?;
             for component in &self.components {
-                let captured = statat(&descriptor, &component.name, AtFlags::SYMLINK_NOFOLLOW)
-                    .map_err(|error| changed_or_io(&component.display_path, error))?;
-                if FileType::from_raw_mode(captured.st_mode) != FileType::Directory
-                    || Fingerprint::from_stat(&captured) != component.fingerprint
-                {
-                    return Err(FrontendBuildError::InputChanged {
-                        path: component.display_path.clone(),
-                    });
-                }
-                let opened = openat(&descriptor, &component.name, DIRECTORY_FLAGS, Mode::empty())
-                    .map_err(|error| changed_or_io(&component.display_path, error))?;
-                let opened = File::from(opened);
-                if Fingerprint::from_metadata(&opened.metadata().map_err(|source| {
+                descriptor = Self::open_verified_component(&descriptor, component)?;
+            }
+            self.root.verify_unchanged()?;
+            Ok(descriptor)
+        }
+
+        fn open_verified_component(
+            parent: &File,
+            component: &ConfinedPathComponent,
+        ) -> Result<File, FrontendBuildError> {
+            let captured = statat(parent, &component.name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| changed_or_io(&component.display_path, error))?;
+            Self::verify_directory_stat(&captured, component)?;
+
+            let opened = openat(parent, &component.name, DIRECTORY_FLAGS, Mode::empty())
+                .map_err(|error| changed_or_io(&component.display_path, error))?;
+            let opened = File::from(opened);
+            let opened_fingerprint =
+                Fingerprint::from_metadata(&opened.metadata().map_err(|source| {
                     FrontendBuildError::Io {
                         operation: FrontendBuildOperation::Inspect,
                         path: component.display_path.clone(),
                         source,
                     }
-                })?) != component.fingerprint
-                {
-                    return Err(FrontendBuildError::InputChanged {
-                        path: component.display_path.clone(),
-                    });
-                }
-                let post_open = statat(&descriptor, &component.name, AtFlags::SYMLINK_NOFOLLOW)
-                    .map_err(|error| changed_or_io(&component.display_path, error))?;
-                if FileType::from_raw_mode(post_open.st_mode) != FileType::Directory
-                    || Fingerprint::from_stat(&post_open) != component.fingerprint
-                {
-                    return Err(FrontendBuildError::InputChanged {
-                        path: component.display_path.clone(),
-                    });
-                }
-                descriptor = opened;
+                })?);
+            if opened_fingerprint != component.fingerprint {
+                return Err(FrontendBuildError::InputChanged {
+                    path: component.display_path.clone(),
+                });
             }
-            self.root.verify_unchanged()?;
-            Ok(descriptor)
+
+            let post_open = statat(parent, &component.name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| changed_or_io(&component.display_path, error))?;
+            Self::verify_directory_stat(&post_open, component)?;
+            Ok(opened)
+        }
+
+        fn verify_directory_stat(
+            stat: &Stat,
+            component: &ConfinedPathComponent,
+        ) -> Result<(), FrontendBuildError> {
+            if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+                || Fingerprint::from_stat(stat) != component.fingerprint
+            {
+                return Err(FrontendBuildError::InputChanged {
+                    path: component.display_path.clone(),
+                });
+            }
+            Ok(())
         }
     }
 
@@ -623,38 +635,12 @@ mod supported {
                 .display_path
                 .join(OsStr::from_bytes(temporary_name.to_bytes()));
             let result = (|| {
-                temporary
-                    .write_all(bytes)
-                    .map_err(|source| FrontendBuildError::Io {
-                        operation: FrontendBuildOperation::Write,
-                        path: temporary_path.clone(),
-                        source,
-                    })?;
-                temporary
-                    .sync_all()
-                    .map_err(|source| FrontendBuildError::Io {
-                        operation: FrontendBuildOperation::Sync,
-                        path: temporary_path.clone(),
-                        source,
-                    })?;
-                let completed =
-                    Fingerprint::from_metadata(&temporary.metadata().map_err(|source| {
-                        FrontendBuildError::Io {
-                            operation: FrontendBuildOperation::Inspect,
-                            path: temporary_path.clone(),
-                            source,
-                        }
-                    })?);
-                if completed.device != created.device
-                    || completed.inode != created.inode
-                    || completed.mode != created.mode
-                    || completed.links != 1
-                    || completed.bytes != bytes.len() as i128
-                {
-                    return Err(FrontendBuildError::UnsafeOutputPath {
-                        path: temporary_path.clone(),
-                    });
-                }
+                let completed = Self::write_verified_temporary(
+                    &mut temporary,
+                    &temporary_path,
+                    created,
+                    bytes,
+                )?;
                 before_rename()?;
                 self.verify_temporary_name(&temporary_name, completed)?;
                 self.revalidate_output_leaf(leaf, &destination, existing)?;
@@ -667,6 +653,47 @@ mod supported {
                 self.cleanup_temporary(&temporary_name, created);
             }
             result
+        }
+
+        fn write_verified_temporary(
+            temporary: &mut File,
+            temporary_path: &Path,
+            created: Fingerprint,
+            bytes: &[u8],
+        ) -> Result<Fingerprint, FrontendBuildError> {
+            temporary
+                .write_all(bytes)
+                .map_err(|source| FrontendBuildError::Io {
+                    operation: FrontendBuildOperation::Write,
+                    path: temporary_path.to_owned(),
+                    source,
+                })?;
+            temporary
+                .sync_all()
+                .map_err(|source| FrontendBuildError::Io {
+                    operation: FrontendBuildOperation::Sync,
+                    path: temporary_path.to_owned(),
+                    source,
+                })?;
+            let completed =
+                Fingerprint::from_metadata(&temporary.metadata().map_err(|source| {
+                    FrontendBuildError::Io {
+                        operation: FrontendBuildOperation::Inspect,
+                        path: temporary_path.to_owned(),
+                        source,
+                    }
+                })?);
+            if completed.device != created.device
+                || completed.inode != created.inode
+                || completed.mode != created.mode
+                || completed.links != 1
+                || completed.bytes != bytes.len() as i128
+            {
+                return Err(FrontendBuildError::UnsafeOutputPath {
+                    path: temporary_path.to_owned(),
+                });
+            }
+            Ok(completed)
         }
 
         fn validate_output_leaf(

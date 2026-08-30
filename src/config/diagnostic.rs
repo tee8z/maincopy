@@ -9,17 +9,11 @@ pub enum ConfigurationAuthority {
     Host,
 }
 
-impl ConfigurationAuthority {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Host => "host",
-        }
-    }
-}
-
 impl fmt::Display for ConfigurationAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+        match self {
+            Self::Host => formatter.write_str("host"),
+        }
     }
 }
 
@@ -104,10 +98,6 @@ impl ConfigurationDiagnostic {
         self
     }
 
-    pub const fn authority(&self) -> ConfigurationAuthority {
-        self.authority
-    }
-
     pub fn field(&self) -> &str {
         &self.field
     }
@@ -118,14 +108,6 @@ impl ConfigurationDiagnostic {
 
     pub const fn message(&self) -> &'static str {
         self.message
-    }
-
-    pub const fn line(&self) -> Option<usize> {
-        self.line
-    }
-
-    pub const fn column(&self) -> Option<usize> {
-        self.column
     }
 }
 
@@ -180,12 +162,12 @@ impl DiagnosticCollector {
         self.diagnostics.push(diagnostic);
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.diagnostics.is_empty()
-    }
-
-    pub(crate) fn finish(self) -> ConfigurationErrors {
-        ConfigurationErrors::from_diagnostics(self.diagnostics)
+    pub(crate) fn into_result(self) -> Result<(), ConfigurationErrors> {
+        if self.diagnostics.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigurationErrors::from_diagnostics(self.diagnostics))
+        }
     }
 }
 
@@ -296,6 +278,25 @@ mod tests {
         let rendered = format!("{errors:?}");
         assert!(!rendered.contains("credential-value"));
         assert!(!rendered.contains("source ="));
+    }
+
+    #[test]
+    fn diagnostic_wire_contract_keeps_the_host_authority() {
+        let diagnostic = ConfigurationDiagnostic::new(
+            ConfigurationAuthority::Host,
+            "$document",
+            ConfigurationValidationCode::HostTomlInvalid,
+            "host TOML does not match the schema",
+        )
+        .at(2, 3);
+
+        assert_eq!(
+            serde_json::to_value(diagnostic).unwrap(),
+            serde_json::from_str::<serde_json::Value>(
+                r#"{"authority":"host","field":"$document","code":"host_toml_invalid","message":"host TOML does not match the schema","line":2,"column":3}"#,
+            )
+            .unwrap()
+        );
     }
 
     #[test]

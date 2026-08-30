@@ -124,7 +124,7 @@ fn checked_in_full_minimal_and_crlf_fixtures_form_one_valid_catalog() {
         "https://cdn.example.com/site/favicon-v1.png"
     );
     assert_eq!(
-        content.publication().assets().allowed_https_origins()[0].as_str(),
+        content.publication().assets.allowed_https_origins[0].as_str(),
         "https://cdn.example.com"
     );
     assert_eq!(
@@ -158,7 +158,6 @@ fn minimal_documents_apply_every_documented_default() {
     );
     assert_eq!(publication.subscriptions(), &SubscriptionSettings::Disabled);
     assert_eq!(publication.tips(), PublicationTipSettings::Unconfigured);
-    assert_eq!(publication.renderer(), RendererSettings::baseline());
 
     let post = content.posts()[0].metadata();
     assert_eq!(post.updated_at(), None);
@@ -211,7 +210,7 @@ fn post_collection_and_logical_path_must_agree() {
         PostSource::in_posts("drafts/wrong.md", MINIMAL_POST),
         PostSource::in_drafts("posts/wrong.md", MINIMAL_POST),
     ] {
-        let path = source.path().as_str().to_owned();
+        let path = source.path.as_str().to_owned();
         assert_eq!(
             error_contract(validate_content(
                 PublicationSource::new("publication.toml", MINIMAL_PUBLICATION),
@@ -851,22 +850,6 @@ fn enum_and_validation_code_wire_names_are_stable() {
         (
             serde_json::to_value(DefaultPostTipPolicy::Disabled).unwrap(),
             "disabled",
-        ),
-        (
-            serde_json::to_value(MarkdownDialect::CommonMark).unwrap(),
-            "common_mark",
-        ),
-        (
-            serde_json::to_value(RawHtmlPolicy::Disabled).unwrap(),
-            "disabled",
-        ),
-        (
-            serde_json::to_value(CodeRenderingMode::EscapedPlainText).unwrap(),
-            "escaped_plain_text",
-        ),
-        (
-            serde_json::to_value(MermaidRenderingMode::Placeholder).unwrap(),
-            "placeholder",
         ),
         (
             serde_json::to_value(PostCollection::Posts).unwrap(),

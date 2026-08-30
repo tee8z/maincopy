@@ -12,7 +12,7 @@ use axum::{
 
 use crate::{
     content::{PostSlug, PostTag},
-    frontend_assets::{FrontendAssetName, FrontendBundleDigest},
+    frontend_assets::{FrontendAssetName, FrontendBundleDigest, IMMUTABLE_CACHE_CONTROL},
     render::{SiteSnapshot, SiteSnapshotReader},
 };
 
@@ -86,19 +86,16 @@ pub(super) async fn application_asset(
         return not_found_response(&snapshot);
     };
 
-    let Ok(etag) = HeaderValue::from_str(&asset.etag().to_string()) else {
+    let Ok(etag) = HeaderValue::from_str(&asset.etag()) else {
         return internal_error_response();
     };
     let mut response = Response::new(Body::from(asset.bytes()));
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static(asset.mime().as_str()),
-    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(asset.mime()));
     headers.insert(
         CACHE_CONTROL,
-        HeaderValue::from_static(asset.cache_policy().as_str()),
+        HeaderValue::from_static(IMMUTABLE_CACHE_CONTROL),
     );
     headers.insert(ETAG, etag);
     headers.insert("x-content-type-options", NOSNIFF);
@@ -170,8 +167,8 @@ mod tests {
         },
         frontend_assets::embedded_manifest,
         render::{
-            BaselineMarkdownRenderer, PublicLedgerProjection, SiteSnapshotBuilder,
-            SiteSnapshotReader, compile_content_catalog, render_site_shell,
+            PublicLedgerProjection, SiteSnapshotReader, build_site_snapshot,
+            compile_content_catalog, render_markdown, render_site_shell,
         },
         web::{PublicState, Readiness, public_router},
     };
@@ -182,13 +179,12 @@ mod tests {
         let content = tree.validate().unwrap();
         let assets = resolve_content_assets(&tree, &content).unwrap();
         let document = content.posts().first().unwrap();
-        let rendered = BaselineMarkdownRenderer
-            .render(
-                document,
-                assets.assets_for(document).unwrap(),
-                assets.site_assets_for(content.publication()).unwrap(),
-            )
-            .unwrap();
+        let rendered = render_markdown(
+            document,
+            assets.assets_for(document).unwrap(),
+            assets.site_assets_for(content.publication()).unwrap(),
+        )
+        .unwrap();
         let ledger = PublicLedgerProjection::try_from_exact_entries([PublishedPostRevision::new(
             rendered.post_id().clone(),
             rendered.revision().clone(),
@@ -197,11 +193,11 @@ mod tests {
         .unwrap();
         let catalog = Arc::new(compile_content_catalog(&content, &assets).unwrap());
         let shell = render_site_shell(catalog, embedded_manifest(), &ledger).unwrap();
-        let snapshot = SiteSnapshotBuilder::new().build(shell, &ledger).unwrap();
-        PublicState::new(
-            SiteSnapshotReader::from_snapshot(snapshot),
-            Readiness::new(true),
-        )
+        let snapshot = build_site_snapshot(shell, &ledger).unwrap();
+        PublicState {
+            snapshots: SiteSnapshotReader::from_snapshot(snapshot),
+            readiness: Readiness::new(true),
+        }
     }
 
     async fn get(path: &str) -> Response {

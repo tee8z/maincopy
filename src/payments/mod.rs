@@ -9,12 +9,13 @@ mod error;
 mod models;
 mod provider;
 mod subscriber;
+#[cfg(test)]
+mod test_support;
 
 pub use error::{
     CommandNotAcceptedReason, CreateTipInvoiceError, CreateTipInvoiceResult,
-    InvoiceCreationUnknownReason, InvoiceNotCreatedReason, PaymentIdentityError,
-    PaymentOperationError, PaymentProviderError, PaymentProviderResult, PaymentTransportError,
-    RetryGuidance,
+    InvoiceCreationUnknownReason, PaymentIdentityError, PaymentOperationError,
+    PaymentProviderError, PaymentProviderResult, PaymentTransportError,
 };
 pub use models::{
     Bolt11Invoice, CreateTipInvoiceRequest, DEFAULT_TIP_INVOICE_DESCRIPTION,
@@ -29,11 +30,9 @@ pub use models::{
     ProviderUpdateCursor, ReconcilePaymentRequest, SatoshiAmount, TipIntentId, TipInvoice,
     TipInvoiceDescription, TipInvoiceView, TipRecoveryReason, TipSettlement,
 };
-pub use provider::{
-    LexeProvider, LexeProviderRuntime, LexeProviderRuntimeError, LightningProvider,
-};
+pub use provider::{LexeProvider, LightningProvider};
 pub use subscriber::{
-    PaymentUpdateAck, PaymentUpdateRetryCause, PaymentUpdateRetryPolicy, PaymentUpdateSubscriber,
+    PaymentUpdateRetryCause, PaymentUpdateRetryPolicy, PaymentUpdateSubscriber,
     PaymentUpdateSubscriberEvent,
 };
 

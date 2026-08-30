@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 use maincopy::payments::{
     Bolt11Invoice, CreateTipInvoiceError, CreateTipInvoiceRequest, IgnoredPaymentUpdateReason,
-    IgnoredProviderPaymentUpdate, InvoiceNotCreatedReason, LightningProvider,
-    NextPaymentUpdatesRequest, PaymentHash, PaymentOperationError, PaymentProviderError,
-    ProviderKind, ProviderPaymentLocator, ProviderPaymentReference, ProviderPaymentUpdate,
-    ProviderPaymentUpdateBatch, ProviderPaymentUpdatePoll, ProviderSubstitute,
-    ProviderUpdateCursor, ReconcilePaymentRequest, SatoshiAmount, SubstituteCall,
-    SubstituteResponses, TipIntentId, TipInvoiceDescription,
+    IgnoredProviderPaymentUpdate, LightningProvider, NextPaymentUpdatesRequest, PaymentHash,
+    PaymentOperationError, PaymentProviderError, ProviderKind, ProviderPaymentLocator,
+    ProviderPaymentReference, ProviderPaymentUpdate, ProviderPaymentUpdateBatch,
+    ProviderPaymentUpdatePoll, ProviderSubstitute, ProviderUpdateCursor, ReconcilePaymentRequest,
+    SatoshiAmount, SubstituteCall, SubstituteResponses, TipIntentId, TipInvoiceDescription,
 };
 
 #[tokio::test]
@@ -37,9 +36,7 @@ async fn external_tests_can_use_the_provider_substitute() {
         .unwrap(),
     );
     let substitute = Arc::new(ProviderSubstitute::new(SubstituteResponses {
-        create_tip_invoice: Err(CreateTipInvoiceError::NotCreated(
-            InvoiceNotCreatedReason::ProviderRejected,
-        )),
+        create_tip_invoice: Err(CreateTipInvoiceError::NotCreated),
         reconcile_invoice_creation: Err(PaymentOperationError::TemporarilyUnavailable.into()),
         reconcile_payment: Err(PaymentOperationError::PaymentNotFound.into()),
         next_payment_updates: Ok(update_response.clone()),
@@ -52,7 +49,7 @@ async fn external_tests_can_use_the_provider_substitute() {
             .create_tip_invoice(create_request.clone())
             .await
             .unwrap_err(),
-        CreateTipInvoiceError::NotCreated(InvoiceNotCreatedReason::ProviderRejected)
+        CreateTipInvoiceError::NotCreated
     );
     assert_eq!(
         provider

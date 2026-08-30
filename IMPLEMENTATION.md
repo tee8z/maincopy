@@ -259,7 +259,9 @@ Rust toolchain and the project license.
 | Command-line parsing | Clap with derive-based typed subcommands | 0 |
 | Serialization and TOML | Serde and a TOML parser | 0 |
 | Errors and diagnostics | Typed library errors and startup context | 0 |
-| Tracing and metrics | Select maintained tracing and metrics facades | 0 |
+| Secret memory | Pin `zeroize` 1.9.0; wipe Maincopy-owned fixed secret buffers on drop | 0 |
+| Tracing | `tracing` 0.1.44 with `tracing-subscriber` 0.3.23 and only its `fmt` feature | 0 |
+| Metrics | Select a maintained metrics facade with the first metric export | Later |
 | UUIDs | `uuid` with only the features used by typed identifiers | 0 and 1 |
 | Operational time | `time::OffsetDateTime` with `serde-well-known`; no custom timestamp type | 0 and 1 |
 | Revision digests | BLAKE3 | 1 |
@@ -288,8 +290,9 @@ Rust toolchain and the project license.
 Do not add a library only because a later slice might need it.
 Record the license and feature flags for each direct dependency.
 
-The frontend selection uses these direct dependencies. License values come
-from upstream crate metadata. They do not select a Maincopy package license.
+These selected direct dependencies have explicit feature and license records.
+License values come from upstream crate metadata. They do not select a
+Maincopy package license.
 
 | Dependency | Exact selected version | Features | Upstream license expression | Declared MSRV |
 | --- | --- | --- | --- | --- |
@@ -298,6 +301,8 @@ from upstream crate metadata. They do not select a Maincopy package license.
 | `blake3` build edge | 1.8.7 | Default features disabled; `std` | `CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception` | Not declared |
 | `lightningcss` | 1.0.0-alpha.72 | Default features disabled | `MPL-2.0` | Not declared |
 | `rustix` build and test edge | 1.1.4 | Default features disabled; `fs`, `std`; Linux and macOS only | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 1.63 |
+| `thiserror` build edge | 2.0.20 | Default features | `MIT OR Apache-2.0` | 1.71 |
+| `zeroize` | 1.9.0 | Default features disabled; `alloc` | `Apache-2.0 OR MIT` | 1.85 |
 
 `walkdir` is not part of the frontend build. Its path-based iterator cannot
 provide the required descriptor-relative traversal boundary.
@@ -430,7 +435,10 @@ Deliverables:
 - File-only effective Lexe credentials and no secret command-line flags.
 - Stable error categories for configuration, validation, availability,
   conflict, and internal failure.
-- Structured tracing with request and task correlation fields.
+- Structured process and task tracing with task correlation fields. Add
+  request correlation with the first request middleware that consumes it.
+- Process logging reads `RUST_LOG` as one case-insensitive level. It accepts
+  `trace`, `debug`, `warn`, or `error`; all other values select `info`.
 - A clock trait for time-sensitive components.
 
 Tests:
@@ -528,7 +536,7 @@ Implement the TOML frontmatter contract from the design.
 
 Deliverables:
 
-- Typed publication, post, distribution, and renderer settings.
+- Typed publication, post, and distribution settings.
 - Required offset-aware `authored_at` metadata.
 - Optional `updated_at` that is not earlier than `authored_at`.
 - UUID, slug, tag, alias, draft, and tip validation.
@@ -540,7 +548,7 @@ Deliverables:
 - Canonical lowercase hyphenated UUID text.
 - Route-safe ASCII slugs, aliases, and normalized tags.
 - Authored UTC-offset preservation for authored metadata.
-- A fixed typed renderer policy that is not authored configuration in v1.
+- A fixed renderer policy that is not authored configuration in v1.
 - Publication-default tip behavior with explicit per-post overrides.
 
 Tests:
@@ -990,9 +998,9 @@ Deliverables:
   does not modify the source tree.
 - Complete `cargo:rerun-if-changed` declarations for input roots, input files,
   and build logic.
-- A generated `FrontendAssetManifest` with typed `CssAsset` and optional
-  `JavaScriptAsset` values. Runtime code does not assemble asset paths, MIME
-  types, or cache policy from raw strings.
+- A generated `FrontendAssetManifest` with one required CSS `FrontendAsset`
+  and one optional JavaScript `FrontendAsset`. Runtime code does not assemble
+  asset paths, MIME types, or cache policy from raw strings.
 - Full `frontend-b3-v1-<64 lowercase hex>` bundle identities and distinct
   typed per-asset content identities. The application route uses the bundle
   identity; the strong ETag uses the selected asset identity.
@@ -1006,8 +1014,8 @@ Deliverables:
   resolved site assets, frontend identity, and the selected public ledger.
 - A `FrontendBundleDigest` included in `SiteShellRendererIdentity` and the
   `SiteSnapshot` digest inputs.
-- A `SiteSnapshotBuilder` that accepts only the opaque shell capability and an
-  explicit publication-ledger projection.
+- A snapshot build function that accepts only the opaque shell capability and
+  an explicit publication-ledger projection.
 - Complete route, chronology, tag, and public-asset indexes in one immutable
   `SiteSnapshot`.
 - Inclusive limits of 40 MiB for one complete page, 50,000 public routes, and
@@ -1713,9 +1721,8 @@ Deliverables:
 
 - Golden Markdown, code, ASCII, and Mermaid outputs.
 - Documented input, output, time, and concurrency defaults.
-- Renderer settings included in revision digests.
-- Versioned renderer and sanitizer implementation identities included in
-  revision digests.
+- Frozen renderer-policy and implementation-version tags included in revision
+  digests through opaque renderer identities.
 - Digests of deterministic rendered fragments and generated asset bytes before
   snapshot-URL injection included in the post or site digest that serves that
   output.

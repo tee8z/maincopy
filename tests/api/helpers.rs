@@ -11,7 +11,7 @@ use maincopy::{
     content::{ContentTreeLimits, discover_content_tree, resolve_content_assets},
     frontend_assets::embedded_manifest,
     render::{
-        PublicLedgerProjection, SiteSnapshotBuilder, SiteSnapshotReader, compile_content_catalog,
+        PublicLedgerProjection, SiteSnapshotReader, build_site_snapshot, compile_content_catalog,
         render_site_shell,
     },
     web::{PublicState, Readiness},
@@ -29,10 +29,11 @@ pub fn public_state(readiness: Readiness) -> PublicState {
     let ledger = PublicLedgerProjection::empty();
     let shell = render_site_shell(catalog, embedded_manifest(), &ledger)
         .expect("empty public shell must render");
-    let snapshot = SiteSnapshotBuilder::new()
-        .build(shell, &ledger)
-        .expect("empty public snapshot must build");
-    PublicState::new(SiteSnapshotReader::from_snapshot(snapshot), readiness)
+    let snapshot = build_site_snapshot(shell, &ledger).expect("empty public snapshot must build");
+    PublicState {
+        snapshots: SiteSnapshotReader::from_snapshot(snapshot),
+        readiness,
+    }
 }
 
 pub async fn get(app: Router, path: &str) -> Response {

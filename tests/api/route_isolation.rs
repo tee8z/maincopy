@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
 use maincopy::{
-    admin::{AdminState, admin_router},
+    admin::admin_router,
     web::{Readiness, public_router},
 };
 
@@ -30,7 +30,7 @@ async fn public_router_does_not_expose_admin_openapi() {
 
 #[tokio::test]
 async fn admin_router_does_not_expose_public_routes() {
-    let response = get(admin_router(AdminState::new()), "/health/live").await;
+    let response = get(admin_router(), "/health/live").await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

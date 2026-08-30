@@ -152,7 +152,7 @@ fn discovers_nested_tree_in_order_owns_bytes_and_validates() {
         ["assets/nested/a.bin", "assets/z-last.bin"]
     );
     assert_eq!(tree.assets()[0].bytes(), opaque);
-    assert_eq!(tree.total_bytes().get(), expected_total as u64);
+    assert_eq!(tree.total_bytes(), expected_total as u64);
 
     write(
         root.path(),
@@ -186,7 +186,7 @@ fn publication_only_tree_ignores_unmanaged_root_entries() {
         .expect("unmanaged root entries must not enter content discovery");
     assert!(tree.posts().is_empty());
     assert!(tree.assets().is_empty());
-    assert_eq!(tree.total_bytes().get(), PUBLICATION.len() as u64);
+    assert_eq!(tree.total_bytes(), PUBLICATION.len() as u64);
 
     let strict_tree = discover_content_tree(
         root.path(),
@@ -201,7 +201,7 @@ fn publication_only_tree_ignores_unmanaged_root_entries() {
         ),
     )
     .expect("unmanaged root entries must not consume the managed-entry limit");
-    assert_eq!(strict_tree.total_bytes().get(), PUBLICATION.len() as u64);
+    assert_eq!(strict_tree.total_bytes(), PUBLICATION.len() as u64);
 }
 
 #[test]
@@ -336,7 +336,7 @@ fn exact_file_tree_entry_depth_and_path_limits_are_inclusive() {
     );
     let tree = discover_content_tree(root.path(), exact)
         .expect("values exactly equal to every limit must be accepted");
-    assert_eq!(tree.total_bytes().get(), total as u64);
+    assert_eq!(tree.total_bytes(), total as u64);
 }
 
 #[test]

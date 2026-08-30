@@ -18,22 +18,19 @@ pub use assets::{
     ResolvedPostAssets, ResolvedSiteAssets, SnapshotAssetPath, SnapshotAssetPathError,
 };
 pub use identity::{
-    AssetBindingTarget, AssetDigest, DigestKind, DigestParseError, PostContentDigest,
-    PostRendererIdentity, PostRendererVersion, PostRevisionDigest, PublishedPostRevision,
-    RevisionIdentityError, SanitizerVersion, SiteShellRendererIdentity, SiteShellRendererVersion,
-    SiteSnapshotDigest, digest_asset, digest_post_content,
+    AssetBindingTarget, AssetDigest, DigestKind, DigestParseError, PostRevisionDigest,
+    PublishedPostRevision, RevisionIdentityError, SiteSnapshotDigest, digest_asset,
 };
+pub(crate) use identity::{PostRendererIdentity, SiteShellRendererIdentity};
 
 pub use model::{
-    AuthorName, AuthorSettings, CodeRenderingMode, DefaultPostTipPolicy, DistributionCopy,
-    DistributionMode, DistributionSettings, DraftStatus, LogicalContentPath, MarkdownDialect,
-    MarkdownSource, MermaidRenderingMode, PlainTextError, PostAlias, PostCollection,
-    PostDescription, PostDocument, PostId, PostIdParseError, PostMetadata, PostSlug, PostSource,
-    PostTag, PostTipPolicy, PostTitle, PrivacyPolicyRevision, PublicationAssetSettings,
+    AuthorName, AuthorSettings, DefaultPostTipPolicy, DistributionCopy, DistributionMode,
+    DistributionSettings, DraftStatus, LogicalContentPath, MarkdownSource, PlainTextError,
+    PostAlias, PostCollection, PostDescription, PostDocument, PostId, PostIdParseError,
+    PostMetadata, PostSlug, PostSource, PostTag, PostTipPolicy, PostTitle, PrivacyPolicyRevision,
     PublicationBaseUrl, PublicationBaseUrlError, PublicationSettings, PublicationSource,
-    PublicationTipSettings, RawHtmlPolicy, RendererSettings, RouteValueError, SiteDescription,
-    SiteSettings, SiteTitle, SubscriptionSettings, TipAmount, TipAmountRange, ValidatedContent,
-    XDistributionSettings,
+    PublicationTipSettings, RouteValueError, SiteDescription, SiteSettings, SiteTitle,
+    SubscriptionSettings, TipAmount, TipAmountRange, ValidatedContent, XDistributionSettings,
 };
 pub use parser::validate_content;
 pub use path::{LogicalAssetPath, LogicalTreePathError};
@@ -46,21 +43,19 @@ pub use resolver::{
     AssetResolutionErrors, AssetResolutionWarning, AssetResolutionWarningCode,
     AssetResolutionWarnings, ResolveContentAssetsError, ResolvedContentAssets, ResolvedLocalAsset,
     ResolvedLocalAssetLookupError, ResolvedLocalAssetStore, ResolvedPostAssetLookupError,
-    ResolvedPostAssetSet, ResolvedSiteAssetLookupError, resolve_content_assets,
+    ResolvedSiteAssetLookupError, resolve_content_assets,
 };
 pub use tree::{
-    ContentByteCount, ContentDepthLimit, ContentEntryLimit, ContentFileByteLimit,
-    ContentPathByteLimit, ContentTreeByteLimit, ContentTreeLimits, ContentTreeLimitsError,
-    DiscoveredAsset, DiscoveredContentTree, DiscoveredPost, DiscoveredPublication,
-    discover_content_tree,
+    ContentDepthLimit, ContentEntryLimit, ContentFileByteLimit, ContentPathByteLimit,
+    ContentTreeByteLimit, ContentTreeLimits, ContentTreeLimitsError, DiscoveredAsset,
+    DiscoveredContentTree, DiscoveredPost, DiscoveredPublication, discover_content_tree,
 };
 pub use validation::{
     ContentValidationCode, ContentValidationError, ContentValidationErrors, FieldPath,
-    ValidationLocation,
 };
 
-pub(crate) use model::{PostMetadataParts, UnresolvedAssetReference, UnresolvedHttpsOrigin};
-pub(crate) use validation::DiagnosticCollector;
+pub(crate) use model::{PublicationAssetSettings, UnresolvedAssetReference, UnresolvedHttpsOrigin};
+pub(crate) use validation::{DiagnosticCollector, ValidationLocation};
 
 #[cfg(test)]
 mod tests;

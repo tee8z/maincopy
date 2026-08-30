@@ -17,8 +17,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let manifest_dir = required_path("CARGO_MANIFEST_DIR")?;
     let out_dir = required_path("OUT_DIR")?;
-    let report = frontend_build_support::compile_frontend(&manifest_dir, &out_dir)?;
-    for input in report.input_paths() {
+    let input_paths = frontend_build_support::compile_frontend(&manifest_dir, &out_dir)?;
+    for input in input_paths {
         println!("cargo::rerun-if-changed={}", input.display());
     }
     Ok(())

@@ -8,11 +8,10 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::frontend_assets::FrontendBundleDigest;
 
 use super::{
-    AssetRevisionReference, CodeRenderingMode, DefaultPostTipPolicy, DigestedAsset,
-    DistributionMode, DistributionSettings, DraftStatus, ExternalAssetOrigin, MarkdownDialect,
-    MermaidRenderingMode, PostDocument, PostId, PostTipPolicy, PublicationSettings,
-    PublicationTipSettings, RawHtmlPolicy, RendererSettings, ResolvedPostAssets,
-    ResolvedSiteAssets, SubscriptionSettings,
+    AssetRevisionReference, DefaultPostTipPolicy, DigestedAsset, DistributionMode,
+    DistributionSettings, DraftStatus, ExternalAssetOrigin, PostDocument, PostId, PostTipPolicy,
+    PublicationSettings, PublicationTipSettings, ResolvedPostAssets, ResolvedSiteAssets,
+    SubscriptionSettings,
 };
 
 const ASSET_CONTEXT: &str = "maincopy asset digest v1";
@@ -25,6 +24,16 @@ const ASSET_RESOLUTION_POLICY_BINDING_CONTEXT: &str = "maincopy asset resolution
 const POST_REVISION_CONTEXT: &str = "maincopy post revision digest v1";
 const SITE_SHELL_OUTPUT_CONTEXT: &str = "maincopy site shell output digest v1";
 const SITE_SNAPSHOT_CONTEXT: &str = "maincopy site snapshot digest v1";
+
+// These frozen tags are the review boundary for the closed v1 rendering
+// policy. Change the relevant tag when a policy or implementation changes.
+const COMMONMARK_DIALECT_TAG: u8 = 0;
+const RAW_HTML_DISABLED_TAG: u8 = 0;
+const ESCAPED_PLAIN_CODE_TAG: u8 = 0;
+const MERMAID_PLACEHOLDER_TAG: u8 = 0;
+const POST_RENDERER_VERSION_TAG: u8 = 0;
+const SANITIZER_VERSION_TAG: u8 = 0;
+const SITE_SHELL_RENDERER_VERSION_TAG: u8 = 0;
 
 const ASSET_PREFIX: &str = "asset-b3-v1-";
 const POST_PREFIX: &str = "post-b3-v1-";
@@ -140,7 +149,7 @@ public_digest_type!(SiteSnapshotDigest, DigestKind::SiteSnapshot);
 
 /// Canonical typed post content excluding resolver-owned asset-valued fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PostContentDigest([u8; 32]);
+pub(crate) struct PostContentDigest([u8; 32]);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicationContentDigest([u8; 32]);
@@ -157,30 +166,8 @@ pub(super) struct PublicationAssetSourceBinding([u8; 32]);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AssetResolutionPolicyBinding([u8; 32]);
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PostRendererVersion {
-    V1,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SanitizerVersion {
-    V1,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SiteShellRendererVersion {
-    V1,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PostRendererIdentity {
-    settings: RendererSettings,
-    renderer: PostRendererVersion,
-    sanitizer: SanitizerVersion,
-}
+pub(crate) struct PostRendererIdentity(());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreInjectionRenderedArticle<'bytes>(&'bytes [u8]);
@@ -196,34 +183,13 @@ impl<'bytes> PreInjectionRenderedArticle<'bytes> {
 }
 
 impl PostRendererIdentity {
-    pub(super) const fn new(
-        settings: RendererSettings,
-        renderer: PostRendererVersion,
-        sanitizer: SanitizerVersion,
-    ) -> Self {
-        Self {
-            settings,
-            renderer,
-            sanitizer,
-        }
-    }
-
-    pub const fn settings(&self) -> RendererSettings {
-        self.settings
-    }
-
-    pub const fn renderer_version(&self) -> PostRendererVersion {
-        self.renderer
-    }
-
-    pub const fn sanitizer_version(&self) -> SanitizerVersion {
-        self.sanitizer
+    pub(super) const fn baseline() -> Self {
+        Self(())
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SiteShellRendererIdentity {
-    renderer: SiteShellRendererVersion,
+pub(crate) struct SiteShellRendererIdentity {
     frontend_bundle: FrontendBundleDigest,
 }
 
@@ -252,21 +218,11 @@ impl SiteShellOutputHasher {
 }
 
 impl SiteShellRendererIdentity {
-    pub(super) const fn new(
-        renderer: SiteShellRendererVersion,
-        frontend_bundle: FrontendBundleDigest,
-    ) -> Self {
-        Self {
-            renderer,
-            frontend_bundle,
-        }
+    pub(super) const fn new(frontend_bundle: FrontendBundleDigest) -> Self {
+        Self { frontend_bundle }
     }
 
-    pub const fn renderer_version(&self) -> SiteShellRendererVersion {
-        self.renderer
-    }
-
-    pub const fn frontend_bundle(&self) -> &FrontendBundleDigest {
+    pub(crate) const fn frontend_bundle(&self) -> &FrontendBundleDigest {
         &self.frontend_bundle
     }
 }
@@ -413,7 +369,7 @@ pub fn digest_asset(bytes: &[u8]) -> AssetDigest {
     AssetDigest::from_hash(transcript.finish())
 }
 
-pub fn digest_post_content(document: &PostDocument) -> PostContentDigest {
+pub(crate) fn digest_post_content(document: &PostDocument) -> PostContentDigest {
     let mut transcript = Transcript::new(POST_CONTENT_CONTEXT, b"maincopy-post-content", 1);
     encode_post_document(&mut transcript, document);
     PostContentDigest(*transcript.finish().as_bytes())
@@ -458,7 +414,7 @@ pub(super) fn bind_publication_asset_source(
     transcript.optional(publication.site().favicon(), |transcript, favicon| {
         transcript.string(favicon.as_str());
     });
-    let authored_origins = publication.assets().allowed_https_origins();
+    let authored_origins = &publication.assets.allowed_https_origins;
     transcript.sequence_len(authored_origins.len());
     for origin in authored_origins {
         transcript.string(origin.as_str());
@@ -722,35 +678,21 @@ fn encode_distribution(transcript: &mut Transcript, distribution: &DistributionS
     });
 }
 
-fn encode_renderer_settings(transcript: &mut Transcript, renderer: RendererSettings) {
-    transcript.tag(match renderer.markdown() {
-        MarkdownDialect::CommonMark => 0,
-    });
-    transcript.tag(match renderer.raw_html() {
-        RawHtmlPolicy::Disabled => 0,
-    });
-    transcript.tag(match renderer.code() {
-        CodeRenderingMode::EscapedPlainText => 0,
-    });
-    transcript.tag(match renderer.mermaid() {
-        MermaidRenderingMode::Placeholder => 0,
-    });
+fn encode_baseline_renderer_policy(transcript: &mut Transcript) {
+    transcript.tag(COMMONMARK_DIALECT_TAG);
+    transcript.tag(RAW_HTML_DISABLED_TAG);
+    transcript.tag(ESCAPED_PLAIN_CODE_TAG);
+    transcript.tag(MERMAID_PLACEHOLDER_TAG);
 }
 
-fn encode_post_renderer(transcript: &mut Transcript, renderer: &PostRendererIdentity) {
-    encode_renderer_settings(transcript, renderer.settings);
-    transcript.tag(match renderer.renderer {
-        PostRendererVersion::V1 => 0,
-    });
-    transcript.tag(match renderer.sanitizer {
-        SanitizerVersion::V1 => 0,
-    });
+fn encode_post_renderer(transcript: &mut Transcript, _renderer: &PostRendererIdentity) {
+    encode_baseline_renderer_policy(transcript);
+    transcript.tag(POST_RENDERER_VERSION_TAG);
+    transcript.tag(SANITIZER_VERSION_TAG);
 }
 
 fn encode_site_renderer(transcript: &mut Transcript, renderer: &SiteShellRendererIdentity) {
-    transcript.tag(match renderer.renderer {
-        SiteShellRendererVersion::V1 => 0,
-    });
+    transcript.tag(SITE_SHELL_RENDERER_VERSION_TAG);
     transcript.fixed_bytes(renderer.frontend_bundle.as_bytes());
 }
 
@@ -785,7 +727,7 @@ fn encode_publication(transcript: &mut Transcript, publication: &PublicationSett
             transcript.0.update(&range.maximum().get().to_be_bytes());
         }
     }
-    encode_renderer_settings(transcript, publication.renderer());
+    encode_baseline_renderer_policy(transcript);
 }
 
 fn sorted_asset_references(
@@ -815,8 +757,8 @@ fn encode_asset_reference(transcript: &mut Transcript, reference: &AssetRevision
     match reference {
         AssetRevisionReference::Local(asset) => {
             transcript.tag(0);
-            transcript.string(asset.path().as_str());
-            transcript.fixed_bytes(asset.digest().as_bytes());
+            transcript.string(asset.path.as_str());
+            transcript.fixed_bytes(asset.digest.as_bytes());
         }
         AssetRevisionReference::External(url) => {
             transcript.tag(1);
@@ -844,11 +786,11 @@ fn sorted_generated_assets(
     assets: &[DigestedAsset],
 ) -> Result<Vec<&DigestedAsset>, RevisionIdentityError> {
     let mut assets: Vec<_> = assets.iter().collect();
-    assets.sort_by(|left, right| left.path().as_str().cmp(right.path().as_str()));
+    assets.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
     for pair in assets.windows(2) {
-        if pair[0].path() == pair[1].path() {
+        if pair[0].path == pair[1].path {
             return Err(RevisionIdentityError::DuplicateGeneratedAsset {
-                path: pair[0].path().as_str().to_owned(),
+                path: pair[0].path.as_str().to_owned(),
             });
         }
     }
@@ -858,8 +800,8 @@ fn sorted_generated_assets(
 fn encode_generated_assets(transcript: &mut Transcript, assets: &[&DigestedAsset]) {
     transcript.sequence_len(assets.len());
     for asset in assets {
-        transcript.string(asset.path().as_str());
-        transcript.fixed_bytes(asset.digest().as_bytes());
+        transcript.string(asset.path.as_str());
+        transcript.fixed_bytes(asset.digest.as_bytes());
     }
 }
 
@@ -925,11 +867,7 @@ name = "Example Author"
     }
 
     fn renderer() -> PostRendererIdentity {
-        PostRendererIdentity::new(
-            RendererSettings::baseline(),
-            PostRendererVersion::V1,
-            SanitizerVersion::V1,
-        )
+        PostRendererIdentity::baseline()
     }
 
     fn frontend_bundle(byte: u8) -> FrontendBundleDigest {
@@ -1003,12 +941,6 @@ name = "Example Author"
             (
                 serde_json::to_value(DigestKind::SiteSnapshot).unwrap(),
                 "site_snapshot",
-            ),
-            (serde_json::to_value(PostRendererVersion::V1).unwrap(), "v1"),
-            (serde_json::to_value(SanitizerVersion::V1).unwrap(), "v1"),
-            (
-                serde_json::to_value(SiteShellRendererVersion::V1).unwrap(),
-                "v1",
             ),
             (
                 serde_json::to_value(AssetBindingTarget::Post).unwrap(),
@@ -1256,7 +1188,7 @@ name = "Example Author"
             baseline,
             digest(
                 &[
-                    DigestedAsset::new(first.path().clone(), digest_asset(b"changed")),
+                    DigestedAsset::new(first.path.clone(), digest_asset(b"changed")),
                     second.clone()
                 ],
                 post.metadata().distribution()
@@ -1270,7 +1202,7 @@ name = "Example Author"
                     DigestedAsset::new(
                         super::super::LogicalAssetPath::parse("assets/generated/renamed.bin")
                             .unwrap(),
-                        first.digest().clone(),
+                        first.digest.clone(),
                     ),
                     second.clone(),
                 ],
@@ -1426,8 +1358,7 @@ name = "Example Author"
             revision,
             OffsetDateTime::from_unix_timestamp(1_777_734_400).unwrap(),
         );
-        let site_renderer =
-            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
+        let site_renderer = SiteShellRendererIdentity::new(frontend_bundle(0x11));
         let forward = [first.clone(), second.clone()];
         let reverse = [second, first.clone()];
         let digest = |posts: &[PublishedPostRevision]| {
@@ -1483,10 +1414,8 @@ name = "Example Author"
         );
         let changed_activation =
             PublishedPostRevision::new(post_id, revision, published_at + time::Duration::SECOND);
-        let baseline_renderer =
-            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
-        let changed_renderer =
-            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x22));
+        let baseline_renderer = SiteShellRendererIdentity::new(frontend_bundle(0x11));
+        let changed_renderer = SiteShellRendererIdentity::new(frontend_bundle(0x22));
         let digest = |renderer: &SiteShellRendererIdentity,
                       shell: &'static [u8],
                       posts: &[PublishedPostRevision]| {
@@ -1541,8 +1470,7 @@ name = "Example Author"
 
     #[test]
     fn publication_favicon_and_site_references_are_required_site_components() {
-        let renderer =
-            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
+        let renderer = SiteShellRendererIdentity::new(frontend_bundle(0x11));
         let baseline_publication = validate_publication(PUBLICATION);
         let digest = |publication: &PublicationSettings, assets: &ResolvedSiteAssets| {
             digest_site_snapshot(&SiteSnapshotInput::new(
@@ -1685,8 +1613,7 @@ name = "Example Author"
             &PUBLICATION.replace("title = \"Example\"", "title = \"Changed\""),
         );
         let site_assets = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
-        let site_renderer =
-            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
+        let site_renderer = SiteShellRendererIdentity::new(frontend_bundle(0x11));
         assert!(matches!(
             digest_site_snapshot(&SiteSnapshotInput::new(
                 &changed_publication,
@@ -1822,8 +1749,7 @@ name = "Example Author"
             format!("{PUBLICATION}\n[assets]\nallowed_https_origins = [\"https://a.example/\"]\n");
         let publication = validate_publication(&authored_first);
         let equivalent_publication = validate_publication(&authored_equivalent);
-        let renderer =
-            SiteShellRendererIdentity::new(SiteShellRendererVersion::V1, frontend_bundle(0x11));
+        let renderer = SiteShellRendererIdentity::new(frontend_bundle(0x11));
         let first = ExternalAssetOrigin::parse("https://a.example").unwrap();
         let second = ExternalAssetOrigin::parse("HTTPS://B.EXAMPLE:443/").unwrap();
         let changed = ExternalAssetOrigin::parse("https://c.example/").unwrap();

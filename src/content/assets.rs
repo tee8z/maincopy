@@ -10,6 +10,40 @@ use super::identity::{
 };
 use super::{AssetDigest, LogicalAssetPath, PostDocument, PublicationSettings, SiteSnapshotDigest};
 
+macro_rules! canonical_url_wire {
+    ($name:ident) => {
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<SerializerType>(
+                &self,
+                serializer: SerializerType,
+            ) -> Result<SerializerType::Ok, SerializerType::Error>
+            where
+                SerializerType: Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<DeserializerType>(
+                deserializer: DeserializerType,
+            ) -> Result<Self, DeserializerType::Error>
+            where
+                DeserializerType: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(&value).map_err(de::Error::custom)
+            }
+        }
+    };
+}
+
 /// A normalized external asset URL that is safe to include in revision input.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ExternalAssetUrl {
@@ -48,35 +82,7 @@ impl ExternalAssetUrl {
     }
 }
 
-impl fmt::Display for ExternalAssetUrl {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl Serialize for ExternalAssetUrl {
-    fn serialize<SerializerType>(
-        &self,
-        serializer: SerializerType,
-    ) -> Result<SerializerType::Ok, SerializerType::Error>
-    where
-        SerializerType: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ExternalAssetUrl {
-    fn deserialize<DeserializerType>(
-        deserializer: DeserializerType,
-    ) -> Result<Self, DeserializerType::Error>
-    where
-        DeserializerType: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(de::Error::custom)
-    }
-}
+canonical_url_wire!(ExternalAssetUrl);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error(
@@ -126,35 +132,7 @@ impl ExternalAssetOrigin {
     }
 }
 
-impl fmt::Display for ExternalAssetOrigin {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl Serialize for ExternalAssetOrigin {
-    fn serialize<SerializerType>(
-        &self,
-        serializer: SerializerType,
-    ) -> Result<SerializerType::Ok, SerializerType::Error>
-    where
-        SerializerType: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ExternalAssetOrigin {
-    fn deserialize<DeserializerType>(
-        deserializer: DeserializerType,
-    ) -> Result<Self, DeserializerType::Error>
-    where
-        DeserializerType: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(de::Error::custom)
-    }
-}
+canonical_url_wire!(ExternalAssetOrigin);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error(
@@ -165,21 +143,13 @@ pub struct ExternalAssetOriginError;
 /// A local asset path paired with the digest of its exact bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DigestedAsset {
-    path: LogicalAssetPath,
-    digest: AssetDigest,
+    pub path: LogicalAssetPath,
+    pub digest: AssetDigest,
 }
 
 impl DigestedAsset {
     pub const fn new(path: LogicalAssetPath, digest: AssetDigest) -> Self {
         Self { path, digest }
-    }
-
-    pub const fn path(&self) -> &LogicalAssetPath {
-        &self.path
-    }
-
-    pub const fn digest(&self) -> &AssetDigest {
-        &self.digest
     }
 }
 
@@ -201,7 +171,7 @@ impl AssetRevisionReference {
 
     pub(crate) fn sort_key(&self) -> (u8, &str) {
         match self {
-            Self::Local(asset) => (0, asset.path().as_str()),
+            Self::Local(asset) => (0, asset.path.as_str()),
             Self::External(url) => (1, url.as_str()),
         }
     }

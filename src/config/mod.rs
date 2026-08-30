@@ -2,23 +2,20 @@
 
 mod diagnostic;
 mod host;
-mod secret;
+pub(crate) mod secret;
 
 pub use diagnostic::{
     ConfigurationAuthority, ConfigurationDiagnostic, ConfigurationErrors,
     ConfigurationValidationCode,
 };
+pub(crate) use host::HostConfigurationOverrides;
 pub use host::{
-    AdminListenerConfiguration, DatabaseBusyTimeout, DatabaseConfiguration, DatabaseReadPoolSize,
-    DatabaseWriterQueueCapacity, HostConfiguration, HostConfigurationLoader,
-    HostConfigurationOverrides, HostPaths, LexeConfiguration, LexeInFlightLimit, LexeNetwork,
-    LexePendingLimit, LexeReconciliationPageSize, LexeRecoveryInterval, LexeResponseTimeout,
-    LightningConfiguration, PublicListenerConfiguration,
+    DatabaseBusyTimeout, DatabaseConfigurationView, DatabaseReadPoolSize,
+    DatabaseWriterQueueCapacity, HostConfiguration, HostConfigurationLoader, HostConfigurationView,
+    LexeConfigurationView, LexeInFlightLimit, LexeNetwork, LexePendingLimit,
+    LexeReconciliationPageSize, LexeRecoveryInterval, LexeResponseTimeout,
 };
-pub use secret::{
-    EnvironmentSecretReference, SecretFileReference, SecretReference, SecretReferenceKind,
-    SecretResolver, SensitivePath,
-};
+pub use secret::{SecretFileReference, SensitivePath};
 
 use diagnostic::single_error;
 

@@ -1,15 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use bitcoin::{
-    hashes::{Hash, sha256},
-    secp256k1::{Secp256k1, SecretKey},
-};
-use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 use time::OffsetDateTime;
 
 use super::{ProviderSubstitute, SubstituteCall, SubstituteResponses, *};
+use crate::payments::test_support::signed_direct_invoice;
 use crate::payments::{
-    Bolt11Invoice, CreateTipInvoiceError, IgnoredPaymentUpdateReason, IgnoredProviderPaymentUpdate,
+    CreateTipInvoiceError, IgnoredPaymentUpdateReason, IgnoredProviderPaymentUpdate,
     InvoiceCreationReconciliation, InvoiceCreationUnknownReason, LightningNetwork,
     NextPaymentUpdatesRequest, PaymentHash, PaymentOperationError, PaymentProviderError,
     ProviderPaymentLocator, ProviderPaymentReference, ProviderPaymentState, ProviderPaymentStatus,
@@ -25,10 +21,7 @@ async fn substitute_variant_delegates_every_operation_exhaustively() {
     let create = create_request(TEST_INTENT_ID);
     let invoice = tip_invoice(&create, payment_reference("created-locator"));
     let reconcile = reconcile_request("known-locator");
-    let status = payment_status(
-        reconcile.payment().clone(),
-        ProviderPaymentState::InvoiceOpen,
-    );
+    let status = payment_status(reconcile.payment.clone(), ProviderPaymentState::InvoiceOpen);
     let update_request = NextPaymentUpdatesRequest::new(Some(update_cursor("cursor-before")));
     let updates = update_batch("cursor-after");
     let substitute = Arc::new(ProviderSubstitute::new(SubstituteResponses {
@@ -274,28 +267,11 @@ fn ignored_update(cursor: &str) -> ProviderPaymentUpdate {
 
 fn tip_invoice(request: &CreateTipInvoiceRequest, payment: ProviderPaymentReference) -> TipInvoice {
     TipInvoice::try_from_invoice(
-        signed_direct_invoice(request.description().as_str(), request.amount().get()),
+        signed_direct_invoice(request.description.as_str(), request.amount.get()),
         request.clone(),
         LightningNetwork::Mainnet,
         OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
         payment,
     )
     .unwrap()
-}
-
-fn signed_direct_invoice(description: &str, amount_sats: u64) -> Bolt11Invoice {
-    let payment_hash = sha256::Hash::from_byte_array([1; 32]);
-    let private_key = SecretKey::from_slice(&[42; 32]).unwrap();
-    let secp = Secp256k1::new();
-    let invoice = InvoiceBuilder::new(Currency::Bitcoin)
-        .amount_milli_satoshis(amount_sats * 1_000)
-        .duration_since_epoch(Duration::from_secs(1_700_000_000))
-        .description(description.to_owned())
-        .payment_hash(payment_hash)
-        .payment_secret(PaymentSecret([42; 32]))
-        .min_final_cltv_expiry_delta(18)
-        .build_signed(|message| secp.sign_ecdsa_recoverable(message, &private_key))
-        .unwrap();
-
-    Bolt11Invoice::parse(&invoice.to_string()).unwrap()
 }

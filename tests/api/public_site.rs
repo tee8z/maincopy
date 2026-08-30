@@ -1,6 +1,6 @@
 use axum::http::{Method, StatusCode, header};
 use maincopy::{
-    frontend_assets::{FrontendAssetName, embedded_manifest},
+    frontend_assets::{FrontendAssetName, IMMUTABLE_CACHE_CONTROL, embedded_manifest},
     web::{Readiness, public_router},
 };
 
@@ -59,15 +59,20 @@ async fn application_assets_require_an_exact_typed_manifest_lookup() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
-        stylesheet.mime().as_str()
+        stylesheet.mime()
     );
     assert_eq!(
         response.headers().get(header::CACHE_CONTROL).unwrap(),
-        stylesheet.cache_policy().as_str()
+        IMMUTABLE_CACHE_CONTROL
     );
     assert_eq!(
-        response.headers().get(header::ETAG).unwrap(),
-        stylesheet.etag().to_string().as_str()
+        response
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        stylesheet.etag()
     );
     assert_eq!(
         response.headers().get("x-content-type-options").unwrap(),

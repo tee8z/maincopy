@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    error::Error,
     ffi::OsStr,
     fmt, io,
     path::{Component, Path, PathBuf},
@@ -11,7 +10,8 @@ use crate::frontend_digest_contract::{
     FrontendDigestInput, frontend_asset_digest, frontend_bundle_digest,
 };
 use crate::frontend_io::{
-    ConfinedDirectory, ConfinedDirectoryIdentity, ConfinedEntryKind, ConfinedFileIdentity,
+    ConfinedDirectory, ConfinedDirectoryIdentity, ConfinedEntry, ConfinedEntryKind,
+    ConfinedFileIdentity,
 };
 use lightningcss::{
     dependencies::DependencyOptions,
@@ -30,17 +30,6 @@ const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOGICAL_PATH_BYTES: usize = 1_024;
 const MAX_SEGMENT_BYTES: usize = 255;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FrontendBuildReport {
-    input_paths: Vec<PathBuf>,
-}
-
-impl FrontendBuildReport {
-    pub(crate) fn input_paths(&self) -> &[PathBuf] {
-        &self.input_paths
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FrontendBuildOperation {
@@ -69,238 +58,103 @@ impl fmt::Display for FrontendBuildOperation {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum FrontendBuildError {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[error("the frontend build requires descriptor-relative I/O on Linux or macOS")]
     UnsupportedHost,
-    MissingInputRoot {
-        path: PathBuf,
-    },
-    InputRootNotDirectory {
-        path: PathBuf,
-    },
-    PathEscape {
-        path: PathBuf,
-    },
-    Symlink {
-        path: PathBuf,
-    },
-    SpecialFile {
-        path: PathBuf,
-    },
-    NonPortablePath {
-        path: PathBuf,
-    },
-    UnexpectedInputType {
-        path: PathBuf,
-    },
-    DuplicatePath {
-        path: PathBuf,
-    },
-    CaseCollision {
-        first: PathBuf,
-        second: PathBuf,
-    },
-    InputEntryLimit {
-        entries: usize,
-        limit: usize,
-    },
+    #[error("frontend input root is missing: {}", .path.display())]
+    MissingInputRoot { path: PathBuf },
+    #[error("frontend input root is not a directory: {}", .path.display())]
+    InputRootNotDirectory { path: PathBuf },
+    #[error("frontend input escaped its declared root: {}", .path.display())]
+    PathEscape { path: PathBuf },
+    #[error("frontend inputs cannot contain symlinks: {}", .path.display())]
+    Symlink { path: PathBuf },
+    #[error(
+        "frontend inputs must be regular files or directories: {}",
+        .path.display()
+    )]
+    SpecialFile { path: PathBuf },
+    #[error("frontend input path is not portable ASCII: {}", .path.display())]
+    NonPortablePath { path: PathBuf },
+    #[error("CSS input root contains a non-CSS file: {}", .path.display())]
+    UnexpectedInputType { path: PathBuf },
+    #[error("frontend input path is duplicated: {}", .path.display())]
+    DuplicatePath { path: PathBuf },
+    #[error(
+        "frontend input paths collide by ASCII case: {} and {}",
+        .first.display(),
+        .second.display()
+    )]
+    CaseCollision { first: PathBuf, second: PathBuf },
+    #[error("frontend input tree contains {entries} entries; limit is {limit}")]
+    InputEntryLimit { entries: usize, limit: usize },
+    #[error(
+        "frontend input {} has depth {depth}; limit is {limit}",
+        .path.display()
+    )]
     InputDepthLimit {
         path: PathBuf,
         depth: usize,
         limit: usize,
     },
+    #[error("frontend/css/site.css is required")]
     MissingStylesheet,
+    #[error(
+        "frontend input {} contains {bytes} bytes; limit is {limit}",
+        .path.display()
+    )]
     InputTooLarge {
         path: PathBuf,
         bytes: u64,
         limit: usize,
     },
-    BundleTooLarge {
-        bytes: usize,
-        limit: usize,
-    },
-    InvalidUtf8 {
-        path: PathBuf,
-    },
-    CssParse {
-        message: Box<str>,
-    },
-    CssMinify {
-        message: Box<str>,
-    },
-    CssPrint {
-        message: Box<str>,
-    },
-    CssDependency {
-        count: usize,
-    },
+    #[error("combined frontend input contains {bytes} bytes; limit is {limit}")]
+    BundleTooLarge { bytes: usize, limit: usize },
+    #[error("frontend input is not valid UTF-8: {}", .path.display())]
+    InvalidUtf8 { path: PathBuf },
+    #[error("cannot parse frontend CSS: {message}")]
+    CssParse { message: Box<str> },
+    #[error("cannot minify frontend CSS: {message}")]
+    CssMinify { message: Box<str> },
+    #[error("cannot serialize frontend CSS: {message}")]
+    CssPrint { message: Box<str> },
+    #[error("frontend CSS contains {count} unsupported import or URL dependencies")]
+    CssDependency { count: usize },
+    #[error("minified frontend stylesheet is empty")]
     EmptyStylesheet,
-    DigestContract {
-        message: Box<str>,
-    },
-    UnsafeOutputPath {
-        path: PathBuf,
-    },
-    InputChanged {
-        path: PathBuf,
-    },
-    OutputChanged {
-        path: PathBuf,
-    },
-    OutputHardlink {
-        path: PathBuf,
-        links: u64,
-    },
-    TemporaryOutputExhausted {
-        path: PathBuf,
-        attempts: u64,
-    },
+    #[error("frontend digest contract failed: {message}")]
+    DigestContract { message: Box<str> },
+    #[error(
+        "frontend output path is a symlink or special file: {}",
+        .path.display()
+    )]
+    UnsafeOutputPath { path: PathBuf },
+    #[error("frontend input changed while the build held it: {}", .path.display())]
+    InputChanged { path: PathBuf },
+    #[error(
+        "frontend output changed before its atomic replacement: {}",
+        .path.display()
+    )]
+    OutputChanged { path: PathBuf },
+    #[error(
+        "frontend output {} has {links} hard links; exactly one is required",
+        .path.display()
+    )]
+    OutputHardlink { path: PathBuf, links: u64 },
+    #[error(
+        "cannot reserve a temporary output for {} after {attempts} attempts",
+        .path.display()
+    )]
+    TemporaryOutputExhausted { path: PathBuf, attempts: u64 },
+    #[error("cannot {operation} frontend path {}: {source}", .path.display())]
     Io {
         operation: FrontendBuildOperation,
         path: PathBuf,
+        #[source]
         source: io::Error,
     },
-}
-
-impl fmt::Display for FrontendBuildError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            Self::UnsupportedHost => formatter
-                .write_str("the frontend build requires descriptor-relative I/O on Linux or macOS"),
-            Self::MissingInputRoot { path } => {
-                write!(
-                    formatter,
-                    "frontend input root is missing: {}",
-                    path.display()
-                )
-            }
-            Self::InputRootNotDirectory { path } => write!(
-                formatter,
-                "frontend input root is not a directory: {}",
-                path.display()
-            ),
-            Self::PathEscape { path } => write!(
-                formatter,
-                "frontend input escaped its declared root: {}",
-                path.display()
-            ),
-            Self::Symlink { path } => write!(
-                formatter,
-                "frontend inputs cannot contain symlinks: {}",
-                path.display()
-            ),
-            Self::SpecialFile { path } => write!(
-                formatter,
-                "frontend inputs must be regular files or directories: {}",
-                path.display()
-            ),
-            Self::NonPortablePath { path } => write!(
-                formatter,
-                "frontend input path is not portable ASCII: {}",
-                path.display()
-            ),
-            Self::UnexpectedInputType { path } => write!(
-                formatter,
-                "CSS input root contains a non-CSS file: {}",
-                path.display()
-            ),
-            Self::DuplicatePath { path } => write!(
-                formatter,
-                "frontend input path is duplicated: {}",
-                path.display()
-            ),
-            Self::CaseCollision { first, second } => write!(
-                formatter,
-                "frontend input paths collide by ASCII case: {} and {}",
-                first.display(),
-                second.display()
-            ),
-            Self::InputEntryLimit { entries, limit } => write!(
-                formatter,
-                "frontend input tree contains {entries} entries; limit is {limit}"
-            ),
-            Self::InputDepthLimit { path, depth, limit } => write!(
-                formatter,
-                "frontend input {} has depth {depth}; limit is {limit}",
-                path.display()
-            ),
-            Self::MissingStylesheet => formatter.write_str("frontend/css/site.css is required"),
-            Self::InputTooLarge { path, bytes, limit } => write!(
-                formatter,
-                "frontend input {} contains {bytes} bytes; limit is {limit}",
-                path.display()
-            ),
-            Self::BundleTooLarge { bytes, limit } => write!(
-                formatter,
-                "combined frontend input contains {bytes} bytes; limit is {limit}"
-            ),
-            Self::InvalidUtf8 { path } => write!(
-                formatter,
-                "frontend input is not valid UTF-8: {}",
-                path.display()
-            ),
-            Self::CssParse { message } => write!(formatter, "cannot parse frontend CSS: {message}"),
-            Self::CssMinify { message } => {
-                write!(formatter, "cannot minify frontend CSS: {message}")
-            }
-            Self::CssPrint { message } => {
-                write!(formatter, "cannot serialize frontend CSS: {message}")
-            }
-            Self::CssDependency { count } => write!(
-                formatter,
-                "frontend CSS contains {count} unsupported import or URL dependencies"
-            ),
-            Self::EmptyStylesheet => formatter.write_str("minified frontend stylesheet is empty"),
-            Self::DigestContract { message } => {
-                write!(formatter, "frontend digest contract failed: {message}")
-            }
-            Self::UnsafeOutputPath { path } => write!(
-                formatter,
-                "frontend output path is a symlink or special file: {}",
-                path.display()
-            ),
-            Self::InputChanged { path } => write!(
-                formatter,
-                "frontend input changed while the build held it: {}",
-                path.display()
-            ),
-            Self::OutputChanged { path } => write!(
-                formatter,
-                "frontend output changed before its atomic replacement: {}",
-                path.display()
-            ),
-            Self::OutputHardlink { path, links } => write!(
-                formatter,
-                "frontend output {} has {links} hard links; exactly one is required",
-                path.display()
-            ),
-            Self::TemporaryOutputExhausted { path, attempts } => write!(
-                formatter,
-                "cannot reserve a temporary output for {} after {attempts} attempts",
-                path.display()
-            ),
-            Self::Io {
-                operation,
-                path,
-                source,
-            } => write!(
-                formatter,
-                "cannot {operation} frontend path {}: {source}",
-                path.display()
-            ),
-        }
-    }
-}
-
-impl Error for FrontendBuildError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            _ => None,
-        }
-    }
 }
 
 struct InputFile {
@@ -352,7 +206,7 @@ impl DiscoveredCss {
 pub(crate) fn compile_frontend(
     manifest_dir: &Path,
     out_dir: &Path,
-) -> Result<FrontendBuildReport, FrontendBuildError> {
+) -> Result<Vec<PathBuf>, FrontendBuildError> {
     let manifest_root = ConfinedDirectory::open_absolute(manifest_dir)?;
     let frontend_path = manifest_dir.join(FRONTEND_ROOT);
     let frontend_root =
@@ -386,17 +240,15 @@ pub(crate) fn compile_frontend(
         discovered.verify_unchanged()
     })?;
 
-    Ok(FrontendBuildReport {
-        input_paths: discovered
-            .inputs
-            .into_iter()
-            .map(|input| {
-                Path::new(FRONTEND_ROOT)
-                    .join("css")
-                    .join(input.logical_path)
-            })
-            .collect(),
-    })
+    Ok(discovered
+        .inputs
+        .into_iter()
+        .map(|input| {
+            Path::new(FRONTEND_ROOT)
+                .join("css")
+                .join(input.logical_path)
+        })
+        .collect())
 }
 
 fn calculate_bundle_digest(
@@ -455,13 +307,13 @@ fn discover_css_directory(
         let path = root.join(&relative);
         enforce_depth(&path, relative.components().count())?;
         match entry.kind() {
+            ConfinedEntryKind::File | ConfinedEntryKind::Directory => {}
             ConfinedEntryKind::Symlink => {
                 return Err(FrontendBuildError::Symlink { path });
             }
             ConfinedEntryKind::Special => {
                 return Err(FrontendBuildError::SpecialFile { path });
             }
-            ConfinedEntryKind::File | ConfinedEntryKind::Directory => {}
         }
 
         let logical_path = normalize_relative_path(&relative, &path)?;
@@ -483,48 +335,60 @@ fn discover_css_directory(
             child.verify_unchanged()?;
             continue;
         }
-        if path.extension().and_then(|extension| extension.to_str()) != Some("css") {
-            return Err(FrontendBuildError::UnexpectedInputType { path });
-        }
-        let identity = identity.file(&entry, &path)?;
-        let mut confined = directory.open_entry_file(&entry, &path)?;
-        let captured_bytes = confined.byte_length()?;
-        enforce_input_size(&path, captured_bytes)?;
-        let captured_bytes =
-            usize::try_from(captured_bytes).map_err(|_| FrontendBuildError::InputTooLarge {
-                path: path.clone(),
-                bytes: captured_bytes,
-                limit: MAX_INPUT_BYTES,
-            })?;
-        let next_parser_stream_bytes = state
-            .parser_stream_bytes
-            .checked_add(captured_bytes)
-            .and_then(|value| value.checked_add(1))
-            .ok_or(FrontendBuildError::BundleTooLarge {
-                bytes: usize::MAX,
-                limit: MAX_BUNDLE_BYTES,
-            })?;
-        enforce_bundle_size(next_parser_stream_bytes)?;
-        let bytes = confined.read_verified(MAX_INPUT_BYTES + 1)?;
-        enforce_input_size(&path, bytes.len() as u64)?;
-        let verified_parser_stream_bytes = state
-            .parser_stream_bytes
-            .checked_add(bytes.len())
-            .and_then(|value| value.checked_add(1))
-            .ok_or(FrontendBuildError::BundleTooLarge {
-                bytes: usize::MAX,
-                limit: MAX_BUNDLE_BYTES,
-            })?;
-        enforce_bundle_size(verified_parser_stream_bytes)?;
-        state.parser_stream_bytes = verified_parser_stream_bytes;
-        state.inputs.push(InputFile {
-            logical_path,
-            disk_path: path,
-            bytes,
-            identity,
-        });
+        collect_css_file(directory, identity, entry, logical_path, path, state)?;
     }
     directory.verify_unchanged()
+}
+
+fn collect_css_file(
+    directory: &ConfinedDirectory,
+    directory_identity: &ConfinedDirectoryIdentity,
+    source: ConfinedEntry,
+    logical_path: String,
+    disk_path: PathBuf,
+    state: &mut DiscoveryState,
+) -> Result<(), FrontendBuildError> {
+    if disk_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("css")
+    {
+        return Err(FrontendBuildError::UnexpectedInputType { path: disk_path });
+    }
+    let identity = directory_identity.file(&source, &disk_path)?;
+    let mut confined = directory.open_entry_file(&source, &disk_path)?;
+    let captured_bytes = confined.byte_length()?;
+    enforce_input_size(&disk_path, captured_bytes)?;
+    let captured_bytes =
+        usize::try_from(captured_bytes).map_err(|_| FrontendBuildError::InputTooLarge {
+            path: disk_path.clone(),
+            bytes: captured_bytes,
+            limit: MAX_INPUT_BYTES,
+        })?;
+    parser_stream_size(state.parser_stream_bytes, captured_bytes)?;
+
+    let bytes = confined.read_verified(MAX_INPUT_BYTES + 1)?;
+    enforce_input_size(&disk_path, bytes.len() as u64)?;
+    state.parser_stream_bytes = parser_stream_size(state.parser_stream_bytes, bytes.len())?;
+    state.inputs.push(InputFile {
+        logical_path,
+        disk_path,
+        bytes,
+        identity,
+    });
+    Ok(())
+}
+
+fn parser_stream_size(current: usize, input: usize) -> Result<usize, FrontendBuildError> {
+    let bytes = current
+        .checked_add(input)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(FrontendBuildError::BundleTooLarge {
+            bytes: usize::MAX,
+            limit: MAX_BUNDLE_BYTES,
+        })?;
+    enforce_bundle_size(bytes)?;
+    Ok(bytes)
 }
 
 fn normalize_relative_path(relative: &Path, full: &Path) -> Result<String, FrontendBuildError> {
@@ -710,7 +574,8 @@ fn generated_manifest(
          pub(super) const GENERATED_FRONTEND_MANIFEST: FrontendAssetManifest =\n\
          \x20   FrontendAssetManifest::from_generated(\n\
          \x20       FrontendBundleDigest::from_generated({}),\n\
-         \x20       CssAsset::from_generated(\n\
+         \x20       FrontendAsset::from_generated(\n\
+         \x20           FrontendAssetKind::Css,\n\
          \x20           FrontendAssetDigest::from_generated({}),\n\
          \x20           FrontendAssetPath::from_generated({public_path:?}),\n\
          \x20           include_bytes!(concat!(env!(\"OUT_DIR\"), \"/maincopy-frontend/site.css\")),\n\
@@ -829,7 +694,7 @@ mod tests {
 
         let first = compile_frontend(&first_source, &first_output).unwrap();
         let second = compile_frontend(&second_source, &second_output).unwrap();
-        assert_eq!(first.input_paths(), second.input_paths());
+        assert_eq!(first, second);
         assert_eq!(
             fs::read(first_output.join(OUTPUT_ROOT).join(CSS_OUTPUT)).unwrap(),
             fs::read(second_output.join(OUTPUT_ROOT).join(CSS_OUTPUT)).unwrap()

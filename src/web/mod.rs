@@ -17,7 +17,7 @@ use crate::render::SiteSnapshotReader;
 ///
 /// Startup keeps the service unready until its required components are
 /// available. Any critical component can make the service unready again.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Readiness {
     ready: Arc<AtomicBool>,
 }
@@ -42,34 +42,11 @@ impl Readiness {
     }
 }
 
-impl Default for Readiness {
-    fn default() -> Self {
-        Self::new(false)
-    }
-}
-
 /// Explicit request-facing dependencies for the public listener.
 #[derive(Clone, Debug)]
 pub struct PublicState {
-    snapshots: SiteSnapshotReader,
-    readiness: Readiness,
-}
-
-impl PublicState {
-    pub const fn new(snapshots: SiteSnapshotReader, readiness: Readiness) -> Self {
-        Self {
-            snapshots,
-            readiness,
-        }
-    }
-
-    pub const fn snapshots(&self) -> &SiteSnapshotReader {
-        &self.snapshots
-    }
-
-    pub const fn readiness(&self) -> &Readiness {
-        &self.readiness
-    }
+    pub snapshots: SiteSnapshotReader,
+    pub readiness: Readiness,
 }
 
 impl FromRef<PublicState> for SiteSnapshotReader {

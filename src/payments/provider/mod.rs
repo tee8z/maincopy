@@ -1,10 +1,14 @@
+#[expect(
+    dead_code,
+    reason = "the Lexe production runtime stays unreachable until SDK secrets zeroize on drop"
+)]
 mod lexe;
 #[cfg(any(test, feature = "test-utils"))]
 mod substitute;
 
 use std::sync::Arc;
 
-pub use lexe::{LexeProvider, LexeProviderRuntime, LexeProviderRuntimeError};
+pub use lexe::LexeProvider;
 #[cfg(any(test, feature = "test-utils"))]
 pub use substitute::{ProviderSubstitute, SubstituteCall, SubstituteResponses};
 
@@ -82,8 +86,8 @@ impl LightningProvider {
         &self,
         request: ReconcilePaymentRequest,
     ) -> PaymentProviderResult<ProviderPaymentStatus> {
-        self.require_matching_provider(request.payment())?;
-        let expected_payment = request.payment().clone();
+        self.require_matching_provider(&request.payment)?;
+        let expected_payment = request.payment.clone();
         let status = match self {
             Self::Lexe(provider) => provider.reconcile_payment(request).await,
             #[cfg(any(test, feature = "test-utils"))]
@@ -98,8 +102,8 @@ impl LightningProvider {
         &self,
         request: NextPaymentUpdatesRequest,
     ) -> PaymentProviderResult<ProviderPaymentUpdatePoll> {
-        let requested_cursor = request.cursor().cloned();
-        if let Some(cursor) = request.cursor() {
+        let requested_cursor = request.cursor.clone();
+        if let Some(cursor) = request.cursor.as_ref() {
             let expected = self.kind();
             let actual = cursor.provider();
             if actual != expected {
@@ -145,7 +149,7 @@ impl LightningProvider {
         expected: &ProviderPaymentReference,
         status: &ProviderPaymentStatus,
     ) -> PaymentProviderResult<()> {
-        if status.payment() == expected {
+        if &status.payment == expected {
             Ok(())
         } else {
             Err(PaymentOperationError::InvalidProviderResponse.into())
@@ -157,7 +161,7 @@ impl LightningProvider {
         request: &CreateTipInvoiceRequest,
         invoice: &TipInvoice,
     ) -> bool {
-        invoice.matches_request(request) && invoice.payment().provider() == self.kind()
+        invoice.matches_request(request) && invoice.payment.provider() == self.kind()
     }
 }
 

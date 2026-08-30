@@ -19,7 +19,9 @@ use super::{
         ConfigurationAuthority, ConfigurationDiagnostic, ConfigurationErrors,
         ConfigurationValidationCode, DiagnosticCollector, single_error, toml_location,
     },
-    secret::{SecretFileReference, SecretReferenceCandidate, SensitivePath},
+    secret::{
+        SecretFileReference, SecretReferenceCandidate, SecretReferenceCandidateError, SensitivePath,
+    },
 };
 
 const MAX_HOST_DOCUMENT_BYTES: u64 = 1024 * 1024;
@@ -48,218 +50,90 @@ const MAX_LEXE_RECOVERY_INTERVAL_SECONDS: u64 = 86_400;
 
 /// Non-secret command-line overrides for `maincopy serve`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct HostConfigurationOverrides {
-    content_root: Option<PathBuf>,
-    state_root: Option<PathBuf>,
-    runtime_root: Option<PathBuf>,
-    database_path: Option<PathBuf>,
-    public_bind: Option<SocketAddr>,
-    admin_socket: Option<PathBuf>,
-    database_busy_timeout_ms: Option<u64>,
-    database_writer_queue_capacity: Option<u64>,
-    database_read_pool_size: Option<u64>,
-    content_publication_file_bytes: Option<u64>,
-    content_post_file_bytes: Option<u64>,
-    content_asset_file_bytes: Option<u64>,
-    content_total_tree_bytes: Option<u64>,
-    content_entries: Option<u64>,
-    content_depth: Option<u64>,
-    content_path_bytes: Option<u64>,
+pub(crate) struct HostConfigurationOverrides {
+    pub(crate) content_root: Option<PathBuf>,
+    pub(crate) state_root: Option<PathBuf>,
+    pub(crate) runtime_root: Option<PathBuf>,
+    pub(crate) database_path: Option<PathBuf>,
+    pub(crate) public_bind: Option<SocketAddr>,
+    pub(crate) admin_socket: Option<PathBuf>,
+    pub(crate) database_busy_timeout_ms: Option<u64>,
+    pub(crate) database_writer_queue_capacity: Option<u64>,
+    pub(crate) database_read_pool_size: Option<u64>,
+    pub(crate) content_publication_file_bytes: Option<u64>,
+    pub(crate) content_post_file_bytes: Option<u64>,
+    pub(crate) content_asset_file_bytes: Option<u64>,
+    pub(crate) content_total_tree_bytes: Option<u64>,
+    pub(crate) content_entries: Option<u64>,
+    pub(crate) content_depth: Option<u64>,
+    pub(crate) content_path_bytes: Option<u64>,
 }
 
-impl HostConfigurationOverrides {
-    pub fn with_content_root(mut self, value: PathBuf) -> Self {
-        self.content_root = Some(value);
-        self
-    }
+macro_rules! bounded_usize_setting {
+    ($name:ident, $minimum:expr, $maximum:expr) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct $name(NonZeroUsize);
 
-    pub fn with_state_root(mut self, value: PathBuf) -> Self {
-        self.state_root = Some(value);
-        self
-    }
+        impl $name {
+            pub fn new(value: usize) -> Option<Self> {
+                NonZeroUsize::new(value)
+                    .filter(|value| ($minimum..=$maximum).contains(&value.get()))
+                    .map(Self)
+            }
 
-    pub fn with_runtime_root(mut self, value: PathBuf) -> Self {
-        self.runtime_root = Some(value);
-        self
-    }
-
-    pub fn with_database_path(mut self, value: PathBuf) -> Self {
-        self.database_path = Some(value);
-        self
-    }
-
-    pub const fn with_public_bind(mut self, value: SocketAddr) -> Self {
-        self.public_bind = Some(value);
-        self
-    }
-
-    pub fn with_admin_socket(mut self, value: PathBuf) -> Self {
-        self.admin_socket = Some(value);
-        self
-    }
-
-    pub const fn with_database_busy_timeout_ms(mut self, value: u64) -> Self {
-        self.database_busy_timeout_ms = Some(value);
-        self
-    }
-
-    pub const fn with_database_writer_queue_capacity(mut self, value: u64) -> Self {
-        self.database_writer_queue_capacity = Some(value);
-        self
-    }
-
-    pub const fn with_database_read_pool_size(mut self, value: u64) -> Self {
-        self.database_read_pool_size = Some(value);
-        self
-    }
-
-    pub const fn with_content_publication_file_bytes(mut self, value: u64) -> Self {
-        self.content_publication_file_bytes = Some(value);
-        self
-    }
-
-    pub const fn with_content_post_file_bytes(mut self, value: u64) -> Self {
-        self.content_post_file_bytes = Some(value);
-        self
-    }
-
-    pub const fn with_content_asset_file_bytes(mut self, value: u64) -> Self {
-        self.content_asset_file_bytes = Some(value);
-        self
-    }
-
-    pub const fn with_content_total_tree_bytes(mut self, value: u64) -> Self {
-        self.content_total_tree_bytes = Some(value);
-        self
-    }
-
-    pub const fn with_content_entries(mut self, value: u64) -> Self {
-        self.content_entries = Some(value);
-        self
-    }
-
-    pub const fn with_content_depth(mut self, value: u64) -> Self {
-        self.content_depth = Some(value);
-        self
-    }
-
-    pub const fn with_content_path_bytes(mut self, value: u64) -> Self {
-        self.content_path_bytes = Some(value);
-        self
-    }
+            pub const fn get(self) -> usize {
+                self.0.get()
+            }
+        }
+    };
 }
+
+macro_rules! bounded_duration_setting {
+    ($name:ident, $constructor:ident, $duration_constructor:ident, $maximum:expr) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct $name(Duration);
+
+        impl $name {
+            pub fn $constructor(value: u64) -> Option<Self> {
+                (value > 0 && value <= $maximum)
+                    .then_some(Self(Duration::$duration_constructor(value)))
+            }
+
+            pub const fn get(self) -> Duration {
+                self.0
+            }
+        }
+    };
+}
+
+bounded_duration_setting!(
+    DatabaseBusyTimeout,
+    from_milliseconds,
+    from_millis,
+    MAX_DATABASE_BUSY_TIMEOUT_MILLISECONDS
+);
+bounded_usize_setting!(
+    DatabaseWriterQueueCapacity,
+    1,
+    MAX_DATABASE_WRITER_QUEUE_CAPACITY
+);
+bounded_usize_setting!(DatabaseReadPoolSize, 1, MAX_DATABASE_READ_POOL_SIZE);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostPaths {
-    content_root: PathBuf,
-    state_root: PathBuf,
-    runtime_root: PathBuf,
-}
-
-impl HostPaths {
-    pub fn content_root(&self) -> &Path {
-        &self.content_root
-    }
-
-    pub fn state_root(&self) -> &Path {
-        &self.state_root
-    }
-
-    pub fn runtime_root(&self) -> &Path {
-        &self.runtime_root
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PublicListenerConfiguration {
-    bind: SocketAddr,
-}
-
-impl PublicListenerConfiguration {
-    pub const fn bind(self) -> SocketAddr {
-        self.bind
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminListenerConfiguration {
-    socket: PathBuf,
-}
-
-impl AdminListenerConfiguration {
-    pub fn socket(&self) -> &Path {
-        &self.socket
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DatabaseBusyTimeout(Duration);
-
-impl DatabaseBusyTimeout {
-    pub fn from_milliseconds(value: u64) -> Option<Self> {
-        (value > 0 && value <= MAX_DATABASE_BUSY_TIMEOUT_MILLISECONDS)
-            .then_some(Self(Duration::from_millis(value)))
-    }
-
-    pub const fn get(self) -> Duration {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DatabaseWriterQueueCapacity(NonZeroUsize);
-
-impl DatabaseWriterQueueCapacity {
-    pub fn new(value: usize) -> Option<Self> {
-        NonZeroUsize::new(value)
-            .filter(|value| value.get() <= MAX_DATABASE_WRITER_QUEUE_CAPACITY)
-            .map(Self)
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DatabaseReadPoolSize(NonZeroUsize);
-
-impl DatabaseReadPoolSize {
-    pub fn new(value: usize) -> Option<Self> {
-        NonZeroUsize::new(value)
-            .filter(|value| value.get() <= MAX_DATABASE_READ_POOL_SIZE)
-            .map(Self)
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DatabaseConfiguration {
+struct DatabaseConfiguration {
     path: PathBuf,
     busy_timeout: DatabaseBusyTimeout,
     writer_queue_capacity: DatabaseWriterQueueCapacity,
     read_pool_size: DatabaseReadPoolSize,
 }
 
-impl DatabaseConfiguration {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub const fn busy_timeout(&self) -> DatabaseBusyTimeout {
-        self.busy_timeout
-    }
-
-    pub const fn writer_queue_capacity(&self) -> DatabaseWriterQueueCapacity {
-        self.writer_queue_capacity
-    }
-
-    pub const fn read_pool_size(&self) -> DatabaseReadPoolSize {
-        self.read_pool_size
-    }
+/// Read-only database settings borrowed from validated host configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseConfigurationView<'configuration> {
+    pub path: &'configuration Path,
+    pub busy_timeout: DatabaseBusyTimeout,
+    pub writer_queue_capacity: DatabaseWriterQueueCapacity,
+    pub read_pool_size: DatabaseReadPoolSize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -272,81 +146,28 @@ pub enum LexeNetwork {
     Regtest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LexeInFlightLimit(NonZeroUsize);
-
-impl LexeInFlightLimit {
-    pub fn new(value: usize) -> Option<Self> {
-        NonZeroUsize::new(value)
-            .filter(|value| (2..=MAX_LEXE_IN_FLIGHT).contains(&value.get()))
-            .map(Self)
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LexePendingLimit(NonZeroUsize);
-
-impl LexePendingLimit {
-    pub fn new(value: usize) -> Option<Self> {
-        NonZeroUsize::new(value)
-            .filter(|value| value.get() <= MAX_LEXE_PENDING)
-            .map(Self)
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LexeResponseTimeout(Duration);
-
-impl LexeResponseTimeout {
-    pub fn from_milliseconds(value: u64) -> Option<Self> {
-        (value > 0 && value <= MAX_LEXE_RESPONSE_TIMEOUT_MILLISECONDS)
-            .then_some(Self(Duration::from_millis(value)))
-    }
-
-    pub const fn get(self) -> Duration {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LexeReconciliationPageSize(NonZeroUsize);
-
-impl LexeReconciliationPageSize {
-    pub fn new(value: usize) -> Option<Self> {
-        NonZeroUsize::new(value)
-            .filter(|value| value.get() <= MAX_LEXE_RECONCILIATION_PAGE_SIZE)
-            .map(Self)
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LexeRecoveryInterval(Duration);
-
-impl LexeRecoveryInterval {
-    pub fn from_seconds(value: u64) -> Option<Self> {
-        (value > 0 && value <= MAX_LEXE_RECOVERY_INTERVAL_SECONDS)
-            .then_some(Self(Duration::from_secs(value)))
-    }
-
-    pub const fn get(self) -> Duration {
-        self.0
-    }
-}
+bounded_usize_setting!(LexeInFlightLimit, 2, MAX_LEXE_IN_FLIGHT);
+bounded_usize_setting!(LexePendingLimit, 1, MAX_LEXE_PENDING);
+bounded_duration_setting!(
+    LexeResponseTimeout,
+    from_milliseconds,
+    from_millis,
+    MAX_LEXE_RESPONSE_TIMEOUT_MILLISECONDS
+);
+bounded_usize_setting!(
+    LexeReconciliationPageSize,
+    1,
+    MAX_LEXE_RECONCILIATION_PAGE_SIZE
+);
+bounded_duration_setting!(
+    LexeRecoveryInterval,
+    from_seconds,
+    from_secs,
+    MAX_LEXE_RECOVERY_INTERVAL_SECONDS
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LexeConfiguration {
+struct LexeConfiguration {
     network: LexeNetwork,
     credentials: SecretFileReference,
     cache_path: Option<SensitivePath>,
@@ -357,87 +178,74 @@ pub struct LexeConfiguration {
     recovery_interval: LexeRecoveryInterval,
 }
 
-impl LexeConfiguration {
-    pub const fn network(&self) -> LexeNetwork {
-        self.network
-    }
-
-    pub const fn credentials(&self) -> &SecretFileReference {
-        &self.credentials
-    }
-
-    pub const fn cache_path(&self) -> Option<&SensitivePath> {
-        self.cache_path.as_ref()
-    }
-
-    pub const fn max_in_flight(&self) -> LexeInFlightLimit {
-        self.max_in_flight
-    }
-
-    pub const fn max_pending(&self) -> LexePendingLimit {
-        self.max_pending
-    }
-
-    pub const fn response_timeout(&self) -> LexeResponseTimeout {
-        self.response_timeout
-    }
-
-    pub const fn reconciliation_page_size(&self) -> LexeReconciliationPageSize {
-        self.reconciliation_page_size
-    }
-
-    pub const fn recovery_interval(&self) -> LexeRecoveryInterval {
-        self.recovery_interval
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LightningConfiguration {
-    Lexe(LexeConfiguration),
-}
-
-impl LightningConfiguration {
-    pub const fn lexe(&self) -> &LexeConfiguration {
-        match self {
-            Self::Lexe(configuration) => configuration,
-        }
-    }
+/// Read-only Lexe settings borrowed from validated host configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LexeConfigurationView<'configuration> {
+    pub network: LexeNetwork,
+    pub credentials: &'configuration SecretFileReference,
+    pub cache_path: Option<&'configuration SensitivePath>,
+    pub max_in_flight: LexeInFlightLimit,
+    pub max_pending: LexePendingLimit,
+    pub response_timeout: LexeResponseTimeout,
+    pub reconciliation_page_size: LexeReconciliationPageSize,
+    pub recovery_interval: LexeRecoveryInterval,
 }
 
 /// Effective host-owned runtime configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostConfiguration {
-    paths: HostPaths,
-    content: ContentTreeLimits,
-    public: PublicListenerConfiguration,
-    admin: AdminListenerConfiguration,
+    content_root: PathBuf,
+    state_root: PathBuf,
+    runtime_root: PathBuf,
+    content_limits: ContentTreeLimits,
+    public_bind: SocketAddr,
+    admin_socket: PathBuf,
     database: DatabaseConfiguration,
-    lightning: Option<LightningConfiguration>,
+    lightning: Option<LexeConfiguration>,
+}
+
+/// Read-only settings borrowed from validated host configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostConfigurationView<'configuration> {
+    pub content_root: &'configuration Path,
+    pub state_root: &'configuration Path,
+    pub runtime_root: &'configuration Path,
+    pub content_limits: ContentTreeLimits,
+    pub public_bind: SocketAddr,
+    pub admin_socket: &'configuration Path,
+    pub database: DatabaseConfigurationView<'configuration>,
+    pub lightning: Option<LexeConfigurationView<'configuration>>,
 }
 
 impl HostConfiguration {
-    pub const fn paths(&self) -> &HostPaths {
-        &self.paths
-    }
-
-    pub const fn content(&self) -> ContentTreeLimits {
-        self.content
-    }
-
-    pub const fn public(&self) -> PublicListenerConfiguration {
-        self.public
-    }
-
-    pub const fn admin(&self) -> &AdminListenerConfiguration {
-        &self.admin
-    }
-
-    pub const fn database(&self) -> &DatabaseConfiguration {
-        &self.database
-    }
-
-    pub const fn lightning(&self) -> Option<&LightningConfiguration> {
-        self.lightning.as_ref()
+    pub fn view(&self) -> HostConfigurationView<'_> {
+        HostConfigurationView {
+            content_root: &self.content_root,
+            state_root: &self.state_root,
+            runtime_root: &self.runtime_root,
+            content_limits: self.content_limits,
+            public_bind: self.public_bind,
+            admin_socket: &self.admin_socket,
+            database: DatabaseConfigurationView {
+                path: &self.database.path,
+                busy_timeout: self.database.busy_timeout,
+                writer_queue_capacity: self.database.writer_queue_capacity,
+                read_pool_size: self.database.read_pool_size,
+            },
+            lightning: self
+                .lightning
+                .as_ref()
+                .map(|configuration| LexeConfigurationView {
+                    network: configuration.network,
+                    credentials: &configuration.credentials,
+                    cache_path: configuration.cache_path.as_ref(),
+                    max_in_flight: configuration.max_in_flight,
+                    max_pending: configuration.max_pending,
+                    response_timeout: configuration.response_timeout,
+                    reconciliation_page_size: configuration.reconciliation_page_size,
+                    recovery_interval: configuration.recovery_interval,
+                }),
+        }
     }
 }
 
@@ -470,7 +278,11 @@ impl HostConfigurationLoader {
         Ok(Self { working_directory })
     }
 
-    pub fn load(
+    pub fn load(&self, config_path: &Path) -> Result<HostConfiguration, ConfigurationErrors> {
+        self.load_with_overrides(config_path, HostConfigurationOverrides::default())
+    }
+
+    pub(crate) fn load_with_overrides(
         &self,
         config_path: &Path,
         overrides: HostConfigurationOverrides,
@@ -679,7 +491,7 @@ fn finalize_host(
         .or(candidate.public.bind)
         .unwrap_or_else(default_public_bind);
 
-    let busy_timeout = validate_duration_milliseconds::<DatabaseBusyTimeout>(
+    let busy_timeout = validate_duration::<DatabaseBusyTimeout>(
         overrides
             .database_busy_timeout_ms
             .or(candidate.database.busy_timeout_ms)
@@ -712,9 +524,7 @@ fn finalize_host(
         .lightning
         .and_then(|candidate| validate_lightning(candidate, file_base, &mut diagnostics));
 
-    if !diagnostics.is_empty() {
-        return Err(diagnostics.finish());
-    }
+    diagnostics.into_result()?;
     match (
         content_root,
         state_root,
@@ -737,16 +547,12 @@ fn finalize_host(
             Some(read_pool_size),
             Some(content),
         ) => Ok(HostConfiguration {
-            paths: HostPaths {
-                content_root,
-                state_root,
-                runtime_root,
-            },
-            content,
-            public: PublicListenerConfiguration { bind: public_bind },
-            admin: AdminListenerConfiguration {
-                socket: admin_socket,
-            },
+            content_root,
+            state_root,
+            runtime_root,
+            content_limits: content,
+            public_bind,
+            admin_socket,
             database: DatabaseConfiguration {
                 path: database_path,
                 busy_timeout,
@@ -980,117 +786,113 @@ fn validate_lightning(
     candidate: LightningCandidate,
     file_base: &Path,
     diagnostics: &mut DiagnosticCollector,
-) -> Option<LightningConfiguration> {
-    match candidate {
-        LightningCandidate::Lexe {
+) -> Option<LexeConfiguration> {
+    let LightningCandidate::Lexe {
+        network,
+        credentials,
+        cache_path,
+        max_in_flight,
+        max_pending,
+        response_timeout_ms,
+        reconciliation_page_size,
+        recovery_interval_seconds,
+    } = candidate;
+
+    let credentials = match credentials.finalize_file(file_base) {
+        Ok(reference) => Some(reference),
+        Err(SecretReferenceCandidateError::EnvironmentUnsupported) => {
+            diagnostics.push(host_diagnostic(
+                "lightning.credentials",
+                ConfigurationValidationCode::LexeCredentialsMustUseFile,
+                "Lexe credentials require a file secret reference",
+            ));
+            None
+        }
+        Err(SecretReferenceCandidateError::Invalid) => {
+            diagnostics.push(host_diagnostic(
+                "lightning.credentials",
+                ConfigurationValidationCode::SecretReferenceInvalid,
+                "secret reference syntax is invalid",
+            ));
+            None
+        }
+    };
+    let cache_path = match cache_path {
+        Some(path) => match resolve_path(file_base, &path).and_then(SensitivePath::new) {
+            Some(path) => Some(Some(path)),
+            None => {
+                diagnostics.push(host_diagnostic(
+                    "lightning.cache_path",
+                    ConfigurationValidationCode::PathInvalid,
+                    "Lexe cache path must not be empty",
+                ));
+                None
+            }
+        },
+        None => Some(None),
+    };
+    let max_in_flight = validate_usize::<LexeInFlightLimit>(
+        max_in_flight.unwrap_or(DEFAULT_LEXE_MAX_IN_FLIGHT as u64),
+        "lightning.max_in_flight",
+        ConfigurationValidationCode::LexeConcurrencyInvalid,
+        LexeInFlightLimit::new,
+        diagnostics,
+    );
+    let max_pending = validate_usize::<LexePendingLimit>(
+        max_pending.unwrap_or(DEFAULT_LEXE_MAX_PENDING as u64),
+        "lightning.max_pending",
+        ConfigurationValidationCode::LimitOutOfRange,
+        LexePendingLimit::new,
+        diagnostics,
+    );
+    let response_timeout = validate_duration::<LexeResponseTimeout>(
+        response_timeout_ms.unwrap_or(DEFAULT_LEXE_RESPONSE_TIMEOUT_MILLISECONDS),
+        "lightning.response_timeout_ms",
+        LexeResponseTimeout::from_milliseconds,
+        diagnostics,
+    );
+    let reconciliation_page_size = validate_usize::<LexeReconciliationPageSize>(
+        reconciliation_page_size.unwrap_or(DEFAULT_LEXE_RECONCILIATION_PAGE_SIZE as u64),
+        "lightning.reconciliation_page_size",
+        ConfigurationValidationCode::PageSizeInvalid,
+        LexeReconciliationPageSize::new,
+        diagnostics,
+    );
+    let recovery_interval = validate_duration::<LexeRecoveryInterval>(
+        recovery_interval_seconds.unwrap_or(DEFAULT_LEXE_RECOVERY_INTERVAL_SECONDS),
+        "lightning.recovery_interval_seconds",
+        LexeRecoveryInterval::from_seconds,
+        diagnostics,
+    );
+
+    match (
+        credentials,
+        cache_path,
+        max_in_flight,
+        max_pending,
+        response_timeout,
+        reconciliation_page_size,
+        recovery_interval,
+    ) {
+        (
+            Some(credentials),
+            Some(cache_path),
+            Some(max_in_flight),
+            Some(max_pending),
+            Some(response_timeout),
+            Some(reconciliation_page_size),
+            Some(recovery_interval),
+        ) => Some(LexeConfiguration {
             network,
             credentials,
             cache_path,
             max_in_flight,
             max_pending,
-            response_timeout_ms,
+            response_timeout,
             reconciliation_page_size,
-            recovery_interval_seconds,
-        } => {
-            let credentials = match credentials.finalize(file_base) {
-                Some(reference) => match reference.into_file() {
-                    Ok(reference) => Some(reference),
-                    Err(_) => {
-                        diagnostics.push(host_diagnostic(
-                            "lightning.credentials",
-                            ConfigurationValidationCode::LexeCredentialsMustUseFile,
-                            "Lexe credentials require a file secret reference",
-                        ));
-                        None
-                    }
-                },
-                None => {
-                    diagnostics.push(host_diagnostic(
-                        "lightning.credentials",
-                        ConfigurationValidationCode::SecretReferenceInvalid,
-                        "secret reference syntax is invalid",
-                    ));
-                    None
-                }
-            };
-            let cache_path = match cache_path {
-                Some(path) => match resolve_path(file_base, &path).and_then(SensitivePath::new) {
-                    Some(path) => Some(Some(path)),
-                    None => {
-                        diagnostics.push(host_diagnostic(
-                            "lightning.cache_path",
-                            ConfigurationValidationCode::PathInvalid,
-                            "Lexe cache path must not be empty",
-                        ));
-                        None
-                    }
-                },
-                None => Some(None),
-            };
-            let max_in_flight = validate_usize::<LexeInFlightLimit>(
-                max_in_flight.unwrap_or(DEFAULT_LEXE_MAX_IN_FLIGHT as u64),
-                "lightning.max_in_flight",
-                ConfigurationValidationCode::LexeConcurrencyInvalid,
-                LexeInFlightLimit::new,
-                diagnostics,
-            );
-            let max_pending = validate_usize::<LexePendingLimit>(
-                max_pending.unwrap_or(DEFAULT_LEXE_MAX_PENDING as u64),
-                "lightning.max_pending",
-                ConfigurationValidationCode::LimitOutOfRange,
-                LexePendingLimit::new,
-                diagnostics,
-            );
-            let response_timeout = validate_duration_milliseconds::<LexeResponseTimeout>(
-                response_timeout_ms.unwrap_or(DEFAULT_LEXE_RESPONSE_TIMEOUT_MILLISECONDS),
-                "lightning.response_timeout_ms",
-                LexeResponseTimeout::from_milliseconds,
-                diagnostics,
-            );
-            let reconciliation_page_size = validate_usize::<LexeReconciliationPageSize>(
-                reconciliation_page_size.unwrap_or(DEFAULT_LEXE_RECONCILIATION_PAGE_SIZE as u64),
-                "lightning.reconciliation_page_size",
-                ConfigurationValidationCode::PageSizeInvalid,
-                LexeReconciliationPageSize::new,
-                diagnostics,
-            );
-            let recovery_interval = validate_duration_seconds::<LexeRecoveryInterval>(
-                recovery_interval_seconds.unwrap_or(DEFAULT_LEXE_RECOVERY_INTERVAL_SECONDS),
-                "lightning.recovery_interval_seconds",
-                LexeRecoveryInterval::from_seconds,
-                diagnostics,
-            );
-
-            match (
-                credentials,
-                cache_path,
-                max_in_flight,
-                max_pending,
-                response_timeout,
-                reconciliation_page_size,
-                recovery_interval,
-            ) {
-                (
-                    Some(credentials),
-                    Some(cache_path),
-                    Some(max_in_flight),
-                    Some(max_pending),
-                    Some(response_timeout),
-                    Some(reconciliation_page_size),
-                    Some(recovery_interval),
-                ) => Some(LightningConfiguration::Lexe(LexeConfiguration {
-                    network,
-                    credentials,
-                    cache_path,
-                    max_in_flight,
-                    max_pending,
-                    response_timeout,
-                    reconciliation_page_size,
-                    recovery_interval,
-                })),
-                _ => None,
-            }
-        }
+            recovery_interval,
+        }),
+        _ => None,
     }
 }
 
@@ -1112,7 +914,7 @@ fn validate_usize<Value>(
     parsed
 }
 
-fn validate_duration_milliseconds<Value>(
+fn validate_duration<Value>(
     raw: u64,
     field: &'static str,
     constructor: impl FnOnce(u64) -> Option<Value>,
@@ -1127,15 +929,6 @@ fn validate_duration_milliseconds<Value>(
         ));
     }
     parsed
-}
-
-fn validate_duration_seconds<Value>(
-    raw: u64,
-    field: &'static str,
-    constructor: impl FnOnce(u64) -> Option<Value>,
-    diagnostics: &mut DiagnosticCollector,
-) -> Option<Value> {
-    validate_duration_milliseconds(raw, field, constructor, diagnostics)
 }
 
 fn host_diagnostic(
@@ -1185,32 +978,32 @@ mod tests {
         let root = tempdir().unwrap();
         write_config(root.path(), "maincopy.toml", "");
         let config = loader(root.path())
-            .load(
-                Path::new("maincopy.toml"),
-                HostConfigurationOverrides::default(),
-            )
+            .load(Path::new("maincopy.toml"))
             .unwrap();
 
-        assert_eq!(config.paths().content_root(), root.path().join("content"));
-        assert_eq!(config.paths().state_root(), root.path().join("state"));
-        assert_eq!(config.paths().runtime_root(), root.path().join("run"));
+        assert_eq!(config.view().content_root, root.path().join("content"));
+        assert_eq!(config.view().state_root, root.path().join("state"));
+        assert_eq!(config.view().runtime_root, root.path().join("run"));
         assert_eq!(
-            config.public().bind(),
+            config.view().public_bind,
             "127.0.0.1:3000".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(config.admin().socket(), root.path().join("run/admin.sock"));
         assert_eq!(
-            config.database().path(),
+            config.view().admin_socket,
+            root.path().join("run/admin.sock")
+        );
+        assert_eq!(
+            config.view().database.path,
             root.path().join("state/maincopy.db")
         );
         assert_eq!(
-            config.database().busy_timeout().get(),
+            config.view().database.busy_timeout.get(),
             Duration::from_secs(5)
         );
-        assert_eq!(config.database().writer_queue_capacity().get(), 128);
-        assert_eq!(config.database().read_pool_size().get(), 4);
-        assert_eq!(config.content(), ContentTreeLimits::default());
-        assert!(config.lightning().is_none());
+        assert_eq!(config.view().database.writer_queue_capacity.get(), 128);
+        assert_eq!(config.view().database.read_pool_size.get(), 4);
+        assert_eq!(config.view().content_limits, ContentTreeLimits::default());
+        assert!(config.view().lightning.is_none());
     }
 
     #[test]
@@ -1228,19 +1021,21 @@ mod tests {
              depth = 6\n\
              path_bytes = 7\n",
         );
-        let overrides = HostConfigurationOverrides::default()
-            .with_content_publication_file_bytes(10)
-            .with_content_post_file_bytes(20)
-            .with_content_asset_file_bytes(30)
-            .with_content_total_tree_bytes(40)
-            .with_content_entries(50)
-            .with_content_depth(7)
-            .with_content_path_bytes(70);
+        let overrides = HostConfigurationOverrides {
+            content_publication_file_bytes: Some(10),
+            content_post_file_bytes: Some(20),
+            content_asset_file_bytes: Some(30),
+            content_total_tree_bytes: Some(40),
+            content_entries: Some(50),
+            content_depth: Some(7),
+            content_path_bytes: Some(70),
+            ..HostConfigurationOverrides::default()
+        };
 
-        let limits = loader(root.path())
-            .load(Path::new("maincopy.toml"), overrides)
-            .unwrap()
-            .content();
+        let config = loader(root.path())
+            .load_with_overrides(Path::new("maincopy.toml"), overrides)
+            .unwrap();
+        let limits = config.view().content_limits;
 
         assert_eq!(limits.publication_file_bytes().get(), 10);
         assert_eq!(limits.post_file_bytes().get(), 20);
@@ -1267,13 +1062,10 @@ mod tests {
              path_bytes = 16\n",
         );
 
-        let limits = loader(root.path())
-            .load(
-                Path::new("maincopy.toml"),
-                HostConfigurationOverrides::default(),
-            )
-            .unwrap()
-            .content();
+        let config = loader(root.path())
+            .load(Path::new("maincopy.toml"))
+            .unwrap();
+        let limits = config.view().content_limits;
 
         assert_eq!(limits.publication_file_bytes().get(), 11);
         assert_eq!(limits.post_file_bytes().get(), 12);
@@ -1310,13 +1102,10 @@ mod tests {
             ),
         );
 
-        let limits = loader(root.path())
-            .load(
-                Path::new("maincopy.toml"),
-                HostConfigurationOverrides::default(),
-            )
-            .unwrap()
-            .content();
+        let config = loader(root.path())
+            .load(Path::new("maincopy.toml"))
+            .unwrap();
+        let limits = config.view().content_limits;
 
         assert_eq!(limits, caps);
     }
@@ -1346,9 +1135,7 @@ mod tests {
                     &name,
                     &format!("[content]\n{field} = {value}\n"),
                 );
-                let errors = loader(root.path())
-                    .load(Path::new(&name), HostConfigurationOverrides::default())
-                    .unwrap_err();
+                let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
 
                 assert_eq!(errors.diagnostics().len(), 1);
                 let expected_field = format!("content.{field}");
@@ -1378,10 +1165,7 @@ mod tests {
         );
 
         let errors = loader(root.path())
-            .load(
-                Path::new("maincopy.toml"),
-                HostConfigurationOverrides::default(),
-            )
+            .load(Path::new("maincopy.toml"))
             .unwrap_err();
 
         assert_eq!(errors.diagnostics().len(), 1);
@@ -1412,58 +1196,62 @@ mod tests {
              writer_queue_capacity = 129\n\
              read_pool_size = 5\n",
         );
-        let overrides = HostConfigurationOverrides::default()
-            .with_content_root(PathBuf::from("cli-content"))
-            .with_runtime_root(PathBuf::from("cli-run"))
-            .with_public_bind("127.0.0.1:4000".parse().unwrap())
-            .with_database_busy_timeout_ms(7_000)
-            .with_database_writer_queue_capacity(130)
-            .with_database_read_pool_size(6);
+        let overrides = HostConfigurationOverrides {
+            content_root: Some(PathBuf::from("cli-content")),
+            runtime_root: Some(PathBuf::from("cli-run")),
+            public_bind: Some("127.0.0.1:4000".parse().unwrap()),
+            database_busy_timeout_ms: Some(7_000),
+            database_writer_queue_capacity: Some(130),
+            database_read_pool_size: Some(6),
+            ..HostConfigurationOverrides::default()
+        };
         let config = loader(root.path())
-            .load(Path::new("host/maincopy.toml"), overrides)
+            .load_with_overrides(Path::new("host/maincopy.toml"), overrides)
             .unwrap();
 
+        assert_eq!(config.view().content_root, root.path().join("cli-content"));
         assert_eq!(
-            config.paths().content_root(),
-            root.path().join("cli-content")
-        );
-        assert_eq!(
-            config.paths().state_root(),
+            config.view().state_root,
             root.path().join("host/file-state")
         );
-        assert_eq!(config.paths().runtime_root(), root.path().join("cli-run"));
-        assert_eq!(config.public().bind().port(), 4_000);
+        assert_eq!(config.view().runtime_root, root.path().join("cli-run"));
+        assert_eq!(config.view().public_bind.port(), 4_000);
         assert_eq!(
-            config.admin().socket(),
+            config.view().admin_socket,
             root.path().join("host/file-admin.sock")
         );
-        assert_eq!(config.database().path(), root.path().join("host/file.db"));
         assert_eq!(
-            config.database().busy_timeout().get(),
+            config.view().database.path,
+            root.path().join("host/file.db")
+        );
+        assert_eq!(
+            config.view().database.busy_timeout.get(),
             Duration::from_secs(7)
         );
-        assert_eq!(config.database().writer_queue_capacity().get(), 130);
-        assert_eq!(config.database().read_pool_size().get(), 6);
+        assert_eq!(config.view().database.writer_queue_capacity.get(), 130);
+        assert_eq!(config.view().database.read_pool_size.get(), 6);
     }
 
     #[test]
     fn derived_defaults_follow_effective_cli_roots() {
         let root = tempdir().unwrap();
         write_config(root.path(), "host/maincopy.toml", "");
-        let overrides = HostConfigurationOverrides::default()
-            .with_state_root(PathBuf::from("cli-state"))
-            .with_runtime_root(PathBuf::from("cli-runtime"));
+        let overrides = HostConfigurationOverrides {
+            state_root: Some(PathBuf::from("cli-state")),
+            runtime_root: Some(PathBuf::from("cli-runtime")),
+            ..HostConfigurationOverrides::default()
+        };
         let config = loader(root.path())
-            .load(Path::new("host/maincopy.toml"), overrides)
+            .load_with_overrides(Path::new("host/maincopy.toml"), overrides)
             .unwrap();
 
-        assert_eq!(config.paths().content_root(), root.path().join("content"));
+        assert_eq!(config.view().content_root, root.path().join("content"));
         assert_eq!(
-            config.database().path(),
+            config.view().database.path,
             root.path().join("cli-state/maincopy.db")
         );
         assert_eq!(
-            config.admin().socket(),
+            config.view().admin_socket,
             root.path().join("cli-runtime/admin.sock")
         );
     }
@@ -1481,27 +1269,24 @@ mod tests {
              cache_path = \"private/cache\"\n",
         );
         let config = loader(root.path())
-            .load(
-                Path::new("host/maincopy.toml"),
-                HostConfigurationOverrides::default(),
-            )
+            .load(Path::new("host/maincopy.toml"))
             .unwrap();
-        let lexe = config.lightning().unwrap().lexe();
+        let lexe = config.view().lightning.unwrap();
 
-        assert_eq!(lexe.network(), LexeNetwork::Mainnet);
+        assert_eq!(lexe.network, LexeNetwork::Mainnet);
         assert_eq!(
-            lexe.credentials().path(),
+            lexe.credentials.path(),
             root.path().join("host/secret/credential.json")
         );
         assert_eq!(
-            lexe.cache_path().unwrap().path(),
+            lexe.cache_path.unwrap().path(),
             root.path().join("host/private/cache")
         );
-        assert_eq!(lexe.max_in_flight().get(), 4);
-        assert_eq!(lexe.max_pending().get(), 64);
-        assert_eq!(lexe.response_timeout().get(), Duration::from_secs(15));
-        assert_eq!(lexe.reconciliation_page_size().get(), 100);
-        assert_eq!(lexe.recovery_interval().get(), Duration::from_secs(60));
+        assert_eq!(lexe.max_in_flight.get(), 4);
+        assert_eq!(lexe.max_pending.get(), 64);
+        assert_eq!(lexe.response_timeout.get(), Duration::from_secs(15));
+        assert_eq!(lexe.reconciliation_page_size.get(), 100);
+        assert_eq!(lexe.recovery_interval.get(), Duration::from_secs(60));
 
         let diagnostic_view = format!("{config:?}");
         for protected in ["credential.json", "private/cache"] {
@@ -1529,19 +1314,16 @@ mod tests {
              recovery_interval_seconds = 90\n",
         );
         let config = loader(root.path())
-            .load(
-                Path::new("host/maincopy.toml"),
-                HostConfigurationOverrides::default(),
-            )
+            .load(Path::new("host/maincopy.toml"))
             .unwrap();
-        let lexe = config.lightning().unwrap().lexe();
+        let lexe = config.view().lightning.unwrap();
 
-        assert_eq!(lexe.network(), LexeNetwork::Testnet4);
-        assert_eq!(lexe.max_in_flight().get(), 6);
-        assert_eq!(lexe.max_pending().get(), 96);
-        assert_eq!(lexe.response_timeout().get(), Duration::from_millis(17_000));
-        assert_eq!(lexe.reconciliation_page_size().get(), 250);
-        assert_eq!(lexe.recovery_interval().get(), Duration::from_secs(90));
+        assert_eq!(lexe.network, LexeNetwork::Testnet4);
+        assert_eq!(lexe.max_in_flight.get(), 6);
+        assert_eq!(lexe.max_pending.get(), 96);
+        assert_eq!(lexe.response_timeout.get(), Duration::from_millis(17_000));
+        assert_eq!(lexe.reconciliation_page_size.get(), 250);
+        assert_eq!(lexe.recovery_interval.get(), Duration::from_secs(90));
     }
 
     #[test]
@@ -1556,9 +1338,7 @@ mod tests {
         {
             let name = format!("missing-{index}.toml");
             write_config(root.path(), &name, source);
-            let errors = loader(root.path())
-                .load(Path::new(&name), HostConfigurationOverrides::default())
-                .unwrap_err();
+            let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
             assert_eq!(
                 errors.diagnostics()[0].code(),
                 ConfigurationValidationCode::HostTomlInvalid
@@ -1592,10 +1372,7 @@ mod tests {
              credentials = { source = \"environment\", variable = \"TOP_SECRET_VARIABLE\" }\n",
         );
         let errors = loader(root.path())
-            .load(
-                Path::new("maincopy.toml"),
-                HostConfigurationOverrides::default(),
-            )
+            .load(Path::new("maincopy.toml"))
             .unwrap_err();
 
         assert_eq!(
@@ -1610,6 +1387,30 @@ mod tests {
         );
         let rendered = format!("{errors:?}");
         assert!(!rendered.contains("TOP_SECRET_VARIABLE"));
+        assert!(!rendered.contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn malformed_environment_lexe_credentials_keep_the_invalid_reference_code() {
+        let root = tempdir().unwrap();
+        write_config(
+            root.path(),
+            "maincopy.toml",
+            "[lightning]\n\
+             provider = \"lexe\"\n\
+             network = \"mainnet\"\n\
+             credentials = { source = \"environment\", variable = \"not-portable\" }\n",
+        );
+        let errors = loader(root.path())
+            .load(Path::new("maincopy.toml"))
+            .unwrap_err();
+
+        assert_eq!(
+            errors.diagnostics()[0].code(),
+            ConfigurationValidationCode::SecretReferenceInvalid
+        );
+        let rendered = format!("{errors:?}");
+        assert!(!rendered.contains("not-portable"));
         assert!(!rendered.contains(root.path().to_string_lossy().as_ref()));
     }
 
@@ -1630,9 +1431,7 @@ mod tests {
         for (index, source) in cases.into_iter().enumerate() {
             let name = format!("case-{index}.toml");
             write_config(root.path(), &name, source);
-            let errors = loader(root.path())
-                .load(Path::new(&name), HostConfigurationOverrides::default())
-                .unwrap_err();
+            let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
             assert_eq!(
                 errors.diagnostics()[0].code(),
                 ConfigurationValidationCode::HostTomlInvalid,
@@ -1656,9 +1455,7 @@ mod tests {
         for (index, source) in cases.into_iter().enumerate() {
             let name = format!("wrong-type-{index}.toml");
             write_config(root.path(), &name, &source);
-            let errors = loader(root.path())
-                .load(Path::new(&name), HostConfigurationOverrides::default())
-                .unwrap_err();
+            let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
 
             assert_eq!(
                 errors.diagnostics()[0].code(),
@@ -1692,10 +1489,7 @@ mod tests {
              recovery_interval_seconds = 0\n",
         );
         let errors = loader(root.path())
-            .load(
-                Path::new("maincopy.toml"),
-                HostConfigurationOverrides::default(),
-            )
+            .load(Path::new("maincopy.toml"))
             .unwrap_err();
         let codes = errors
             .diagnostics()
@@ -1764,16 +1558,10 @@ mod tests {
         fs::write(root.path().join("not-utf8.toml"), [0xff, 0x00]).unwrap();
 
         let too_large = loader(root.path())
-            .load(
-                Path::new("too-large.toml"),
-                HostConfigurationOverrides::default(),
-            )
+            .load(Path::new("too-large.toml"))
             .unwrap_err();
         let not_utf8 = loader(root.path())
-            .load(
-                Path::new("not-utf8.toml"),
-                HostConfigurationOverrides::default(),
-            )
+            .load(Path::new("not-utf8.toml"))
             .unwrap_err();
 
         assert_eq!(

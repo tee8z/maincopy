@@ -5,43 +5,29 @@ use utoipa::ToSchema;
 use super::Readiness;
 
 #[derive(Debug, Serialize, ToSchema)]
-struct Health<Status> {
-    status: Status,
+struct Health {
+    status: HealthStatus,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-enum LivenessStatus {
+enum HealthStatus {
     Live,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-enum ReadinessStatus {
     Ready,
     NotReady,
 }
 
 pub(super) async fn live() -> impl IntoResponse {
     Json(Health {
-        status: LivenessStatus::Live,
+        status: HealthStatus::Live,
     })
 }
 
 pub(super) async fn ready(State(readiness): State<Readiness>) -> impl IntoResponse {
-    if readiness.is_ready() {
-        (
-            StatusCode::OK,
-            Json(Health {
-                status: ReadinessStatus::Ready,
-            }),
-        )
+    let (status_code, status) = if readiness.is_ready() {
+        (StatusCode::OK, HealthStatus::Ready)
     } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(Health {
-                status: ReadinessStatus::NotReady,
-            }),
-        )
-    }
+        (StatusCode::SERVICE_UNAVAILABLE, HealthStatus::NotReady)
+    };
+    (status_code, Json(Health { status }))
 }

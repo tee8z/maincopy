@@ -28,8 +28,8 @@ impl fmt::Display for LogicalContentPath {
 
 #[derive(Clone, Debug)]
 pub struct PublicationSource<'source> {
-    path: LogicalContentPath,
-    contents: &'source str,
+    pub path: LogicalContentPath,
+    pub contents: &'source str,
 }
 
 impl<'source> PublicationSource<'source> {
@@ -39,54 +39,30 @@ impl<'source> PublicationSource<'source> {
             contents,
         }
     }
-
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub const fn contents(&self) -> &'source str {
-        self.contents
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct PostSource<'source> {
-    path: LogicalContentPath,
-    contents: &'source str,
-    collection: PostCollection,
+    pub path: LogicalContentPath,
+    pub contents: &'source str,
+    pub collection: PostCollection,
 }
 
 impl<'source> PostSource<'source> {
     pub fn in_posts(path: impl Into<String>, contents: &'source str) -> Self {
-        Self::in_collection(path, contents, PostCollection::Posts)
-    }
-
-    pub fn in_drafts(path: impl Into<String>, contents: &'source str) -> Self {
-        Self::in_collection(path, contents, PostCollection::Drafts)
-    }
-
-    pub(crate) fn in_collection(
-        path: impl Into<String>,
-        contents: &'source str,
-        collection: PostCollection,
-    ) -> Self {
         Self {
             path: LogicalContentPath::new(path),
             contents,
-            collection,
+            collection: PostCollection::Posts,
         }
     }
 
-    pub const fn path(&self) -> &LogicalContentPath {
-        &self.path
-    }
-
-    pub const fn contents(&self) -> &'source str {
-        self.contents
-    }
-
-    pub const fn collection(&self) -> PostCollection {
-        self.collection
+    pub fn in_drafts(path: impl Into<String>, contents: &'source str) -> Self {
+        Self {
+            path: LogicalContentPath::new(path),
+            contents,
+            collection: PostCollection::Drafts,
+        }
     }
 }
 
@@ -437,71 +413,6 @@ impl DistributionSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MarkdownDialect {
-    CommonMark,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RawHtmlPolicy {
-    Disabled,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeRenderingMode {
-    EscapedPlainText,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MermaidRenderingMode {
-    Placeholder,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct RendererSettings {
-    markdown: MarkdownDialect,
-    raw_html: RawHtmlPolicy,
-    code: CodeRenderingMode,
-    mermaid: MermaidRenderingMode,
-}
-
-impl RendererSettings {
-    pub const fn baseline() -> Self {
-        Self {
-            markdown: MarkdownDialect::CommonMark,
-            raw_html: RawHtmlPolicy::Disabled,
-            code: CodeRenderingMode::EscapedPlainText,
-            mermaid: MermaidRenderingMode::Placeholder,
-        }
-    }
-
-    pub const fn markdown(&self) -> MarkdownDialect {
-        self.markdown
-    }
-
-    pub const fn raw_html(&self) -> RawHtmlPolicy {
-        self.raw_html
-    }
-
-    pub const fn code(&self) -> CodeRenderingMode {
-        self.code
-    }
-
-    pub const fn mermaid(&self) -> MermaidRenderingMode {
-        self.mermaid
-    }
-}
-
-impl Default for RendererSettings {
-    fn default() -> Self {
-        Self::baseline()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct TipAmount(NonZeroU64);
@@ -638,30 +549,17 @@ impl AuthorSettings {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct PublicationAssetSettings {
-    allowed_https_origins: Vec<UnresolvedHttpsOrigin>,
-}
-
-impl PublicationAssetSettings {
-    pub(crate) fn new(allowed_https_origins: Vec<UnresolvedHttpsOrigin>) -> Self {
-        Self {
-            allowed_https_origins,
-        }
-    }
-
-    pub(crate) fn allowed_https_origins(&self) -> &[UnresolvedHttpsOrigin] {
-        &self.allowed_https_origins
-    }
+pub(crate) struct PublicationAssetSettings {
+    pub(crate) allowed_https_origins: Vec<UnresolvedHttpsOrigin>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PublicationSettings {
     site: SiteSettings,
     author: AuthorSettings,
-    assets: PublicationAssetSettings,
+    pub(crate) assets: PublicationAssetSettings,
     subscriptions: SubscriptionSettings,
     tips: PublicationTipSettings,
-    renderer: RendererSettings,
 }
 
 impl PublicationSettings {
@@ -671,7 +569,6 @@ impl PublicationSettings {
         assets: PublicationAssetSettings,
         subscriptions: SubscriptionSettings,
         tips: PublicationTipSettings,
-        renderer: RendererSettings,
     ) -> Self {
         Self {
             site,
@@ -679,7 +576,6 @@ impl PublicationSettings {
             assets,
             subscriptions,
             tips,
-            renderer,
         }
     }
 
@@ -691,10 +587,6 @@ impl PublicationSettings {
         &self.author
     }
 
-    pub const fn assets(&self) -> &PublicationAssetSettings {
-        &self.assets
-    }
-
     pub const fn subscriptions(&self) -> &SubscriptionSettings {
         &self.subscriptions
     }
@@ -702,48 +594,27 @@ impl PublicationSettings {
     pub const fn tips(&self) -> PublicationTipSettings {
         self.tips
     }
-
-    pub const fn renderer(&self) -> RendererSettings {
-        self.renderer
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PostMetadata {
-    id: PostId,
-    title: PostTitle,
-    slug: PostSlug,
+    pub(crate) id: PostId,
+    pub(crate) title: PostTitle,
+    pub(crate) slug: PostSlug,
     #[serde(with = "time::serde::rfc3339")]
-    authored_at: OffsetDateTime,
+    pub(crate) authored_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339::option")]
-    updated_at: Option<OffsetDateTime>,
-    description: PostDescription,
-    image: Option<UnresolvedAssetReference>,
-    tags: Vec<PostTag>,
-    aliases: Vec<PostAlias>,
-    draft: DraftStatus,
-    tips: PostTipPolicy,
-    distribution: DistributionSettings,
+    pub(crate) updated_at: Option<OffsetDateTime>,
+    pub(crate) description: PostDescription,
+    pub(crate) image: Option<UnresolvedAssetReference>,
+    pub(crate) tags: Vec<PostTag>,
+    pub(crate) aliases: Vec<PostAlias>,
+    pub(crate) draft: DraftStatus,
+    pub(crate) tips: PostTipPolicy,
+    pub(crate) distribution: DistributionSettings,
 }
 
 impl PostMetadata {
-    pub(crate) fn new(parts: PostMetadataParts) -> Self {
-        Self {
-            id: parts.id,
-            title: parts.title,
-            slug: parts.slug,
-            authored_at: parts.authored_at,
-            updated_at: parts.updated_at,
-            description: parts.description,
-            image: parts.image,
-            tags: parts.tags,
-            aliases: parts.aliases,
-            draft: parts.draft,
-            tips: parts.tips,
-            distribution: parts.distribution,
-        }
-    }
-
     pub const fn id(&self) -> &PostId {
         &self.id
     }
@@ -791,21 +662,6 @@ impl PostMetadata {
     pub const fn distribution(&self) -> &DistributionSettings {
         &self.distribution
     }
-}
-
-pub(crate) struct PostMetadataParts {
-    pub(crate) id: PostId,
-    pub(crate) title: PostTitle,
-    pub(crate) slug: PostSlug,
-    pub(crate) authored_at: OffsetDateTime,
-    pub(crate) updated_at: Option<OffsetDateTime>,
-    pub(crate) description: PostDescription,
-    pub(crate) image: Option<UnresolvedAssetReference>,
-    pub(crate) tags: Vec<PostTag>,
-    pub(crate) aliases: Vec<PostAlias>,
-    pub(crate) draft: DraftStatus,
-    pub(crate) tips: PostTipPolicy,
-    pub(crate) distribution: DistributionSettings,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

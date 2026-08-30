@@ -5,16 +5,16 @@ mod site;
 pub use catalog::{
     CatalogBuildError, CatalogBuildErrorCode, ContentCatalog, compile_content_catalog,
 };
+pub(crate) use markdown::GeneratedPostAsset;
 pub use markdown::{
-    BaselineMarkdownRenderer, CodeBlockOrdinal, GeneratedPostAsset, MarkdownRenderError,
-    MarkdownRenderErrorCode, MarkdownRenderLocation, MermaidBlockOrdinal, MermaidPlaceholder,
-    NavigationRejection, RenderDestinationKind, RenderedPost,
+    CodeBlockOrdinal, MarkdownRenderError, MarkdownRenderErrorCode, MarkdownRenderLocation,
+    MermaidBlockOrdinal, MermaidPlaceholder, NavigationRejection, RenderDestinationKind,
+    RenderedPost, render_markdown,
 };
 pub use site::{
-    CanonicalSiteUrl, PublicLedgerProjection, PublicLedgerProjectionError,
-    PublicLedgerProjectionErrorCode, RenderedSiteShell, SiteSnapshot, SiteSnapshotBuildError,
-    SiteSnapshotBuildErrorCode, SiteSnapshotBuilder, SiteSnapshotReader, SnapshotActivationError,
-    SnapshotActivationErrorCode, SnapshotActivationOutcome, SnapshotPublicAsset, render_site_shell,
+    CanonicalSiteUrl, PublicLedgerProjection, RenderedSiteShell, SiteSnapshot,
+    SiteSnapshotBuildError, SiteSnapshotBuildErrorCode, SiteSnapshotReader, SnapshotPublicAsset,
+    build_site_snapshot, render_site_shell,
 };
 
 #[allow(

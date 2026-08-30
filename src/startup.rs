@@ -13,24 +13,20 @@ use tracing::Instrument as _;
 
 use crate::{
     cli::{AdminCommand, ProcessArguments, ProcessCommand, ServeArguments},
-    config::{
-        HostConfiguration, HostConfigurationLoader, LightningConfiguration, tip_provider_required,
-    },
+    config::{HostConfiguration, HostConfigurationLoader, tip_provider_required},
     content::{
         ContentTreeLimits, ContentValidationErrors, DiscoveredContentTree, ValidatedContent,
         discover_content_tree,
     },
-    error::{
-        ApplicationError, CriticalTaskName, PanicMessage, ProcessComponent, ProcessError,
-        ProcessExit, ShutdownSignal, UnavailableReason,
-    },
-    observability::{TaskCorrelationId, task_span},
+    error::{ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal},
+    observability::{initialize_logging, task_span},
     web::Readiness,
 };
 
 type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), ApplicationError>> + Send>>;
 type CriticalTaskFuture = Pin<Box<dyn Future<Output = CriticalTaskResult> + Send>>;
 type CriticalTaskResult = Result<(), CriticalTaskFailure>;
+type CriticalTaskFailure = Box<dyn std::error::Error + Send + Sync>;
 
 /// Owns Maincopy's process-level resources and lifecycle.
 ///
@@ -38,7 +34,11 @@ type CriticalTaskResult = Result<(), CriticalTaskFailure>;
 /// task creation belong in [`Application::build`]. Runtime supervision and
 /// ordered shutdown belong in [`Application::run_until_stop`].
 pub(crate) struct Application {
-    _startup: Option<StartupConfiguration>,
+    _startup: StartupConfiguration,
+    runtime: ApplicationRuntime,
+}
+
+struct ApplicationRuntime {
     readiness: Readiness,
     cancellation: CancellationToken,
     shutdown: ShutdownFuture,
@@ -49,7 +49,6 @@ struct StartupConfiguration {
     _host: HostConfiguration,
     _content_tree: DiscoveredContentTree,
     _validated_content: ValidatedContent,
-    _lightning: Option<LightningConfiguration>,
 }
 
 impl StartupConfiguration {
@@ -68,31 +67,26 @@ impl StartupConfiguration {
         ) -> Result<DiscoveredContentTree, ContentValidationErrors>,
     {
         let (path, overrides) = arguments.into_configuration();
-        let host =
-            HostConfigurationLoader::from_process_working_directory()?.load(&path, overrides)?;
-        let content_tree = discover(host.paths().content_root(), host.content())?;
+        let host = HostConfigurationLoader::from_process_working_directory()?
+            .load_with_overrides(&path, overrides)?;
+        let host_view = host.view();
+        let content_tree = discover(host_view.content_root, host_view.content_limits)?;
         let validated_content = content_tree.validate()?;
-        let lightning = if validated_content.publication().tips().is_configured() {
-            Some(
-                host.lightning()
-                    .cloned()
-                    .ok_or_else(tip_provider_required)?,
-            )
-        } else {
-            None
-        };
+        if validated_content.publication().tips().is_configured() && host_view.lightning.is_none() {
+            return Err(tip_provider_required().into());
+        }
 
         Ok(Self {
             _host: host,
             _content_tree: content_tree,
             _validated_content: validated_content,
-            _lightning: lightning,
         })
     }
 }
 
 /// Parses one process command and runs it to completion.
 pub async fn run_until_stop() -> ProcessExit {
+    initialize_logging();
     let mut driver = ProductionDriver;
     run_with(std::env::args_os(), &mut driver).await
 }
@@ -111,8 +105,14 @@ where
     match dispatch_with(arguments, driver).await {
         Ok(()) => ProcessExit::Success,
         Err(error) => {
-            eprintln!("maincopy: {error}");
-            error.exit()
+            let exit = error.exit();
+            tracing::error!(
+                error = %error,
+                category = ?error.category(),
+                exit_code = exit.code(),
+                "process command failed"
+            );
+            exit
         }
     }
 }
@@ -124,7 +124,10 @@ fn report_command_error(error: clap::Error) -> ProcessExit {
     };
 
     if let Err(print_error) = error.print() {
-        eprintln!("maincopy: failed to print command output: {print_error}");
+        tracing::error!(
+            error = %print_error,
+            "failed to print command output"
+        );
         return ProcessExit::Internal;
     }
 
@@ -143,7 +146,7 @@ where
             let application = driver.build_application(*arguments).await?;
             driver.run_application(application).await
         }
-        ProcessCommand::Admin(arguments) => driver.run_admin_command(arguments.command).await,
+        ProcessCommand::Admin { command } => driver.run_admin_command(command).await,
     }
 }
 
@@ -198,22 +201,28 @@ impl ProcessDriver for ProductionDriver {
 
     async fn run_admin_command(&mut self, command: AdminCommand) -> Result<(), ProcessError> {
         match command {
-            AdminCommand::Capabilities => Err(ProcessError::Unavailable {
-                component: ProcessComponent::AdminApi,
-                reason: UnavailableReason::NotImplemented,
-            }),
+            AdminCommand::Capabilities => Err(ProcessError::AdminApiUnavailable),
         }
     }
 }
 
 impl Application {
     fn build(startup: StartupConfiguration) -> Result<Self, ApplicationError> {
-        let mut application =
-            Self::build_with_signal_installer(Readiness::default(), install_termination_signal)?;
-        application._startup = Some(startup);
-        Ok(application)
+        Ok(Self {
+            _startup: startup,
+            runtime: ApplicationRuntime::build_with_signal_installer(
+                Readiness::default(),
+                install_termination_signal,
+            )?,
+        })
     }
 
+    async fn run_until_stop(self) -> Result<(), ApplicationError> {
+        self.runtime.run_until_stop().await
+    }
+}
+
+impl ApplicationRuntime {
     fn build_with_signal_installer<Install>(
         readiness: Readiness,
         install_signal: Install,
@@ -243,12 +252,11 @@ impl Application {
     ) -> Self {
         let mut supervisor = JoinSet::new();
         for task in critical_tasks {
-            let span = task_span(TaskCorrelationId::new(), task.name);
-            supervisor.spawn(SupervisedTask::new(task).instrument(span));
+            let span = task_span(task.name);
+            supervisor.spawn(task.instrument(span));
         }
 
         Self {
-            _startup: None,
             readiness,
             cancellation,
             shutdown,
@@ -301,18 +309,8 @@ fn unexpected_task_failure(
     completion: Option<Result<(CriticalTaskName, CriticalTaskCompletion), JoinError>>,
 ) -> ApplicationError {
     match completion {
-        Some(Ok((task, CriticalTaskCompletion::Returned(Ok(()))))) => {
-            ApplicationError::CriticalTaskExited { task }
-        }
-        Some(Ok((task, CriticalTaskCompletion::Returned(Err(failure))))) => {
-            ApplicationError::CriticalTaskFailed {
-                task,
-                source: failure.0,
-            }
-        }
-        Some(Ok((task, CriticalTaskCompletion::Panicked(message)))) => {
-            ApplicationError::CriticalTaskPanicked { task, message }
-        }
+        Some(Ok((task, completion))) => task_completion_failure(task, completion)
+            .unwrap_or(ApplicationError::CriticalTaskExited { task }),
         Some(Err(source)) => ApplicationError::TaskSupervisor { source },
         None => ApplicationError::TaskSupervisorEmpty,
     }
@@ -322,17 +320,23 @@ fn drained_task_failure(
     completion: Result<(CriticalTaskName, CriticalTaskCompletion), JoinError>,
 ) -> Option<ApplicationError> {
     match completion {
-        Ok((_, CriticalTaskCompletion::Returned(Ok(())))) => None,
-        Ok((task, CriticalTaskCompletion::Returned(Err(failure)))) => {
-            Some(ApplicationError::CriticalTaskFailed {
-                task,
-                source: failure.0,
-            })
+        Ok((task, completion)) => task_completion_failure(task, completion),
+        Err(source) => Some(ApplicationError::TaskSupervisor { source }),
+    }
+}
+
+fn task_completion_failure(
+    task: CriticalTaskName,
+    completion: CriticalTaskCompletion,
+) -> Option<ApplicationError> {
+    match completion {
+        CriticalTaskCompletion::Returned(Ok(())) => None,
+        CriticalTaskCompletion::Returned(Err(source)) => {
+            Some(ApplicationError::CriticalTaskFailed { task, source })
         }
-        Ok((task, CriticalTaskCompletion::Panicked(message))) => {
+        CriticalTaskCompletion::Panicked(message) => {
             Some(ApplicationError::CriticalTaskPanicked { task, message })
         }
-        Err(source) => Some(ApplicationError::TaskSupervisor { source }),
     }
 }
 
@@ -354,28 +358,12 @@ impl CriticalTask {
     }
 }
 
-struct CriticalTaskFailure(Box<dyn std::error::Error + Send + Sync>);
-
 enum CriticalTaskCompletion {
     Returned(CriticalTaskResult),
-    Panicked(PanicMessage),
+    Panicked(Box<str>),
 }
 
-struct SupervisedTask {
-    name: CriticalTaskName,
-    future: CriticalTaskFuture,
-}
-
-impl SupervisedTask {
-    fn new(task: CriticalTask) -> Self {
-        Self {
-            name: task.name,
-            future: task.future,
-        }
-    }
-}
-
-impl Future for SupervisedTask {
+impl Future for CriticalTask {
     type Output = (CriticalTaskName, CriticalTaskCompletion);
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
@@ -387,10 +375,20 @@ impl Future for SupervisedTask {
             }
             Err(payload) => Poll::Ready((
                 task.name,
-                CriticalTaskCompletion::Panicked(PanicMessage::from_payload(payload.as_ref())),
+                CriticalTaskCompletion::Panicked(panic_message(payload.as_ref())),
             )),
         }
     }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Box<str> {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone().into_boxed_str();
+    }
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return Box::from(*message);
+    }
+    Box::from("non-string panic payload")
 }
 
 #[cfg(unix)]
@@ -827,8 +825,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
 
-        assert!(startup._host.lightning().is_some());
-        assert!(startup._lightning.is_none());
+        assert!(startup._host.view().lightning.is_some());
         assert!(!credential_path.exists());
     }
 
@@ -837,7 +834,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let readiness = Readiness::default();
         let mut installation_attempted = false;
 
-        let result = Application::build_with_signal_installer(readiness.clone(), || {
+        let result = ApplicationRuntime::build_with_signal_installer(readiness.clone(), || {
             installation_attempted = true;
             Err(ApplicationError::SignalRegistration {
                 signal: ShutdownSignal::Terminate,
@@ -879,7 +876,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                 })
             })
             .collect();
-        let application = Application::with_parts(
+        let application = ApplicationRuntime::with_parts(
             readiness.clone(),
             cancellation.clone(),
             Box::pin(async move {
@@ -919,9 +916,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
     async fn task_error_cancels_and_drains_before_returning_failure() {
         let (result, readiness, cancellation, companion_drained) =
             run_with_unexpected_task(async {
-                Err(CriticalTaskFailure(Box::new(std::io::Error::other(
-                    "task failed",
-                ))))
+                Err(Box::new(std::io::Error::other("task failed")) as CriticalTaskFailure)
             })
             .await;
 
@@ -978,7 +973,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                 Ok(())
             }
         };
-        let application = Application::with_parts(
+        let application = ApplicationRuntime::with_parts(
             readiness.clone(),
             cancellation.clone(),
             Box::pin(std::future::pending()),

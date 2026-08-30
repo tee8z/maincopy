@@ -10,9 +10,8 @@ use super::{
     PlainTextError, PostAlias, PostDescription, PostDocument, PostId, PostMetadata, PostSlug,
     PostSource, PostTag, PostTipPolicy, PostTitle, PrivacyPolicyRevision, PublicationAssetSettings,
     PublicationBaseUrl, PublicationSettings, PublicationSource, PublicationTipSettings,
-    RendererSettings, SiteDescription, SiteSettings, SiteTitle, TipAmount, TipAmountRange,
-    UnresolvedAssetReference, UnresolvedHttpsOrigin, ValidatedContent, ValidationLocation,
-    XDistributionSettings,
+    SiteDescription, SiteSettings, SiteTitle, TipAmount, TipAmountRange, UnresolvedAssetReference,
+    UnresolvedHttpsOrigin, ValidatedContent, ValidationLocation, XDistributionSettings,
 };
 
 pub fn validate_content<'source>(
@@ -23,7 +22,7 @@ pub fn validate_content<'source>(
     let publication = parse_publication(publication, &mut diagnostics);
 
     let mut post_sources: Vec<_> = posts.into_iter().collect();
-    post_sources.sort_by(|left, right| left.path().cmp(right.path()));
+    post_sources.sort_by(|left, right| left.path.cmp(&right.path));
     let post_candidates: Vec<_> = post_sources
         .into_iter()
         .enumerate()
@@ -86,8 +85,8 @@ fn parse_publication(
     diagnostics: &mut DiagnosticCollector,
 ) -> PublicationCandidate {
     let start_error_count = diagnostics.len();
-    let path = source.path().clone();
-    let mut table = match source.contents().parse::<Table>() {
+    let path = source.path.clone();
+    let mut table = match source.contents.parse::<Table>() {
         Ok(table) => table,
         Err(error) => {
             diagnostics.push(ContentValidationError::new(
@@ -97,7 +96,7 @@ fn parse_publication(
                 format!("publication TOML is invalid: {error}"),
             ));
             return PublicationCandidate {
-                path: source.path().clone(),
+                path: source.path,
                 settings: None,
                 tips: None,
             };
@@ -189,7 +188,9 @@ fn parse_publication(
             })
             .collect();
             reject_unknown_fields(assets, "assets", &path, diagnostics);
-            Some(PublicationAssetSettings::new(origins))
+            Some(PublicationAssetSettings {
+                allowed_https_origins: origins,
+            })
         }
     };
 
@@ -199,16 +200,9 @@ fn parse_publication(
 
     let settings = if diagnostics.len() == start_error_count {
         match (site, author, assets, subscriptions, tips) {
-            (Some(site), Some(author), Some(assets), Some(subscriptions), Some(tips)) => {
-                Some(PublicationSettings::new(
-                    site,
-                    author,
-                    assets,
-                    subscriptions,
-                    tips,
-                    RendererSettings::baseline(),
-                ))
-            }
+            (Some(site), Some(author), Some(assets), Some(subscriptions), Some(tips)) => Some(
+                PublicationSettings::new(site, author, assets, subscriptions, tips),
+            ),
             _ => {
                 diagnostics.push(invariant_error(
                     path.clone(),
@@ -399,40 +393,10 @@ fn parse_post(
     diagnostics: &mut DiagnosticCollector,
 ) -> PostCandidate {
     let start_error_count = diagnostics.len();
-    let path = source.path().clone();
-    if super::path::PortableLogicalPath::parse(path.as_str(), usize::MAX).is_err() {
-        diagnostics.push(ContentValidationError::new(
-            path.clone(),
-            "$path",
-            ContentValidationCode::InvalidLogicalContentPath,
-            "post source path must use portable logical-path components",
-        ));
-    }
-    if !source.collection().contains_path(path.as_str()) {
-        diagnostics.push(ContentValidationError::new(
-            path.clone(),
-            "$path",
-            ContentValidationCode::PostCollectionPathMismatch,
-            format!(
-                "post source collection requires a path below {}/",
-                source.collection().directory()
-            ),
-        ));
-    }
-    if !path
-        .as_str()
-        .rsplit('/')
-        .next()
-        .is_some_and(|name| name.ends_with(".md"))
-    {
-        diagnostics.push(ContentValidationError::new(
-            path.clone(),
-            "$path",
-            ContentValidationCode::UnexpectedPostEntry,
-            "post source path must use the exact lowercase .md suffix",
-        ));
-    }
-    let Some((frontmatter, markdown)) = split_frontmatter(source.contents(), &path, diagnostics)
+    let path = source.path.clone();
+
+    validate_post_source_path(&source, &path, diagnostics);
+    let Some((mut table, markdown)) = parse_post_frontmatter(source.contents, &path, diagnostics)
     else {
         return PostCandidate {
             source_index,
@@ -443,26 +407,6 @@ fn parse_post(
             aliases: Vec::new(),
             tips: None,
         };
-    };
-    let mut table = match frontmatter.parse::<Table>() {
-        Ok(table) => table,
-        Err(error) => {
-            diagnostics.push(ContentValidationError::new(
-                path.clone(),
-                "$frontmatter",
-                ContentValidationCode::FrontmatterTomlInvalid,
-                format!("frontmatter TOML is invalid: {error}"),
-            ));
-            return PostCandidate {
-                source_index,
-                path,
-                document: None,
-                id: None,
-                slug: None,
-                aliases: Vec::new(),
-                tips: None,
-            };
-        }
     };
 
     if table.remove("published_at").is_some() {
@@ -541,9 +485,160 @@ fn parse_post(
                 diagnostics,
             )
         });
+    let tags = parse_post_tags(&mut table, &path, diagnostics);
+    let aliases: Vec<_> =
+        take_optional_string_array(&mut table, "aliases", "aliases", &path, diagnostics)
+            .into_iter()
+            .filter_map(|(index, value)| match PostAlias::parse(value) {
+                Ok(alias) => Some((index, alias)),
+                Err(error) => {
+                    diagnostics.push(ContentValidationError::new(
+                        path.clone(),
+                        indexed_field("aliases", index),
+                        ContentValidationCode::InvalidPostAlias,
+                        error.to_string(),
+                    ));
+                    None
+                }
+            })
+            .collect();
+    let authored_draft = take_optional_bool(&mut table, "draft", "draft", &path, diagnostics);
+    let draft = resolve_draft_status(source.collection, authored_draft, &path, diagnostics);
+    let tips = match take_optional_bool(&mut table, "tips", "tips", &path, diagnostics) {
+        OptionalField::Missing => Some(PostTipPolicy::InheritPublication),
+        OptionalField::Valid(true) => Some(PostTipPolicy::Enabled),
+        OptionalField::Valid(false) => Some(PostTipPolicy::Disabled),
+        OptionalField::Invalid => None,
+    };
+    let distribution = parse_distribution(&mut table, &path, diagnostics);
+    reject_unknown_fields(table, "", &path, diagnostics);
 
+    let document = if diagnostics.len() == start_error_count {
+        match (
+            id.clone(),
+            title,
+            slug.clone(),
+            authored_at,
+            description,
+            tips,
+            distribution,
+        ) {
+            (
+                Some(id),
+                Some(title),
+                Some(slug),
+                Some(authored_at),
+                Some(description),
+                Some(tips),
+                Some(distribution),
+            ) => Some(PostDocument::new(
+                path.clone(),
+                PostMetadata {
+                    id,
+                    title,
+                    slug,
+                    authored_at,
+                    updated_at: updated_at_value,
+                    description,
+                    image,
+                    tags,
+                    aliases: aliases.iter().map(|(_, alias)| alias.clone()).collect(),
+                    draft,
+                    tips,
+                    distribution,
+                },
+                MarkdownSource::new(markdown),
+            )),
+            _ => {
+                diagnostics.push(invariant_error(
+                    path.clone(),
+                    "post validation succeeded without all required typed fields",
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    PostCandidate {
+        source_index,
+        path,
+        document,
+        id,
+        slug,
+        aliases,
+        tips,
+    }
+}
+
+fn validate_post_source_path(
+    source: &PostSource<'_>,
+    path: &LogicalContentPath,
+    diagnostics: &mut DiagnosticCollector,
+) {
+    if super::path::PortableLogicalPath::parse(path.as_str(), usize::MAX).is_err() {
+        diagnostics.push(ContentValidationError::new(
+            path.clone(),
+            "$path",
+            ContentValidationCode::InvalidLogicalContentPath,
+            "post source path must use portable logical-path components",
+        ));
+    }
+    if !source.collection.contains_path(path.as_str()) {
+        diagnostics.push(ContentValidationError::new(
+            path.clone(),
+            "$path",
+            ContentValidationCode::PostCollectionPathMismatch,
+            format!(
+                "post source collection requires a path below {}/",
+                source.collection.directory()
+            ),
+        ));
+    }
+    if !path
+        .as_str()
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.ends_with(".md"))
+    {
+        diagnostics.push(ContentValidationError::new(
+            path.clone(),
+            "$path",
+            ContentValidationCode::UnexpectedPostEntry,
+            "post source path must use the exact lowercase .md suffix",
+        ));
+    }
+}
+
+fn parse_post_frontmatter<'source>(
+    contents: &'source str,
+    path: &LogicalContentPath,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<(Table, &'source str)> {
+    let (frontmatter, markdown) = split_frontmatter(contents, path, diagnostics)?;
+    let table = match frontmatter.parse::<Table>() {
+        Ok(table) => table,
+        Err(error) => {
+            diagnostics.push(ContentValidationError::new(
+                path.clone(),
+                "$frontmatter",
+                ContentValidationCode::FrontmatterTomlInvalid,
+                format!("frontmatter TOML is invalid: {error}"),
+            ));
+            return None;
+        }
+    };
+    Some((table, markdown))
+}
+
+fn parse_post_tags(
+    table: &mut Table,
+    path: &LogicalContentPath,
+    diagnostics: &mut DiagnosticCollector,
+) -> Vec<PostTag> {
     let mut first_tag_indexes = BTreeMap::new();
-    let tags: Vec<_> = take_optional_string_array(&mut table, "tags", "tags", &path, diagnostics)
+    take_optional_string_array(table, "tags", "tags", path, diagnostics)
         .into_iter()
         .filter_map(|(index, value)| match PostTag::parse(value) {
             Ok(tag) => {
@@ -575,25 +670,16 @@ fn parse_post(
                 None
             }
         })
-        .collect();
-    let aliases: Vec<_> =
-        take_optional_string_array(&mut table, "aliases", "aliases", &path, diagnostics)
-            .into_iter()
-            .filter_map(|(index, value)| match PostAlias::parse(value) {
-                Ok(alias) => Some((index, alias)),
-                Err(error) => {
-                    diagnostics.push(ContentValidationError::new(
-                        path.clone(),
-                        indexed_field("aliases", index),
-                        ContentValidationCode::InvalidPostAlias,
-                        error.to_string(),
-                    ));
-                    None
-                }
-            })
-            .collect();
-    let authored_draft = take_optional_bool(&mut table, "draft", "draft", &path, diagnostics);
-    let draft = match (source.collection(), authored_draft) {
+        .collect()
+}
+
+fn resolve_draft_status(
+    collection: super::PostCollection,
+    authored: OptionalField<bool>,
+    path: &LogicalContentPath,
+    diagnostics: &mut DiagnosticCollector,
+) -> DraftStatus {
+    match (collection, authored) {
         (super::PostCollection::Drafts, OptionalField::Valid(false)) => {
             diagnostics.push(ContentValidationError::new(
                 path.clone(),
@@ -609,72 +695,6 @@ fn parse_post(
             OptionalField::Missing | OptionalField::Valid(false) | OptionalField::Invalid,
         ) => DraftStatus::Publishable,
         (super::PostCollection::Posts, OptionalField::Valid(true)) => DraftStatus::Draft,
-    };
-    let tips = match take_optional_bool(&mut table, "tips", "tips", &path, diagnostics) {
-        OptionalField::Missing => Some(PostTipPolicy::InheritPublication),
-        OptionalField::Valid(true) => Some(PostTipPolicy::Enabled),
-        OptionalField::Valid(false) => Some(PostTipPolicy::Disabled),
-        OptionalField::Invalid => None,
-    };
-    let distribution = parse_distribution(&mut table, &path, diagnostics);
-    reject_unknown_fields(table, "", &path, diagnostics);
-
-    let document = if diagnostics.len() == start_error_count {
-        match (
-            id.clone(),
-            title,
-            slug.clone(),
-            authored_at,
-            description,
-            tips,
-            distribution,
-        ) {
-            (
-                Some(id),
-                Some(title),
-                Some(slug),
-                Some(authored_at),
-                Some(description),
-                Some(tips),
-                Some(distribution),
-            ) => Some(PostDocument::new(
-                path.clone(),
-                PostMetadata::new(super::PostMetadataParts {
-                    id,
-                    title,
-                    slug,
-                    authored_at,
-                    updated_at: updated_at_value,
-                    description,
-                    image,
-                    tags,
-                    aliases: aliases.iter().map(|(_, alias)| alias.clone()).collect(),
-                    draft,
-                    tips,
-                    distribution,
-                }),
-                MarkdownSource::new(markdown),
-            )),
-            _ => {
-                diagnostics.push(invariant_error(
-                    path.clone(),
-                    "post validation succeeded without all required typed fields",
-                ));
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    PostCandidate {
-        source_index,
-        path,
-        document,
-        id,
-        slug,
-        aliases,
-        tips,
     }
 }
 
