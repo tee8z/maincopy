@@ -564,6 +564,7 @@ mod tests {
             publication_id: uuid(publication_id),
             stable_post_id: PostId::parse(POST_ID).unwrap(),
             pinned_post_digest: PostRevisionDigest::from_bytes(REVISION_BYTES),
+            expected_revision: None,
             expected_site,
             source_commit: None,
             now: OffsetDateTime::from_unix_timestamp(now).unwrap(),

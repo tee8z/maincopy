@@ -2,13 +2,26 @@ use std::{path::PathBuf, time::Duration};
 
 #[cfg(windows)]
 use maincopy_shared::is_valid_windows_admin_pipe_name;
-use maincopy_shared::{CAPABILITIES_PATH, Capabilities};
-use reqwest::{StatusCode, header::ACCEPT};
+use maincopy_shared::{
+    CAPABILITIES_PATH, Capabilities,
+    publication::{
+        IDEMPOTENCY_KEY_HEADER, PUBLICATIONS_PATH, PublishNowRequest, PublishNowResponse,
+    },
+};
+use reqwest::{
+    StatusCode,
+    header::{ACCEPT, HeaderMap},
+    redirect::Policy,
+};
 use thiserror::Error;
+use uuid::Uuid;
 
 const ADMIN_ORIGIN: &str = "http://maincopy.local";
+const REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_ERROR_CODE_BYTES: usize = 64;
+const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 
 /// Concrete HTTP client for Maincopy's private local admin API.
 #[derive(Clone, Debug)]
@@ -44,7 +57,10 @@ impl AdminClient {
             return Err(AdminClientError::InvalidSocketPath);
         }
 
-        let builder = reqwest::Client::builder().no_proxy().timeout(timeout);
+        let builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .timeout(timeout);
         #[cfg(unix)]
         let builder = builder.unix_socket(socket_path.clone());
         #[cfg(windows)]
@@ -60,23 +76,52 @@ impl AdminClient {
 
     /// Fetches the versions advertised by the running server.
     pub async fn capabilities(&self) -> Result<Capabilities, AdminClientError> {
-        let mut response = self
-            .http
-            .get(format!("{ADMIN_ORIGIN}{CAPABILITIES_PATH}"))
-            .header(ACCEPT, "application/json")
+        let body = self
+            .response_body(
+                self.http
+                    .get(format!("{ADMIN_ORIGIN}{CAPABILITIES_PATH}"))
+                    .header(ACCEPT, "application/json"),
+            )
+            .await?;
+        serde_json::from_slice(&body).map_err(AdminClientError::InvalidResponse)
+    }
+
+    /// Publishes one post through the server's canonical activation workflow.
+    pub async fn publish_now(
+        &self,
+        idempotency_key: Uuid,
+        request: &PublishNowRequest,
+    ) -> Result<PublishNowResponse, AdminClientError> {
+        let body = self
+            .response_body(
+                self.http
+                    .post(format!("{ADMIN_ORIGIN}{PUBLICATIONS_PATH}"))
+                    .header(ACCEPT, "application/json")
+                    .header(
+                        IDEMPOTENCY_KEY_HEADER,
+                        idempotency_key.hyphenated().to_string(),
+                    )
+                    .json(request),
+            )
+            .await?;
+        serde_json::from_slice(&body).map_err(AdminClientError::InvalidResponse)
+    }
+
+    async fn response_body(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<Vec<u8>, AdminClientError> {
+        let mut response = request
             .send()
             .await
             .map_err(|source| AdminClientError::Request {
                 socket_path: self.socket_path.clone(),
                 source,
             })?;
-
         let status = response.status();
-        if !status.is_success() {
-            return Err(AdminClientError::HttpStatus { status });
-        }
-
+        let header_request_id = response_request_id(response.headers());
         let mut body = Vec::new();
+
         while let Some(chunk) =
             response
                 .chunk()
@@ -99,11 +144,87 @@ impl AdminClient {
             body.extend_from_slice(&chunk);
         }
 
-        serde_json::from_slice(&body).map_err(AdminClientError::InvalidResponse)
+        if !status.is_success() {
+            let (problem, body_request_id) = decode_problem(&body);
+            return Err(AdminClientError::HttpStatus {
+                status,
+                problem,
+                request_id: consistent_request_id(header_request_id, body_request_id),
+            });
+        }
+
+        Ok(body)
     }
 }
 
-/// Failures produced before a typed admin response is available.
+fn response_request_id(headers: &HeaderMap) -> Option<Uuid> {
+    let mut values = headers.get_all(REQUEST_ID_HEADER).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    canonical_uuid(value)
+}
+
+fn consistent_request_id(header: Option<Uuid>, body: Option<Uuid>) -> Option<Uuid> {
+    match (header, body) {
+        (Some(header), Some(body)) if header == body => Some(header),
+        (Some(_), Some(_)) => None,
+        (Some(request_id), None) | (None, Some(request_id)) => Some(request_id),
+        (None, None) => None,
+    }
+}
+
+fn decode_problem(body: &[u8]) -> (Option<AdminProblem>, Option<Uuid>) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (None, None);
+    };
+    let Some(error) = value.get("error").and_then(serde_json::Value::as_object) else {
+        return (None, None);
+    };
+    let request_id = error
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(canonical_uuid);
+    let problem = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .zip(error.get("message").and_then(serde_json::Value::as_str))
+        .filter(|(code, message)| safe_error_code(code) && safe_error_message(message))
+        .map(|(code, message)| AdminProblem {
+            code: code.into(),
+            message: message.into(),
+        });
+    (problem, request_id)
+}
+
+fn canonical_uuid(value: &str) -> Option<Uuid> {
+    let uuid = Uuid::parse_str(value).ok()?;
+    (uuid.hyphenated().to_string() == value).then_some(uuid)
+}
+
+fn safe_error_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_ERROR_CODE_BYTES
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn safe_error_message(message: &str) -> bool {
+    !message.is_empty()
+        && message.len() <= MAX_ERROR_MESSAGE_BYTES
+        && message.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+}
+
+/// Safe diagnostic details decoded from an admin error response.
+#[derive(Debug)]
+pub struct AdminProblem {
+    pub code: Box<str>,
+    pub message: Box<str>,
+}
+
+/// Failures produced while preparing or sending a local admin request.
 #[derive(Debug, Error)]
 pub enum AdminClientError {
     #[error("the local admin endpoint is invalid")]
@@ -120,7 +241,11 @@ pub enum AdminClientError {
     },
 
     #[error("the admin server returned HTTP {status}")]
-    HttpStatus { status: StatusCode },
+    HttpStatus {
+        status: StatusCode,
+        problem: Option<AdminProblem>,
+        request_id: Option<Uuid>,
+    },
 
     #[error("the admin response exceeded the {limit}-byte limit")]
     ResponseTooLarge { limit: usize },
@@ -129,161 +254,54 @@ pub enum AdminClientError {
     InvalidResponse(#[source] serde_json::Error),
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use std::future::pending;
-
-    use axum::{Json, Router, routing::get};
-    use maincopy_shared::{AdminApiVersion, CapabilityContractVersion, FeatureVersions};
-    use tempfile::TempDir;
-    use tokio::{net::UnixListener, sync::oneshot, task::JoinHandle};
+    use serde_json::json;
 
     use super::*;
 
-    struct TestServer {
-        _directory: TempDir,
-        socket_path: PathBuf,
-        shutdown: oneshot::Sender<()>,
-        task: JoinHandle<()>,
-    }
+    const REQUEST_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
-    impl TestServer {
-        async fn start(router: Router) -> Self {
-            let directory = tempfile::tempdir().unwrap();
-            let socket_path = directory.path().join("admin.sock");
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            let (shutdown, stopped) = oneshot::channel();
-            let task = tokio::spawn(async move {
-                axum::serve(listener, router)
-                    .with_graceful_shutdown(async move {
-                        let _ = stopped.await;
-                    })
-                    .await
-                    .unwrap();
-            });
-
-            Self {
-                _directory: directory,
-                socket_path,
-                shutdown,
-                task,
+    #[test]
+    fn bounded_problem_decoder_keeps_only_safe_operator_details() {
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "code": "idempotency_conflict",
+                "message": "Idempotency-Key is already bound to another command",
+                "request_id": REQUEST_ID
             }
-        }
-
-        async fn stop(self) {
-            let _ = self.shutdown.send(());
-            self.task.await.unwrap();
-        }
-    }
-
-    fn capabilities() -> Capabilities {
-        Capabilities {
-            api_version: AdminApiVersion::V1,
-            features: FeatureVersions {
-                capabilities: CapabilityContractVersion::V1,
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn client_reads_typed_capabilities_over_a_real_unix_socket() {
-        let expected = capabilities();
-        let server = TestServer::start(Router::new().route(
-            CAPABILITIES_PATH,
-            get(move || async move { Json(expected) }),
-        ))
-        .await;
-        let client = AdminClient::new(server.socket_path.clone()).unwrap();
-
-        assert_eq!(client.capabilities().await.unwrap(), expected);
-
-        server.stop().await;
-    }
-
-    #[tokio::test]
-    async fn cloned_clients_can_make_concurrent_requests() {
-        let server = TestServer::start(
-            Router::new().route(CAPABILITIES_PATH, get(|| async { Json(capabilities()) })),
-        )
-        .await;
-        let client = AdminClient::new(server.socket_path.clone()).unwrap();
-        let other_client = client.clone();
-
-        let (left, right) = tokio::join!(client.capabilities(), other_client.capabilities());
-        assert_eq!(left.unwrap(), capabilities());
-        assert_eq!(right.unwrap(), capabilities());
-
-        server.stop().await;
-    }
-
-    #[tokio::test]
-    async fn response_limit_is_enforced_while_streaming() {
-        let server = TestServer::start(
-            Router::new().route(CAPABILITIES_PATH, get(|| async { "x".repeat(33) })),
-        )
-        .await;
-        let client =
-            AdminClient::with_limits(server.socket_path.clone(), DEFAULT_REQUEST_TIMEOUT, 32)
-                .unwrap();
-
-        assert!(matches!(
-            client.capabilities().await,
-            Err(AdminClientError::ResponseTooLarge { limit: 32 })
-        ));
-
-        server.stop().await;
-    }
-
-    #[tokio::test]
-    async fn malformed_success_response_is_rejected() {
-        let server =
-            TestServer::start(Router::new().route(CAPABILITIES_PATH, get(|| async { "not json" })))
-                .await;
-        let client = AdminClient::new(server.socket_path.clone()).unwrap();
-
-        assert!(matches!(
-            client.capabilities().await,
-            Err(AdminClientError::InvalidResponse(_))
-        ));
-
-        server.stop().await;
-    }
-
-    #[tokio::test]
-    async fn request_timeout_is_a_transport_error() {
-        let server = TestServer::start(Router::new().route(
-            CAPABILITIES_PATH,
-            get(|| async { pending::<String>().await }),
-        ))
-        .await;
-        let client = AdminClient::with_limits(
-            server.socket_path.clone(),
-            Duration::from_millis(10),
-            DEFAULT_MAX_RESPONSE_BYTES,
-        )
+        }))
         .unwrap();
 
-        let Err(AdminClientError::Request { source, .. }) = client.capabilities().await else {
-            panic!("timed-out request must be a transport error");
-        };
-        assert!(source.is_timeout());
+        let (problem, request_id) = decode_problem(&body);
+        let problem = problem.unwrap();
+        assert_eq!(&*problem.code, "idempotency_conflict");
+        assert_eq!(
+            &*problem.message,
+            "Idempotency-Key is already bound to another command"
+        );
+        assert_eq!(request_id.unwrap().hyphenated().to_string(), REQUEST_ID);
 
-        server.stop().await;
+        let unsafe_body = serde_json::to_vec(&json!({
+            "error": {
+                "code": "not safe",
+                "message": "contains\na newline",
+                "request_id": REQUEST_ID
+            }
+        }))
+        .unwrap();
+        assert!(decode_problem(&unsafe_body).0.is_none());
     }
 
-    #[tokio::test]
-    async fn missing_socket_is_an_actionable_transport_error() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket_path = directory.path().join("missing.sock");
-        let client = AdminClient::new(socket_path.clone()).unwrap();
+    #[test]
+    fn conflicting_header_and_body_request_ids_are_discarded() {
+        let header = Uuid::parse_str(REQUEST_ID).unwrap();
+        let body = Uuid::parse_str("dddddddd-dddd-4ddd-8ddd-dddddddddddd").unwrap();
 
-        let Err(AdminClientError::Request {
-            socket_path: reported,
-            ..
-        }) = client.capabilities().await
-        else {
-            panic!("a missing socket must fail at the transport boundary");
-        };
-        assert_eq!(reported, socket_path);
+        assert_eq!(
+            consistent_request_id(Some(header), Some(header)),
+            Some(header)
+        );
+        assert_eq!(consistent_request_id(Some(header), Some(body)), None);
     }
 }

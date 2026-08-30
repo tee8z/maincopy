@@ -21,8 +21,8 @@ use crate::{
 
 use super::store::{
     BeginPublishNow, BegunPublication, CommandIdempotencyKey, FinishPublication,
-    FinishedPublication, PublicationStore, PublishNowState, RecoverablePublicationActivation,
-    SiteHead,
+    FinishedPublication, LookupPublishNow, PublicationStore, PublishNowLookupError,
+    PublishNowState, RecoverablePublicationActivation, SiteHead,
 };
 
 /// Owns the serialized transition from durable publication intent to public visibility.
@@ -67,6 +67,40 @@ impl PublicationCoordinator {
         &mut self,
         command: PublishNow,
     ) -> Result<PublishedPublication, PublicationActivationError> {
+        let replay = self
+            .store
+            .publish_now_replay(LookupPublishNow {
+                creation_key: CommandIdempotencyKey::new(command.creation_key),
+                stable_post_id: command.stable_post_id.clone(),
+                expected_revision: command.expected_revision.clone(),
+            })
+            .await;
+        let replay = match replay {
+            Ok(replay) => replay,
+            Err(error @ PublishNowLookupError::InvalidStoredState) => {
+                let _safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
+                return Err(PublicationActivationError::Lookup(error));
+            }
+            Err(error) => return Err(PublicationActivationError::Lookup(error)),
+        };
+        match replay {
+            Some(PublishNowState::Published(finished)) => return published_result(finished),
+            Some(PublishNowState::Activating(begun)) => {
+                let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
+                let selected = select_stored_post(&self.catalog, begun.publication.view())?;
+                let candidate = self.candidate_for_begun(
+                    &selected,
+                    begun.publication.view(),
+                    &begun.candidate_site_digest,
+                    None,
+                )?;
+                return self
+                    .activate_and_finish(begun, selected, candidate, &mut safety)
+                    .await;
+            }
+            None => {}
+        }
+
         let selected = select_post(
             &self.catalog,
             &command.stable_post_id,
@@ -86,6 +120,7 @@ impl PublicationCoordinator {
             publication_id: command.publication_id,
             stable_post_id: selected.stable_post_id.clone(),
             pinned_post_digest: selected.revision.clone(),
+            expected_revision: command.expected_revision,
             expected_site: self.site.clone(),
             source_commit: self.source_commit.clone(),
             now,
@@ -127,7 +162,7 @@ impl PublicationCoordinator {
             &selected,
             begun.publication.view(),
             &begun.candidate_site_digest,
-            prebuilt,
+            Some(prebuilt),
         )?;
         self.activate_and_finish(begun, selected, candidate, &mut safety)
             .await
@@ -140,26 +175,9 @@ impl PublicationCoordinator {
     ) -> Result<PublishedPublication, PublicationActivationError> {
         let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
         let view = activation.publication.view();
-        let selected = select_post(
-            &self.catalog,
-            &view.stable_post_id,
-            Some(&view.pinned_post_digest),
-        )?;
-        validate_activating(view, &selected)?;
-        let published_at = view
-            .activation_started_at
-            .ok_or(PublicationActivationError::DurableStateMismatch)?;
-        let candidate = build_candidate(
-            Arc::clone(&self.catalog),
-            self.frontend,
-            &self.ledger,
-            &selected,
-            published_at,
-        )?;
-        if candidate.already_published {
-            return Err(PublicationActivationError::DurableStateMismatch);
-        }
-        require_candidate_digest(&candidate, &activation.candidate_site_digest)?;
+        let selected = select_stored_post(&self.catalog, view)?;
+        let candidate =
+            self.candidate_for_begun(&selected, view, &activation.candidate_site_digest, None)?;
         let begun = BegunPublication {
             publication_id: activation.publication_id,
             publication: activation.publication,
@@ -175,7 +193,7 @@ impl PublicationCoordinator {
         selected: &SelectedPost,
         publication: &super::CanonicalPublicationView,
         stored_digest: &SiteSnapshotDigest,
-        prebuilt: CandidateSnapshot,
+        prebuilt: Option<CandidateSnapshot>,
     ) -> Result<CandidateSnapshot, PublicationActivationError> {
         if publication.stable_post_id != selected.stable_post_id
             || publication.pinned_post_digest != selected.revision
@@ -187,18 +205,23 @@ impl PublicationCoordinator {
         let published_at = publication
             .activation_started_at
             .ok_or(PublicationActivationError::DurableStateMismatch)?;
-        let candidate =
-            if prebuilt.published_at == published_at && prebuilt.digest == *stored_digest {
+        let candidate = match prebuilt {
+            Some(prebuilt)
+                if prebuilt.published_at == published_at && prebuilt.digest == *stored_digest =>
+            {
                 prebuilt
-            } else {
-                build_candidate(
-                    Arc::clone(&self.catalog),
-                    self.frontend,
-                    &self.ledger,
-                    selected,
-                    published_at,
-                )?
-            };
+            }
+            _ => build_candidate(
+                Arc::clone(&self.catalog),
+                self.frontend,
+                &self.ledger,
+                selected,
+                published_at,
+            )?,
+        };
+        if candidate.already_published {
+            return Err(PublicationActivationError::DurableStateMismatch);
+        }
         require_candidate_digest(&candidate, stored_digest)?;
         Ok(candidate)
     }
@@ -279,6 +302,23 @@ fn select_post(
     })
 }
 
+fn select_stored_post(
+    catalog: &ContentCatalog,
+    publication: &super::CanonicalPublicationView,
+) -> Result<SelectedPost, PublicationActivationError> {
+    let rendered = catalog
+        .get(&publication.stable_post_id, &publication.pinned_post_digest)
+        .ok_or(PublicationActivationError::DurableStateMismatch)?;
+    if rendered.document.metadata.draft == DraftStatus::Draft {
+        return Err(PublicationActivationError::DurableStateMismatch);
+    }
+    Ok(SelectedPost {
+        stable_post_id: rendered.document.metadata.id.clone(),
+        revision: rendered.revision.clone(),
+        slug: rendered.document.metadata.slug.clone(),
+    })
+}
+
 struct CandidateSnapshot {
     ledger: PublicLedgerProjection,
     snapshot: SiteSnapshot,
@@ -344,20 +384,33 @@ fn validate_finished(
     finished: FinishedPublication,
     selected: &SelectedPost,
 ) -> Result<PublishedPublication, PublicationActivationError> {
+    let current_matches = finished
+        .publication
+        .view()
+        .current_published_digest
+        .as_ref()
+        == Some(&selected.revision);
+    let result = published_result(finished)?;
+    if result.stable_post_id != selected.stable_post_id
+        || result.revision != selected.revision
+        || !current_matches
+    {
+        return Err(PublicationActivationError::DurableStateMismatch);
+    }
+    Ok(result)
+}
+
+fn published_result(
+    finished: FinishedPublication,
+) -> Result<PublishedPublication, PublicationActivationError> {
     let view = finished.publication.view();
     let published_at = view
         .published_at
         .ok_or(PublicationActivationError::DurableStateMismatch)?;
-    if view.stable_post_id != selected.stable_post_id
-        || view.pinned_post_digest != selected.revision
-        || view.current_published_digest.as_ref() != Some(&selected.revision)
-    {
-        return Err(PublicationActivationError::DurableStateMismatch);
-    }
     Ok(PublishedPublication {
         publication_id: finished.publication_id,
-        stable_post_id: selected.stable_post_id.clone(),
-        revision: selected.revision.clone(),
+        stable_post_id: view.stable_post_id.clone(),
+        revision: view.pinned_post_digest.clone(),
         published_at,
         site: finished.site,
     })
@@ -430,6 +483,8 @@ pub(crate) enum PublicationActivationError {
     #[error(transparent)]
     SnapshotBuild(#[from] SiteSnapshotBuildError),
     #[error(transparent)]
+    Lookup(#[from] PublishNowLookupError),
+    #[error(transparent)]
     Database(#[from] DatabaseMutationError),
 }
 
@@ -446,7 +501,7 @@ mod tests {
             DatabaseWriterQueueCapacity,
         },
         content::{
-            DiscoveredContentTree, PostCollection, resolve_content_assets,
+            DiscoveredContentTree, DiscoveredPost, PostCollection, resolve_content_assets,
             tree::{post, publication},
         },
         database,
@@ -459,6 +514,29 @@ mod tests {
     const DRAFT_ID: &str = "22222222-2222-4222-8222-222222222222";
 
     fn catalog() -> Arc<ContentCatalog> {
+        compile_catalog(vec![
+            post(
+                "posts/publishable.md",
+                PostCollection::Posts,
+                post_source(PUBLISHABLE_ID, "publishable", false),
+            ),
+            post(
+                "drafts/draft.md",
+                PostCollection::Drafts,
+                post_source(DRAFT_ID, "draft", true),
+            ),
+        ])
+    }
+
+    fn catalog_without_publishable_post() -> Arc<ContentCatalog> {
+        compile_catalog(vec![post(
+            "drafts/draft.md",
+            PostCollection::Drafts,
+            post_source(DRAFT_ID, "draft", true),
+        )])
+    }
+
+    fn compile_catalog(posts: Vec<DiscoveredPost>) -> Arc<ContentCatalog> {
         let tree = DiscoveredContentTree::new(
             publication(
                 "publication.toml",
@@ -472,18 +550,7 @@ mod tests {
                  allowed_https_origins = []\n"
                     .to_owned(),
             ),
-            vec![
-                post(
-                    "posts/publishable.md",
-                    PostCollection::Posts,
-                    post_source(PUBLISHABLE_ID, "publishable", false),
-                ),
-                post(
-                    "drafts/draft.md",
-                    PostCollection::Drafts,
-                    post_source(DRAFT_ID, "draft", true),
-                ),
-            ],
+            posts,
             Vec::new(),
             0,
         );
@@ -638,13 +705,37 @@ mod tests {
                 .is_some()
         );
 
-        assert_eq!(coordinator.publish_now(request).await.unwrap(), published);
         let mut duplicate = command();
         duplicate.creation_key = Uuid::new_v4();
         duplicate.publication_id = Uuid::new_v4();
         assert!(matches!(
             coordinator.publish_now(duplicate).await,
             Err(PublicationActivationError::AlreadyPublished { .. })
+        ));
+
+        coordinator.catalog = catalog_without_publishable_post();
+        assert_eq!(
+            coordinator.publish_now(request.clone()).await.unwrap(),
+            published
+        );
+
+        let mut changed_precondition = request.clone();
+        changed_precondition.expected_revision = Some(published.revision.clone());
+        assert!(matches!(
+            coordinator.publish_now(changed_precondition).await,
+            Err(PublicationActivationError::Lookup(
+                PublishNowLookupError::IdempotencyConflict
+            ))
+        ));
+
+        let mut changed_post = request;
+        changed_post.stable_post_id =
+            PostId::parse("33333333-3333-4333-8333-333333333333").unwrap();
+        assert!(matches!(
+            coordinator.publish_now(changed_post).await,
+            Err(PublicationActivationError::Lookup(
+                PublishNowLookupError::IdempotencyConflict
+            ))
         ));
         assert!(readiness.is_ready());
         assert!(!cancellation.is_cancelled());

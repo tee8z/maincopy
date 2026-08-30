@@ -9,6 +9,7 @@ mod platform {
         path::{Path, PathBuf},
     };
 
+    use axum::Router;
     use tokio::net::UnixListener;
     use tokio_util::sync::CancellationToken;
 
@@ -36,9 +37,13 @@ mod platform {
             Ok(Self { listener, cleanup })
         }
 
-        pub(crate) async fn serve(self, cancellation: CancellationToken) -> Result<(), io::Error> {
+        pub(crate) async fn serve(
+            self,
+            router: Router,
+            cancellation: CancellationToken,
+        ) -> Result<(), io::Error> {
             let Self { listener, cleanup } = self;
-            let result = axum::serve(listener, super::super::admin_router())
+            let result = axum::serve(listener, router)
                 .with_graceful_shutdown(cancellation.cancelled_owned())
                 .await;
             drop(cleanup);
@@ -240,6 +245,7 @@ mod platform {
         time::Duration,
     };
 
+    use axum::Router;
     use maincopy_shared::is_valid_windows_admin_pipe_name;
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use tokio_util::sync::CancellationToken;
@@ -283,8 +289,12 @@ mod platform {
             })
         }
 
-        pub(crate) async fn serve(self, cancellation: CancellationToken) -> Result<(), io::Error> {
-            axum::serve(self.listener, super::super::admin_router())
+        pub(crate) async fn serve(
+            self,
+            router: Router,
+            cancellation: CancellationToken,
+        ) -> Result<(), io::Error> {
+            axum::serve(self.listener, router)
                 .with_graceful_shutdown(cancellation.cancelled_owned())
                 .await
         }
@@ -458,6 +468,7 @@ mod platform {
 mod platform {
     use std::{io, path::Path};
 
+    use axum::Router;
     use tokio_util::sync::CancellationToken;
 
     pub(crate) struct AdminSocket;
@@ -467,7 +478,11 @@ mod platform {
             Err(AdminSocketError)
         }
 
-        pub(crate) async fn serve(self, _cancellation: CancellationToken) -> Result<(), io::Error> {
+        pub(crate) async fn serve(
+            self,
+            _router: Router,
+            _cancellation: CancellationToken,
+        ) -> Result<(), io::Error> {
             unreachable!("unsupported admin sockets cannot be constructed")
         }
     }

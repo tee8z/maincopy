@@ -1,16 +1,40 @@
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use maincopy_server::{
     admin::admin_router,
     web::{Readiness, public_router},
 };
+use maincopy_shared::{ADMIN_CAPABILITIES_PATH, publication::PUBLICATIONS_PATH};
 
-use crate::helpers::{get, public_state};
+use crate::helpers::{get, public_state, request};
+
+#[tokio::test]
+async fn public_router_does_not_expose_version_neutral_admin_discovery() {
+    let response = get(
+        public_router(public_state(Readiness::new(true))),
+        ADMIN_CAPABILITIES_PATH,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
 
 #[tokio::test]
 async fn public_router_does_not_expose_admin_routes() {
     let response = get(
         public_router(public_state(Readiness::new(true))),
         "/api/admin/v1/capabilities",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn public_router_does_not_expose_publication_commands() {
+    let response = request(
+        public_router(public_state(Readiness::new(true))),
+        Method::POST,
+        PUBLICATIONS_PATH,
     )
     .await;
 

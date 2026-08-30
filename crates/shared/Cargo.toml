@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-schema = ["dep:utoipa"]
+schema = ["dep:utoipa", "utoipa/time", "utoipa/uuid"]
 
 [dependencies]
 serde.workspace = true
+time.workspace = true
 utoipa = { workspace = true, optional = true }
+uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 serde_json.workspace = true

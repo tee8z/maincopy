@@ -4,4 +4,4 @@
 mod client;
 
 #[cfg(any(unix, windows))]
-pub use client::{AdminClient, AdminClientError};
+pub use client::{AdminClient, AdminClientError, AdminProblem};

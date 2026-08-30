@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::{
-    admin::AdminSocket,
+    admin::{AdminSocket, runtime_admin_router},
     cli::ServerArguments,
     config::{HostConfiguration, HostConfigurationLoader, tip_provider_required},
     content::{
@@ -85,6 +85,7 @@ struct ServingState {
     readiness: Readiness,
     publication_coordinator: Arc<tokio::sync::Mutex<PublicationCoordinator>>,
     public_server: PublicServer,
+    admin_router: axum::Router,
     admin_socket: AdminSocket,
 }
 
@@ -243,6 +244,7 @@ impl Application {
             readiness,
             publication_coordinator,
             public_server,
+            admin_router,
             admin_socket,
         } = serving_state;
         #[cfg(test)]
@@ -257,7 +259,7 @@ impl Application {
         let admin_cancellation = cancellation.clone();
         let admin_task = CriticalTask::new(CriticalTaskName::AdminServer, async move {
             admin_socket
-                .serve(admin_cancellation)
+                .serve(admin_router, admin_cancellation)
                 .await
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
@@ -413,6 +415,7 @@ async fn prepare_serving_state(
             })?;
     }
     let publication_coordinator = Arc::new(tokio::sync::Mutex::new(publication_coordinator));
+    let admin_router = runtime_admin_router(Arc::clone(&publication_coordinator));
     let public_server = PublicServer::bind(
         public_bind,
         PublicState {
@@ -434,6 +437,7 @@ async fn prepare_serving_state(
         readiness,
         publication_coordinator,
         public_server,
+        admin_router,
         admin_socket,
     })
 }
@@ -1023,6 +1027,116 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let html = response.text().await.unwrap();
         assert!(html.contains("Pinned startup source"));
         assert!(html.contains("No posts have been published yet."));
+
+        stop_built_application(application).await;
+        assert!(!socket_path.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn admin_publication_route_activates_the_public_site_and_replays_success() {
+        use maincopy_shared::publication::{
+            IDEMPOTENCY_KEY_HEADER, PUBLICATIONS_PATH, PublishNowRequest, PublishNowResponse,
+        };
+
+        let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
+        let content_root = root.path().join("content");
+        write_durable_post(&content_root);
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let socket_path = root.path().join("run/admin.sock");
+        let application = Application::build(startup).await.unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path.clone())
+            .build()
+            .unwrap();
+        let request = PublishNowRequest {
+            post_id: uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap(),
+            expected_revision: None,
+        };
+        let creation_key = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+        let response = client
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(IDEMPOTENCY_KEY_HEADER, creation_key)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let published: PublishNowResponse = response.json().await.unwrap();
+        assert_eq!(published.post_id, request.post_id);
+        assert!(published.revision.starts_with("post-b3-v1-"));
+        assert!(published.site_digest.starts_with("site-b3-v1-"));
+        assert_eq!(published.site_version, 2);
+
+        let replay = client
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(IDEMPOTENCY_KEY_HEADER, creation_key)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            replay.json::<PublishNowResponse>().await.unwrap(),
+            published
+        );
+
+        let request_id = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let malformed = client
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(IDEMPOTENCY_KEY_HEADER, uuid::Uuid::new_v4().to_string())
+            .header("x-request-id", request_id)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body("{")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = malformed.json().await.unwrap();
+        assert_eq!(error["error"]["code"], "invalid_request_body");
+        assert_eq!(error["error"]["request_id"], request_id);
+
+        let oversized = client
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(IDEMPOTENCY_KEY_HEADER, uuid::Uuid::new_v4().to_string())
+            .header("x-request-id", request_id)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(" ".repeat(4 * 1024 + 1))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(oversized.headers()["x-request-id"], request_id);
+        let error: serde_json::Value = oversized.json().await.unwrap();
+        assert_eq!(error["error"]["code"], "request_body_too_large");
+        assert_eq!(error["error"]["request_id"], request_id);
+        assert_eq!(
+            client
+                .get("http://maincopy.local/api/admin/v1/capabilities")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+
+        let public = reqwest::get(format!(
+            "http://{}/posts/durable-publication",
+            application.public_addr
+        ))
+        .await
+        .unwrap();
+        assert_eq!(public.status(), reqwest::StatusCode::OK);
+        assert!(
+            public
+                .text()
+                .await
+                .unwrap()
+                .contains("Durable article body.")
+        );
 
         stop_built_application(application).await;
         assert!(!socket_path.exists());

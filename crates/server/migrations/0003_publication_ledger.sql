@@ -5,6 +5,7 @@ CREATE TABLE canonical_publications (
     publication_id BLOB PRIMARY KEY CHECK (length(publication_id) = 16),
     creation_key BLOB UNIQUE,
     stable_post_id BLOB NOT NULL,
+    requested_revision_digest BLOB,
     pinned_post_digest BLOB NOT NULL,
     state TEXT NOT NULL,
     version INTEGER NOT NULL,

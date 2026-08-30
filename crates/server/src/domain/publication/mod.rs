@@ -1,13 +1,7 @@
 //! Publication models, persistence operations, and public HTTP handlers.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the publication coordinator is composed now; the admin command lands next"
-    )
-)]
 pub(crate) mod activation;
+pub(crate) mod admin;
 pub(crate) mod store;
 pub(crate) mod web;
 

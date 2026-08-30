@@ -31,13 +31,6 @@ pub(crate) enum Mutation {
         command: CreateTargetJob,
         respond_to: oneshot::Sender<CreateTargetJobResult>,
     },
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the publication coordinator is composed now; the admin command lands next"
-        )
-    )]
     BeginPublishNow {
         command: BeginPublishNow,
         respond_to: oneshot::Sender<BeginPublishNowResult>,
