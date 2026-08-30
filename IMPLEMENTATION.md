@@ -687,9 +687,11 @@ constructors remain content-internal until WP1.4 gives ownership to the
 renderer.
 
 Also bind post and site resolver capabilities to the normalized effective
-allowlist. `PostRevisionInput::new` requires both capabilities and rejects a
-policy mismatch. Keep that private policy binding outside the post transcript,
-so a policy-only change does not change the historical post digest.
+allowlist. The content-internal post finalizer requires both capabilities and
+rejects a policy mismatch. Only the WP1.4 renderer can call this raw-component
+finalizer; public callers receive an opaque `RenderedPost`. Keep the private
+policy binding outside the post transcript, so a policy-only change does not
+change the historical post digest.
 
 Deliverables:
 
@@ -747,19 +749,25 @@ Deliverables:
 - Escaped block and inline raw-HTML events.
 - Rebuilt and validated link and image events.
 - Absolute HTTPS and same-site root-relative navigation only.
-- Exact lowercase `mermaid` fence recognition with no trailing info tokens.
+- Recognition only when the complete CommonMark-decoded fence-info value is
+  exact lowercase `mermaid`, with no trailing info tokens.
 - No V1 heading anchors or authored code-fence classes.
 - Inclusive limits of 32 MiB rendered HTML, 256 KiB per Mermaid block, and 64
   Mermaid blocks per post.
 - One opaque render product that binds the source, resolved assets, renderer
   identity, rendered bytes, and generated outputs.
 - A complete immutable content catalog with resolved posts and rendered assets.
-- A typed snapshot-builder input contract that requires explicit publication
-  ledger state and one real rendered-site-shell capability.
+- Candidate-scoped catalog ownership. `(PostId, PostRevisionDigest)` is an
+  exact lookup identity, not a cross-candidate authorization or cache key.
+- One private catalog projection capability that binds the current site policy
+  and exact local byte store. Projection checks policy and every local asset
+  digest before it emits asset URLs.
 
 WP2.1 creates the production Maud shell capability and frontend bundle
-identity. It performs the first production snapshot build and activation.
-WP1.4 must not create a fake shell or an empty frontend identity.
+identity. It also owns the typed snapshot-builder input that requires the real
+shell and explicit publication-ledger state. It performs the first production
+snapshot build and activation. WP1.4 must not create a fake shell or an empty
+frontend identity.
 
 Tests:
 
@@ -775,6 +783,12 @@ Tests:
 - Reject every Markdown image or file destination that has no matching
   resolver-approved occurrence.
 - Reject a render product that belongs to different source or asset inputs.
+- Reject an old same-digest render product after the effective asset policy
+  changes; accept a freshly rendered product for the current policy.
+- Reject a rendered product against a candidate store whose same logical path
+  contains different bytes; accept it against its original exact store.
+- Reject a resolver bundle with a different publication or post set before the
+  catalog takes ownership of any bytes.
 - Drop the source tree after compilation and retain a usable catalog.
 - Require both `PostId` and `PostRevisionDigest` for catalog lookup.
 

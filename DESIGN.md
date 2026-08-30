@@ -561,10 +561,11 @@ not rewrite line endings for the digest. Authored timestamps include the
 instant and authored UTC offset. The public-ledger input normalizes operational
 publication timestamps to UTC before it encodes them.
 
-WP1.3 supplies pure final calculators, but it does not create a shortcut from
-`ValidatedContent` to a final revision or snapshot digest. The post calculator
+WP1.3 supplies pure internal finalizers, but it does not create a shortcut from
+`ValidatedContent` to a final revision or snapshot digest. The post finalizer
 requires the content, resolved referenced assets, renderer and sanitizer
-identity, rendered output, and generated-output components. The site calculator
+identity, rendered output, and generated-output components. WP1.4 is its sole
+production caller and exposes only an opaque `RenderedPost`. The site finalizer
 requires resolved publication and site assets, shell and frontend identities,
 pre-injection shell output, and the public post ledger entries. Later work
 packages construct these required components. None has a default value.
@@ -627,6 +628,16 @@ path, field, and stable error code.
 
 The tree walk produces owned candidate bytes in deterministic logical-path
 order. Parsing and later compiler stages use only those owned bytes.
+
+The intermediate `ContentCatalog` belongs to one complete resolver candidate.
+`(PostId, PostRevisionDigest)` is an exact lookup identity inside that catalog;
+it is not a cross-candidate authorization or cache key. A render cache must
+also bind the private effective asset-policy capability. Snapshot projection
+compares that capability with the current site policy before it emits an
+external asset URL. It also resolves every local asset slot by its exact digest
+against the same catalog's owned byte store before it emits a snapshot URL.
+Equal public revision digests do not authorize reuse after an allowlist or
+local-byte change.
 
 Asset resolution runs before Markdown rendering. The resolver supplies typed
 destinations for each Markdown image and file link. The renderer does not emit
@@ -711,8 +722,9 @@ resolver occurrence.
 
 Plain, `text`, `ascii`, and unknown code fences produce the same escaped
 `<pre><code>` structure. V1 does not preserve an authored code-fence class.
-Only an exact lowercase `mermaid` fence creates a typed Mermaid placeholder.
-Trailing info tokens do not create a Mermaid placeholder.
+Only a fence whose complete CommonMark-decoded info value is the exact
+lowercase value `mermaid` creates a typed Mermaid placeholder. Trailing info
+tokens and case variants do not create a Mermaid placeholder.
 
 V1 applies these inclusive renderer limits:
 

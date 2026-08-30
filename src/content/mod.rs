@@ -6,6 +6,7 @@ mod model;
 mod parser;
 mod path;
 mod provenance;
+pub(crate) mod render;
 mod resolver;
 mod tree;
 mod validation;
@@ -19,10 +20,9 @@ pub use assets::{
 pub use identity::{
     AssetBindingTarget, AssetDigest, DigestKind, DigestParseError, FrontendBundleDigest,
     PostContentDigest, PostRendererIdentity, PostRendererVersion, PostRevisionDigest,
-    PostRevisionInput, PreInjectionRenderedArticle, PreInjectionSiteShell, PublishedPostRevision,
-    RevisionIdentityError, SanitizerVersion, SiteShellRendererIdentity, SiteShellRendererVersion,
-    SiteSnapshotDigest, SiteSnapshotInput, digest_asset, digest_frontend_bundle,
-    digest_post_content, digest_post_revision, digest_site_snapshot,
+    PreInjectionSiteShell, PublishedPostRevision, RevisionIdentityError, SanitizerVersion,
+    SiteShellRendererIdentity, SiteShellRendererVersion, SiteSnapshotDigest, SiteSnapshotInput,
+    digest_asset, digest_frontend_bundle, digest_post_content, digest_site_snapshot,
 };
 
 pub use model::{
@@ -47,7 +47,7 @@ pub use resolver::{
     AssetResolutionErrors, AssetResolutionWarning, AssetResolutionWarningCode,
     AssetResolutionWarnings, ResolveContentAssetsError, ResolvedContentAssets, ResolvedLocalAsset,
     ResolvedLocalAssetLookupError, ResolvedLocalAssetStore, ResolvedPostAssetLookupError,
-    ResolvedPostAssetSet, resolve_content_assets,
+    ResolvedPostAssetSet, ResolvedSiteAssetLookupError, resolve_content_assets,
 };
 pub use tree::{
     ContentByteCount, ContentDepthLimit, ContentEntryLimit, ContentFileByteLimit,

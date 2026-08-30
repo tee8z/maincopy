@@ -62,6 +62,18 @@ impl ResolvedContentAssets {
         &self.site
     }
 
+    pub fn site_assets_for(
+        &self,
+        publication: &super::PublicationSettings,
+    ) -> Result<&ResolvedSiteAssets, ResolvedSiteAssetLookupError> {
+        if self.site.source_binding()
+            != &super::identity::bind_publication_asset_source(publication)
+        {
+            return Err(ResolvedSiteAssetLookupError::SourceBindingMismatch);
+        }
+        Ok(&self.site)
+    }
+
     pub fn posts(&self) -> &[ResolvedPostAssetSet] {
         &self.posts
     }
@@ -92,6 +104,13 @@ impl ResolvedContentAssets {
         }
         Ok(&entry.assets)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedSiteAssetLookupError {
+    #[error("the publication source does not match the resolved site asset capability")]
+    SourceBindingMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,6 +182,10 @@ impl ResolvedLocalAssetStore {
 
     pub fn get(&self, path: &LogicalAssetPath) -> Option<&ResolvedLocalAsset> {
         self.assets.get(path)
+    }
+
+    pub(super) fn paths(&self) -> impl ExactSizeIterator<Item = &LogicalAssetPath> {
+        self.assets.keys()
     }
 
     pub fn resolve(
@@ -1534,6 +1557,10 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(ResolvedPostAssetLookupError::SourceBindingMismatch).unwrap(),
+            "source_binding_mismatch"
+        );
+        assert_eq!(
+            serde_json::to_value(ResolvedSiteAssetLookupError::SourceBindingMismatch).unwrap(),
             "source_binding_mismatch"
         );
         assert_eq!(

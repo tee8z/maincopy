@@ -184,16 +184,9 @@ pub struct PostRendererIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PreInjectionRenderedArticle<'bytes>(&'bytes [u8]);
+struct PreInjectionRenderedArticle<'bytes>(&'bytes [u8]);
 
 impl<'bytes> PreInjectionRenderedArticle<'bytes> {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the post renderer becomes the sole constructor in WP 1.4"
-        )
-    )]
     pub(super) const fn new(bytes: &'bytes [u8]) -> Self {
         Self(bytes)
     }
@@ -204,7 +197,7 @@ impl<'bytes> PreInjectionRenderedArticle<'bytes> {
 }
 
 impl PostRendererIdentity {
-    pub const fn new(
+    pub(super) const fn new(
         settings: RendererSettings,
         renderer: PostRendererVersion,
         sanitizer: SanitizerVersion,
@@ -214,6 +207,18 @@ impl PostRendererIdentity {
             renderer,
             sanitizer,
         }
+    }
+
+    pub const fn settings(&self) -> RendererSettings {
+        self.settings
+    }
+
+    pub const fn renderer_version(&self) -> PostRendererVersion {
+        self.renderer
+    }
+
+    pub const fn sanitizer_version(&self) -> SanitizerVersion {
+        self.sanitizer
     }
 }
 
@@ -256,7 +261,7 @@ impl SiteShellRendererIdentity {
 }
 
 /// Every component is required, even when an asset collection is empty.
-pub struct PostRevisionInput<'input> {
+struct PostRevisionInput<'input> {
     document: &'input PostDocument,
     assets: &'input ResolvedPostAssets,
     site_assets: Option<&'input ResolvedSiteAssets>,
@@ -267,7 +272,7 @@ pub struct PostRevisionInput<'input> {
 }
 
 impl<'input> PostRevisionInput<'input> {
-    pub const fn new(
+    const fn new(
         document: &'input PostDocument,
         assets: &'input ResolvedPostAssets,
         site_assets: &'input ResolvedSiteAssets,
@@ -473,7 +478,7 @@ pub fn digest_frontend_bundle(bytes: &[u8]) -> FrontendBundleDigest {
     FrontendBundleDigest(*transcript.finish().as_bytes())
 }
 
-pub fn digest_post_revision(
+fn digest_post_revision(
     input: &PostRevisionInput<'_>,
 ) -> Result<PostRevisionDigest, RevisionIdentityError> {
     let referenced_assets = sorted_asset_references(input.assets.references())?;
@@ -499,6 +504,31 @@ pub fn digest_post_revision(
     encode_generated_assets(&mut transcript, &generated_assets);
     encode_distribution(&mut transcript, input.effective_distribution);
     Ok(PostRevisionDigest::from_hash(transcript.finish()))
+}
+
+/// Close the post-rendering capability into its public revision identity.
+///
+/// This is the only production seam that can construct the pre-injection
+/// wrapper. The content compiler's renderer is the sole production caller;
+/// public callers cannot compose a revision from arbitrary bytes.
+pub(super) fn finalize_post_revision(
+    document: &PostDocument,
+    assets: &ResolvedPostAssets,
+    site_assets: &ResolvedSiteAssets,
+    renderer: &PostRendererIdentity,
+    pre_injection_article: &[u8],
+    generated_assets: &[DigestedAsset],
+    effective_distribution: &DistributionSettings,
+) -> Result<PostRevisionDigest, RevisionIdentityError> {
+    digest_post_revision(&PostRevisionInput::new(
+        document,
+        assets,
+        site_assets,
+        renderer,
+        PreInjectionRenderedArticle::new(pre_injection_article),
+        generated_assets,
+        effective_distribution,
+    ))
 }
 
 pub fn digest_site_snapshot(
