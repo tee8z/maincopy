@@ -65,6 +65,11 @@ impl ContentCatalog {
             .get(&(post_id.clone(), revision.clone()))
             .map(Arc::as_ref)
     }
+
+    /// Returns the exact rendered revisions retained by this catalog.
+    pub(crate) fn rendered_posts(&self) -> impl ExactSizeIterator<Item = &RenderedPost> {
+        self.revisions.values().map(Arc::as_ref)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

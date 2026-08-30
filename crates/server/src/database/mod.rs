@@ -40,6 +40,7 @@ pub(crate) struct BootstrappedDatabase {
 }
 
 impl BootstrappedDatabase {
+    #[cfg(test)]
     pub(crate) async fn close(self) -> Result<(), sqlx::Error> {
         let Self {
             _writer,

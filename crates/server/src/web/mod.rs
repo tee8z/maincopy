@@ -6,9 +6,11 @@ use std::sync::{
 use axum::Router;
 
 mod health;
+mod server;
 
 use crate::{domain::publication::web::router as publication_router, render::SiteSnapshotReader};
 use health::router as health_router;
+pub(crate) use server::PublicServer;
 
 /// Shared readiness state for the public health endpoint.
 ///

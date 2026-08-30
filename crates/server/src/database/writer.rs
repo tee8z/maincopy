@@ -16,7 +16,8 @@ use super::{
 #[cfg(test)]
 use crate::domain::publication::store::{CommandIdempotencyKey, CreateTargetJob};
 use crate::domain::publication::store::{
-    PublicationStore, TargetJobMutationError, create as create_target_job,
+    PublicationStore, StartupSnapshotMutationError, TargetJobMutationError,
+    create as create_target_job, install_startup,
 };
 
 pub(crate) struct DatabaseWriter {
@@ -127,6 +128,52 @@ impl DatabaseWriter {
         }
 
         match mutation {
+            Mutation::InstallStartupSnapshot {
+                command,
+                respond_to,
+            } => {
+                let mut transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .map_err(|source| DatabaseWriterError::Begin { source })?;
+                match install_startup(&mut transaction, command).await {
+                    Ok(head) => match transaction.commit().await {
+                        Ok(()) => {
+                            let _ = respond_to.send(Ok(head));
+                            Ok(())
+                        }
+                        Err(source) => {
+                            let _ = respond_to.send(Err(DatabaseCommandError::OutcomeUnknown));
+                            Err(DatabaseWriterError::Commit { source })
+                        }
+                    },
+                    Err(StartupSnapshotMutationError::Command(error)) => {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(|source| DatabaseWriterError::Rollback { source })?;
+                        let _ = respond_to.send(Err(error));
+                        Ok(())
+                    }
+                    Err(StartupSnapshotMutationError::Operation(source)) => {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(|source| DatabaseWriterError::Rollback { source })?;
+                        Err(DatabaseWriterError::Operation { source })
+                    }
+                    Err(StartupSnapshotMutationError::CorruptStoredState) => {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(|source| DatabaseWriterError::Rollback { source })?;
+                        Err(DatabaseWriterError::CorruptData {
+                            entity: "startup publication state",
+                        })
+                    }
+                }
+            }
             Mutation::CreateTargetJob {
                 command,
                 respond_to,
@@ -275,11 +322,14 @@ mod tests {
     use super::*;
     use crate::{
         config::{DatabaseBusyTimeout, DatabaseReadPoolSize, DatabaseWriterQueueCapacity},
-        content::{PostId, PostRevisionDigest},
+        content::{DraftStatus, PostId, PostRevisionDigest, PostSlug, SiteSnapshotDigest},
         database,
         domain::{
             distribution::{DistributionTarget, TargetPayload},
-            publication::{TargetJob, TargetJobStatus},
+            publication::{
+                TargetJob, TargetJobStatus,
+                store::{InstallStartupSnapshot, ObservedPostRevision, SiteHead},
+            },
         },
     };
 
@@ -335,6 +385,13 @@ mod tests {
         (root, path, database)
     }
 
+    async fn empty_database() -> (tempfile::TempDir, PathBuf, BootstrappedDatabase) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state/maincopy.db");
+        let database = database::bootstrap(configuration(&path)).await.unwrap();
+        (root, path, database)
+    }
+
     fn uuid(value: &str) -> Uuid {
         Uuid::parse_str(value).unwrap()
     }
@@ -367,6 +424,28 @@ mod tests {
                 TargetPayload::new(body).unwrap(),
             ),
         }
+    }
+
+    fn startup_command(
+        expected: Option<SiteHead>,
+        candidate: SiteSnapshotDigest,
+    ) -> InstallStartupSnapshot {
+        InstallStartupSnapshot {
+            expected,
+            candidate_digest: candidate,
+            activated_at: OffsetDateTime::from_unix_timestamp(10).unwrap(),
+            source_commit: None,
+            posts: vec![ObservedPostRevision {
+                stable_post_id: PostId::parse(POST_ID).unwrap(),
+                revision_digest: PostRevisionDigest::from_bytes(REVISION_BYTES),
+                publication_status: DraftStatus::Publishable,
+                slug: PostSlug::parse("first").unwrap(),
+            }],
+        }
+    }
+
+    fn site_digest(byte: u8) -> SiteSnapshotDigest {
+        SiteSnapshotDigest::from_bytes([byte; 32])
     }
 
     async fn stop_writer(
@@ -407,6 +486,87 @@ mod tests {
             .fetch_one(&mut database._writer)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn startup_snapshot_install_is_idempotent_cas_guarded_and_reuses_history() {
+        let (_root, path, database) = empty_database().await;
+        let (store, writer) = database.into_store(4);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(writer.run(shutdown.clone()));
+
+        let first = store
+            .publications
+            .install_startup_snapshot(startup_command(None, site_digest(0x11)))
+            .await
+            .unwrap();
+        assert_eq!(first.version, 1);
+        assert_eq!(
+            store
+                .publications
+                .startup_snapshot_state()
+                .await
+                .unwrap()
+                .site,
+            Some(first.clone())
+        );
+
+        let retry = store
+            .publications
+            .install_startup_snapshot(startup_command(None, first.digest.clone()))
+            .await
+            .unwrap();
+        assert_eq!(retry, first);
+
+        let second = store
+            .publications
+            .install_startup_snapshot(startup_command(Some(first.clone()), site_digest(0x22)))
+            .await
+            .unwrap();
+        assert_eq!(second.version, 2);
+
+        let restored = store
+            .publications
+            .install_startup_snapshot(startup_command(Some(second.clone()), first.digest.clone()))
+            .await
+            .unwrap();
+        assert_eq!(restored.version, 3);
+        assert_eq!(restored.digest, first.digest);
+
+        let stale = store
+            .publications
+            .install_startup_snapshot(startup_command(Some(first), site_digest(0x33)))
+            .await;
+        assert_eq!(
+            stale,
+            Err(DatabaseMutationError::Command(
+                DatabaseCommandError::Rejected
+            ))
+        );
+        assert_eq!(
+            store
+                .publications
+                .startup_snapshot_state()
+                .await
+                .unwrap()
+                .site,
+            Some(restored)
+        );
+
+        stop_writer(shutdown, task).await;
+        drop(store);
+        let mut reopened = database::bootstrap(configuration(&path)).await.unwrap();
+        let site_revisions: i64 = sqlx::query_scalar("SELECT count(*) FROM site_revisions")
+            .fetch_one(&mut reopened._writer)
+            .await
+            .unwrap();
+        let post_revisions: i64 = sqlx::query_scalar("SELECT count(*) FROM post_revisions")
+            .fetch_one(&mut reopened._writer)
+            .await
+            .unwrap();
+        assert_eq!(site_revisions, 2);
+        assert_eq!(post_revisions, 1);
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]

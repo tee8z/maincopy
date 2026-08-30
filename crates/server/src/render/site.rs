@@ -48,13 +48,6 @@ impl PublicLedgerProjection {
         self.entries.is_empty()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the SQLite projection adapter lands after the DB-neutral snapshot layer"
-        )
-    )]
     pub(crate) fn try_from_exact_entries(
         entries: impl IntoIterator<Item = PublishedPostRevision>,
     ) -> Result<Self, PublicLedgerProjectionError> {

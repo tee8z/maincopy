@@ -3,10 +3,12 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use clap::{Parser, error::ErrorKind};
+use time::OffsetDateTime;
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -16,14 +18,23 @@ use crate::{
     cli::ServerArguments,
     config::{HostConfiguration, HostConfigurationLoader, tip_provider_required},
     content::{
-        ContentTreeLimits, ContentValidationErrors, DiscoveredContentTree, ValidatedContent,
-        discover_content_tree,
+        ContentTreeLimits, ContentValidationErrors, DiscoveredContentTree, SourceCommit,
+        SourceCommitDiscovery, ValidatedContent, discover_content_tree, discover_source_commit,
+        resolve_content_assets,
     },
-    database::{self, BootstrappedDatabase, DatabaseStore},
-    error::{ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal},
+    database::{self, DatabaseStore},
+    domain::publication::store::{InstallStartupSnapshot, ObservedPostRevision},
+    error::{
+        ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal, StartupStage,
+    },
+    frontend_assets::FrontendAssetManifest,
     observability::{initialize_logging, task_span},
     process_lock::{ProcessLock, ProcessLockError},
-    web::Readiness,
+    render::{
+        ContentCatalog, SiteSnapshotReader, build_site_snapshot, compile_content_catalog,
+        render_site_shell,
+    },
+    web::{PublicServer, PublicState, Readiness},
 };
 
 type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), ApplicationError>> + Send>>;
@@ -40,6 +51,8 @@ pub(crate) struct Application {
     _startup: StartupConfiguration,
     _database: DatabaseStore,
     runtime: ApplicationRuntime,
+    #[cfg(test)]
+    public_addr: std::net::SocketAddr,
 }
 
 struct ApplicationRuntime {
@@ -56,6 +69,18 @@ struct StartupConfiguration {
     _host: HostConfiguration,
     _content_tree: DiscoveredContentTree,
     _validated_content: ValidatedContent,
+}
+
+struct CompiledStartupContent {
+    catalog: Arc<ContentCatalog>,
+    observed_posts: Vec<ObservedPostRevision>,
+    source_commit: Option<SourceCommit>,
+}
+
+struct ServingState {
+    readiness: Readiness,
+    public_server: PublicServer,
+    admin_socket: AdminSocket,
 }
 
 impl StartupConfiguration {
@@ -153,52 +178,30 @@ impl Application {
         let cancellation = CancellationToken::new();
         let host = startup._host.view();
         let database_queue_capacity = host.database.writer_queue_capacity.get();
+        let frontend = crate::frontend_assets::embedded_manifest();
+        frontend.validate().map_err(|error| {
+            startup_failure(
+                StartupStage::FrontendAssets,
+                "validate embedded frontend assets",
+                error,
+            )
+        })?;
+        let shutdown = install_termination_signal()?;
+        let compiled = compile_startup_content(&startup, host.content_root)?;
+
         let database = match database::bootstrap(host.database).await {
             Ok(database) => database,
             Err(database::DatabaseStartupError::AlreadyOwned) => {
                 return Err(ProcessError::AlreadyRunning);
             }
             Err(error) => {
-                tracing::error!(error = %error, "database bootstrap failed");
-                return Err(ApplicationError::Startup {
-                    stage: crate::error::StartupStage::Database,
-                }
-                .into());
+                return Err(startup_failure(
+                    StartupStage::Database,
+                    "bootstrap the database",
+                    error,
+                ));
             }
         };
-        let shutdown = match crate::frontend_assets::embedded_manifest()
-            .validate()
-            .map_err(|_| ApplicationError::Startup {
-                stage: crate::error::StartupStage::FrontendAssets,
-            })
-            .and_then(|()| install_termination_signal())
-        {
-            Ok(shutdown) => shutdown,
-            Err(error) => {
-                return Err(close_database_after_startup_failure(database, error.into()).await);
-            }
-        };
-        let admin_socket = match AdminSocket::bind(host.admin_socket) {
-            Ok(admin_socket) => admin_socket,
-            Err(error) => {
-                let process_error = if error.is_conflict() {
-                    ProcessError::AlreadyRunning
-                } else {
-                    ApplicationError::Startup {
-                        stage: crate::error::StartupStage::Listeners,
-                    }
-                    .into()
-                };
-                return Err(close_database_after_startup_failure(database, process_error).await);
-            }
-        };
-        let admin_cancellation = cancellation.clone();
-        let admin_task = CriticalTask::new(CriticalTaskName::AdminServer, async move {
-            admin_socket
-                .serve(admin_cancellation)
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
         let (database_store, database_writer) = database.into_store(database_queue_capacity);
         let database_shutdown = CancellationToken::new();
         let writer_shutdown = database_shutdown.clone();
@@ -208,18 +211,63 @@ impl Application {
                 .await
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
+        let database_task = spawn_critical_task(database_task);
+
+        let serving_state = match prepare_serving_state(
+            &database_store,
+            compiled,
+            frontend,
+            host.public_bind,
+            host.admin_socket,
+        )
+        .await
+        {
+            Ok(setup) => setup,
+            Err(error) => {
+                return Err(close_writer_after_startup_failure(
+                    database_store,
+                    database_shutdown,
+                    database_task,
+                    error,
+                )
+                .await);
+            }
+        };
+        let ServingState {
+            readiness,
+            public_server,
+            admin_socket,
+        } = serving_state;
+        #[cfg(test)]
+        let public_addr = public_server.local_addr;
+        let public_cancellation = cancellation.clone();
+        let public_task = CriticalTask::new(CriticalTaskName::PublicServer, async move {
+            public_server
+                .serve(public_cancellation)
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
+        let admin_cancellation = cancellation.clone();
+        let admin_task = CriticalTask::new(CriticalTaskName::AdminServer, async move {
+            admin_socket
+                .serve(admin_cancellation)
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
 
         Ok(Self {
             _startup: startup,
             _database: database_store,
             runtime: ApplicationRuntime::with_database_writer(
-                Readiness::default(),
+                readiness,
                 cancellation,
                 database_shutdown,
                 shutdown,
-                vec![admin_task],
+                vec![public_task, admin_task],
                 database_task,
             ),
+            #[cfg(test)]
+            public_addr,
         })
     }
 
@@ -228,6 +276,8 @@ impl Application {
             _startup: startup,
             _database: database,
             runtime,
+            #[cfg(test)]
+                public_addr: _,
         } = self;
         let runtime_result = runtime.run_until_stop().await;
         drop(database);
@@ -236,11 +286,128 @@ impl Application {
     }
 }
 
-async fn close_database_after_startup_failure(
-    database: BootstrappedDatabase,
+fn compile_startup_content(
+    startup: &StartupConfiguration,
+    content_root: &Path,
+) -> Result<CompiledStartupContent, ProcessError> {
+    let resolved_assets =
+        resolve_content_assets(&startup._content_tree, &startup._validated_content).map_err(
+            |error| startup_failure(StartupStage::Content, "resolve content assets", error),
+        )?;
+    let catalog = Arc::new(
+        compile_content_catalog(&startup._validated_content, &resolved_assets).map_err(
+            |error| startup_failure(StartupStage::Content, "compile the content catalog", error),
+        )?,
+    );
+    let observed_posts = catalog
+        .rendered_posts()
+        .map(|post| ObservedPostRevision {
+            stable_post_id: post.document.metadata.id.clone(),
+            revision_digest: post.revision.clone(),
+            publication_status: post.document.metadata.draft,
+            slug: post.document.metadata.slug.clone(),
+        })
+        .collect();
+    let source_commit = match discover_source_commit(content_root) {
+        SourceCommitDiscovery::Discovered(commit) => Some(commit),
+        SourceCommitDiscovery::Unavailable(reason) => {
+            tracing::warn!(?reason, "content source commit is unavailable");
+            None
+        }
+    };
+    Ok(CompiledStartupContent {
+        catalog,
+        observed_posts,
+        source_commit,
+    })
+}
+
+async fn prepare_serving_state(
+    database: &DatabaseStore,
+    compiled: CompiledStartupContent,
+    frontend: &'static FrontendAssetManifest,
+    public_bind: std::net::SocketAddr,
+    admin_socket: &Path,
+) -> Result<ServingState, ProcessError> {
+    let startup_state = database
+        .publications
+        .startup_snapshot_state()
+        .await
+        .map_err(|error| {
+            startup_failure(
+                StartupStage::Database,
+                "load the startup publication ledger",
+                error,
+            )
+        })?;
+    let shell = render_site_shell(compiled.catalog, frontend, &startup_state.ledger)
+        .map_err(|error| startup_failure(StartupStage::Content, "render the site shell", error))?;
+    let snapshot = build_site_snapshot(shell, &startup_state.ledger).map_err(|error| {
+        startup_failure(StartupStage::Content, "build the site snapshot", error)
+    })?;
+    database
+        .publications
+        .install_startup_snapshot(InstallStartupSnapshot {
+            expected: startup_state.site,
+            candidate_digest: snapshot.digest.clone(),
+            activated_at: OffsetDateTime::now_utc(),
+            source_commit: compiled.source_commit,
+            posts: compiled.observed_posts,
+        })
+        .await
+        .map_err(|error| {
+            startup_failure(
+                StartupStage::Database,
+                "install the startup site snapshot",
+                error,
+            )
+        })?;
+
+    let readiness = Readiness::default();
+    let public_server = PublicServer::bind(
+        public_bind,
+        PublicState {
+            snapshots: SiteSnapshotReader::from_snapshot(snapshot),
+            readiness: readiness.clone(),
+        },
+    )
+    .await
+    .map_err(|error| startup_failure(StartupStage::Listeners, "bind the public listener", error))?;
+    tracing::info!(bind = %public_server.local_addr, "public listener bound");
+    let admin_socket = AdminSocket::bind(admin_socket).map_err(|error| {
+        if error.is_conflict() {
+            ProcessError::AlreadyRunning
+        } else {
+            startup_failure(StartupStage::Listeners, "bind the admin listener", error)
+        }
+    })?;
+    Ok(ServingState {
+        readiness,
+        public_server,
+        admin_socket,
+    })
+}
+
+fn startup_failure(
+    stage: StartupStage,
+    operation: &'static str,
+    error: impl std::fmt::Display,
+) -> ProcessError {
+    tracing::error!(%stage, operation, error = %error, "startup operation failed");
+    ApplicationError::Startup { stage }.into()
+}
+
+async fn close_writer_after_startup_failure(
+    database: DatabaseStore,
+    shutdown: CancellationToken,
+    writer: JoinHandle<(CriticalTaskName, CriticalTaskCompletion)>,
     process_error: ProcessError,
 ) -> ProcessError {
-    let _ = database.close().await;
+    drop(database);
+    shutdown.cancel();
+    if let Some(error) = drained_task_failure(writer.await) {
+        tracing::error!(error = %error, "database writer failed during startup cleanup");
+    }
     process_error
 }
 
@@ -273,12 +440,11 @@ impl ApplicationRuntime {
         database_shutdown: CancellationToken,
         shutdown: ShutdownFuture,
         critical_tasks: Vec<CriticalTask>,
-        database_writer: CriticalTask,
+        database_writer: JoinHandle<(CriticalTaskName, CriticalTaskCompletion)>,
     ) -> Self {
         let mut runtime = Self::with_parts(readiness, cancellation, shutdown, critical_tasks);
-        let span = task_span(database_writer.name);
         runtime.database_shutdown = database_shutdown;
-        runtime.database_writer = Some(tokio::spawn(database_writer.instrument(span)));
+        runtime.database_writer = Some(database_writer);
         runtime
     }
 
@@ -312,6 +478,13 @@ impl ApplicationRuntime {
             None => Ok(()),
         }
     }
+}
+
+fn spawn_critical_task(
+    task: CriticalTask,
+) -> JoinHandle<(CriticalTaskName, CriticalTaskCompletion)> {
+    let span = task_span(task.name);
+    tokio::spawn(task.instrument(span))
 }
 
 fn first_shutdown_failure(failures: [Option<ApplicationError>; 3]) -> Option<ApplicationError> {
@@ -560,6 +733,8 @@ name = \"Startup Tester\"\n";
             fixture_root.join("state").into_os_string(),
             OsString::from("--runtime-root"),
             fixture_root.join("run").into_os_string(),
+            OsString::from("--public-bind"),
+            OsString::from("127.0.0.1:0"),
         ];
         for (flag, value) in overrides {
             command.push(OsString::from(flag));
@@ -726,7 +901,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
-    async fn application_build_binds_the_admin_socket_and_registers_its_task() {
+    async fn application_build_serves_the_initial_site_and_binds_the_admin_socket() {
         let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
@@ -735,13 +910,27 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let application = Application::build(startup).await.unwrap();
 
         assert!(socket_path.exists());
-        assert_eq!(application.runtime.critical_tasks.len(), 1);
+        assert_eq!(application.runtime.critical_tasks.len(), 2);
         assert!(application.runtime.database_writer.is_some());
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{}/", application.public_addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let html = response.text().await.unwrap();
+        assert!(html.contains("Pinned startup source"));
+        assert!(html.contains("No posts have been published yet."));
 
         let Application {
             _startup: startup,
             _database: database,
             mut runtime,
+            public_addr: _,
         } = application;
         runtime.cancellation.cancel();
         assert!(
@@ -875,7 +1064,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                 Ok(())
             }),
             Vec::new(),
-            writer,
+            spawn_critical_task(writer),
         );
 
         let running = tokio::spawn(application.run_until_stop());
@@ -924,7 +1113,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                 Ok(())
             }),
             vec![producer],
-            writer,
+            spawn_critical_task(writer),
         );
 
         let running = tokio::spawn(application.run_until_stop());
@@ -1019,7 +1208,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             database_shutdown.clone(),
             Box::pin(std::future::pending()),
             vec![companion],
-            writer,
+            spawn_critical_task(writer),
         );
 
         let result = application.run_until_stop().await;

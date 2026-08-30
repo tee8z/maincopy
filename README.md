@@ -98,6 +98,11 @@ The private API controls when a pinned article revision first becomes public.
 A content reload cannot expose an unpublished or scheduled post. Distribution
 jobs become eligible only after the canonical post is active.
 
+At startup, `maincopyd` compiles the pinned content tree and loads the durable
+`Published` projection. It installs that immutable snapshot before it binds the
+public listener. A fresh database serves the configured site shell with no
+published posts.
+
 Each content compilation pins the configured root once. It loads only
 `publication.toml`, `posts/`, `drafts/`, and `assets/` through confined
 descriptor-relative lookups. Descendant links, special files, mount crossings,

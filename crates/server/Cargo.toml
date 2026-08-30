@@ -58,6 +58,7 @@ rustix = { workspace = true, features = ["fs", "std"] }
 [dev-dependencies]
 bitcoin.workspace = true
 lightningcss.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -1987,6 +1987,7 @@ dependencies = [
  "maincopy-shared",
  "maud",
  "pulldown-cmark",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",

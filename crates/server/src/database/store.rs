@@ -1,7 +1,10 @@
 use thiserror::Error;
 use tokio::sync::oneshot;
 
-use crate::domain::publication::store::{CreateTargetJob, CreateTargetJobResult, PublicationStore};
+use crate::domain::publication::store::{
+    CreateTargetJob, CreateTargetJobResult, InstallStartupSnapshot, InstallStartupSnapshotResult,
+    PublicationStore,
+};
 
 /// The server-facing database capability.
 ///
@@ -9,13 +12,6 @@ use crate::domain::publication::store::{CreateTargetJob, CreateTargetJobResult, 
 /// commands to the sole writer task. This type never exposes a SQLx connection.
 #[derive(Clone)]
 pub(crate) struct DatabaseStore {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "admin publication reads and mutations are the next API slice"
-        )
-    )]
     pub(crate) publications: PublicationStore,
 }
 
@@ -26,6 +22,10 @@ impl DatabaseStore {
 }
 
 pub(crate) enum Mutation {
+    InstallStartupSnapshot {
+        command: InstallStartupSnapshot,
+        respond_to: oneshot::Sender<InstallStartupSnapshotResult>,
+    },
     CreateTargetJob {
         command: CreateTargetJob,
         respond_to: oneshot::Sender<CreateTargetJobResult>,

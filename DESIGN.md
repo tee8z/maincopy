@@ -1833,9 +1833,15 @@ error. Payment reconciliation and update subscription are feature tasks. Their
 failure makes payment readiness fail and disables tip operations, but article
 routes stay ready.
 
-Before either listener binds, startup reconciles all durable `Applying` reload
-operations and all canonical `Activating` records. Public requests therefore
-never observe an unresolved recovery state after process start.
+Before either listener binds, startup checks all durable reload and canonical
+publication records. The current implementation rejects unresolved `Applying`
+and `Activating` records. WP1.5 and WP5.2 will replace this rejection with
+deterministic reconciliation.
+
+Startup builds the initial public snapshot from the exact durable `Published`
+projection. A fresh database produces an empty projection. Startup never
+publishes a post implicitly. The writer records each compiled post revision and
+installs the site head before either listener binds.
 
 Startup follows this order:
 
@@ -1850,10 +1856,9 @@ Startup follows this order:
 7. Apply embedded migrations. This step is a no-op for an accepted restore.
 8. Verify foreign keys, then open the query-only read pool.
 9. Spawn the writer task.
-10. Start the one snapshot-transition coordinator. Reconcile retained
-   `Applying` reloads and then claimed `Activating` publications in
-   deterministic ledger order. Any intermediate installs occur while listeners
-   are closed.
+10. Reject unresolved `Applying` reloads and `Activating` publications while
+    their recovery coordinators are unavailable. Later work packages reconcile
+    them in deterministic ledger order while listeners remain closed.
 11. Compile and install the canonical initial snapshot produced by that
    recovered ledger state.
 12. Build the configured `LightningProvider` and start its bounded `JoinSet`
