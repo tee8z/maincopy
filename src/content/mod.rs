@@ -6,13 +6,15 @@ mod model;
 mod parser;
 mod path;
 mod provenance;
+mod resolver;
 mod tree;
 mod validation;
 
 pub use assets::{
-    AssetRevisionReference, DigestedAsset, ExternalAssetOrigin, ExternalAssetOriginError,
-    ExternalAssetUrl, ExternalAssetUrlError, ResolvedPostAssets, ResolvedSiteAssets,
-    SnapshotAssetPath, SnapshotAssetPathError,
+    AssetRevisionReference, AuthoredMarkdownDestination, DigestedAsset, ExternalAssetOrigin,
+    ExternalAssetOriginError, ExternalAssetUrl, ExternalAssetUrlError, MarkdownDestinationKind,
+    MarkdownDestinationOrdinal, MarkdownSourceRange, ResolvedMarkdownDestination,
+    ResolvedPostAssets, ResolvedSiteAssets, SnapshotAssetPath, SnapshotAssetPathError,
 };
 pub use identity::{
     AssetBindingTarget, AssetDigest, DigestKind, DigestParseError, FrontendBundleDigest,
@@ -39,6 +41,13 @@ pub use path::{LogicalAssetPath, LogicalTreePathError};
 pub use provenance::{
     SourceCommit, SourceCommitAlgorithm, SourceCommitDiscovery, SourceCommitParseError,
     SourceCommitUnavailableReason, discover_source_commit,
+};
+pub use resolver::{
+    AllowedOriginOrdinal, AssetReferenceLocation, AssetResolutionCode, AssetResolutionError,
+    AssetResolutionErrors, AssetResolutionWarning, AssetResolutionWarningCode,
+    AssetResolutionWarnings, ResolveContentAssetsError, ResolvedContentAssets, ResolvedLocalAsset,
+    ResolvedLocalAssetLookupError, ResolvedLocalAssetStore, ResolvedPostAssetLookupError,
+    ResolvedPostAssetSet, resolve_content_assets,
 };
 pub use tree::{
     ContentByteCount, ContentDepthLimit, ContentEntryLimit, ContentFileByteLimit,

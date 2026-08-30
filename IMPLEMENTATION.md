@@ -173,12 +173,14 @@ for it.
 
 ```mermaid
 flowchart LR
-    S0[Slice 0: Foundation] --> S1[Slice 1: Content compiler]
+    S0[Slice 0: Foundation] --> S1F[Content compiler foundation]
     S0 --> S3[Slice 3: SQLite]
-    S1 --> S2[Slice 2: Canonical web]
+    S1F --> S2[Slice 2: Canonical web]
     S3 --> S2
-    S3 --> S4[Slice 4: Admin API]
-    S2 --> S5[Slice 5: Canonical publication and UI]
+    S2 --> RI[Reload integration WP1.5]
+    S3 --> RI
+    RI --> S4[Slice 4: Admin API]
+    RI --> S5[Slice 5: Canonical publication and UI]
     S4 --> S5
     S2 --> S6[Slice 6: Rendering]
     S2 --> S7[Slice 7: Lightning tips]
@@ -195,7 +197,8 @@ flowchart LR
     S9 --> S10
 ```
 
-Slices 1 and 3 can run in parallel after Slice 0.
+The content compiler foundation and SQLite core can run in parallel after
+Slice 0. WP1.5 runs after the canonical web and SQLite core.
 Rendering and Lightning tips can run in parallel after Slice 2.
 
 ## Review stacks
@@ -222,11 +225,12 @@ Slices 1 and 3 use separate stacks after Slice 0 merges.
 | Stack | Bottom-to-top PR layers | Prerequisite |
 | --- | --- | --- |
 | Foundation | 0.1 -> 0.2 -> 0.3 -> 0.4 | None |
-| Content compiler | 1.1 -> 1.2 -> 1.3 -> 1.4 -> 1.5 -> 1.6 | Slice 0 |
-| Canonical web | 2.1 -> 2.2 -> 2.3 -> 2.4 -> 2.5 | Slices 1 and 3 |
+| Content compiler | 1.1 -> 1.2 -> 1.3 -> 1.6 -> 1.4 | Slice 0 |
 | SQLite core | 3.1 -> 3.2 -> 3.3 -> 3.4 -> 3.5 | Slice 0 |
-| Admin API | 4.1 -> 4.2 -> 4.3 -> 4.4 | Slice 3 |
-| Canonical publication | 5.1 -> 5.2 -> 5.3 -> 5.4 -> 5.5 | Slices 2 and 4 |
+| Canonical web | 2.1 -> 2.2 -> 2.3 -> 2.4 -> 2.5 | Content compiler and SQLite core |
+| Reload coordination | 1.5 | Content compiler, SQLite core, and canonical web |
+| Admin API | 4.1 -> 4.2 -> 4.3 -> 4.4 | Reload coordination |
+| Canonical publication | 5.1 -> 5.2 -> 5.3 -> 5.4 -> 5.5 | Reload coordination and Slice 4 |
 | Rendering | 6.1 -> 6.2 -> 6.3 -> 6.4 | Slice 2 |
 | Lightning tips | 7.1 -> 7.2 -> 7.3 -> 7.4 | Slice 2 |
 | Newsletter capture | 8.1 -> 8.2 -> 8.3 -> 8.4 -> 8.5 | Slices 2, 3, and 4 |
@@ -261,8 +265,8 @@ Rust toolchain and the project license.
 | Revision digests | BLAKE3 | 1 |
 | Tree walking | Linux `rustix` `openat2` with strict resolve flags | 1 |
 | Asset URLs and origins | Select one standards-compliant URL parser | 0 and 1 |
-| Markdown | Select a CommonMark implementation through fixtures | 1 |
-| Snapshot activation | Select a lock-free or short-lock `Arc` swap | 1 |
+| Markdown | Pin `pulldown-cmark` 0.13.4 with only its `html` feature | 1 |
+| Snapshot activation | Pin `arc-swap` 1.9.2 without optional features | 2 |
 | HTTP service | Axum and Tower | 0 and 2 |
 | HTML templates | Maud | 2 |
 | Frontend asset build | A custom deterministic `build.rs` with reviewed CSS and JavaScript minifiers | 2 |
@@ -475,6 +479,14 @@ Tests:
 Compile Git content into a deterministic catalog and public `SiteSnapshot`.
 Filter public posts through explicit canonical publication state.
 
+The work-package numbers identify review units, not execution order. Implement
+the resolver core from WP1.6 after WP1.3 and before WP1.4. WP1.4 must consume
+real resolver output for every final post revision.
+
+WP1.5 is a cross-slice integration package. Implement it after SQLite and the
+production site shell. The compiler foundation can support Slice 2 before
+WP1.5 completes.
+
 ### Work package 1.1: Publication and post domain model
 
 Implement the TOML frontmatter contract from the design.
@@ -674,6 +686,11 @@ rendered article and site shell with separate pre-injection wrapper types whose
 constructors remain content-internal until WP1.4 gives ownership to the
 renderer.
 
+Also bind post and site resolver capabilities to the normalized effective
+allowlist. `PostRevisionInput::new` requires both capabilities and rejects a
+policy mismatch. Keep that private policy binding outside the post transcript,
+so a policy-only change does not change the historical post digest.
+
 Deliverables:
 
 - A canonical binary transcript that is independent from presentation
@@ -717,7 +734,7 @@ Tests:
 - Preserve the jobs state-machine and idempotency-key wire contracts while
   replacing unchecked identity strings.
 
-### Work package 1.4: Baseline Markdown and snapshot compiler
+### Work package 1.4: Baseline Markdown renderer and immutable catalog
 
 Add the safe baseline renderer needed by the canonical web slice.
 
@@ -726,18 +743,40 @@ Deliverables:
 - CommonMark parsing with raw HTML disabled.
 - Escaped code and ASCII blocks without syntax highlighting.
 - A typed placeholder for Mermaid blocks before Slice 6.
-- A complete immutable content catalog with posts and rendered assets.
-- A public snapshot builder that accepts explicit publication ledger state.
-- Atomic public snapshot activation through an `Arc`-owned handle.
+- `pulldown-cmark` `Options::empty()` with no CommonMark extensions.
+- Escaped block and inline raw-HTML events.
+- Rebuilt and validated link and image events.
+- Absolute HTTPS and same-site root-relative navigation only.
+- Exact lowercase `mermaid` fence recognition with no trailing info tokens.
+- No V1 heading anchors or authored code-fence classes.
+- Inclusive limits of 32 MiB rendered HTML, 256 KiB per Mermaid block, and 64
+  Mermaid blocks per post.
+- One opaque render product that binds the source, resolved assets, renderer
+  identity, rendered bytes, and generated outputs.
+- A complete immutable content catalog with resolved posts and rendered assets.
+- A typed snapshot-builder input contract that requires explicit publication
+  ledger state and one real rendered-site-shell capability.
+
+WP2.1 creates the production Maud shell capability and frontend bundle
+identity. It performs the first production snapshot build and activation.
+WP1.4 must not create a fake shell or an empty frontend identity.
 
 Tests:
 
-- Verify that handlers can consume the snapshot without source files.
 - Verify that raw HTML cannot enter rendered article HTML.
-- Verify that a compile error leaves the active snapshot unchanged.
-- Verify that draft content and its private assets stay unreachable.
-- Verify that valid unpublished content stays outside public indexes.
-- Take `published_at` only from injected canonical publication state.
+- Escape block HTML, inline HTML, comments, style elements, script elements,
+  and SVG text.
+- Reject unsafe, protocol-relative, credential-bearing, control-containing,
+  backslash-containing, and traversal-like destinations.
+- Produce identical escaped output for plain, `text`, `ascii`, and unknown code
+  fence labels.
+- Enforce each renderer limit at its boundary and one unit past it.
+- Lock exact HTML goldens and repeated-build byte equality.
+- Reject every Markdown image or file destination that has no matching
+  resolver-approved occurrence.
+- Reject a render product that belongs to different source or asset inputs.
+- Drop the source tree after compilation and retain a usable catalog.
+- Require both `PostId` and `PostRevisionDigest` for catalog lookup.
 
 ### Work package 1.5: Reload and publication filtering
 
@@ -746,14 +785,14 @@ Implement explicit reload coordination without first-publication side effects.
 Deliverables:
 
 - A reload coordinator invoked only by the admin operation after startup.
-- One snapshot-transition coordinator shared by published-revision reloads and
-  first-publication activation. It is the only owner of atomic snapshot swaps.
+- One snapshot-transition primitive that owns atomic snapshot swaps. The reload
+  coordinator uses it here; WP5.2 extends the same primitive with
+  first-publication activation.
 - One operation ID shared by requests coalesced into the same reload.
 - No implicit file watcher.
 - Serialized candidate compilations.
 - Coalescing for repeated reload requests.
-- A published-revision reload view that starts from SQLite `Published` records;
-  first-publication activation uses the separate claimed-snapshot workflow.
+- A published-revision reload view that starts from SQLite `Published` records.
 - A retained revision catalog for scheduled pinned revisions.
 - Published-post revision updates after a successful reload.
 - A typed `ReloadState` with durable `Applying`, `Applied`, and `Failed`
@@ -763,6 +802,11 @@ Deliverables:
 - Candidate-input retention until the operation reaches a terminal state.
 - One complete snapshot swap followed by one writer transaction that advances
   current digests and commits `Applied`.
+- Initial public-snapshot construction from the canonical ledger.
+- Reconciliation of every `Applying` reload before listener binding.
+- Deterministic recovery of retained `Applying` candidates followed by one
+  final canonical snapshot. WP5.2 extends this startup sequence after the
+  durable activation workflow exists.
 - Preservation of the original SQLite `published_at` on an update.
 - Rejection when a published post changes to `draft = true`.
 - Readiness state for initial and later compilation.
@@ -790,10 +834,14 @@ Failure tests:
 
 Add one typed asset-reference model for site and post content.
 
+Implement the resolver core before WP1.4. CSP generation, HTTP asset serving,
+and other web integration remain in their later work packages.
+
 Deliverables:
 
 - Publication configuration for exact allowlisted HTTPS CDN origins.
 - A typed local-path or external-URL choice for each asset reference.
+- A private policy binding shared by site and post resolver capabilities.
 - Site favicon, image, and downloadable-file references.
 - Post image and downloadable-file references.
 - Markdown image and file links resolved through the same validator.
@@ -815,7 +863,8 @@ Failure tests:
 - Change local favicon bytes at the same path and require a new site digest and
   immutable URL.
 - Accept an external asset from an exact allowlisted HTTPS origin.
-- Reject HTTP, user information, invalid ports, and malformed URLs.
+- Reject HTTP, user information, invalid ports, raw controls, backslashes, and
+  malformed URLs.
 - Reject URL fragments.
 - Reject a sibling subdomain that is not explicitly allowlisted.
 - Reject an external origin that differs only after normalization.
@@ -824,8 +873,19 @@ Failure tests:
 - Change local bytes and verify a new revision digest.
 - Change an external URL and verify a new post revision digest.
 - Change the allowlist and verify a new site snapshot digest.
+- Revoke an allowed origin and reject a post capability from the prior policy
+  during public snapshot construction.
 
-### Slice 1 exit gate
+### Content compiler foundation gate
+
+- The compiler aggregates stable and actionable validation errors.
+- All post revision digests are deterministic.
+- The immutable catalog owns every rendered post and required local asset byte.
+- Local and allowlisted external assets use one validation model.
+- No production code can construct a final snapshot without a rendered site
+  shell and explicit publication ledger state.
+
+### Content and reload integration gate
 
 - The compiler aggregates stable and actionable validation errors.
 - All snapshot and revision digests are deterministic.
@@ -876,8 +936,16 @@ Deliverables:
   types, or cache policy from raw strings.
 - Embedded bundle bytes and exact manifest lookup through the application
   asset handler.
+- One opaque rendered-site-shell capability bound to publication settings,
+  resolved site assets, frontend identity, and the selected public ledger.
 - A `FrontendBundleDigest` included in `SiteShellRendererIdentity` and the
   `SiteSnapshot` digest inputs.
+- A `SiteSnapshotBuilder` that accepts only the opaque shell capability and an
+  explicit publication-ledger projection.
+- Complete route, chronology, tag, and public-asset indexes in one immutable
+  `SiteSnapshot`.
+- One `Arc<ArcSwap<SiteSnapshot>>` with separate reader and activation
+  capabilities. Public handlers receive only the reader capability.
 - Canonical URLs from validated publication configuration.
 - Canonical `published_at` values supplied by SQLite activation records.
 - Git `authored_at` and `updated_at` values presented as author metadata.
@@ -887,6 +955,7 @@ Deliverables:
 Tests:
 
 - Call every route with `ServiceExt::oneshot` and no socket.
+- Consume a compiled snapshot after the source tree is removed.
 - Escape titles, descriptions, tags, and route parameters.
 - Randomize frontend input discovery order and require identical combined
   bytes, manifest metadata, and digest.
@@ -898,6 +967,17 @@ Tests:
 - Return not found for scheduled posts and an activating post before its swap.
 - Render the claimed activating revision after its atomic snapshot swap.
 - Render canonical publication time from the injected ledger view.
+- Keep drafts, unpublished posts, scheduled posts, and their private assets out
+  of every public index and asset path.
+- Reject a site shell that belongs to different publication, asset, frontend,
+  or ledger inputs.
+- Reject a rendered post whose private asset-policy binding differs from the
+  current site policy.
+- Keep the historical post digest unchanged when only the site allowlist
+  changes.
+- Fail a candidate build without changing the active snapshot.
+- Let concurrent readers observe one complete old or new snapshot, never mixed
+  fields.
 - Return stable not-found and method-not-allowed responses.
 - Verify that no public route can resolve an admin path.
 
@@ -1103,18 +1183,9 @@ Deliverables:
 
 - An exclusive process lock before the write connection opens.
 - Safe stale-lock handling.
-- Startup ordering that matches the accepted design.
+- Database startup ordering that matches the accepted design.
 - Read-only restore-marker, schema, and digest verification before the write
   connection opens when a restore marker is required or present.
-- Initial public-snapshot construction from the canonical ledger.
-- Reconciliation of every `Applying` reload operation before listener binding.
-- Reconciliation of `Activating` records before listener binding.
-- Deterministic startup recovery order: resolve retained `Applying` candidates,
-  then claimed `Activating` revisions. Required intermediate snapshot installs
-  occur only while listeners are closed. Compile, install, and assert one final
-  canonical initial snapshot after replay.
-- Serialization between runtime reload and activation so two transitions
-  cannot install competing snapshots.
 - Cleanup after any partial startup failure.
 - Shutdown ordering that closes readers and writer safely.
 
@@ -1125,8 +1196,8 @@ Failure tests:
 - Fail each startup stage and verify reverse-order cleanup.
 - Terminate during a write and verify the accepted command drains.
 - Reject new commands after shutdown begins.
-- Start with a scheduled record and keep its post hidden.
-- Start with an activating record and reconcile before listener binding.
+- Start with a valid database and expose its read and write capabilities only
+  after every database startup check succeeds.
 
 ### Work package 3.5: Database health and fault reporting
 
@@ -1356,6 +1427,11 @@ Deliverables:
 - A documented late or missed schedule policy.
 - Immediate activation of an overdue schedule with requested and actual times.
 - Startup reconciliation of every `Activating` record before listener binding.
+- Extension of the WP1.5 startup recovery sequence so retained `Applying`
+  reloads are reconciled first, claimed `Activating` publications are
+  reconciled second, and one final canonical snapshot is installed last.
+- Serialization between reload and activation transitions through the shared
+  snapshot-transition primitive.
 - Bounded activation concurrency and ordered shutdown.
 
 The snapshot swap must happen before the `Published` commit.

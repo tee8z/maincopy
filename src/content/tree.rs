@@ -291,6 +291,10 @@ impl DiscoveredAsset {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub(crate) fn owned_bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

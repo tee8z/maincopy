@@ -1,12 +1,12 @@
-use std::fmt;
+use std::{fmt, num::NonZeroUsize, ops::Range};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 use url::Url;
 
 use super::identity::{
-    PostAssetSourceBinding, PublicationAssetSourceBinding, bind_post_asset_source,
-    bind_publication_asset_source,
+    AssetResolutionPolicyBinding, PostAssetSourceBinding, PublicationAssetSourceBinding,
+    bind_asset_resolution_policy, bind_post_asset_source, bind_publication_asset_source,
 };
 use super::{AssetDigest, LogicalAssetPath, PostDocument, PublicationSettings, SiteSnapshotDigest};
 
@@ -19,11 +19,11 @@ pub struct ExternalAssetUrl {
 
 impl ExternalAssetUrl {
     pub fn parse(value: &str) -> Result<Self, ExternalAssetUrlError> {
+        if has_forbidden_raw_url_input(value) {
+            return Err(ExternalAssetUrlError);
+        }
         let value = value.trim();
-        let has_valid_raw_authority = value.split_once("://").is_some_and(|(_, remainder)| {
-            let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-            !remainder[..authority_end].contains('@')
-        });
+        let has_valid_raw_authority = has_valid_raw_authority(value);
         let mut url = Url::parse(value).map_err(|_| ExternalAssetUrlError)?;
         if url.scheme() != "https"
             || url.host().is_none()
@@ -79,7 +79,9 @@ impl<'de> Deserialize<'de> for ExternalAssetUrl {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("external asset URL must be an absolute HTTPS URL without credentials or a fragment")]
+#[error(
+    "external asset URL must be an absolute HTTPS URL without credentials, a fragment, controls, or backslashes"
+)]
 pub struct ExternalAssetUrlError;
 
 /// A normalized HTTPS origin used by the effective asset allowlist.
@@ -91,15 +93,17 @@ pub struct ExternalAssetOrigin {
 
 impl ExternalAssetOrigin {
     pub fn parse(value: &str) -> Result<Self, ExternalAssetOriginError> {
+        if has_forbidden_raw_url_input(value) {
+            return Err(ExternalAssetOriginError);
+        }
         let value = value.trim();
-        let has_valid_raw_authority = value.split_once("://").is_some_and(|(_, remainder)| {
-            let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-            !remainder[..authority_end].contains('@')
-        });
+        let has_valid_raw_authority = has_valid_raw_authority(value);
+        let has_valid_raw_suffix = has_root_only_raw_suffix(value);
         let mut url = Url::parse(value).map_err(|_| ExternalAssetOriginError)?;
         if url.scheme() != "https"
             || url.host().is_none()
             || !has_valid_raw_authority
+            || !has_valid_raw_suffix
             || !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -154,7 +158,7 @@ impl<'de> Deserialize<'de> for ExternalAssetOrigin {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error(
-    "asset origin must be an absolute HTTPS origin without credentials, path, query, or fragment"
+    "asset origin must be an absolute HTTPS origin without credentials, path, query, fragment, controls, or backslashes"
 )]
 pub struct ExternalAssetOriginError;
 
@@ -203,36 +207,161 @@ impl AssetRevisionReference {
     }
 }
 
+/// The one-based position of a link or image destination in a Markdown event stream.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct MarkdownDestinationOrdinal(NonZeroUsize);
+
+impl MarkdownDestinationOrdinal {
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    pub(super) const fn new(value: NonZeroUsize) -> Self {
+        Self(value)
+    }
+}
+
+/// A half-open byte range in the exact Markdown source bound to a resolution.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct MarkdownSourceRange {
+    start: usize,
+    end: usize,
+}
+
+impl MarkdownSourceRange {
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    pub const fn end(self) -> usize {
+        self.end
+    }
+
+    pub fn as_range(self) -> Range<usize> {
+        self.start..self.end
+    }
+
+    pub(super) const fn new(range: Range<usize>) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkdownDestinationKind {
+    Image,
+    Download,
+}
+
+/// The destination value produced by the CommonMark parser for one occurrence.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct AuthoredMarkdownDestination(Box<str>);
+
+impl AuthoredMarkdownDestination {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(super) fn new(value: &str) -> Self {
+        Self(value.into())
+    }
+}
+
+/// One resolver-approved Markdown asset destination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedMarkdownDestination {
+    ordinal: MarkdownDestinationOrdinal,
+    source_range: MarkdownSourceRange,
+    kind: MarkdownDestinationKind,
+    authored: AuthoredMarkdownDestination,
+    target: AssetRevisionReference,
+}
+
+impl ResolvedMarkdownDestination {
+    pub const fn ordinal(&self) -> MarkdownDestinationOrdinal {
+        self.ordinal
+    }
+
+    pub const fn source_range(&self) -> MarkdownSourceRange {
+        self.source_range
+    }
+
+    pub const fn kind(&self) -> MarkdownDestinationKind {
+        self.kind
+    }
+
+    pub const fn authored(&self) -> &AuthoredMarkdownDestination {
+        &self.authored
+    }
+
+    pub const fn target(&self) -> &AssetRevisionReference {
+        &self.target
+    }
+
+    pub(super) fn new(
+        ordinal: MarkdownDestinationOrdinal,
+        source_range: MarkdownSourceRange,
+        kind: MarkdownDestinationKind,
+        authored: AuthoredMarkdownDestination,
+        target: AssetRevisionReference,
+    ) -> Self {
+        Self {
+            ordinal,
+            source_range,
+            kind,
+            authored,
+            target,
+        }
+    }
+}
+
 /// Resolver-owned, complete asset inputs for one post revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedPostAssets {
     source_binding: PostAssetSourceBinding,
+    policy_binding: AssetResolutionPolicyBinding,
     image: Option<AssetRevisionReference>,
     references: Vec<AssetRevisionReference>,
+    markdown_destinations: Vec<ResolvedMarkdownDestination>,
 }
 
 impl ResolvedPostAssets {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the asset resolver becomes the sole constructor in WP 1.6"
-        )
-    )]
+    #[cfg(test)]
     pub(super) fn new(
         document: &PostDocument,
         image: Option<AssetRevisionReference>,
         references: Vec<AssetRevisionReference>,
     ) -> Self {
+        Self::from_resolution(document, &[], image, references, Vec::new())
+    }
+
+    pub(super) fn from_resolution(
+        document: &PostDocument,
+        allowed_origins: &[ExternalAssetOrigin],
+        image: Option<AssetRevisionReference>,
+        references: Vec<AssetRevisionReference>,
+        markdown_destinations: Vec<ResolvedMarkdownDestination>,
+    ) -> Self {
         Self {
             source_binding: bind_post_asset_source(document),
+            policy_binding: bind_asset_resolution_policy(allowed_origins),
             image,
             references,
+            markdown_destinations,
         }
     }
 
     pub(super) const fn source_binding(&self) -> &PostAssetSourceBinding {
         &self.source_binding
+    }
+
+    pub(super) const fn policy_binding(&self) -> &AssetResolutionPolicyBinding {
+        &self.policy_binding
     }
 
     pub const fn image(&self) -> Option<&AssetRevisionReference> {
@@ -242,25 +371,23 @@ impl ResolvedPostAssets {
     pub fn references(&self) -> &[AssetRevisionReference] {
         &self.references
     }
+
+    pub fn markdown_destinations(&self) -> &[ResolvedMarkdownDestination] {
+        &self.markdown_destinations
+    }
 }
 
 /// Resolver-owned, complete asset inputs for one site snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedSiteAssets {
     source_binding: PublicationAssetSourceBinding,
+    policy_binding: AssetResolutionPolicyBinding,
     favicon: Option<AssetRevisionReference>,
     allowed_origins: Vec<ExternalAssetOrigin>,
     references: Vec<AssetRevisionReference>,
 }
 
 impl ResolvedSiteAssets {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the asset resolver becomes the sole constructor in WP 1.6"
-        )
-    )]
     pub(super) fn new(
         publication: &PublicationSettings,
         favicon: Option<AssetRevisionReference>,
@@ -269,6 +396,7 @@ impl ResolvedSiteAssets {
     ) -> Self {
         Self {
             source_binding: bind_publication_asset_source(publication),
+            policy_binding: bind_asset_resolution_policy(&allowed_origins),
             favicon,
             allowed_origins,
             references,
@@ -277,6 +405,10 @@ impl ResolvedSiteAssets {
 
     pub(super) const fn source_binding(&self) -> &PublicationAssetSourceBinding {
         &self.source_binding
+    }
+
+    pub(super) const fn policy_binding(&self) -> &AssetResolutionPolicyBinding {
+        &self.policy_binding
     }
 
     pub const fn favicon(&self) -> Option<&AssetRevisionReference> {
@@ -355,6 +487,26 @@ impl Serialize for SnapshotAssetPath {
 #[error("logical asset path is outside the assets namespace")]
 pub struct SnapshotAssetPathError;
 
+fn has_valid_raw_authority(value: &str) -> bool {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    !authority.is_empty() && !authority.contains('@') && !authority.ends_with(':')
+}
+
+fn has_forbidden_raw_url_input(value: &str) -> bool {
+    value.contains('\\') || value.chars().any(char::is_control)
+}
+
+fn has_root_only_raw_suffix(value: &str) -> bool {
+    value.split_once("://").is_some_and(|(_, remainder)| {
+        let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+        matches!(&remainder[authority_end..], "" | "/")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,7 +521,13 @@ mod tests {
             "https://user@example.com/image.png",
             "https://@example.com/image.png",
             "HTTPS://@example.com/image.png",
+            "https://example.com:/image.png",
+            "https://example.com:invalid/image.png",
+            "https://example.com:65536/image.png",
             "https://example.com/image.png#fragment",
+            "https://example.com\\evil.png",
+            "https://exa\nmple.com/image.png",
+            "https://exa\tmple.com/image.png",
             "/image.png",
         ] {
             assert_eq!(ExternalAssetUrl::parse(invalid), Err(ExternalAssetUrlError));
@@ -387,9 +545,17 @@ mod tests {
         for invalid in [
             "http://example.com",
             "https://@example.com",
+            "https://example.com:",
+            "https://example.com:invalid",
+            "https://example.com:65536",
             "https://example.com/path",
+            "https://example.com/foo/..",
+            "https://example.com/%2e",
             "https://example.com/?query=1",
             "https://example.com/#fragment",
+            "https://example.com\\path",
+            "https://exa\nmple.com",
+            "https://exa\tmple.com",
         ] {
             assert_eq!(
                 ExternalAssetOrigin::parse(invalid),

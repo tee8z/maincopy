@@ -448,7 +448,8 @@ copies them into the immutable snapshot asset directory.
 An external asset URL must use HTTPS and match an origin in
 `assets.allowed_https_origins`. The match includes the scheme, host, and port.
 Maincopy rejects user information, fragments, non-HTTPS schemes, and origins
-that are not listed.
+that are not listed. It also rejects raw controls and backslashes before URL
+normalization.
 
 V1 does not fetch, proxy, upload, or transform an external asset. The reader's
 browser requests it directly. This rule keeps the compiler outside the server-
@@ -459,6 +460,11 @@ The post revision digest includes the normalized external URL. It cannot cover
 bytes that a CDN changes at the same URL. Operators should use immutable,
 versioned CDN URLs. Maincopy reports a validation warning for a URL that does
 not appear versioned, but it does not guess from remote headers.
+
+Each resolved post capability carries a private binding to the effective asset
+policy that approved it. This binding is not part of the post digest. The
+public snapshot builder compares it with the current site policy and rejects a
+stale approval after an allowlist change.
 
 The site favicon follows the same rules. A local favicon receives an immutable
 snapshot URL. An external favicon remains a direct allowlisted HTTPS URL.
@@ -604,9 +610,9 @@ and it does not by itself prove that a mutable worktree matches the commit.
 flowchart LR
     Walk[Walk content tree] --> Parse[Parse configuration and posts]
     Parse --> Validate[Validate complete model]
-    Validate --> Render[Render Markdown and diagrams]
-    Render --> Assets[Compile immutable asset revision]
-    Assets --> Index[Build indexes and feeds]
+    Validate --> Assets[Resolve and digest asset references]
+    Assets --> Render[Render Markdown and diagrams]
+    Render --> Index[Build indexes and feeds]
     Index --> Candidate[Candidate content snapshot]
     Candidate --> Published[Apply SQLite publication ledger]
     Published -->|all checks pass| Activate[Atomic SiteSnapshot activation]
@@ -621,6 +627,10 @@ path, field, and stable error code.
 
 The tree walk produces owned candidate bytes in deterministic logical-path
 order. Parsing and later compiler stages use only those owned bytes.
+
+Asset resolution runs before Markdown rendering. The resolver supplies typed
+destinations for each Markdown image and file link. The renderer does not emit
+an authored destination that the resolver did not approve.
 
 Request handlers never parse Markdown, execute a diagram renderer, or read the
 mutable content tree. They read an immutable `SiteSnapshot`.
@@ -689,6 +699,45 @@ Maud owns the page structure. The Markdown renderer owns article content.
 Rendered Markdown crosses into Maud through one reviewed `PreEscaped` boundary.
 All other strings use normal escaping.
 
+V1 uses strict CommonMark without optional extensions. It does not add heading
+anchors. The renderer converts block and inline raw HTML into escaped text.
+Authored HTML therefore remains visible as text and never becomes active HTML.
+
+The renderer validates and rebuilds every link and image event. V1 permits
+absolute HTTPS navigation and same-site root-relative navigation. It rejects
+other schemes, protocol-relative URLs, credentials, controls, backslashes, and
+traversal. Images and asset-file links also require one matching approved
+resolver occurrence.
+
+Plain, `text`, `ascii`, and unknown code fences produce the same escaped
+`<pre><code>` structure. V1 does not preserve an authored code-fence class.
+Only an exact lowercase `mermaid` fence creates a typed Mermaid placeholder.
+Trailing info tokens do not create a Mermaid placeholder.
+
+V1 applies these inclusive renderer limits:
+
+| Resource | Limit |
+| --- | ---: |
+| Rendered article HTML | 32 MiB |
+| One Mermaid source block | 256 KiB |
+| Mermaid blocks in one post | 64 |
+
+The existing content-tree limit keeps one Markdown source at or below 4 MiB.
+The renderer uses checked output writes and returns a typed limit error.
+
+The Markdown renderer returns one opaque render product. The product binds the
+rendered bytes, generated outputs, renderer identity, source document, and
+resolved assets. A digest calculator rejects a product for different inputs.
+
+The site-shell renderer returns an equivalent opaque product. The public
+snapshot builder requires that product and cannot substitute empty shell bytes
+or an invented frontend identity. WP2.1 supplies the production Maud shell and
+frontend bundle.
+
+Asset URL injection uses typed render slots. Identity calculation and final
+snapshot rendering project those slots through different typed scopes. The
+compiler never replaces magic text inside trusted HTML.
+
 Syntax highlighting and diagram rendering run during compilation. A
 `DiagramRenderer` trait isolates Mermaid from the Markdown parser.
 
@@ -697,6 +746,11 @@ time, and concurrency limits. Maincopy sanitizes the resulting SVG before use.
 
 The Mermaid implementation remains an implementation spike. V1 cannot release
 until a representative fixture corpus passes.
+
+`PostRendererVersion::V1` identifies the exact CommonMark parser, event policy,
+and HTML serializer above. `SanitizerVersion::V1` identifies the raw-HTML and
+destination policy. An output-affecting policy change requires an explicit
+identity-version review before a golden output changes.
 
 ## Public web contract
 

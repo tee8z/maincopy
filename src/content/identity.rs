@@ -19,6 +19,7 @@ const PUBLICATION_CONTENT_CONTEXT: &str = "maincopy publication content digest v
 const POST_ASSET_SOURCE_BINDING_CONTEXT: &str = "maincopy post asset source binding v1";
 const PUBLICATION_ASSET_SOURCE_BINDING_CONTEXT: &str =
     "maincopy publication asset source binding v1";
+const ASSET_RESOLUTION_POLICY_BINDING_CONTEXT: &str = "maincopy asset resolution policy binding v1";
 const POST_REVISION_CONTEXT: &str = "maincopy post revision digest v1";
 const FRONTEND_BUNDLE_CONTEXT: &str = "maincopy frontend bundle digest v1";
 const SITE_SNAPSHOT_CONTEXT: &str = "maincopy site snapshot digest v1";
@@ -150,6 +151,10 @@ pub(super) struct PostAssetSourceBinding([u8; 32]);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PublicationAssetSourceBinding([u8; 32]);
 
+/// A private capability binding for the effective external-asset allowlist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AssetResolutionPolicyBinding([u8; 32]);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrontendBundleDigest([u8; 32]);
 
@@ -254,6 +259,7 @@ impl SiteShellRendererIdentity {
 pub struct PostRevisionInput<'input> {
     document: &'input PostDocument,
     assets: &'input ResolvedPostAssets,
+    site_assets: Option<&'input ResolvedSiteAssets>,
     renderer: &'input PostRendererIdentity,
     pre_injection_article: PreInjectionRenderedArticle<'input>,
     generated_assets: &'input [DigestedAsset],
@@ -264,6 +270,7 @@ impl<'input> PostRevisionInput<'input> {
     pub const fn new(
         document: &'input PostDocument,
         assets: &'input ResolvedPostAssets,
+        site_assets: &'input ResolvedSiteAssets,
         renderer: &'input PostRendererIdentity,
         pre_injection_article: PreInjectionRenderedArticle<'input>,
         generated_assets: &'input [DigestedAsset],
@@ -272,6 +279,27 @@ impl<'input> PostRevisionInput<'input> {
         Self {
             document,
             assets,
+            site_assets: Some(site_assets),
+            renderer,
+            pre_injection_article,
+            generated_assets,
+            effective_distribution,
+        }
+    }
+
+    #[cfg(test)]
+    const fn new_unchecked(
+        document: &'input PostDocument,
+        assets: &'input ResolvedPostAssets,
+        renderer: &'input PostRendererIdentity,
+        pre_injection_article: PreInjectionRenderedArticle<'input>,
+        generated_assets: &'input [DigestedAsset],
+        effective_distribution: &'input DistributionSettings,
+    ) -> Self {
+        Self {
+            document,
+            assets,
+            site_assets: None,
             renderer,
             pre_injection_article,
             generated_assets,
@@ -344,6 +372,8 @@ impl<'input> SiteSnapshotInput<'input> {
 pub enum RevisionIdentityError {
     #[error("resolved asset inputs are bound to different {target:?} content")]
     ResolvedAssetBindingMismatch { target: AssetBindingTarget },
+    #[error("post assets were approved under a different external-asset policy")]
+    ResolvedAssetPolicyMismatch,
     #[error("asset reference is duplicated: {value}")]
     DuplicateAssetReference { value: String },
     #[error("generated asset path is duplicated: {path}")]
@@ -420,6 +450,23 @@ pub(super) fn bind_publication_asset_source(
     PublicationAssetSourceBinding(*transcript.finish().as_bytes())
 }
 
+pub(super) fn bind_asset_resolution_policy(
+    allowed_origins: &[ExternalAssetOrigin],
+) -> AssetResolutionPolicyBinding {
+    let mut origins: Vec<_> = allowed_origins.iter().collect();
+    origins.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let mut transcript = Transcript::new(
+        ASSET_RESOLUTION_POLICY_BINDING_CONTEXT,
+        b"maincopy-asset-resolution-policy-binding",
+        1,
+    );
+    transcript.sequence_len(origins.len());
+    for origin in origins {
+        transcript.string(origin.as_str());
+    }
+    AssetResolutionPolicyBinding(*transcript.finish().as_bytes())
+}
+
 pub fn digest_frontend_bundle(bytes: &[u8]) -> FrontendBundleDigest {
     let mut transcript = Transcript::new(FRONTEND_BUNDLE_CONTEXT, b"maincopy-frontend-bundle", 1);
     transcript.bytes(bytes);
@@ -436,6 +483,12 @@ pub fn digest_post_revision(
         return Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
             target: AssetBindingTarget::Post,
         });
+    }
+    if input
+        .site_assets
+        .is_some_and(|site_assets| input.assets.policy_binding() != site_assets.policy_binding())
+    {
+        return Err(RevisionIdentityError::ResolvedAssetPolicyMismatch);
     }
     let mut transcript = Transcript::new(POST_REVISION_CONTEXT, b"maincopy-post-revision", 1);
     transcript.fixed_bytes(&content.0);
@@ -1019,7 +1072,7 @@ name = "Example Author"
             digest_asset(b"diagram"),
         )];
         let renderer = renderer();
-        let baseline = digest_post_revision(&PostRevisionInput::new(
+        let baseline = digest_post_revision(&PostRevisionInput::new_unchecked(
             &post,
             &ResolvedPostAssets::new(&post, None, refs.to_vec()),
             &renderer,
@@ -1028,7 +1081,7 @@ name = "Example Author"
             post.metadata().distribution(),
         ))
         .unwrap();
-        let changed = digest_post_revision(&PostRevisionInput::new(
+        let changed = digest_post_revision(&PostRevisionInput::new_unchecked(
             &post,
             &ResolvedPostAssets::new(&post, None, refs.to_vec()),
             &renderer,
@@ -1048,7 +1101,7 @@ name = "Example Author"
             AssetRevisionReference::local(local),
         ];
         assert!(matches!(
-            digest_post_revision(&PostRevisionInput::new(
+            digest_post_revision(&PostRevisionInput::new_unchecked(
                 &post,
                 &ResolvedPostAssets::new(&post, None, duplicate_refs.to_vec()),
                 &renderer,
@@ -1076,7 +1129,7 @@ name = "Example Author"
         let reverse = [second, first];
 
         let digest = |assets: &[AssetRevisionReference]| {
-            digest_post_revision(&PostRevisionInput::new(
+            digest_post_revision(&PostRevisionInput::new_unchecked(
                 &post,
                 &ResolvedPostAssets::new(&post, None, assets.to_vec()),
                 &renderer,
@@ -1107,7 +1160,7 @@ name = "Example Author"
             digest_asset(b"second"),
         );
         let digest = |generated: &[DigestedAsset], distribution: &DistributionSettings| {
-            digest_post_revision(&PostRevisionInput::new(
+            digest_post_revision(&PostRevisionInput::new_unchecked(
                 &post,
                 &ResolvedPostAssets::new(&post, None, Vec::new()),
                 &renderer,
@@ -1189,7 +1242,7 @@ name = "Example Author"
         let (_, post) = validate_post(&frontmatter("2026-08-29T12:00:00Z"), "# Body\n");
         let renderer = renderer();
         let digest = |assets: &[AssetRevisionReference]| {
-            digest_post_revision(&PostRevisionInput::new(
+            digest_post_revision(&PostRevisionInput::new_unchecked(
                 &post,
                 &ResolvedPostAssets::new(&post, None, assets.to_vec()),
                 &renderer,
@@ -1240,7 +1293,7 @@ name = "Example Author"
         let unresolved = ResolvedPostAssets::new(&first, None, Vec::new());
         let renderer = renderer();
         let digest = |post: &PostDocument, assets: &ResolvedPostAssets| {
-            digest_post_revision(&PostRevisionInput::new(
+            digest_post_revision(&PostRevisionInput::new_unchecked(
                 post,
                 assets,
                 &renderer,
@@ -1282,7 +1335,7 @@ name = "Example Author"
     fn site_identity_sorts_ledger_entries_and_normalizes_operational_time() {
         let (publication, post) = validate_post(&frontmatter("2026-08-29T12:00:00Z"), "# Body\n");
         let renderer = renderer();
-        let revision = digest_post_revision(&PostRevisionInput::new(
+        let revision = digest_post_revision(&PostRevisionInput::new_unchecked(
             &post,
             &ResolvedPostAssets::new(&post, None, Vec::new()),
             &renderer,
@@ -1342,7 +1395,7 @@ name = "Example Author"
     fn renderer_output_public_revision_and_activation_each_change_site_identity() {
         let (publication, post) = validate_post(&frontmatter("2026-08-29T12:00:00Z"), "# Body\n");
         let post_renderer = renderer();
-        let revision = digest_post_revision(&PostRevisionInput::new(
+        let revision = digest_post_revision(&PostRevisionInput::new_unchecked(
             &post,
             &ResolvedPostAssets::new(&post, None, Vec::new()),
             &post_renderer,
@@ -1525,7 +1578,7 @@ name = "Example Author"
         let post_assets = ResolvedPostAssets::new(&baseline_post, None, Vec::new());
         let post_renderer = renderer();
         assert!(matches!(
-            digest_post_revision(&PostRevisionInput::new(
+            digest_post_revision(&PostRevisionInput::new_unchecked(
                 &changed_post,
                 &post_assets,
                 &post_renderer,
@@ -1552,7 +1605,7 @@ name = "Example Author"
             Vec::new(),
         );
         assert!(matches!(
-            digest_post_revision(&PostRevisionInput::new(
+            digest_post_revision(&PostRevisionInput::new_unchecked(
                 &changed_image_post,
                 &image_assets,
                 &post_renderer,
@@ -1644,6 +1697,63 @@ name = "Example Author"
     }
 
     #[test]
+    fn post_revision_rejects_assets_approved_before_allowlist_revocation() {
+        let image_frontmatter = format!(
+            "{}image = \"https://cdn.example/cover-v1.png\"\n",
+            frontmatter("2026-08-29T12:00:00Z")
+        );
+        let (publication, post) = validate_post(&image_frontmatter, "# Body\n");
+        let allowed = vec![ExternalAssetOrigin::parse("https://cdn.example/").unwrap()];
+        let expanded = vec![
+            ExternalAssetOrigin::parse("https://cdn.example/").unwrap(),
+            ExternalAssetOrigin::parse("https://media.example/").unwrap(),
+        ];
+        let image = AssetRevisionReference::external(
+            ExternalAssetUrl::parse("https://cdn.example/cover-v1.png").unwrap(),
+        );
+        let approved_assets = ResolvedPostAssets::from_resolution(
+            &post,
+            &allowed,
+            Some(image.clone()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let expanded_assets = ResolvedPostAssets::from_resolution(
+            &post,
+            &expanded,
+            Some(image),
+            Vec::new(),
+            Vec::new(),
+        );
+        let approved_site = ResolvedSiteAssets::new(&publication, None, allowed, Vec::new());
+        let expanded_site = ResolvedSiteAssets::new(&publication, None, expanded, Vec::new());
+        let revoked_site = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
+        let renderer = renderer();
+        let digest = |assets: &ResolvedPostAssets, site_assets: &ResolvedSiteAssets| {
+            digest_post_revision(&PostRevisionInput::new(
+                &post,
+                assets,
+                site_assets,
+                &renderer,
+                PreInjectionRenderedArticle::new(b"rendered"),
+                &[],
+                post.metadata().distribution(),
+            ))
+        };
+
+        let approved = digest(&approved_assets, &approved_site).unwrap();
+        assert_eq!(approved, digest(&expanded_assets, &expanded_site).unwrap());
+        assert_eq!(
+            digest(&approved_assets, &revoked_site),
+            Err(RevisionIdentityError::ResolvedAssetPolicyMismatch)
+        );
+        assert_eq!(
+            digest(&approved_assets, &expanded_site),
+            Err(RevisionIdentityError::ResolvedAssetPolicyMismatch)
+        );
+    }
+
+    #[test]
     fn effective_normalized_allowlist_is_order_independent_and_identity_bearing() {
         let authored_first = format!(
             "{PUBLICATION}\n[assets]\nallowed_https_origins = [\"HTTPS://A.EXAMPLE:443\"]\n"
@@ -1711,7 +1821,7 @@ name = "Example Author"
         let (_, post) = validate_post(&frontmatter("2026-08-29T12:00:00Z"), "# Body\n");
         let renderer = renderer();
         let digest = |_provenance: Option<&super::super::SourceCommit>| {
-            digest_post_revision(&PostRevisionInput::new(
+            digest_post_revision(&PostRevisionInput::new_unchecked(
                 &post,
                 &ResolvedPostAssets::new(&post, None, Vec::new()),
                 &renderer,

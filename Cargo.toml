@@ -9,6 +9,7 @@ blake3 = "1.8.3"
 clap = { version = "4.6.6", features = ["derive"] }
 lexe = "=0.1.22"
 lightning-invoice = { version = "0.34.0", features = ["std"] }
+pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["serde-well-known"] }
