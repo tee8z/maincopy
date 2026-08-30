@@ -3,12 +3,14 @@
 
 CREATE TABLE canonical_publications (
     publication_id BLOB PRIMARY KEY CHECK (length(publication_id) = 16),
+    creation_key BLOB UNIQUE,
     stable_post_id BLOB NOT NULL,
     pinned_post_digest BLOB NOT NULL,
     state TEXT NOT NULL,
     version INTEGER NOT NULL,
     scheduled_at_ns INTEGER NOT NULL,
     activation_at_ns INTEGER,
+    activation_site_digest BLOB,
     published_at_ns INTEGER,
     current_published_digest BLOB,
     source_commit BLOB,

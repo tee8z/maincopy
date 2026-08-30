@@ -863,24 +863,10 @@ impl SiteSnapshotReader {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "WP 1.5 gives the transition coordinator sole ownership of activation"
-    )
-)]
 pub(crate) struct SiteSnapshotActivator {
     active: Arc<ArcSwap<SiteSnapshot>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "WP 1.5 gives the transition coordinator sole ownership of activation"
-    )
-)]
 pub(crate) fn snapshot_store(initial: SiteSnapshot) -> (SiteSnapshotReader, SiteSnapshotActivator) {
     let active = Arc::new(ArcSwap::from_pointee(initial));
     (
@@ -892,13 +878,6 @@ pub(crate) fn snapshot_store(initial: SiteSnapshot) -> (SiteSnapshotReader, Site
 }
 
 impl SiteSnapshotActivator {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "WP 1.5 gives the transition coordinator sole ownership of activation"
-        )
-    )]
     pub(crate) fn activate(
         &mut self,
         expected: &SiteSnapshotDigest,

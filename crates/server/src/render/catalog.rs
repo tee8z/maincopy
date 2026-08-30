@@ -66,6 +66,14 @@ impl ContentCatalog {
             .map(Arc::as_ref)
     }
 
+    /// Finds the one revision supplied by this candidate content tree for a post.
+    pub(crate) fn current_post(&self, post_id: &PostId) -> Option<&RenderedPost> {
+        self.revisions
+            .iter()
+            .find(|((candidate, _), _)| candidate == post_id)
+            .map(|(_, rendered)| rendered.as_ref())
+    }
+
     /// Returns the exact rendered revisions retained by this catalog.
     pub(crate) fn rendered_posts(&self) -> impl ExactSizeIterator<Item = &RenderedPost> {
         self.revisions.values().map(Arc::as_ref)

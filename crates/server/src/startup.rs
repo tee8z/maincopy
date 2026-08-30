@@ -23,7 +23,10 @@ use crate::{
         resolve_content_assets,
     },
     database::{self, DatabaseStore},
-    domain::publication::store::{InstallStartupSnapshot, ObservedPostRevision},
+    domain::publication::{
+        activation::PublicationCoordinator,
+        store::{InstallStartupSnapshot, ObservedPostRevision},
+    },
     error::{
         ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal, StartupStage,
     },
@@ -31,8 +34,8 @@ use crate::{
     observability::{initialize_logging, task_span},
     process_lock::{ProcessLock, ProcessLockError},
     render::{
-        ContentCatalog, SiteSnapshotReader, build_site_snapshot, compile_content_catalog,
-        render_site_shell,
+        ContentCatalog, build_site_snapshot, compile_content_catalog, render_site_shell,
+        snapshot_store,
     },
     web::{PublicServer, PublicState, Readiness},
 };
@@ -50,6 +53,7 @@ type CriticalTaskFailure = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) struct Application {
     _startup: StartupConfiguration,
     _database: DatabaseStore,
+    publication_coordinator: Arc<tokio::sync::Mutex<PublicationCoordinator>>,
     runtime: ApplicationRuntime,
     #[cfg(test)]
     public_addr: std::net::SocketAddr,
@@ -79,6 +83,7 @@ struct CompiledStartupContent {
 
 struct ServingState {
     readiness: Readiness,
+    publication_coordinator: Arc<tokio::sync::Mutex<PublicationCoordinator>>,
     public_server: PublicServer,
     admin_socket: AdminSocket,
 }
@@ -219,6 +224,7 @@ impl Application {
             frontend,
             host.public_bind,
             host.admin_socket,
+            cancellation.clone(),
         )
         .await
         {
@@ -235,6 +241,7 @@ impl Application {
         };
         let ServingState {
             readiness,
+            publication_coordinator,
             public_server,
             admin_socket,
         } = serving_state;
@@ -258,6 +265,7 @@ impl Application {
         Ok(Self {
             _startup: startup,
             _database: database_store,
+            publication_coordinator,
             runtime: ApplicationRuntime::with_database_writer(
                 readiness,
                 cancellation,
@@ -275,11 +283,13 @@ impl Application {
         let Self {
             _startup: startup,
             _database: database,
+            publication_coordinator,
             runtime,
             #[cfg(test)]
                 public_addr: _,
         } = self;
         let runtime_result = runtime.run_until_stop().await;
+        drop(publication_coordinator);
         drop(database);
         drop(startup);
         runtime_result
@@ -328,8 +338,9 @@ async fn prepare_serving_state(
     frontend: &'static FrontendAssetManifest,
     public_bind: std::net::SocketAddr,
     admin_socket: &Path,
+    cancellation: CancellationToken,
 ) -> Result<ServingState, ProcessError> {
-    let startup_state = database
+    let mut startup_state = database
         .publications
         .startup_snapshot_state()
         .await
@@ -340,18 +351,31 @@ async fn prepare_serving_state(
                 error,
             )
         })?;
-    let shell = render_site_shell(compiled.catalog, frontend, &startup_state.ledger)
-        .map_err(|error| startup_failure(StartupStage::Content, "render the site shell", error))?;
+    let shell = render_site_shell(
+        Arc::clone(&compiled.catalog),
+        frontend,
+        &startup_state.ledger,
+    )
+    .map_err(|error| startup_failure(StartupStage::Content, "render the site shell", error))?;
     let snapshot = build_site_snapshot(shell, &startup_state.ledger).map_err(|error| {
         startup_failure(StartupStage::Content, "build the site snapshot", error)
     })?;
-    database
+    if !startup_state.activating.is_empty()
+        && startup_state.site.as_ref().map(|site| &site.digest) != Some(&snapshot.digest)
+    {
+        return Err(startup_failure(
+            StartupStage::Content,
+            "rebuild the durable pre-activation site snapshot",
+            "the rebuilt base snapshot does not match the durable site head",
+        ));
+    }
+    let installed_site = database
         .publications
         .install_startup_snapshot(InstallStartupSnapshot {
             expected: startup_state.site,
             candidate_digest: snapshot.digest.clone(),
             activated_at: OffsetDateTime::now_utc(),
-            source_commit: compiled.source_commit,
+            source_commit: compiled.source_commit.clone(),
             posts: compiled.observed_posts,
         })
         .await
@@ -364,10 +388,35 @@ async fn prepare_serving_state(
         })?;
 
     let readiness = Readiness::default();
+    let (snapshots, activator) = snapshot_store(snapshot);
+    let mut publication_coordinator = PublicationCoordinator {
+        catalog: compiled.catalog,
+        ledger: startup_state.ledger,
+        site: installed_site,
+        activator,
+        store: database.publications.clone(),
+        frontend,
+        source_commit: compiled.source_commit,
+        readiness: readiness.clone(),
+        cancellation: cancellation.clone(),
+    };
+    if let Some(activation) = startup_state.activating.pop() {
+        publication_coordinator
+            .recover(activation)
+            .await
+            .map_err(|error| {
+                startup_failure(
+                    StartupStage::Database,
+                    "recover the activating publication",
+                    error,
+                )
+            })?;
+    }
+    let publication_coordinator = Arc::new(tokio::sync::Mutex::new(publication_coordinator));
     let public_server = PublicServer::bind(
         public_bind,
         PublicState {
-            snapshots: SiteSnapshotReader::from_snapshot(snapshot),
+            snapshots,
             readiness: readiness.clone(),
         },
     )
@@ -383,6 +432,7 @@ async fn prepare_serving_state(
     })?;
     Ok(ServingState {
         readiness,
+        publication_coordinator,
         public_server,
         admin_socket,
     })
@@ -712,6 +762,17 @@ base_url = \"https://startup.example.test\"\n\
 description = \"Startup configuration test.\"\n\
 [author]\n\
 name = \"Startup Tester\"\n";
+    const DURABLE_POST_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const DURABLE_PUBLICATION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const DURABLE_POST: &str = "+++\n\
+id = \"11111111-1111-4111-8111-111111111111\"\n\
+title = \"Durable publication\"\n\
+slug = \"durable-publication\"\n\
+authored_at = 2026-08-29T12:00:00Z\n\
+description = \"A publication restored from SQLite.\"\n\
++++\n\
+# Durable publication\n\n\
+Durable article body.\n";
 
     fn server_arguments_for(config: &Path, content_root: &Path) -> ServerArguments {
         server_arguments_for_with(config, content_root, &[])
@@ -760,10 +821,20 @@ name = \"Startup Tester\"\n";
         (root, arguments, publication_path)
     }
 
+    fn write_durable_post(content_root: &Path) {
+        fs::create_dir(content_root.join("posts")).unwrap();
+        fs::write(
+            content_root.join("posts/durable-publication.md"),
+            DURABLE_POST,
+        )
+        .unwrap();
+    }
+
     async fn stop_built_application(application: Application) {
         let Application {
             _startup: startup,
             _database: database,
+            publication_coordinator,
             mut runtime,
             public_addr: _,
         } = application;
@@ -779,6 +850,7 @@ name = \"Startup Tester\"\n";
                 .await
                 .is_none()
         );
+        drop(publication_coordinator);
         drop(database);
         drop(startup);
         tokio::task::yield_now().await;
@@ -961,22 +1033,9 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
     async fn restart_serves_the_durable_published_revision() {
         use sqlx::{ConnectOptions as _, Connection as _};
 
-        const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
-        const PUBLICATION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        const POST: &str = "+++\n\
-id = \"11111111-1111-4111-8111-111111111111\"\n\
-title = \"Durable publication\"\n\
-slug = \"durable-publication\"\n\
-authored_at = 2026-08-29T12:00:00Z\n\
-description = \"A publication restored from SQLite.\"\n\
-+++\n\
-# Durable publication\n\n\
-Durable article body.\n";
-
         let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
         let content_root = root.path().join("content");
-        fs::create_dir(content_root.join("posts")).unwrap();
-        fs::write(content_root.join("posts/durable-publication.md"), POST).unwrap();
+        write_durable_post(&content_root);
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
         let database_path = startup._host.view().database.path.to_owned();
@@ -1000,12 +1059,14 @@ Durable article body.\n";
         .unwrap();
         assert_eq!(
             stable_post_id.as_slice(),
-            uuid::Uuid::parse_str(POST_ID)
+            uuid::Uuid::parse_str(DURABLE_POST_ID)
                 .unwrap()
                 .as_bytes()
                 .as_slice()
         );
-        let publication_id = uuid::Uuid::parse_str(PUBLICATION_ID).unwrap().into_bytes();
+        let publication_id = uuid::Uuid::parse_str(DURABLE_PUBLICATION_ID)
+            .unwrap()
+            .into_bytes();
         sqlx::query(
             "INSERT INTO canonical_publications (\
                 publication_id, stable_post_id, pinned_post_digest, state, version, \
@@ -1050,6 +1111,125 @@ Durable article body.\n";
         assert!(html.contains(&published_at.to_string()));
 
         stop_built_application(application).await;
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn startup_recovers_one_durable_publication_activation_before_binding() {
+        use sqlx::{ConnectOptions as _, Connection as _};
+
+        use crate::{
+            content::{PostId, PublishedPostRevision},
+            render::PublicLedgerProjection,
+        };
+
+        let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
+        let content_root = root.path().join("content");
+        write_durable_post(&content_root);
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let database_path = startup._host.view().database.path.to_owned();
+        stop_built_application(Application::build(startup).await.unwrap()).await;
+
+        let arguments = server_arguments_for(&root.path().join("maincopy.toml"), &content_root);
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let assets =
+            resolve_content_assets(&startup._content_tree, &startup._validated_content).unwrap();
+        let catalog =
+            Arc::new(compile_content_catalog(&startup._validated_content, &assets).unwrap());
+        let post_id = PostId::parse(DURABLE_POST_ID).unwrap();
+        let rendered = catalog.current_post(&post_id).unwrap();
+        let revision = rendered.revision.clone();
+        let activation_at = OffsetDateTime::from_unix_timestamp(1_777_734_400).unwrap();
+        let candidate_ledger = PublicLedgerProjection::empty()
+            .with_published(PublishedPostRevision::new(
+                post_id,
+                revision.clone(),
+                activation_at,
+            ))
+            .unwrap();
+        let shell = render_site_shell(
+            Arc::clone(&catalog),
+            crate::frontend_assets::embedded_manifest(),
+            &candidate_ledger,
+        )
+        .unwrap();
+        let candidate = build_site_snapshot(shell, &candidate_ledger).unwrap();
+        let candidate_digest = candidate.digest.clone();
+        let activation_at_ns = i64::try_from(activation_at.unix_timestamp_nanos()).unwrap();
+        let publication_id = uuid::Uuid::parse_str(DURABLE_PUBLICATION_ID)
+            .unwrap()
+            .into_bytes();
+        let creation_key = uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+            .unwrap()
+            .into_bytes();
+        let stable_post_id = uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap().into_bytes();
+        let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database_path)
+            .foreign_keys(true)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO canonical_publications (\
+                publication_id, creation_key, stable_post_id, pinned_post_digest, state, version, \
+                scheduled_at_ns, activation_at_ns, activation_site_digest\
+             ) VALUES (?, ?, ?, ?, 'activating', 2, ?, ?, ?)",
+        )
+        .bind(publication_id.as_slice())
+        .bind(creation_key.as_slice())
+        .bind(stable_post_id.as_slice())
+        .bind(revision.as_bytes().as_slice())
+        .bind(activation_at_ns)
+        .bind(activation_at_ns)
+        .bind(candidate_digest.as_bytes().as_slice())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+
+        let application = Application::build(startup).await.unwrap();
+        {
+            let coordinator = application.publication_coordinator.lock().await;
+            assert_eq!(coordinator.site.digest, candidate_digest);
+            assert_eq!(coordinator.ledger.len(), 1);
+        }
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!(
+                "http://{}/posts/durable-publication",
+                application.public_addr
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let html = response.text().await.unwrap();
+        assert!(html.contains("Durable article body."));
+        assert!(html.contains(&activation_at.to_string()));
+        stop_built_application(application).await;
+
+        let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database_path)
+            .connect()
+            .await
+            .unwrap();
+        let (state, current_digest, published_at_ns): (String, Vec<u8>, i64) = sqlx::query_as(
+            "SELECT state, current_published_digest, published_at_ns \
+             FROM canonical_publications WHERE publication_id = ?",
+        )
+        .bind(publication_id.as_slice())
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(state, "published");
+        assert_eq!(current_digest, revision.as_bytes());
+        assert_eq!(published_at_ns, activation_at_ns);
+        connection.close().await.unwrap();
     }
 
     #[tokio::test]

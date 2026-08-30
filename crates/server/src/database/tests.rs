@@ -500,6 +500,8 @@ async fn identifiers_and_hashes_use_blob_storage() {
     assert_eq!(
         columns,
         [
+            "canonical_publications.activation_site_digest:BLOB",
+            "canonical_publications.creation_key:BLOB",
             "canonical_publications.current_published_digest:BLOB",
             "canonical_publications.pinned_post_digest:BLOB",
             "canonical_publications.publication_id:BLOB",

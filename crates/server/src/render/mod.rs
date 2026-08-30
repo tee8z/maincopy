@@ -19,8 +19,4 @@ pub use site::{
     build_site_snapshot, render_site_shell,
 };
 
-#[allow(
-    unused_imports,
-    reason = "WP 1.5 gives the transition coordinator sole ownership of activation"
-)]
 pub(crate) use site::{SiteSnapshotActivator, snapshot_store};

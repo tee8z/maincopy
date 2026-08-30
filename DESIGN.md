@@ -1427,6 +1427,10 @@ At the scheduled time, Maincopy uses this sequence:
 3. The writer copies that timestamp to `published_at`, changes the canonical
    state to `Published`, and releases due target jobs in one transaction.
 
+An immediate publication stores one client creation key for idempotency. The
+`Activating` row also stores the exact candidate site digest. SQLite enforces
+only creation-key uniqueness. The application validates the activation state.
+
 An `Activating` database row does not make a post visible by itself. The atomic
 snapshot swap in step 2 is the only visibility point. At steady state, every
 public post has a `Published` row. During the short activation interval, the
@@ -1833,10 +1837,9 @@ error. Payment reconciliation and update subscription are feature tasks. Their
 failure makes payment readiness fail and disables tip operations, but article
 routes stay ready.
 
-Before either listener binds, startup checks all durable reload and canonical
-publication records. The current implementation rejects unresolved `Applying`
-and `Activating` records. WP1.5 and WP5.2 will replace this rejection with
-deterministic reconciliation.
+Before either listener binds, startup checks every durable reload state and
+canonical publication record. It rejects an unresolved `Applying` reload. It
+recovers one exact `Activating` publication and rejects ambiguous activations.
 
 Startup builds the initial public snapshot from the exact durable `Published`
 projection. A fresh database produces an empty projection. Startup never
@@ -1845,30 +1848,31 @@ installs the site head before either listener binds.
 
 Startup follows this order:
 
-1. Parse and validate configuration.
-2. Acquire the runtime process lock and database-identity ownership lock.
-3. For an existing nonempty database, run the read-only application and
+1. Parse configuration, acquire the runtime process lock, and validate content.
+2. Validate frontend assets, install shutdown handling, and compile content.
+3. Acquire the database-identity ownership lock.
+4. For an existing nonempty database, run the read-only application and
    migration preflight.
-4. When a restore marker applies, verify the accepted schema and logical
+5. When a restore marker applies, verify the accepted schema and logical
    digests through the same read-only connection.
-5. Close the read-only connection.
-6. Open the write connection and configure WAL.
-7. Apply embedded migrations. This step is a no-op for an accepted restore.
-8. Verify foreign keys, then open the query-only read pool.
-9. Spawn the writer task.
-10. Reject unresolved `Applying` reloads and `Activating` publications while
-    their recovery coordinators are unavailable. Later work packages reconcile
-    them in deterministic ledger order while listeners remain closed.
-11. Compile and install the canonical initial snapshot produced by that
-   recovered ledger state.
-12. Build the configured `LightningProvider` and start its bounded `JoinSet`
+6. Close the read-only connection.
+7. Open the write connection and configure WAL.
+8. Apply embedded migrations. This step is a no-op for an accepted restore.
+9. Verify foreign keys, then open the query-only read pool.
+10. Spawn the writer task.
+11. Load the durable site head, published projection, and canonical records.
+12. Reject `Applying` reloads and build the canonical base snapshot. If an
+    activation exists, require that snapshot to match the durable site head.
+13. Install the base snapshot, construct the coordinator, and finish one
+    claimed activation while listeners remain closed.
+14. Build the configured `LightningProvider` and start its bounded `JoinSet`
     operation queue when tips are enabled. Run paged remote catch-up from the
     durable update cursor. Keep payment readiness false until it succeeds.
-13. Start the long-lived payment-update subscriber at that durable cursor. It
+15. Start the long-lived payment-update subscriber at that durable cursor. It
     uses finite long-poll waits and the same catch-up and state-transition path.
-14. Install shutdown handling and complete all listener prerequisites.
-15. Bind the public and admin listeners.
-16. Mark core article service readiness true. Do not wait for Lexe.
+16. Complete the remaining listener prerequisites.
+17. Bind the public and admin listeners.
+18. Mark core article service readiness true. Do not wait for Lexe.
 
 Shutdown follows this order:
 

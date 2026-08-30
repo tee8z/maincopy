@@ -2,8 +2,9 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 
 use crate::domain::publication::store::{
-    CreateTargetJob, CreateTargetJobResult, InstallStartupSnapshot, InstallStartupSnapshotResult,
-    PublicationStore,
+    BeginPublishNow, BeginPublishNowResult, CreateTargetJob, CreateTargetJobResult,
+    FinishPublication, FinishPublicationResult, InstallStartupSnapshot,
+    InstallStartupSnapshotResult, PublicationStore,
 };
 
 /// The server-facing database capability.
@@ -29,6 +30,21 @@ pub(crate) enum Mutation {
     CreateTargetJob {
         command: CreateTargetJob,
         respond_to: oneshot::Sender<CreateTargetJobResult>,
+    },
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the publication coordinator is composed now; the admin command lands next"
+        )
+    )]
+    BeginPublishNow {
+        command: BeginPublishNow,
+        respond_to: oneshot::Sender<BeginPublishNowResult>,
+    },
+    FinishPublication {
+        command: FinishPublication,
+        respond_to: oneshot::Sender<FinishPublicationResult>,
     },
 }
 

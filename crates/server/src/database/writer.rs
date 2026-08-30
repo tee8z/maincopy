@@ -1,10 +1,10 @@
 use std::fs::File;
 
-use sqlx::{Connection as _, SqliteConnection, SqlitePool};
+use sqlx::{Connection as _, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use thiserror::Error;
 #[cfg(test)]
 use tokio::sync::Barrier;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -13,12 +13,14 @@ use super::{
     BootstrappedDatabase,
     store::{DatabaseCommandError, DatabaseStore, Mutation},
 };
+use crate::domain::publication::store::{
+    BeginPublishNowResult, CreateTargetJobResult, FinishPublicationResult, FinishedPublication,
+    InstallStartupSnapshotResult, PublicationMutationError, PublicationStore, PublishNowState,
+    SiteHead, StartupSnapshotMutationError, StoredTargetJob, TargetJobMutationError,
+    begin_publish_now, create as create_target_job, finish_publication, install_startup,
+};
 #[cfg(test)]
 use crate::domain::publication::store::{CommandIdempotencyKey, CreateTargetJob};
-use crate::domain::publication::store::{
-    PublicationStore, StartupSnapshotMutationError, TargetJobMutationError,
-    create as create_target_job, install_startup,
-};
 
 pub(crate) struct DatabaseWriter {
     connection: SqliteConnection,
@@ -126,108 +128,207 @@ impl DatabaseWriter {
             control.dequeued.wait().await;
             control.release.wait().await;
         }
-
-        match mutation {
-            Mutation::InstallStartupSnapshot {
-                command,
-                respond_to,
-            } => {
-                let mut transaction = self
-                    .connection
-                    .begin()
+        let mut transaction = self
+            .connection
+            .begin()
+            .await
+            .map_err(|source| DatabaseWriterError::Begin { source })?;
+        let applied = match apply_mutation(&mut transaction, mutation).await {
+            Ok(applied) => applied,
+            Err(failed) => {
+                transaction
+                    .rollback()
                     .await
-                    .map_err(|source| DatabaseWriterError::Begin { source })?;
-                match install_startup(&mut transaction, command).await {
-                    Ok(head) => match transaction.commit().await {
-                        Ok(()) => {
-                            let _ = respond_to.send(Ok(head));
-                            Ok(())
-                        }
-                        Err(source) => {
-                            let _ = respond_to.send(Err(DatabaseCommandError::OutcomeUnknown));
-                            Err(DatabaseWriterError::Commit { source })
-                        }
-                    },
-                    Err(StartupSnapshotMutationError::Command(error)) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .map_err(|source| DatabaseWriterError::Rollback { source })?;
-                        let _ = respond_to.send(Err(error));
-                        Ok(())
-                    }
-                    Err(StartupSnapshotMutationError::Operation(source)) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .map_err(|source| DatabaseWriterError::Rollback { source })?;
-                        Err(DatabaseWriterError::Operation { source })
-                    }
-                    Err(StartupSnapshotMutationError::CorruptStoredState) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .map_err(|source| DatabaseWriterError::Rollback { source })?;
-                        Err(DatabaseWriterError::CorruptData {
-                            entity: "startup publication state",
-                        })
-                    }
-                }
+                    .map_err(|source| DatabaseWriterError::Rollback { source })?;
+                return failed.finish();
             }
-            Mutation::CreateTargetJob {
-                command,
-                respond_to,
-            } => {
-                let mut transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .map_err(|source| DatabaseWriterError::Begin { source })?;
-                match create_target_job(&mut transaction, command).await {
-                    Ok(job) => {
-                        #[cfg(test)]
-                        abort_at(WriterCrashPoint::AfterApplyBeforeCommit);
+        };
 
-                        match transaction.commit().await {
-                            Ok(()) => {
-                                #[cfg(test)]
-                                abort_at(WriterCrashPoint::AfterCommitBeforeReply);
+        #[cfg(test)]
+        if applied.output.is_target_creation() {
+            abort_at(WriterCrashPoint::AfterApplyBeforeCommit);
+        }
 
-                                let _ = respond_to.send(Ok(job));
-                                Ok(())
-                            }
-                            Err(source) => {
-                                let _ = respond_to.send(Err(DatabaseCommandError::OutcomeUnknown));
-                                Err(DatabaseWriterError::Commit { source })
-                            }
-                        }
-                    }
-                    Err(TargetJobMutationError::Command(error)) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .map_err(|source| DatabaseWriterError::Rollback { source })?;
-                        let _ = respond_to.send(Err(error));
-                        Ok(())
-                    }
-                    Err(TargetJobMutationError::Operation(source)) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .map_err(|source| DatabaseWriterError::Rollback { source })?;
-                        Err(DatabaseWriterError::Operation { source })
-                    }
-                    Err(TargetJobMutationError::CorruptStoredJob) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .map_err(|source| DatabaseWriterError::Rollback { source })?;
-                        Err(DatabaseWriterError::CorruptData {
-                            entity: "target job",
-                        })
-                    }
-                }
+        if let Err(source) = transaction.commit().await {
+            applied
+                .responder
+                .send_error(DatabaseCommandError::OutcomeUnknown);
+            return Err(DatabaseWriterError::Commit { source });
+        }
+
+        #[cfg(test)]
+        if applied.output.is_target_creation() {
+            abort_at(WriterCrashPoint::AfterCommitBeforeReply);
+        }
+
+        applied.responder.send_success(applied.output);
+        Ok(())
+    }
+}
+
+struct AppliedMutation {
+    responder: MutationResponder,
+    output: MutationOutput,
+}
+
+struct FailedMutation {
+    responder: MutationResponder,
+    error: ApplyError,
+}
+
+enum MutationResponder {
+    Startup(oneshot::Sender<InstallStartupSnapshotResult>),
+    Target(oneshot::Sender<CreateTargetJobResult>),
+    BeginPublication(oneshot::Sender<BeginPublishNowResult>),
+    FinishPublication(oneshot::Sender<FinishPublicationResult>),
+}
+
+enum MutationOutput {
+    Startup(SiteHead),
+    Target(StoredTargetJob),
+    BeginPublication(PublishNowState),
+    FinishPublication(FinishedPublication),
+}
+
+enum ApplyError {
+    Command(DatabaseCommandError),
+    Operation(sqlx::Error),
+    Corrupt(&'static str),
+}
+
+async fn apply_mutation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    mutation: Mutation,
+) -> Result<AppliedMutation, FailedMutation> {
+    let (responder, result) = match mutation {
+        Mutation::InstallStartupSnapshot {
+            command,
+            respond_to,
+        } => (
+            MutationResponder::Startup(respond_to),
+            install_startup(transaction, command)
+                .await
+                .map(MutationOutput::Startup)
+                .map_err(ApplyError::startup),
+        ),
+        Mutation::CreateTargetJob {
+            command,
+            respond_to,
+        } => (
+            MutationResponder::Target(respond_to),
+            create_target_job(transaction, command)
+                .await
+                .map(MutationOutput::Target)
+                .map_err(ApplyError::target),
+        ),
+        Mutation::BeginPublishNow {
+            command,
+            respond_to,
+        } => (
+            MutationResponder::BeginPublication(respond_to),
+            begin_publish_now(transaction, command)
+                .await
+                .map(MutationOutput::BeginPublication)
+                .map_err(ApplyError::publication),
+        ),
+        Mutation::FinishPublication {
+            command,
+            respond_to,
+        } => (
+            MutationResponder::FinishPublication(respond_to),
+            finish_publication(transaction, command)
+                .await
+                .map(MutationOutput::FinishPublication)
+                .map_err(ApplyError::publication),
+        ),
+    };
+    match result {
+        Ok(output) => Ok(AppliedMutation { responder, output }),
+        Err(error) => Err(FailedMutation { responder, error }),
+    }
+}
+
+impl MutationResponder {
+    fn send_success(self, output: MutationOutput) {
+        match (self, output) {
+            (Self::Startup(sender), MutationOutput::Startup(value)) => {
+                let _ = sender.send(Ok(value));
             }
+            (Self::Target(sender), MutationOutput::Target(value)) => {
+                let _ = sender.send(Ok(value));
+            }
+            (Self::BeginPublication(sender), MutationOutput::BeginPublication(value)) => {
+                let _ = sender.send(Ok(value));
+            }
+            (Self::FinishPublication(sender), MutationOutput::FinishPublication(value)) => {
+                let _ = sender.send(Ok(value));
+            }
+            _ => unreachable!("mutation responder and output were constructed together"),
+        }
+    }
+
+    fn send_error(self, error: DatabaseCommandError) {
+        match self {
+            Self::Startup(sender) => {
+                let _ = sender.send(Err(error));
+            }
+            Self::Target(sender) => {
+                let _ = sender.send(Err(error));
+            }
+            Self::BeginPublication(sender) => {
+                let _ = sender.send(Err(error));
+            }
+            Self::FinishPublication(sender) => {
+                let _ = sender.send(Err(error));
+            }
+        }
+    }
+}
+
+impl MutationOutput {
+    #[cfg(test)]
+    const fn is_target_creation(&self) -> bool {
+        matches!(self, Self::Target(_))
+    }
+}
+
+impl ApplyError {
+    fn startup(error: StartupSnapshotMutationError) -> Self {
+        match error {
+            StartupSnapshotMutationError::Command(error) => Self::Command(error),
+            StartupSnapshotMutationError::Operation(source) => Self::Operation(source),
+            StartupSnapshotMutationError::CorruptStoredState => {
+                Self::Corrupt("startup publication state")
+            }
+        }
+    }
+
+    fn target(error: TargetJobMutationError) -> Self {
+        match error {
+            TargetJobMutationError::Command(error) => Self::Command(error),
+            TargetJobMutationError::Operation(source) => Self::Operation(source),
+            TargetJobMutationError::CorruptStoredJob => Self::Corrupt("target job"),
+        }
+    }
+
+    fn publication(error: PublicationMutationError) -> Self {
+        match error {
+            PublicationMutationError::Command(error) => Self::Command(error),
+            PublicationMutationError::Operation(source) => Self::Operation(source),
+            PublicationMutationError::CorruptStoredState => Self::Corrupt("canonical publication"),
+        }
+    }
+}
+
+impl FailedMutation {
+    fn finish(self) -> Result<(), DatabaseWriterError> {
+        match self.error {
+            ApplyError::Command(error) => {
+                self.responder.send_error(error);
+                Ok(())
+            }
+            ApplyError::Operation(source) => Err(DatabaseWriterError::Operation { source }),
+            ApplyError::Corrupt(entity) => Err(DatabaseWriterError::CorruptData { entity }),
         }
     }
 }
@@ -328,7 +429,10 @@ mod tests {
             distribution::{DistributionTarget, TargetPayload},
             publication::{
                 TargetJob, TargetJobStatus,
-                store::{InstallStartupSnapshot, ObservedPostRevision, SiteHead},
+                store::{
+                    BeginPublishNow, FinishPublication, InstallStartupSnapshot,
+                    ObservedPostRevision, PublishNowState, SiteHead,
+                },
             },
         },
     };
@@ -446,6 +550,39 @@ mod tests {
 
     fn site_digest(byte: u8) -> SiteSnapshotDigest {
         SiteSnapshotDigest::from_bytes([byte; 32])
+    }
+
+    fn begin_publication(
+        creation_key: &str,
+        publication_id: &str,
+        expected_site: SiteHead,
+        candidate: SiteSnapshotDigest,
+        now: i64,
+    ) -> BeginPublishNow {
+        BeginPublishNow {
+            creation_key: CommandIdempotencyKey::new(uuid(creation_key)),
+            publication_id: uuid(publication_id),
+            stable_post_id: PostId::parse(POST_ID).unwrap(),
+            pinned_post_digest: PostRevisionDigest::from_bytes(REVISION_BYTES),
+            expected_site,
+            source_commit: None,
+            now: OffsetDateTime::from_unix_timestamp(now).unwrap(),
+            candidate_site_digest: candidate,
+        }
+    }
+
+    fn finish_publication_command(
+        publication_id: &str,
+        expected_site: SiteHead,
+        candidate: SiteSnapshotDigest,
+    ) -> FinishPublication {
+        FinishPublication {
+            publication_id: uuid(publication_id),
+            expected_publication_version: 2,
+            expected_site,
+            candidate_site_digest: candidate,
+            slug: PostSlug::parse("first").unwrap(),
+        }
     }
 
     async fn stop_writer(
@@ -567,6 +704,266 @@ mod tests {
         assert_eq!(site_revisions, 2);
         assert_eq!(post_revisions, 1);
         reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn immediate_publication_is_recoverable_idempotent_and_releases_waiting_jobs() {
+        let (_root, path, database) = empty_database().await;
+        let (store, writer) = database.into_store(8);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(writer.run(shutdown.clone()));
+
+        let initial = store
+            .publications
+            .install_startup_snapshot(startup_command(None, site_digest(0x10)))
+            .await
+            .unwrap();
+        let candidate = site_digest(0x20);
+        let begun = store
+            .publications
+            .begin_publish_now(begin_publication(
+                COMMAND_ID,
+                PUBLICATION_ID,
+                initial.clone(),
+                candidate.clone(),
+                20,
+            ))
+            .await
+            .unwrap();
+        let PublishNowState::Activating(begun) = begun else {
+            panic!("new publication must be activating");
+        };
+        assert_eq!(begun.publication.view().version, 2);
+        assert_eq!(
+            begun
+                .publication
+                .view()
+                .activation_started_at
+                .unwrap()
+                .unix_timestamp(),
+            20
+        );
+        assert_eq!(begun.candidate_site_digest, candidate);
+
+        let recovery = store.publications.startup_snapshot_state().await.unwrap();
+        assert!(recovery.ledger.is_empty());
+        assert_eq!(recovery.activating.len(), 1);
+        assert_eq!(recovery.activating[0].candidate_site_digest, candidate);
+
+        store
+            .publications
+            .create_target_job(create_command(
+                OTHER_COMMAND_ID,
+                JOB_ID,
+                PUBLICATION_ID,
+                "publish copy",
+            ))
+            .await
+            .unwrap();
+
+        let finished = store
+            .publications
+            .finish_publication(finish_publication_command(
+                PUBLICATION_ID,
+                initial.clone(),
+                candidate.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(finished.publication.view().version, 3);
+        assert_eq!(
+            finished
+                .publication
+                .view()
+                .published_at
+                .unwrap()
+                .unix_timestamp(),
+            20
+        );
+        assert_eq!(finished.site.digest, candidate);
+        assert_eq!(finished.site.version, 2);
+
+        let job = store
+            .publications
+            .target_job(uuid(JOB_ID))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(job.status, TargetJobStatus::Ready(_)));
+        let state = store.publications.startup_snapshot_state().await.unwrap();
+        assert!(state.activating.is_empty());
+        assert_eq!(state.ledger.len(), 1);
+        assert_eq!(state.site, Some(finished.site.clone()));
+
+        let finish_retry = store
+            .publications
+            .finish_publication(finish_publication_command(
+                PUBLICATION_ID,
+                initial.clone(),
+                candidate.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(finish_retry, finished);
+
+        let begin_retry = store
+            .publications
+            .begin_publish_now(begin_publication(
+                COMMAND_ID,
+                OTHER_PUBLICATION_ID,
+                initial,
+                site_digest(0x99),
+                99,
+            ))
+            .await
+            .unwrap();
+        let PublishNowState::Published(begin_retry) = begin_retry else {
+            panic!("creation-key retry must return the committed publication");
+        };
+        assert_eq!(begin_retry, finished);
+
+        stop_writer(shutdown, task).await;
+        drop(store);
+        let mut reopened = database::bootstrap(configuration(&path)).await.unwrap();
+        let route: (Vec<u8>, Vec<u8>, String) = sqlx::query_as(
+            "SELECT stable_post_id, revision_digest, kind \
+             FROM published_routes WHERE route = 'first'",
+        )
+        .fetch_one(&mut reopened._writer)
+        .await
+        .unwrap();
+        assert_eq!(route.0, uuid(POST_ID).as_bytes());
+        assert_eq!(route.1, REVISION_BYTES);
+        assert_eq!(route.2, "post");
+        let canonical: (String, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT state, creation_key, activation_site_digest \
+             FROM canonical_publications WHERE publication_id = ?",
+        )
+        .bind(uuid(PUBLICATION_ID).as_bytes().as_slice())
+        .fetch_one(&mut reopened._writer)
+        .await
+        .unwrap();
+        assert_eq!(canonical.0, "published");
+        assert_eq!(canonical.1, uuid(COMMAND_ID).as_bytes());
+        assert_eq!(canonical.2, candidate.as_bytes());
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_begin_guards_head_history_concurrency_and_creation_identity() {
+        let (_root, _path, database) = empty_database().await;
+        let (store, writer) = database.into_store(8);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(writer.run(shutdown.clone()));
+        let first = store
+            .publications
+            .install_startup_snapshot(startup_command(None, site_digest(0x31)))
+            .await
+            .unwrap();
+        let current = store
+            .publications
+            .install_startup_snapshot(startup_command(Some(first.clone()), site_digest(0x32)))
+            .await
+            .unwrap();
+
+        for rejected in [
+            begin_publication(
+                COMMAND_ID,
+                PUBLICATION_ID,
+                first.clone(),
+                site_digest(0x33),
+                20,
+            ),
+            begin_publication(
+                COMMAND_ID,
+                PUBLICATION_ID,
+                current.clone(),
+                first.digest.clone(),
+                20,
+            ),
+        ] {
+            assert_eq!(
+                store.publications.begin_publish_now(rejected).await,
+                Err(DatabaseMutationError::Command(
+                    DatabaseCommandError::Rejected
+                ))
+            );
+        }
+
+        store
+            .publications
+            .begin_publish_now(begin_publication(
+                COMMAND_ID,
+                PUBLICATION_ID,
+                current.clone(),
+                site_digest(0x34),
+                20,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .publications
+                .begin_publish_now(begin_publication(
+                    OTHER_COMMAND_ID,
+                    OTHER_PUBLICATION_ID,
+                    current.clone(),
+                    site_digest(0x35),
+                    21,
+                ))
+                .await,
+            Err(DatabaseMutationError::Command(
+                DatabaseCommandError::Rejected
+            ))
+        );
+
+        let mut conflicting = begin_publication(
+            COMMAND_ID,
+            OTHER_PUBLICATION_ID,
+            current,
+            site_digest(0x36),
+            22,
+        );
+        conflicting.stable_post_id = PostId::parse(OTHER_POST_ID).unwrap();
+        assert_eq!(
+            store.publications.begin_publish_now(conflicting).await,
+            Err(DatabaseMutationError::Command(
+                DatabaseCommandError::IdempotencyConflict
+            ))
+        );
+        stop_writer(shutdown, task).await;
+    }
+
+    #[tokio::test]
+    async fn publication_begin_rejects_a_draft_revision_without_consuming_the_key() {
+        let (_root, _path, database) = empty_database().await;
+        let (store, writer) = database.into_store(4);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(writer.run(shutdown.clone()));
+        let mut install = startup_command(None, site_digest(0x40));
+        install.posts[0].publication_status = DraftStatus::Draft;
+        let initial = store
+            .publications
+            .install_startup_snapshot(install)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .publications
+                .begin_publish_now(begin_publication(
+                    COMMAND_ID,
+                    PUBLICATION_ID,
+                    initial,
+                    site_digest(0x41),
+                    20,
+                ))
+                .await,
+            Err(DatabaseMutationError::Command(
+                DatabaseCommandError::Rejected
+            ))
+        );
+        stop_writer(shutdown, task).await;
     }
 
     #[tokio::test]
