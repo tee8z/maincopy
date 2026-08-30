@@ -1,10 +1,27 @@
 //! Git-owned content types and compilation.
 
+mod assets;
+mod identity;
 mod model;
 mod parser;
 mod path;
+mod provenance;
 mod tree;
 mod validation;
+
+pub use assets::{
+    AssetRevisionReference, DigestedAsset, ExternalAssetOrigin, ExternalAssetOriginError,
+    ExternalAssetUrl, ExternalAssetUrlError, ResolvedPostAssets, ResolvedSiteAssets,
+    SnapshotAssetPath, SnapshotAssetPathError,
+};
+pub use identity::{
+    AssetBindingTarget, AssetDigest, DigestKind, DigestParseError, FrontendBundleDigest,
+    PostContentDigest, PostRendererIdentity, PostRendererVersion, PostRevisionDigest,
+    PostRevisionInput, PreInjectionRenderedArticle, PreInjectionSiteShell, PublishedPostRevision,
+    RevisionIdentityError, SanitizerVersion, SiteShellRendererIdentity, SiteShellRendererVersion,
+    SiteSnapshotDigest, SiteSnapshotInput, digest_asset, digest_frontend_bundle,
+    digest_post_content, digest_post_revision, digest_site_snapshot,
+};
 
 pub use model::{
     AuthorName, AuthorSettings, CodeRenderingMode, DefaultPostTipPolicy, DistributionCopy,
@@ -19,6 +36,10 @@ pub use model::{
 };
 pub use parser::validate_content;
 pub use path::{LogicalAssetPath, LogicalTreePathError};
+pub use provenance::{
+    SourceCommit, SourceCommitAlgorithm, SourceCommitDiscovery, SourceCommitParseError,
+    SourceCommitUnavailableReason, discover_source_commit,
+};
 pub use tree::{
     ContentByteCount, ContentDepthLimit, ContentEntryLimit, ContentFileByteLimit,
     ContentPathByteLimit, ContentTreeByteLimit, ContentTreeLimits, ContentTreeLimitsError,

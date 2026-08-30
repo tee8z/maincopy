@@ -642,20 +642,80 @@ Failure tests:
 
 Implement post and site digest calculation.
 
+Use full versioned BLAKE3 identities with these exact lowercase wire prefixes:
+`asset-b3-v1-`, `post-b3-v1-`, and `site-b3-v1-`. Follow each prefix with 64
+lowercase hexadecimal characters. Git metadata uses `git-sha1:` or
+`git-sha256:` and a complete lowercase object ID.
+
+Use separate BLAKE3 derive-key contexts for assets, posts, and sites. Encode a
+fixed kind marker and schema version before the payload. Length-frame every
+byte string and sequence with fixed-width big-endian integers. Encode options
+and enums with explicit discriminants. Do not hash Serde, TOML, JSON, debug
+output, host paths, native-width integers, or map iteration.
+
+Hash exact Markdown source bytes. Encode authored timestamp instants and their
+authored offsets. Normalize operational publication timestamps to UTC before
+encoding them. Sort semantic path-keyed sets by validated logical bytes.
+Preserve authored tag and alias order.
+
+The final post and site calculators must accept complete, non-`Default` input
+records. Do not expose a `ValidatedContent` shortcut that omits resolved asset,
+renderer, rendered-output, frontend, shell-output, or public-ledger inputs.
+Later work packages build those required components and call the calculators.
+
+Use opaque resolver-owned `ResolvedPostAssets` and `ResolvedSiteAssets` inputs.
+Bind each input to a private complete-source fingerprint, including unresolved
+authored asset syntax, and reject a binding for different post or publication
+content. Keep this binding fingerprint outside the final public identity.
+Exclude unresolved authored image, favicon, and allowlist strings from the
+canonical component. Require the resolver-owned value to supply normalized
+role-aware references and the full effective CDN allowlist. Represent the
+rendered article and site shell with separate pre-injection wrapper types whose
+constructors remain content-internal until WP1.4 gives ownership to the
+renderer.
+
 Deliverables:
 
-- Canonical frontmatter serialization for digest input.
-- BLAKE3 post revision digests.
-- BLAKE3 site snapshot digests.
-- Asset digests and immutable compiled paths.
-- Optional Git commit discovery that does not affect digest validity.
+- A canonical binary transcript that is independent from presentation
+  serializers.
+- Strict typed parsing and serialization for every digest kind.
+- Canonical typed frontmatter and exact Markdown components.
+- Final BLAKE3 post revision calculators with every required component.
+- Final BLAKE3 site snapshot calculators with every required component.
+- Resolver-owned asset capabilities bound to their canonical source content.
+- Raw-byte asset digests and snapshot-scoped immutable asset paths.
+- Content-owned revision and source-commit types reused by jobs and
+  distribution.
+- Optional typed Git provenance that does not affect digest validity and does
+  not claim that an unchecked mutable worktree exactly matches the commit.
 
 Tests:
 
-- Produce the same digest for repeated equivalent builds.
-- Change each required digest input and verify a new digest.
-- Verify that file traversal order cannot change a digest.
-- Compile without a `.git` directory and retain valid identity.
+- Lock hard-coded canonical transcript and digest goldens for each domain.
+- Reject abbreviated, uppercase, wrong-kind, wrong-version, and non-hexadecimal
+  identity strings.
+- Produce different identities for the same bytes in different digest domains.
+- Prove that length framing distinguishes ambiguous component boundaries.
+- Produce the same content component for reordered TOML keys, comments,
+  quoting, and explicit documented defaults.
+- Change each required post or site component and verify a new final digest.
+- Preserve authored tag and alias order as identity-bearing input.
+- Reverse every semantic set input and retain the same digest.
+- Change a referenced asset path or bytes and require a new parent digest.
+- Reject a resolved asset capability that was created for different source
+  content.
+- Change an unreferenced asset and retain an unrelated post digest.
+- Change renderer identity without output and rendered output without identity;
+  require a new revision in both cases.
+- Change a public activation timestamp or post revision and require a new site
+  digest.
+- Verify exact snapshot-scoped public and storage asset paths.
+- Keep all draft, unpublished, and scheduled assets out of public path
+  construction.
+- Compile without `.git` and retain valid content identity.
+- Change only Git provenance and retain the same content identities.
+- Preserve the jobs state-machine and idempotency-key wire contracts while
+  replacing unchecked identity strings.
 
 ### Work package 1.4: Baseline Markdown and snapshot compiler
 

@@ -33,8 +33,9 @@ usable release is built.
 The repository contains the accepted v1 architecture, the ordered development
 plan, the process-composition scaffold, the canonical publication-job domain,
 the provider-neutral payment domain, the typed content contract, the bounded
-Linux content-tree loader, and a locked Nix development environment. Most
-product slices remain under construction.
+Linux content-tree loader, versioned content and snapshot identity primitives,
+and a locked Nix development environment. Most product slices remain under
+construction.
 
 - [DESIGN.md](DESIGN.md) defines system behavior and trust boundaries.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) defines the delivery order and exit
@@ -81,6 +82,12 @@ Each content compilation pins the configured root once. It loads only
 descriptor-relative lookups. Descendant links, special files, mount crossings,
 unsafe names, and resource-limit excesses fail closed. Later compiler stages
 use owned bytes and never reopen the mutable source tree.
+
+Revision identities use domain-separated, versioned BLAKE3 transcripts rather
+than presentation serialization. Opaque resolved-asset inputs are bound to the
+post or publication that produced them. Final post and site calculators also
+require typed pre-injection renderer output and the public publication-ledger
+projection, so a partial compiler stage cannot mint a final identity.
 
 Maud templates remain Rust modules. A custom build script deterministically
 combines and minifies first-party CSS and optional JavaScript, writes typed

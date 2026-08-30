@@ -338,10 +338,6 @@ impl UnresolvedAssetReference {
         normalize_plain_text(value).map(Self)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by asset resolution in WP 1.6")
-    )]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -356,10 +352,6 @@ impl UnresolvedHttpsOrigin {
         normalize_plain_text(value).map(Self)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by asset resolution in WP 1.6")
-    )]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -622,10 +614,6 @@ impl SiteSettings {
         &self.description
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by asset resolution in WP 1.6")
-    )]
     pub(crate) const fn favicon(&self) -> Option<&UnresolvedAssetReference> {
         self.favicon.as_ref()
     }
@@ -658,10 +646,6 @@ impl PublicationAssetSettings {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by asset resolution in WP 1.6")
-    )]
     pub(crate) fn allowed_https_origins(&self) -> &[UnresolvedHttpsOrigin] {
         &self.allowed_https_origins
     }
@@ -781,10 +765,6 @@ impl PostMetadata {
         &self.description
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by asset resolution in WP 1.6")
-    )]
     pub(crate) const fn image(&self) -> Option<&UnresolvedAssetReference> {
         self.image.as_ref()
     }

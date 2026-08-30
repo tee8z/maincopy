@@ -3,6 +3,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+use crate::content::{PostId, PostRevisionDigest};
+
 pub const CURRENT_PAYLOAD_VERSION: u16 = 1;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
@@ -93,10 +95,12 @@ pub enum PayloadError {
 
 /// Builds a stable, unambiguous key for one target delivery.
 pub(crate) fn target_idempotency_key(
-    stable_post_id: &str,
-    revision_digest: &str,
+    stable_post_id: &PostId,
+    revision_digest: &PostRevisionDigest,
     target: DistributionTarget,
 ) -> TargetIdempotencyKey {
+    let stable_post_id = stable_post_id.as_str();
+    let revision_digest = revision_digest.as_str();
     let target = target.as_str();
     TargetIdempotencyKey(
         [stable_post_id, revision_digest, target]
@@ -110,6 +114,13 @@ pub(crate) fn target_idempotency_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const POST_A: &str = "11111111-1111-4111-8111-111111111111";
+    const POST_B: &str = "22222222-2222-4222-8222-222222222222";
+    const DIGEST_A: &str =
+        "post-b3-v1-1111111111111111111111111111111111111111111111111111111111111111";
+    const DIGEST_B: &str =
+        "post-b3-v1-2222222222222222222222222222222222222222222222222222222222222222";
 
     #[test]
     fn rejects_an_unknown_payload_version() {
@@ -143,10 +154,19 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_keys_do_not_have_separator_collisions() {
+    fn typed_identities_produce_distinct_idempotency_keys() {
+        let post_a = PostId::parse(POST_A).unwrap();
+        let post_b = PostId::parse(POST_B).unwrap();
+        let digest_a = PostRevisionDigest::parse(DIGEST_A).unwrap();
+        let digest_b = PostRevisionDigest::parse(DIGEST_B).unwrap();
+
         assert_ne!(
-            target_idempotency_key("post|revision", "digest", DistributionTarget::X),
-            target_idempotency_key("post", "revision|digest", DistributionTarget::X)
+            target_idempotency_key(&post_a, &digest_a, DistributionTarget::X),
+            target_idempotency_key(&post_b, &digest_a, DistributionTarget::X)
+        );
+        assert_ne!(
+            target_idempotency_key(&post_a, &digest_a, DistributionTarget::X),
+            target_idempotency_key(&post_a, &digest_b, DistributionTarget::X)
         );
     }
 

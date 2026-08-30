@@ -503,7 +503,7 @@ Each post revision receives a BLAKE3 digest. The digest includes:
 - normalized frontmatter;
 - the Markdown source;
 - referenced asset paths and digests;
-- effective renderer settings; and
+- effective renderer settings;
 - versioned renderer and sanitizer implementation identities;
 - digests of deterministic rendered article fragments and generated asset
   bytes before snapshot-URL injection; and
@@ -521,6 +521,82 @@ renderer identity change when an implementation change alters output.
 
 Git commit metadata is recorded when available. Content digests remain valid
 when a deployment artifact does not include `.git`.
+
+#### Digest encoding
+
+V1 uses full 256-bit BLAKE3 values. The wire encoding is one lowercase prefix
+and 64 lowercase hexadecimal characters:
+
+| Identity | Wire prefix |
+| --- | --- |
+| Asset content | `asset-b3-v1-` |
+| Post revision | `post-b3-v1-` |
+| Site snapshot | `site-b3-v1-` |
+
+Parsing rejects an abbreviated value, uppercase text, an unknown algorithm or
+schema version, a wrong identity kind, and non-hexadecimal text. A digest type
+does not have a constructor that accepts an arbitrary string.
+
+Each digest kind uses a separate BLAKE3 derive-key context. Its canonical V1
+transcript starts with a fixed kind marker and a big-endian schema version.
+Byte strings use a big-endian 64-bit length. Sequences use a big-endian 64-bit
+count. Options use an explicit one-byte discriminant. Enums use fixed numeric
+tags. Integers never use a native word size or native byte order.
+
+The digest code does not hash TOML, JSON, a Serde representation, a debug
+representation, a hash-map iteration, or a host filesystem path. It sorts
+semantic path-keyed sets by their validated logical bytes. It preserves the
+documented authored order of tags and aliases.
+
+Canonical post content uses the typed, effective frontmatter model. TOML key
+order, comments, quoting style, and an omitted value that equals its documented
+default do not change the identity. Markdown source bytes remain exact; V1 does
+not rewrite line endings for the digest. Authored timestamps include the
+instant and authored UTC offset. The public-ledger input normalizes operational
+publication timestamps to UTC before it encodes them.
+
+WP1.3 supplies pure final calculators, but it does not create a shortcut from
+`ValidatedContent` to a final revision or snapshot digest. The post calculator
+requires the content, resolved referenced assets, renderer and sanitizer
+identity, rendered output, and generated-output components. The site calculator
+requires resolved publication and site assets, shell and frontend identities,
+pre-injection shell output, and the public post ledger entries. Later work
+packages construct these required components. None has a default value.
+
+The asset resolver returns opaque `ResolvedPostAssets` and
+`ResolvedSiteAssets` values. Each value carries a private source-binding
+fingerprint that covers the complete typed source, including authored image,
+favicon, and allowlist syntax. The final calculator rejects a resolved value
+that belongs to different source content. This private binding is not part of
+the public post or site identity. Raw authored asset text is therefore not
+hashed as a substitute for resolution. The resolved value supplies the
+role-aware normalized image or favicon, the effective normalized CDN
+allowlist, and the complete referenced-asset set.
+
+The rendered post fragment and site shell use distinct pre-injection wrapper
+types. This prevents the final calculators from confusing output that already
+contains a snapshot-scoped URL with the output that is an input to that
+snapshot digest. Their constructors are content-internal. WP1.4 makes the
+renderer the sole production constructor and binds each result to its complete
+render input.
+
+An asset content digest covers its raw bytes. A parent post or site transcript
+also covers the normalized logical path or external URL. An unreferenced asset
+does not change a post revision.
+
+Content-asset URLs remain snapshot-scoped:
+
+```text
+/assets/{site-snapshot-digest}/{logical-path-without-assets-prefix}
+```
+
+Only the public snapshot manifest creates these URLs. Calculating an asset
+digest does not make a draft, unpublished, or scheduled asset public.
+
+Git object IDs use `git-sha1:` plus 40 lowercase hexadecimal characters or
+`git-sha256:` plus 64 lowercase hexadecimal characters. Source commit metadata
+is optional provenance. It is not an input to an asset, post, or site digest,
+and it does not by itself prove that a mutable worktree matches the commit.
 
 ## Content compilation
 

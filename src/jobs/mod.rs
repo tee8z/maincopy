@@ -4,33 +4,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
 
+pub use crate::content::{PostRevisionDigest, SourceCommit};
+
 use crate::{
     content::PostId,
     distribution::{
         DistributionTarget, TargetIdempotencyKey, TargetPayload, target_idempotency_key,
     },
 };
-
-macro_rules! string_identifier {
-    ($name:ident) => {
-        #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(String);
-
-        impl $name {
-            pub fn new(value: impl Into<String>) -> Self {
-                Self(value.into())
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-    };
-}
-
-string_identifier!(PostRevisionDigest);
-string_identifier!(SourceCommit);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,8 +266,8 @@ impl TargetJob {
     }
     pub fn idempotency_key(&self) -> TargetIdempotencyKey {
         target_idempotency_key(
-            self.stable_post_id().as_str(),
-            self.pinned_post_digest().as_str(),
+            self.stable_post_id(),
+            self.pinned_post_digest(),
             *self.target(),
         )
     }
@@ -463,6 +444,11 @@ mod tests {
 
     const POST_A: &str = "11111111-1111-4111-8111-111111111111";
     const POST_B: &str = "22222222-2222-4222-8222-222222222222";
+    const DIGEST_A: &str =
+        "post-b3-v1-1111111111111111111111111111111111111111111111111111111111111111";
+    const DIGEST_B: &str =
+        "post-b3-v1-2222222222222222222222222222222222222222222222222222222222222222";
+    const SOURCE_COMMIT_A: &str = "git-sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn at(seconds: i64) -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(seconds).unwrap()
@@ -471,10 +457,10 @@ mod tests {
         PostId::parse(value).unwrap()
     }
     fn digest(value: &str) -> PostRevisionDigest {
-        PostRevisionDigest::new(value)
+        PostRevisionDigest::parse(value).unwrap()
     }
     fn scheduled_publication(scheduled_at: OffsetDateTime) -> CanonicalPublication {
-        CanonicalPublication::schedule(post_id(POST_A), digest("digest-a"), None, scheduled_at)
+        CanonicalPublication::schedule(post_id(POST_A), digest(DIGEST_A), None, scheduled_at)
     }
     fn published_publication(scheduled_at: OffsetDateTime) -> CanonicalPublication {
         let mut publication = scheduled_publication(scheduled_at);
@@ -486,7 +472,7 @@ mod tests {
         TargetJob::waiting(
             DistributionTarget::X,
             post_id(POST_A),
-            digest("digest-a"),
+            digest(DIGEST_A),
             scheduled_at,
             TargetPayload::new("copy").unwrap(),
         )
@@ -496,8 +482,8 @@ mod tests {
     fn canonical_success_path_assigns_publication_time() {
         let mut publication = CanonicalPublication::schedule(
             post_id(POST_A),
-            digest("digest-a"),
-            Some(SourceCommit::new("commit-a")),
+            digest(DIGEST_A),
+            Some(SourceCommit::parse(SOURCE_COMMIT_A).unwrap()),
             at(10),
         );
         publication.begin_activation(1, at(11)).unwrap();
@@ -508,7 +494,7 @@ mod tests {
             publication
                 .current_published_digest()
                 .map(PostRevisionDigest::as_str),
-            Some("digest-a")
+            Some(DIGEST_A)
         );
         assert_eq!(publication.version(), 3);
     }
@@ -544,7 +530,7 @@ mod tests {
         );
         publication.retry_blocked(3, at(12)).unwrap();
         assert_eq!(publication.state(), CanonicalState::Activating);
-        assert_eq!(publication.pinned_post_digest().as_str(), "digest-a");
+        assert_eq!(publication.pinned_post_digest().as_str(), DIGEST_A);
         assert_eq!(publication.published_at(), None);
         assert_eq!(publication.block_reason(), None);
         assert_eq!(publication.activation_started_at(), Some(at(12)));
@@ -616,7 +602,7 @@ mod tests {
         assert_eq!(target, before);
 
         let mut other_post =
-            CanonicalPublication::schedule(post_id(POST_B), digest("digest-a"), None, at(10));
+            CanonicalPublication::schedule(post_id(POST_B), digest(DIGEST_A), None, at(10));
         other_post.begin_activation(1, at(10)).unwrap();
         other_post.commit_published(2).unwrap();
         assert_eq!(
@@ -626,7 +612,7 @@ mod tests {
         assert_eq!(target, before);
 
         let mut other_revision =
-            CanonicalPublication::schedule(post_id(POST_A), digest("digest-b"), None, at(10));
+            CanonicalPublication::schedule(post_id(POST_A), digest(DIGEST_B), None, at(10));
         other_revision.begin_activation(1, at(10)).unwrap();
         other_revision.commit_published(2).unwrap();
         assert_eq!(
@@ -723,11 +709,28 @@ mod tests {
             serde_json::json!("revision_unavailable")
         );
 
-        let publication = scheduled_publication(at(10));
+        let publication = CanonicalPublication::schedule(
+            post_id(POST_A),
+            digest(DIGEST_A),
+            Some(SourceCommit::parse(SOURCE_COMMIT_A).unwrap()),
+            at(10),
+        );
+        let publication = serde_json::to_value(publication).unwrap();
         assert_eq!(
-            serde_json::to_value(publication).unwrap()["scheduled_at"],
+            publication["scheduled_at"],
             serde_json::json!("1970-01-01T00:00:10Z")
         );
+        assert_eq!(
+            publication["pinned_post_digest"],
+            serde_json::json!(DIGEST_A)
+        );
+        assert_eq!(
+            publication["source_commit"],
+            serde_json::json!(SOURCE_COMMIT_A)
+        );
+
+        let target = serde_json::to_value(job(at(10))).unwrap();
+        assert_eq!(target["pinned_post_digest"], serde_json::json!(DIGEST_A));
     }
 
     #[test]
@@ -756,8 +759,23 @@ mod tests {
         let target = job(at(10));
         assert_eq!(
             target.idempotency_key().as_str(),
-            "36:11111111-1111-4111-8111-111111111111|8:digest-a|1:x"
+            concat!(
+                "36:11111111-1111-4111-8111-111111111111|75:",
+                "post-b3-v1-1111111111111111111111111111111111111111111111111111111111111111",
+                "|1:x"
+            )
         );
+    }
+
+    #[test]
+    fn jobs_reexport_the_content_owned_identity_types() {
+        let content_digest: crate::content::PostRevisionDigest = digest(DIGEST_A);
+        let jobs_digest: PostRevisionDigest = content_digest;
+        assert_eq!(jobs_digest.as_str(), DIGEST_A);
+
+        let content_commit = crate::content::SourceCommit::parse(SOURCE_COMMIT_A).unwrap();
+        let jobs_commit: SourceCommit = content_commit;
+        assert_eq!(jobs_commit.as_str(), SOURCE_COMMIT_A);
     }
 
     #[test]
