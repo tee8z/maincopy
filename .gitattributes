@@ -1,1 +1,2 @@
 tests/fixtures/content/posts/crlf-valid.md binary
+*.sql text eol=lf

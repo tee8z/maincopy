@@ -54,16 +54,11 @@
               || (builtins.match ".*/templates(/.*)?" path != null);
           };
 
-          commonNativeBuildInputs = [ pkgs.pkg-config ];
-          commonBuildInputs = [ pkgs.sqlite ];
-
           cargoArtifacts = craneLib.buildDepsOnly {
             inherit src;
             pname = "maincopy-dependencies";
             version = "0.1.0";
             cargoExtraArgs = "--locked";
-            nativeBuildInputs = commonNativeBuildInputs;
-            buildInputs = commonBuildInputs;
             strictDeps = true;
           };
 
@@ -72,16 +67,12 @@
             pname = "maincopy-workspace";
             version = "0.1.0";
             cargoExtraArgs = "--locked";
-            nativeBuildInputs = commonNativeBuildInputs;
-            buildInputs = commonBuildInputs;
             strictDeps = true;
           };
         in
         {
           inherit
             cargoArtifacts
-            commonBuildInputs
-            commonNativeBuildInputs
             craneLib
             maincopy
             pkgs
@@ -125,8 +116,6 @@
           clippy = project.craneLib.cargoClippy {
             inherit (project) cargoArtifacts src;
             cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
-            nativeBuildInputs = project.commonNativeBuildInputs;
-            buildInputs = project.commonBuildInputs;
             strictDeps = true;
           };
 
@@ -137,8 +126,6 @@
           tests = project.craneLib.cargoTest {
             inherit (project) cargoArtifacts src;
             cargoTestExtraArgs = "--all-targets --all-features";
-            nativeBuildInputs = project.commonNativeBuildInputs;
-            buildInputs = project.commonBuildInputs;
             strictDeps = true;
           };
 

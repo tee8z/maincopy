@@ -659,6 +659,15 @@ fn canonical_uuid_slug_tag_and_alias_rules_are_enforced() {
         );
     }
 
+    let maximum_route_value = "a".repeat(1024);
+    assert!(PostSlug::parse(&maximum_route_value).is_ok());
+    assert!(PostAlias::parse(&maximum_route_value).is_ok());
+    assert!(PostTag::parse(&maximum_route_value).is_ok());
+    let oversized_route_value = "a".repeat(1025);
+    assert!(PostSlug::parse(&oversized_route_value).is_err());
+    assert!(PostAlias::parse(&oversized_route_value).is_err());
+    assert!(PostTag::parse(&oversized_route_value).is_err());
+
     let tags = MINIMAL_POST.replace(
         "description = \"Only the required post fields are present.\"",
         "description = \"Only the required post fields are present.\"\ntags = [\" Rust \" , \"RUST\", \"C++\"]",

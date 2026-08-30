@@ -15,10 +15,12 @@ blake3.workspace = true
 clap.workspace = true
 lexe.workspace = true
 lightning-invoice.workspace = true
+libsqlite3-sys.workspace = true
 maincopy-shared = { workspace = true, features = ["schema"] }
 maud.workspace = true
 pulldown-cmark.workspace = true
 serde.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

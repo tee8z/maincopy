@@ -19,6 +19,7 @@ use crate::{
         ContentTreeLimits, ContentValidationErrors, DiscoveredContentTree, ValidatedContent,
         discover_content_tree,
     },
+    database::{self, BootstrappedDatabase},
     error::{ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal},
     observability::{initialize_logging, task_span},
     process_lock::{ProcessLock, ProcessLockError},
@@ -37,6 +38,7 @@ type CriticalTaskFailure = Box<dyn std::error::Error + Send + Sync>;
 /// ordered shutdown belong in [`Application::run_until_stop`].
 pub(crate) struct Application {
     _startup: StartupConfiguration,
+    _database: BootstrappedDatabase,
     runtime: ApplicationRuntime,
 }
 
@@ -76,7 +78,8 @@ impl StartupConfiguration {
         let process_lock = match ProcessLock::acquire(host_view.runtime_root) {
             Ok(process_lock) => process_lock,
             Err(ProcessLockError::AlreadyRunning) => return Err(ProcessError::AlreadyRunning),
-            Err(_) => {
+            Err(error) => {
+                tracing::error!(error = %error, "process lock acquisition failed");
                 return Err(ApplicationError::Startup {
                     stage: crate::error::StartupStage::ProcessLock,
                 }
@@ -131,7 +134,7 @@ where
 
 async fn run_server(arguments: ServerArguments) -> Result<(), ProcessError> {
     let startup = StartupConfiguration::load(arguments)?;
-    let application = Application::build(startup)?;
+    let application = Application::build(startup).await?;
     application
         .run_until_stop()
         .await
@@ -156,19 +159,41 @@ fn report_command_error(error: clap::Error) -> ProcessExit {
 }
 
 impl Application {
-    fn build(startup: StartupConfiguration) -> Result<Self, ProcessError> {
+    async fn build(startup: StartupConfiguration) -> Result<Self, ProcessError> {
         let cancellation = CancellationToken::new();
-        let admin_socket =
-            AdminSocket::bind(startup._host.view().admin_socket).map_err(|error| {
-                if error.is_conflict() {
+        let database = match database::bootstrap(startup._host.view().database).await {
+            Ok(database) => database,
+            Err(database::DatabaseStartupError::AlreadyOwned) => {
+                return Err(ProcessError::AlreadyRunning);
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "database bootstrap failed");
+                return Err(ApplicationError::Startup {
+                    stage: crate::error::StartupStage::Database,
+                }
+                .into());
+            }
+        };
+        let shutdown = match prepare_shutdown(install_termination_signal) {
+            Ok(shutdown) => shutdown,
+            Err(error) => {
+                return Err(close_database_after_startup_failure(database, error.into()).await);
+            }
+        };
+        let admin_socket = match AdminSocket::bind(startup._host.view().admin_socket) {
+            Ok(admin_socket) => admin_socket,
+            Err(error) => {
+                let process_error = if error.is_conflict() {
                     ProcessError::AlreadyRunning
                 } else {
                     ApplicationError::Startup {
                         stage: crate::error::StartupStage::Listeners,
                     }
                     .into()
-                }
-            })?;
+                };
+                return Err(close_database_after_startup_failure(database, process_error).await);
+            }
+        };
         let admin_cancellation = cancellation.clone();
         let admin_task = CriticalTask::new(CriticalTaskName::AdminServer, async move {
             admin_socket
@@ -179,45 +204,53 @@ impl Application {
 
         Ok(Self {
             _startup: startup,
-            runtime: ApplicationRuntime::build_with_signal_installer(
+            _database: database,
+            runtime: ApplicationRuntime::with_parts(
                 Readiness::default(),
                 cancellation,
+                shutdown,
                 vec![admin_task],
-                install_termination_signal,
-            )
-            .map_err(ProcessError::from)?,
+            ),
         })
     }
 
     async fn run_until_stop(self) -> Result<(), ApplicationError> {
-        self.runtime.run_until_stop().await
+        let Self {
+            _startup: startup,
+            _database: database,
+            runtime,
+        } = self;
+        let runtime_result = runtime.run_until_stop().await;
+        let close_result = database
+            .close()
+            .await
+            .map_err(|_| ApplicationError::DatabaseClose);
+        drop(startup);
+        runtime_result.and(close_result)
     }
 }
 
-impl ApplicationRuntime {
-    fn build_with_signal_installer<Install>(
-        readiness: Readiness,
-        cancellation: CancellationToken,
-        critical_tasks: Vec<CriticalTask>,
-        install_signal: Install,
-    ) -> Result<Self, ApplicationError>
-    where
-        Install: FnOnce() -> Result<ShutdownFuture, ApplicationError>,
-    {
-        crate::frontend_assets::embedded_manifest()
-            .validate()
-            .map_err(|_| ApplicationError::Startup {
-                stage: crate::error::StartupStage::FrontendAssets,
-            })?;
-        let shutdown = install_signal()?;
-        Ok(Self::with_parts(
-            readiness,
-            cancellation,
-            shutdown,
-            critical_tasks,
-        ))
-    }
+async fn close_database_after_startup_failure(
+    database: BootstrappedDatabase,
+    process_error: ProcessError,
+) -> ProcessError {
+    let _ = database.close().await;
+    process_error
+}
 
+fn prepare_shutdown<Install>(install_signal: Install) -> Result<ShutdownFuture, ApplicationError>
+where
+    Install: FnOnce() -> Result<ShutdownFuture, ApplicationError>,
+{
+    crate::frontend_assets::embedded_manifest()
+        .validate()
+        .map_err(|_| ApplicationError::Startup {
+            stage: crate::error::StartupStage::FrontendAssets,
+        })?;
+    install_signal()
+}
+
+impl ApplicationRuntime {
     fn with_parts(
         readiness: Readiness,
         cancellation: CancellationToken,
@@ -659,33 +692,77 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
         let socket_path = root.path().join("run/admin.sock");
 
-        let application = Application::build(startup).unwrap();
+        let application = Application::build(startup).await.unwrap();
 
         assert!(socket_path.exists());
         assert_eq!(application.runtime.critical_tasks.len(), 1);
 
-        drop(application);
+        let Application {
+            _startup: startup,
+            _database: database,
+            runtime,
+        } = application;
+        drop(runtime);
+        database.close().await.unwrap();
+        drop(startup);
         tokio::task::yield_now().await;
         assert!(!socket_path.exists());
     }
 
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn database_failure_leaves_the_admin_socket_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use sqlx::{ConnectOptions as _, Connection as _};
+
+        let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let database_path = startup._host.view().database.path.to_owned();
+        let socket_path = root.path().join("run/admin.sock");
+        let database_parent = database_path.parent().unwrap();
+        fs::create_dir_all(database_parent).unwrap();
+        fs::set_permissions(database_parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut foreign = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA application_id = 7")
+            .execute(&mut foreign)
+            .await
+            .unwrap();
+        foreign.close().await.unwrap();
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = match Application::build(startup).await {
+            Ok(_) => panic!("a foreign database must fail before listener binding"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ProcessError::Application(ApplicationError::Startup {
+                stage: crate::error::StartupStage::Database
+            })
+        ));
+        assert!(!socket_path.exists());
+    }
+
     #[test]
-    fn signal_registration_failure_prevents_application_construction_and_readiness() {
-        let readiness = Readiness::default();
+    fn signal_registration_failure_prevents_listener_preparation() {
         let mut installation_attempted = false;
 
-        let result = ApplicationRuntime::build_with_signal_installer(
-            readiness.clone(),
-            CancellationToken::new(),
-            Vec::new(),
-            || {
-                installation_attempted = true;
-                Err(ApplicationError::SignalRegistration {
-                    signal: ShutdownSignal::Terminate,
-                    source: std::io::Error::other("signal registration failed"),
-                })
-            },
-        );
+        let result = prepare_shutdown(|| {
+            installation_attempted = true;
+            Err(ApplicationError::SignalRegistration {
+                signal: ShutdownSignal::Terminate,
+                source: std::io::Error::other("signal registration failed"),
+            })
+        });
 
         assert!(installation_attempted);
         assert!(matches!(
@@ -695,7 +772,6 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                 ..
             })
         ));
-        assert!(!readiness.is_ready());
     }
 
     #[tokio::test]

@@ -266,8 +266,8 @@ Rust toolchain and the project license.
 | HTTP service | Axum and Tower | 0 and 2 |
 | HTML templates | Maud | 2 |
 | Frontend asset build | Deterministic `crates/server/build.rs`; Lightning CSS 1.0.0-alpha.72 for V1 CSS; add a reviewed JavaScript minifier only with the first JavaScript input | 2 |
-| SQLite | SQLx with SQLite and embedded migrations | 3 |
-| Process lock | Select a cross-process file-lock implementation | 3 |
+| SQLite | Pin SQLx 0.9.0 with embedded migrations and bundled SQLite 3.51.3 | 3 |
+| Process lock | Use standard-library file locks for runtime and database ownership | 3 |
 | OpenAPI | `utoipa` and `utoipa-axum` with stable path/schema ordering | 0 and 4 |
 | Syntax highlighting | Select through the rendering corpus | 6 |
 | Mermaid | Select through the required implementation spike | 6 |
@@ -297,15 +297,22 @@ Maincopy package license.
 | `rustix` build and test edge | 1.1.4 | Default features disabled; `fs`, `std`; Linux and macOS only | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 1.63 |
 | `thiserror` build edge | 2.0.20 | Default features | `MIT OR Apache-2.0` | 1.71 |
 | `zeroize` | 1.9.0 | Default features disabled; `alloc` | `Apache-2.0 OR MIT` | 1.85 |
+| `sqlx` | 0.9.0 | Default features disabled; `macros`, `migrate`, `sqlite-bundled` | `MIT OR Apache-2.0` | 1.94 |
+| `libsqlite3-sys` | 0.37.0 | Default features disabled; `bundled` | `MIT` | Not declared |
+
+`libsqlite3-sys` 0.37.0 bundles SQLite 3.51.3. SQLite places its bundled source
+in the public domain. Maincopy rejects an older linked SQLite version at
+startup because 3.51.3 fixes the accepted WAL-reset race.
 
 `walkdir` is not part of the frontend build. Its path-based iterator cannot
 provide the required descriptor-relative traversal boundary.
 
-The locked Nix toolchain is Rust 1.98. The Lexe 0.1.22 crates declare Rust
-1.90. Several direct dependencies do not declare a minimum supported Rust
-version (MSRV). Therefore, `Cargo.toml` does not declare `rust-version` yet.
-Set that field only after one complete locked dependency graph establishes the
-package MSRV. Keep the package-license decision separate from this work.
+The locked Nix toolchain is Rust 1.98. SQLx 0.9.0 declares Rust 1.94, and the
+Lexe 0.1.22 crates declare Rust 1.90. Several direct dependencies do not
+declare a minimum supported Rust version (MSRV). Therefore, `Cargo.toml` does
+not declare `rust-version` yet. Set that field only after one complete locked
+dependency graph establishes the package MSRV. Keep the package-license
+decision separate from this work.
 
 ## Implementation decisions and remaining gates
 
@@ -548,7 +555,8 @@ Deliverables:
 - Required site title, HTTPS canonical origin, site description, and author
   name in `publication.toml`.
 - Canonical lowercase hyphenated UUID text.
-- Route-safe ASCII slugs, aliases, and normalized tags.
+- Route-safe ASCII slugs, aliases, and normalized tags, each with an inclusive
+  1,024-byte limit.
 - Authored UTC-offset preservation for authored metadata.
 - A fixed renderer policy that is not authored configuration in v1.
 - Publication-default tip behavior with explicit per-post overrides.
@@ -1190,32 +1198,65 @@ Add embedded migrations and the initial operational schema.
 
 Deliverables:
 
-- Tables from the accepted design.
+- Core migrations for content, reload, canonical publication, and target jobs.
+- No payment, subscription, outbox, attempt, remote-publication, or audit
+  tables before the owning feature slice.
+- `site_revisions`, one explicit singleton `site_state`, `post_revisions`, and
+  `published_routes`.
 - A `canonical_publications` ledger with required pinned post digests and
   optional source commits.
 - A `reload_operations` ledger for the `Applying`, `Applied`, and `Failed`
   published-revision update states.
+- A `reload_post_changes` ledger with expected and candidate post digests.
 - Canonical state storage for scheduled, activating, blocked, published, and
   cancelled records.
 - Scheduled, activation, and canonical publication timestamps.
-- A current published revision digest that can advance on reload.
+- A current published revision digest that can advance without changing its
+  immutable publication pin or original `published_at`.
+- Persisted `publishable` and `draft` revision eligibility. Draft revisions
+  cannot enter a canonical schedule or become current.
 - Expected-current and candidate site/post digests for reload reconciliation.
+- One explicit `site_state` head for current-site comparisons. Do not infer the
+  head from insertion order or the greatest version.
 - Target-job linkage and a `WaitingForCanonical` state.
+- `TargetPayloadDigest` validation for the immutable payload version and body.
 - Foreign keys, uniqueness constraints, and schema versioning.
+- Embedded transactional SQLx migrations. Reject any migration that uses
+  `-- no-transaction`.
+- SQLx 0.9.0 with `macros`, `migrate`, and `sqlite-bundled` only.
+- An exact `libsqlite3-sys` 0.37.0 pin and a SQLite 3.51.3 runtime floor.
+- A database-identity ownership lock acquired before database inspection. Hold
+  it until the writer connection closes.
+- Read-only preflight for each existing nonempty database. Validate the
+  application ID and complete migration history before writer access.
+- Typed rejection for foreign, future, missing, modified, and incomplete
+  migration state.
 - Startup configuration for WAL and `synchronous=NORMAL`.
 - Per-connection foreign keys and busy timeout.
-- A migration stage before listener binding.
+- Migration and integrity stages before listener binding. An incompatible
+  database must leave both listener endpoints absent.
 
 Tests:
 
 - Create the database from an empty local directory.
-- Upgrade every retained schema fixture.
-- Reject a schema newer than the binary.
-- Verify WAL, synchronous mode, foreign keys, and busy timeout.
+- Complete each empty intermediate version in the first migration batch.
+- After the first release, upgrade a populated checked-in fixture for every
+  shipped schema version.
+- Reject foreign, future, missing, modified, and incomplete migration state
+  during read-only preflight.
+- Reject a migration file that disables its transaction.
+- Reject a second owner for one database, including with another runtime root.
+- Verify WAL, synchronous mode, foreign keys, busy timeout, defensive schema
+  pragmas, and recursive immutable-ledger triggers.
 - Verify that migrations cannot run after listeners bind.
+- Verify that incompatible startup does not create a listener endpoint.
 - Reject two live canonical publication records for one post.
+- Reject a canonical schedule for a draft revision.
 - Reject a target-job release while its canonical record is not published.
+- Reject a target payload view when its body and digest differ.
 - Keep canonical `published_at` absent before activation commits.
+- Advance the current published digest only to a publishable revision for the
+  same stable post.
 - Permit blocked retry without changing the pinned revision.
 - Require cancel and replacement to select a different revision.
 
@@ -1234,6 +1275,8 @@ Deliverables:
 
 Failure tests:
 
+- Decode persisted target jobs through the concrete adapter and reject a body,
+  digest, or payload-version mismatch.
 - Drop a caller after enqueue and verify command completion.
 - Retry the same idempotency key and create one action.
 - Force a transaction error and verify complete rollback.
@@ -1267,7 +1310,8 @@ Protect the single-daemon topology and connect storage through startup.
 
 Deliverables:
 
-- An exclusive process lock before the write connection opens.
+- A runtime-root process lock before database bootstrap begins.
+- Integration with the database-identity ownership lock from WP3.1.
 - Safe stale-lock handling.
 - Database startup ordering that matches the accepted design.
 - Read-only restore-marker, schema, and digest verification before the write

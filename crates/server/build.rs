@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-changed=build_support/frontend_io.rs");
     println!("cargo::rerun-if-changed=frontend");
     println!("cargo::rerun-if-changed=frontend/css");
+    println!("cargo::rerun-if-changed=migrations");
 
     let manifest_dir = required_path("CARGO_MANIFEST_DIR")?;
     let out_dir = required_path("OUT_DIR")?;

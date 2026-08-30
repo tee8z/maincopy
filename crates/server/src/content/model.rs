@@ -194,11 +194,14 @@ plain_text_type!(PrivacyPolicyRevision);
 plain_text_type!(DistributionCopy);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("value must use lowercase ASCII words separated by single hyphens")]
+#[error("value must use at most 1024 bytes of lowercase ASCII words separated by single hyphens")]
 pub struct RouteValueError;
+
+const MAX_ROUTE_VALUE_BYTES: usize = 1024;
 
 fn is_route_safe(value: &str) -> bool {
     !value.is_empty()
+        && value.len() <= MAX_ROUTE_VALUE_BYTES
         && value.split('-').all(|word| {
             !word.is_empty()
                 && word

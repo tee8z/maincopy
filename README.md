@@ -34,8 +34,8 @@ The repository contains the accepted v1 architecture, the ordered development
 plan, the process-composition scaffold, the canonical publication-job domain,
 the provider-neutral payment domain, the typed content contract, the bounded
 Linux content-tree loader, versioned content and snapshot identity primitives,
-and a locked Nix development environment. Most product slices remain under
-construction.
+the embedded core SQLite schema and bootstrap, and a locked Nix development
+environment. Most product slices remain under construction.
 
 - [DESIGN.md](DESIGN.md) defines system behavior and trust boundaries.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) defines the delivery order and exit

@@ -1,5 +1,7 @@
 //! Versioned, immutable payloads for outbound distribution targets.
 
+use std::{fmt, str::FromStr};
+
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
@@ -7,6 +9,9 @@ use crate::content::{PostId, PostRevisionDigest};
 
 pub const CURRENT_PAYLOAD_VERSION: u16 = 1;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+const TARGET_PAYLOAD_CONTEXT: &str = "maincopy target payload digest v1";
+const TARGET_PAYLOAD_PREFIX: &str = "target-payload-b3-v1-";
+const DIGEST_HEX_LENGTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +42,86 @@ pub struct TargetPayload {
     version: u16,
     body: String,
 }
+
+/// Stable identity of one versioned target payload.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TargetPayloadDigest {
+    encoded: Box<str>,
+}
+
+impl TargetPayloadDigest {
+    pub fn parse(value: &str) -> Result<Self, TargetPayloadDigestParseError> {
+        let hex = value
+            .strip_prefix(TARGET_PAYLOAD_PREFIX)
+            .ok_or(TargetPayloadDigestParseError)?;
+        if hex.len() != DIGEST_HEX_LENGTH
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(TargetPayloadDigestParseError);
+        }
+
+        Ok(Self {
+            encoded: value.into(),
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.encoded
+    }
+
+    fn for_payload(payload: &TargetPayload) -> Self {
+        let mut transcript = blake3::Hasher::new_derive_key(TARGET_PAYLOAD_CONTEXT);
+        transcript.update(&payload.version.to_be_bytes());
+        transcript.update(&(payload.body.len() as u64).to_be_bytes());
+        transcript.update(payload.body.as_bytes());
+        let hash = transcript.finalize();
+        Self {
+            encoded: format!("{TARGET_PAYLOAD_PREFIX}{}", hash.to_hex()).into_boxed_str(),
+        }
+    }
+}
+
+impl fmt::Display for TargetPayloadDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TargetPayloadDigest {
+    type Err = TargetPayloadDigestParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for TargetPayloadDigest {
+    fn serialize<Serializer>(
+        &self,
+        serializer: Serializer,
+    ) -> Result<Serializer::Ok, Serializer::Error>
+    where
+        Serializer: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TargetPayloadDigest {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("target payload digest must use the canonical BLAKE3 encoding")]
+pub struct TargetPayloadDigestParseError;
 
 impl<'de> Deserialize<'de> for TargetPayload {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -82,6 +167,10 @@ impl TargetPayload {
 
     pub fn body(&self) -> &str {
         &self.body
+    }
+
+    pub fn digest(&self) -> TargetPayloadDigest {
+        TargetPayloadDigest::for_payload(self)
     }
 }
 
@@ -173,6 +262,28 @@ mod tests {
     fn deserialization_rejects_unknown_payload_fields() {
         let json = r#"{"version":1,"body":"copy","new_field":true}"#;
         assert!(serde_json::from_str::<TargetPayload>(json).is_err());
+    }
+
+    #[test]
+    fn payload_digest_is_domain_separated_and_round_trips() {
+        let payload = TargetPayload::new("copy").unwrap();
+        let digest = payload.digest();
+
+        assert_eq!(
+            digest.as_str(),
+            "target-payload-b3-v1-149abb216bf262f3259b06dd1e16e590\
+             c49d208657753fe83b892adcab70c73c"
+        );
+        assert_eq!(TargetPayloadDigest::parse(digest.as_str()).unwrap(), digest);
+        assert_eq!(
+            serde_json::from_value::<TargetPayloadDigest>(serde_json::to_value(&digest).unwrap())
+                .unwrap(),
+            digest
+        );
+        assert_ne!(
+            TargetPayload::new("different copy").unwrap().digest(),
+            digest
+        );
     }
 
     #[test]

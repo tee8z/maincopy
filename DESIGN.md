@@ -499,7 +499,7 @@ text = "SQLite is a file, but deployment still has coordination rules."
 
 Post UUID text must use the canonical lowercase hyphenated form. Slugs and
 aliases use lowercase ASCII letters, digits, and single hyphens. They cannot
-start or end with a hyphen.
+start or end with a hyphen. Each slug, alias, and tag is at most 1,024 bytes.
 
 Tags use the same route-safe grammar after Maincopy trims outer whitespace and
 converts ASCII letters to lowercase. Maincopy preserves authored tag and alias
@@ -1097,6 +1097,34 @@ data.
 SQLite stores operational history. It does not store Markdown or rendered
 article HTML.
 
+### Connection bootstrap
+
+Maincopy uses SQLx 0.9.0 with embedded migrations and bundled SQLite support.
+It pins `libsqlite3-sys` 0.37.0, which bundles SQLite 3.51.3.
+
+Startup rejects a linked SQLite version below 3.51.3. This version is the
+minimum accepted fix level for the WAL-reset corruption race.
+
+The daemon acquires a database-identity ownership lock before database
+inspection. It retains this lock until it closes the writer connection.
+
+For an existing nonempty database, startup uses a read-only connection for
+preflight. The preflight validates the application ID and the complete SQLx
+migration history. It rejects future, missing, modified, or incomplete
+migrations before it opens a writer connection.
+
+After preflight, startup opens the writer and sets the required pragmas. It
+then runs the embedded migrations and checks foreign-key integrity.
+
+The writer verifies WAL mode, `synchronous=NORMAL`, foreign keys, the configured
+busy timeout, `trusted_schema=OFF`, enabled check constraints,
+`query_only=OFF`, `locking_mode=NORMAL`, `cell_size_check=ON`, and
+`recursive_triggers=ON`. Recursive triggers make immutable-ledger delete
+guards apply to `INSERT OR REPLACE` operations.
+
+Each migration uses SQLx's transaction boundary. Migration files must not use
+the `-- no-transaction` directive.
+
 ### Concurrency model
 
 ```mermaid
@@ -1155,8 +1183,11 @@ and a tested restore procedure.
 
 ### Process ownership
 
-The `maincopyd` process acquires an exclusive lock before it opens the write
-connection. A second writer process fails before it mutates the database.
+The `maincopyd` process acquires a runtime process lock during startup. It also
+acquires the database-identity ownership lock before database inspection.
+
+Different runtime roots cannot bypass database ownership. A second process for
+the same database fails before database mutation.
 
 The CLI and admin UI never open SQLite for writes. They send requests to the
 running admin service.
@@ -1164,22 +1195,28 @@ running admin service.
 If the admin service is unavailable, mutating CLI commands fail with an
 actionable error. They never fall back to direct writes.
 
-### Initial schema
+### WP3.1 core schema
 
 | Table | Purpose |
 | --- | --- |
-| `site_revisions` | Records activated site snapshots and Git commits. |
-| `post_revisions` | Records stable IDs, slugs, and revision digests. |
+| `site_revisions` | Records retained site snapshot identities and Git commits. |
+| `site_state` | Identifies the one current site revision with an advancing version. |
+| `post_revisions` | Records stable IDs, slugs, revision digests, and publication eligibility. |
 | `published_routes` | Remembers public slugs and aliases across restarts. |
 | `reload_operations` | Reconciles published-revision snapshot swaps and digest commits. |
+| `reload_post_changes` | Binds each reload to expected and candidate post revisions. |
 | `canonical_publications` | Stores pinned schedules and canonical activation state. |
 | `publication_jobs` | Stores schedules, immutable payloads, and job state. |
-| `publication_attempts` | Stores each target attempt and sanitized outcome. |
-| `remote_publications` | Stores remote IDs and canonical remote URLs. |
-| `subscriptions` | Stores normalized addresses, consent, and lifecycle state. |
-| `subscription_tokens` | Stores confirmation and unsubscribe token digests. |
-| `email_outbox` | Stores confirmation and subscription-control work with sanitized outcomes. |
-| `audit_events` | Stores admin actor, action, request ID, and timestamp. |
+
+`site_state` is the explicit current-site head. Schema logic does not infer the
+current site from insertion order or the greatest revision version.
+
+Each post revision is `publishable` or `draft`. Only a `publishable` revision
+can enter a canonical schedule or become the current published revision.
+
+WP3.1 does not create speculative tables for later features. The owning slices
+add attempt, remote-publication, payment, subscription, outbox, and audit
+tables when their domain contracts are ready.
 
 Scheduled payloads contain a schema version. An upgrade must migrate or reject
 an incompatible pending payload. It must never reinterpret one silently.
@@ -1319,6 +1356,10 @@ set of target jobs. Content changes never mutate this pinned revision. An
 operator must cancel and replace an eligible schedule to select another
 revision.
 
+The immutable pin records the scheduled publication identity. After initial
+publication, a reload can advance `current_published_digest` for the same post.
+The reload does not change the pin or the original `published_at` value.
+
 The create command stores the canonical schedule and one child job per selected
 target in one writer transaction. A successful `202 Accepted` response means
 that this transaction committed; it does not mean that publication ran.
@@ -1368,6 +1409,13 @@ Each target job binds one target, the same post revision, a bounded immutable
 payload and digest, one payload schema version, and its own scheduled UTC
 instant. The publication detail resource aggregates related one-target jobs.
 SQLite does not store canonical Markdown.
+
+`TargetPayloadDigest` uses the prefix `target-payload-b3-v1-`. Its BLAKE3
+derive-key context is `maincopy target payload digest v1`.
+
+The digest transcript contains the big-endian payload version, the big-endian
+body length, and the exact body bytes. Rehydration rejects a payload when its
+stored body and digest do not match.
 
 Maincopy retains a compiled revision while a scheduled or non-terminal record
 refers to it. If the revision or payload is missing, the canonical publication
@@ -1753,27 +1801,30 @@ never observe an unresolved recovery state after process start.
 Startup follows this order:
 
 1. Parse and validate configuration.
-2. Acquire the process lock.
-3. When a restore acceptance marker is required or present, open the database
-   read-only, verify the accepted schema and digests, prove that no migration
-   is pending, and close that connection.
-4. Open the write connection and configure WAL.
-5. Apply embedded migrations. This step is a no-op for an accepted restore.
-6. Open the query-only read pool.
-7. Spawn the writer task.
-8. Start the one snapshot-transition coordinator. Reconcile retained
+2. Acquire the runtime process lock and database-identity ownership lock.
+3. For an existing nonempty database, run the read-only application and
+   migration preflight.
+4. When a restore marker applies, verify the accepted schema and logical
+   digests through the same read-only connection.
+5. Close the read-only connection.
+6. Open the write connection and configure WAL.
+7. Apply embedded migrations. This step is a no-op for an accepted restore.
+8. Verify foreign keys, then open the query-only read pool.
+9. Spawn the writer task.
+10. Start the one snapshot-transition coordinator. Reconcile retained
    `Applying` reloads and then claimed `Activating` publications in
    deterministic ledger order. Any intermediate installs occur while listeners
    are closed.
-9. Compile and install the canonical initial snapshot produced by that
+11. Compile and install the canonical initial snapshot produced by that
    recovered ledger state.
-10. Build the configured `LightningProvider` and start its bounded `JoinSet`
+12. Build the configured `LightningProvider` and start its bounded `JoinSet`
     operation queue when tips are enabled. Run paged remote catch-up from the
     durable update cursor. Keep payment readiness false until it succeeds.
-11. Start the long-lived payment-update subscriber at that durable cursor. It
+13. Start the long-lived payment-update subscriber at that durable cursor. It
     uses finite long-poll waits and the same catch-up and state-transition path.
-12. Bind the public and admin listeners.
-13. Mark core article service readiness true. Do not wait for Lexe.
+14. Install shutdown handling and complete all listener prerequisites.
+15. Bind the public and admin listeners.
+16. Mark core article service readiness true. Do not wait for Lexe.
 
 Shutdown follows this order:
 
@@ -1964,6 +2015,7 @@ The following decisions do not change the architecture:
 ## References
 
 - [SQLite write-ahead logging](https://sqlite.org/wal.html)
+- [SQLite 3.51.3 release](https://sqlite.org/releaselog/3_51_3.html)
 - [Tokio synchronization and channels](https://docs.rs/tokio/latest/tokio/sync/)
 - [SQLx SQLite connection options](https://docs.rs/sqlx/latest/sqlx/sqlite/struct.SqliteConnectOptions.html)
 - [Litestream operation](https://litestream.io/how-it-works/)

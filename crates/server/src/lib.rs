@@ -5,6 +5,7 @@ pub mod admin;
 mod cli;
 pub mod config;
 pub mod content;
+mod database;
 pub mod distribution;
 pub mod error;
 pub mod frontend_assets;

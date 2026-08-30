@@ -33,8 +33,8 @@ jobs:
       - name: Build Maincopy
         run: nix build --print-build-logs
 
-  windows-client:
-    name: Windows shared and CLI tests
+  windows:
+    name: Windows workspace checks
     runs-on: windows-latest
     timeout-minutes: 20
 
@@ -49,3 +49,6 @@ jobs:
 
       - name: Test shared contracts and CLI
         run: cargo test --locked --package maincopy-shared --package maincopy-cli --all-targets
+
+      - name: Check the server
+        run: cargo check --locked --package maincopy-server --all-targets --all-features

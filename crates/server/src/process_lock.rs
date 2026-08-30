@@ -109,7 +109,7 @@ fn validate_private_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn open_private_file(path: &Path) -> io::Result<File> {
+pub(crate) fn open_private_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     if let Ok(metadata) = std::fs::symlink_metadata(path)
@@ -117,7 +117,7 @@ fn open_private_file(path: &Path) -> io::Result<File> {
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "process lock path is not a regular file",
+            "private file path is not a regular file",
         ));
     }
 
@@ -136,14 +136,14 @@ fn open_private_file(path: &Path) -> io::Result<File> {
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "process lock ownership or permissions are unsafe",
+            "private file ownership or permissions are unsafe",
         ));
     }
     Ok(file)
 }
 
 #[cfg(not(unix))]
-fn open_private_file(path: &Path) -> io::Result<File> {
+pub(crate) fn open_private_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .write(true)

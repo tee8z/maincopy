@@ -9,7 +9,8 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::{
     content::{PostId, PostRevisionDigest, SourceCommit},
     distribution::{
-        DistributionTarget, TargetIdempotencyKey, TargetPayload, target_idempotency_key,
+        DistributionTarget, TargetIdempotencyKey, TargetPayload, TargetPayloadDigest,
+        target_idempotency_key,
     },
 };
 
@@ -176,10 +177,8 @@ impl CanonicalPublicationView {
                     CanonicalState::Blocked | CanonicalState::Cancelled
                 )
             }
-            (Some(started), Some(published), Some(digest), None) => {
-                self.state == CanonicalState::Published
-                    && started == published
-                    && digest == &self.pinned_post_digest
+            (Some(started), Some(published), Some(_), None) => {
+                self.state == CanonicalState::Published && started == published
             }
             _ => false,
         };
@@ -372,6 +371,7 @@ pub struct TargetJobView {
     #[serde(with = "time::serde::rfc3339")]
     pub scheduled_at: OffsetDateTime,
     pub payload: TargetPayload,
+    pub payload_digest: TargetPayloadDigest,
     pub version: u64,
 }
 
@@ -426,13 +426,17 @@ impl TargetJobView {
             TargetJobState::Running | TargetJobState::Succeeded => 3,
             TargetJobState::Failed | TargetJobState::OutcomeUnknown => 4,
         };
-        (self.version >= minimum_version)
-            .then_some(())
-            .ok_or(RehydrationError::TargetVersion {
+        if self.version < minimum_version {
+            return Err(RehydrationError::TargetVersion {
                 state: self.state,
                 version: self.version,
                 minimum: minimum_version,
-            })
+            });
+        }
+        if self.payload.digest() != self.payload_digest {
+            return Err(RehydrationError::TargetPayloadDigestMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -451,6 +455,7 @@ impl TargetJob<target::WaitingForCanonical> {
         scheduled_at: OffsetDateTime,
         payload: TargetPayload,
     ) -> Self {
+        let payload_digest = payload.digest();
         Self {
             entity: TargetJobView {
                 state: TargetJobState::WaitingForCanonical,
@@ -459,6 +464,7 @@ impl TargetJob<target::WaitingForCanonical> {
                 pinned_post_digest,
                 scheduled_at: scheduled_at.to_offset(UtcOffset::UTC),
                 payload,
+                payload_digest,
                 version: 1,
             },
             marker: PhantomData,
@@ -619,6 +625,8 @@ pub enum RehydrationError {
         version: u64,
         minimum: u64,
     },
+    #[error("target job payload does not match its stored digest")]
+    TargetPayloadDigestMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -972,6 +980,7 @@ mod tests {
                 "pinned_post_digest": DIGEST_A,
                 "scheduled_at": "1970-01-01T00:00:10Z",
                 "payload": {"version": 1, "body": "copy"},
+                "payload_digest": "target-payload-b3-v1-149abb216bf262f3259b06dd1e16e590c49d208657753fe83b892adcab70c73c",
                 "version": 1,
             })
         );
@@ -1081,14 +1090,12 @@ mod tests {
             }
         );
 
-        let mut canonical = published_publication(at(10)).into_view();
-        canonical.current_published_digest = Some(digest(DIGEST_B));
-        assert_eq!(
-            CanonicalPublicationStatus::try_from(canonical).unwrap_err(),
-            RehydrationError::CanonicalFields {
-                state: CanonicalState::Published
-            }
-        );
+        let mut reloaded = published_publication(at(10)).into_view();
+        reloaded.current_published_digest = Some(digest(DIGEST_B));
+        assert!(matches!(
+            CanonicalPublicationStatus::try_from(reloaded),
+            Ok(CanonicalPublicationStatus::Published(_))
+        ));
 
         let mut canonical = scheduled_publication(at(10)).into_view();
         canonical.version = 0;
@@ -1111,6 +1118,13 @@ mod tests {
                 version: 2,
                 minimum: 3,
             }
+        );
+
+        let mut target = job(at(10)).into_view();
+        target.payload = TargetPayload::new("tampered copy").unwrap();
+        assert_eq!(
+            TargetJobStatus::try_from(target).unwrap_err(),
+            RehydrationError::TargetPayloadDigestMismatch
         );
     }
 

@@ -47,7 +47,7 @@ pub enum ProcessError {
     #[error(transparent)]
     Validation(#[from] ContentValidationErrors),
 
-    #[error("another Maincopy server already owns the configured runtime")]
+    #[error("another process already owns a required Maincopy resource")]
     AlreadyRunning,
 
     #[error(transparent)]
@@ -113,6 +113,9 @@ pub enum ApplicationError {
 
     #[error("the critical task supervisor became empty unexpectedly")]
     TaskSupervisorEmpty,
+
+    #[error("database writer failed to close")]
+    DatabaseClose,
 
     #[error("application construction failed during {stage}")]
     Startup { stage: StartupStage },
@@ -257,7 +260,8 @@ mod tests {
 
         assert_display! {
             ProcessError::AlreadyRunning =>
-                "another Maincopy server already owns the configured runtime",
+                "another process already owns a required Maincopy resource",
+            ApplicationError::DatabaseClose => "database writer failed to close",
             ShutdownSignal::Interrupt => "interrupt",
             ShutdownSignal::Terminate => "terminate",
             CriticalTaskName::PublicServer => "public server",
