@@ -1,5 +1,6 @@
 //! Wire contracts shared by Maincopy's server and operator client.
 
+pub mod posts;
 pub mod publication;
 
 use serde::{Deserialize, Serialize};

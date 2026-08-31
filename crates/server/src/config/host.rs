@@ -9,21 +9,16 @@ use std::{
 
 #[cfg(windows)]
 use maincopy_shared::{DEFAULT_WINDOWS_ADMIN_PIPE, is_valid_windows_admin_pipe_name};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::content::{
     ContentDepthLimit, ContentEntryLimit, ContentFileByteLimit, ContentPathByteLimit,
     ContentTreeByteLimit, ContentTreeLimits,
 };
 
-use super::{
-    diagnostic::{
-        ConfigurationDiagnostic, ConfigurationErrors, ConfigurationValidationCode,
-        DiagnosticCollector, single_error, toml_location,
-    },
-    secret::{
-        SecretFileReference, SecretReferenceCandidate, SecretReferenceCandidateError, SensitivePath,
-    },
+use super::diagnostic::{
+    ConfigurationDiagnostic, ConfigurationErrors, ConfigurationValidationCode, DiagnosticCollector,
+    single_error, toml_location,
 };
 
 const MAX_HOST_DOCUMENT_BYTES: u64 = 1024 * 1024;
@@ -36,19 +31,9 @@ const DEFAULT_PUBLIC_PORT: u16 = 3000;
 const DEFAULT_BUSY_TIMEOUT_MILLISECONDS: u64 = 5_000;
 const DEFAULT_WRITER_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_READ_POOL_SIZE: usize = 4;
-const DEFAULT_LEXE_MAX_IN_FLIGHT: usize = 4;
-const DEFAULT_LEXE_MAX_PENDING: usize = 64;
-const DEFAULT_LEXE_RESPONSE_TIMEOUT_MILLISECONDS: u64 = 15_000;
-const DEFAULT_LEXE_RECONCILIATION_PAGE_SIZE: usize = 100;
-const DEFAULT_LEXE_RECOVERY_INTERVAL_SECONDS: u64 = 60;
 const MAX_DATABASE_BUSY_TIMEOUT_MILLISECONDS: u64 = 300_000;
 const MAX_DATABASE_WRITER_QUEUE_CAPACITY: usize = 65_536;
 const MAX_DATABASE_READ_POOL_SIZE: usize = 256;
-const MAX_LEXE_IN_FLIGHT: usize = 1_024;
-const MAX_LEXE_PENDING: usize = 65_536;
-const MAX_LEXE_RESPONSE_TIMEOUT_MILLISECONDS: u64 = 300_000;
-const MAX_LEXE_RECONCILIATION_PAGE_SIZE: usize = 1_000;
-const MAX_LEXE_RECOVERY_INTERVAL_SECONDS: u64 = 86_400;
 
 /// Non-secret command-line overrides for `maincopyd`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -138,61 +123,6 @@ pub struct DatabaseConfigurationView<'configuration> {
     pub read_pool_size: DatabaseReadPoolSize,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LexeNetwork {
-    Mainnet,
-    Testnet3,
-    Testnet4,
-    Signet,
-    Regtest,
-}
-
-bounded_usize_setting!(LexeInFlightLimit, 2, MAX_LEXE_IN_FLIGHT);
-bounded_usize_setting!(LexePendingLimit, 1, MAX_LEXE_PENDING);
-bounded_duration_setting!(
-    LexeResponseTimeout,
-    from_milliseconds,
-    from_millis,
-    MAX_LEXE_RESPONSE_TIMEOUT_MILLISECONDS
-);
-bounded_usize_setting!(
-    LexeReconciliationPageSize,
-    1,
-    MAX_LEXE_RECONCILIATION_PAGE_SIZE
-);
-bounded_duration_setting!(
-    LexeRecoveryInterval,
-    from_seconds,
-    from_secs,
-    MAX_LEXE_RECOVERY_INTERVAL_SECONDS
-);
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct LexeConfiguration {
-    network: LexeNetwork,
-    credentials: SecretFileReference,
-    cache_path: Option<SensitivePath>,
-    max_in_flight: LexeInFlightLimit,
-    max_pending: LexePendingLimit,
-    response_timeout: LexeResponseTimeout,
-    reconciliation_page_size: LexeReconciliationPageSize,
-    recovery_interval: LexeRecoveryInterval,
-}
-
-/// Read-only Lexe settings borrowed from validated host configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LexeConfigurationView<'configuration> {
-    pub network: LexeNetwork,
-    pub credentials: &'configuration SecretFileReference,
-    pub cache_path: Option<&'configuration SensitivePath>,
-    pub max_in_flight: LexeInFlightLimit,
-    pub max_pending: LexePendingLimit,
-    pub response_timeout: LexeResponseTimeout,
-    pub reconciliation_page_size: LexeReconciliationPageSize,
-    pub recovery_interval: LexeRecoveryInterval,
-}
-
 /// Effective host-owned runtime configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostConfiguration {
@@ -203,7 +133,6 @@ pub struct HostConfiguration {
     public_bind: SocketAddr,
     admin_socket: PathBuf,
     database: DatabaseConfiguration,
-    lightning: Option<LexeConfiguration>,
 }
 
 /// Read-only settings borrowed from validated host configuration.
@@ -216,7 +145,6 @@ pub struct HostConfigurationView<'configuration> {
     pub public_bind: SocketAddr,
     pub admin_socket: &'configuration Path,
     pub database: DatabaseConfigurationView<'configuration>,
-    pub lightning: Option<LexeConfigurationView<'configuration>>,
 }
 
 impl HostConfiguration {
@@ -234,19 +162,6 @@ impl HostConfiguration {
                 writer_queue_capacity: self.database.writer_queue_capacity,
                 read_pool_size: self.database.read_pool_size,
             },
-            lightning: self
-                .lightning
-                .as_ref()
-                .map(|configuration| LexeConfigurationView {
-                    network: configuration.network,
-                    credentials: &configuration.credentials,
-                    cache_path: configuration.cache_path.as_ref(),
-                    max_in_flight: configuration.max_in_flight,
-                    max_pending: configuration.max_pending,
-                    response_timeout: configuration.response_timeout,
-                    reconciliation_page_size: configuration.reconciliation_page_size,
-                    recovery_interval: configuration.recovery_interval,
-                }),
         }
     }
 }
@@ -323,7 +238,6 @@ struct HostCandidate {
     public: PublicCandidate,
     admin: AdminCandidate,
     database: DatabaseCandidate,
-    lightning: Option<LightningCandidate>,
 }
 
 #[derive(Default, Deserialize)]
@@ -365,21 +279,6 @@ struct DatabaseCandidate {
     busy_timeout_ms: Option<u64>,
     writer_queue_capacity: Option<u64>,
     read_pool_size: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
-enum LightningCandidate {
-    Lexe {
-        network: LexeNetwork,
-        credentials: SecretReferenceCandidate,
-        cache_path: Option<PathBuf>,
-        max_in_flight: Option<u64>,
-        max_pending: Option<u64>,
-        response_timeout_ms: Option<u64>,
-        reconciliation_page_size: Option<u64>,
-        recovery_interval_seconds: Option<u64>,
-    },
 }
 
 fn read_host_source(path: &Path) -> Result<String, ConfigurationErrors> {
@@ -513,10 +412,6 @@ fn finalize_host(
         DatabaseReadPoolSize::new,
         &mut diagnostics,
     );
-    let lightning = candidate
-        .lightning
-        .and_then(|candidate| validate_lightning(candidate, file_base, &mut diagnostics));
-
     diagnostics.into_result()?;
     match (
         content_root,
@@ -552,7 +447,6 @@ fn finalize_host(
                 writer_queue_capacity,
                 read_pool_size,
             },
-            lightning,
         }),
         _ => Err(single_error(host_diagnostic(
             "$document",
@@ -823,120 +717,6 @@ fn validate_resolved_path(
     }
 }
 
-fn validate_lightning(
-    candidate: LightningCandidate,
-    file_base: &Path,
-    diagnostics: &mut DiagnosticCollector,
-) -> Option<LexeConfiguration> {
-    let LightningCandidate::Lexe {
-        network,
-        credentials,
-        cache_path,
-        max_in_flight,
-        max_pending,
-        response_timeout_ms,
-        reconciliation_page_size,
-        recovery_interval_seconds,
-    } = candidate;
-
-    let credentials = match credentials.finalize_file(file_base) {
-        Ok(reference) => Some(reference),
-        Err(SecretReferenceCandidateError::EnvironmentUnsupported) => {
-            diagnostics.push(host_diagnostic(
-                "lightning.credentials",
-                ConfigurationValidationCode::LexeCredentialsMustUseFile,
-                "Lexe credentials require a file secret reference",
-            ));
-            None
-        }
-        Err(SecretReferenceCandidateError::Invalid) => {
-            diagnostics.push(host_diagnostic(
-                "lightning.credentials",
-                ConfigurationValidationCode::SecretReferenceInvalid,
-                "secret reference syntax is invalid",
-            ));
-            None
-        }
-    };
-    let cache_path = match cache_path {
-        Some(path) => match resolve_path(file_base, &path).and_then(SensitivePath::new) {
-            Some(path) => Some(Some(path)),
-            None => {
-                diagnostics.push(host_diagnostic(
-                    "lightning.cache_path",
-                    ConfigurationValidationCode::PathInvalid,
-                    "Lexe cache path must not be empty",
-                ));
-                None
-            }
-        },
-        None => Some(None),
-    };
-    let max_in_flight = validate_usize::<LexeInFlightLimit>(
-        max_in_flight.unwrap_or(DEFAULT_LEXE_MAX_IN_FLIGHT as u64),
-        "lightning.max_in_flight",
-        ConfigurationValidationCode::LexeConcurrencyInvalid,
-        LexeInFlightLimit::new,
-        diagnostics,
-    );
-    let max_pending = validate_usize::<LexePendingLimit>(
-        max_pending.unwrap_or(DEFAULT_LEXE_MAX_PENDING as u64),
-        "lightning.max_pending",
-        ConfigurationValidationCode::LimitOutOfRange,
-        LexePendingLimit::new,
-        diagnostics,
-    );
-    let response_timeout = validate_duration::<LexeResponseTimeout>(
-        response_timeout_ms.unwrap_or(DEFAULT_LEXE_RESPONSE_TIMEOUT_MILLISECONDS),
-        "lightning.response_timeout_ms",
-        LexeResponseTimeout::from_milliseconds,
-        diagnostics,
-    );
-    let reconciliation_page_size = validate_usize::<LexeReconciliationPageSize>(
-        reconciliation_page_size.unwrap_or(DEFAULT_LEXE_RECONCILIATION_PAGE_SIZE as u64),
-        "lightning.reconciliation_page_size",
-        ConfigurationValidationCode::PageSizeInvalid,
-        LexeReconciliationPageSize::new,
-        diagnostics,
-    );
-    let recovery_interval = validate_duration::<LexeRecoveryInterval>(
-        recovery_interval_seconds.unwrap_or(DEFAULT_LEXE_RECOVERY_INTERVAL_SECONDS),
-        "lightning.recovery_interval_seconds",
-        LexeRecoveryInterval::from_seconds,
-        diagnostics,
-    );
-
-    match (
-        credentials,
-        cache_path,
-        max_in_flight,
-        max_pending,
-        response_timeout,
-        reconciliation_page_size,
-        recovery_interval,
-    ) {
-        (
-            Some(credentials),
-            Some(cache_path),
-            Some(max_in_flight),
-            Some(max_pending),
-            Some(response_timeout),
-            Some(reconciliation_page_size),
-            Some(recovery_interval),
-        ) => Some(LexeConfiguration {
-            network,
-            credentials,
-            cache_path,
-            max_in_flight,
-            max_pending,
-            response_timeout,
-            reconciliation_page_size,
-            recovery_interval,
-        }),
-        _ => None,
-    }
-}
-
 fn validate_usize<Value>(
     raw: u64,
     field: &'static str,
@@ -1044,7 +824,6 @@ mod tests {
         assert_eq!(config.view().database.writer_queue_capacity.get(), 128);
         assert_eq!(config.view().database.read_pool_size.get(), 4);
         assert_eq!(config.view().content_limits, ContentTreeLimits::default());
-        assert!(config.view().lightning.is_none());
     }
 
     #[test]
@@ -1304,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn lexe_requires_network_file_credentials_and_locks_defaults() {
+    fn removed_payment_provider_configuration_is_rejected_as_unknown() {
         let root = tempdir().unwrap();
         write_config(
             root.path(),
@@ -1315,150 +1094,18 @@ mod tests {
              credentials = { source = \"file\", path = \"secret/credential.json\" }\n\
              cache_path = \"private/cache\"\n",
         );
-        let config = loader(root.path())
+        let errors = loader(root.path())
             .load(Path::new("host/maincopy.toml"))
-            .unwrap();
-        let lexe = config.view().lightning.unwrap();
+            .unwrap_err();
 
-        assert_eq!(lexe.network, LexeNetwork::Mainnet);
         assert_eq!(
-            lexe.credentials.path(),
-            root.path().join("host/secret/credential.json")
+            errors.diagnostics()[0].code,
+            ConfigurationValidationCode::HostTomlInvalid
         );
-        assert_eq!(
-            lexe.cache_path.unwrap().path(),
-            root.path().join("host/private/cache")
-        );
-        assert_eq!(lexe.max_in_flight.get(), 4);
-        assert_eq!(lexe.max_pending.get(), 64);
-        assert_eq!(lexe.response_timeout.get(), Duration::from_secs(15));
-        assert_eq!(lexe.reconciliation_page_size.get(), 100);
-        assert_eq!(lexe.recovery_interval.get(), Duration::from_secs(60));
-
-        let diagnostic_view = format!("{config:?}");
+        let diagnostic_view = format!("{errors:?} {errors}");
         for protected in ["credential.json", "private/cache"] {
             assert!(!diagnostic_view.contains(protected));
         }
-        assert!(diagnostic_view.contains("SecretFileReference(<redacted>)"));
-        assert!(diagnostic_view.contains("SensitivePath(<redacted>)"));
-    }
-
-    #[test]
-    fn complete_documented_lexe_schema_uses_explicit_units() {
-        let root = tempdir().unwrap();
-        write_config(
-            root.path(),
-            "host/maincopy.toml",
-            "[lightning]\n\
-             provider = \"lexe\"\n\
-             network = \"testnet4\"\n\
-             credentials = { source = \"file\", path = \"secret/credential.json\" }\n\
-             cache_path = \"private/cache\"\n\
-             max_in_flight = 6\n\
-             max_pending = 96\n\
-             response_timeout_ms = 17000\n\
-             reconciliation_page_size = 250\n\
-             recovery_interval_seconds = 90\n",
-        );
-        let config = loader(root.path())
-            .load(Path::new("host/maincopy.toml"))
-            .unwrap();
-        let lexe = config.view().lightning.unwrap();
-
-        assert_eq!(lexe.network, LexeNetwork::Testnet4);
-        assert_eq!(lexe.max_in_flight.get(), 6);
-        assert_eq!(lexe.max_pending.get(), 96);
-        assert_eq!(lexe.response_timeout.get(), Duration::from_millis(17_000));
-        assert_eq!(lexe.reconciliation_page_size.get(), 250);
-        assert_eq!(lexe.recovery_interval.get(), Duration::from_secs(90));
-    }
-
-    #[test]
-    fn lexe_network_and_credentials_are_required() {
-        let root = tempdir().unwrap();
-        for (index, source) in [
-            "[lightning]\nprovider = \"lexe\"\ncredentials = { source = \"file\", path = \"credential\" }\n",
-            "[lightning]\nprovider = \"lexe\"\nnetwork = \"mainnet\"\n",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let name = format!("missing-{index}.toml");
-            write_config(root.path(), &name, source);
-            let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
-            assert_eq!(
-                errors.diagnostics()[0].code,
-                ConfigurationValidationCode::HostTomlInvalid
-            );
-        }
-    }
-
-    #[test]
-    fn lexe_network_wire_names_are_stable() {
-        let cases = [
-            (LexeNetwork::Mainnet, "mainnet"),
-            (LexeNetwork::Testnet3, "testnet3"),
-            (LexeNetwork::Testnet4, "testnet4"),
-            (LexeNetwork::Signet, "signet"),
-            (LexeNetwork::Regtest, "regtest"),
-        ];
-        for (network, expected) in cases {
-            assert_eq!(serde_json::to_value(network).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn environment_lexe_credentials_are_rejected_without_disclosure() {
-        let root = tempdir().unwrap();
-        write_config(
-            root.path(),
-            "maincopy.toml",
-            "[lightning]\n\
-             provider = \"lexe\"\n\
-             network = \"mainnet\"\n\
-             credentials = { source = \"environment\", variable = \"TOP_SECRET_VARIABLE\" }\n",
-        );
-        let errors = loader(root.path())
-            .load(Path::new("maincopy.toml"))
-            .unwrap_err();
-
-        assert_eq!(
-            errors.diagnostics()[0].code,
-            ConfigurationValidationCode::LexeCredentialsMustUseFile
-        );
-        assert_eq!(
-            errors.to_string(),
-            "configuration validation failed; \
-             host:lightning.credentials:lexe_credentials_must_use_file: \
-             Lexe credentials require a file secret reference"
-        );
-        let rendered = format!("{errors:?}");
-        assert!(!rendered.contains("TOP_SECRET_VARIABLE"));
-        assert!(!rendered.contains(root.path().to_string_lossy().as_ref()));
-    }
-
-    #[test]
-    fn malformed_environment_lexe_credentials_keep_the_invalid_reference_code() {
-        let root = tempdir().unwrap();
-        write_config(
-            root.path(),
-            "maincopy.toml",
-            "[lightning]\n\
-             provider = \"lexe\"\n\
-             network = \"mainnet\"\n\
-             credentials = { source = \"environment\", variable = \"not-portable\" }\n",
-        );
-        let errors = loader(root.path())
-            .load(Path::new("maincopy.toml"))
-            .unwrap_err();
-
-        assert_eq!(
-            errors.diagnostics()[0].code,
-            ConfigurationValidationCode::SecretReferenceInvalid
-        );
-        let rendered = format!("{errors:?}");
-        assert!(!rendered.contains("not-portable"));
-        assert!(!rendered.contains(root.path().to_string_lossy().as_ref()));
     }
 
     #[test]
@@ -1524,16 +1171,7 @@ mod tests {
             "[database]\n\
              busy_timeout_ms = 0\n\
              writer_queue_capacity = 0\n\
-             read_pool_size = 0\n\
-             [lightning]\n\
-             provider = \"lexe\"\n\
-             network = \"regtest\"\n\
-             credentials = { source = \"file\", path = \"credential\" }\n\
-             max_in_flight = 1\n\
-             max_pending = 0\n\
-             response_timeout_ms = 0\n\
-             reconciliation_page_size = 1001\n\
-             recovery_interval_seconds = 0\n",
+             read_pool_size = 0\n",
         );
         let errors = loader(root.path())
             .load(Path::new("maincopy.toml"))
@@ -1544,10 +1182,8 @@ mod tests {
             .map(|diagnostic| diagnostic.code)
             .collect::<Vec<_>>();
 
-        assert!(codes.contains(&ConfigurationValidationCode::LexeConcurrencyInvalid));
         assert!(codes.contains(&ConfigurationValidationCode::LimitOutOfRange));
         assert!(codes.contains(&ConfigurationValidationCode::DurationInvalid));
-        assert!(codes.contains(&ConfigurationValidationCode::PageSizeInvalid));
     }
 
     #[test]
@@ -1564,24 +1200,6 @@ mod tests {
         assert!(DatabaseWriterQueueCapacity::new(MAX_DATABASE_WRITER_QUEUE_CAPACITY + 1).is_none());
         assert!(DatabaseReadPoolSize::new(MAX_DATABASE_READ_POOL_SIZE).is_some());
         assert!(DatabaseReadPoolSize::new(MAX_DATABASE_READ_POOL_SIZE + 1).is_none());
-        assert!(LexeInFlightLimit::new(MAX_LEXE_IN_FLIGHT).is_some());
-        assert!(LexeInFlightLimit::new(MAX_LEXE_IN_FLIGHT + 1).is_none());
-        assert!(LexePendingLimit::new(MAX_LEXE_PENDING).is_some());
-        assert!(LexePendingLimit::new(MAX_LEXE_PENDING + 1).is_none());
-        assert!(
-            LexeResponseTimeout::from_milliseconds(MAX_LEXE_RESPONSE_TIMEOUT_MILLISECONDS)
-                .is_some()
-        );
-        assert!(
-            LexeResponseTimeout::from_milliseconds(MAX_LEXE_RESPONSE_TIMEOUT_MILLISECONDS + 1)
-                .is_none()
-        );
-        assert!(LexeReconciliationPageSize::new(MAX_LEXE_RECONCILIATION_PAGE_SIZE).is_some());
-        assert!(LexeReconciliationPageSize::new(MAX_LEXE_RECONCILIATION_PAGE_SIZE + 1).is_none());
-        assert!(LexeRecoveryInterval::from_seconds(MAX_LEXE_RECOVERY_INTERVAL_SECONDS).is_some());
-        assert!(
-            LexeRecoveryInterval::from_seconds(MAX_LEXE_RECOVERY_INTERVAL_SECONDS + 1).is_none()
-        );
     }
 
     #[test]

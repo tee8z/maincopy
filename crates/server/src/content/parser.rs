@@ -3,15 +3,21 @@ use std::collections::BTreeMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use toml::{Table, Value};
 
+use crate::domain::content::{
+    AuthorName, AuthorSettings, DistributionCopy, DistributionMode, DistributionSettings,
+    MarkdownSource, PlainTextError, PostAlias, PostDescription, PostDocument, PostId, PostMetadata,
+    PostSlug, PostTag, PostTipPolicy, PostTitle, PrivacyPolicyRevision, PublicationAssetSettings,
+    PublicationBaseUrl, PublicationSettings, PublicationTipSettings, RouteConflict, RouteKind,
+    SiteDescription, SiteSettings, SiteTitle, SubscriptionSettings, TipAmount,
+    UnresolvedAssetReference, UnresolvedHttpsOrigin, ValidatedContent, XDistributionSettings,
+    classify_route_conflict, configured_publication_tips, post_tip_policy,
+    post_tips_are_supported, resolve_draft_status as resolve_authored_draft_status,
+    subscription_settings, timestamps_are_ordered,
+};
+
 use super::{
-    AuthorName, AuthorSettings, ContentValidationCode, ContentValidationError,
-    ContentValidationErrors, DefaultPostTipPolicy, DiagnosticCollector, DistributionCopy,
-    DistributionMode, DistributionSettings, DraftStatus, LogicalContentPath, MarkdownSource,
-    PlainTextError, PostAlias, PostDescription, PostDocument, PostId, PostMetadata, PostSlug,
-    PostSource, PostTag, PostTipPolicy, PostTitle, PrivacyPolicyRevision, PublicationAssetSettings,
-    PublicationBaseUrl, PublicationSettings, PublicationSource, PublicationTipSettings,
-    SiteDescription, SiteSettings, SiteTitle, TipAmount, TipAmountRange, UnresolvedAssetReference,
-    UnresolvedHttpsOrigin, ValidatedContent, ValidationLocation, XDistributionSettings,
+    ContentValidationCode, ContentValidationError, ContentValidationErrors, DiagnosticCollector,
+    LogicalContentPath, PostCollection, PostSource, PublicationSource, ValidationLocation,
 };
 
 pub fn validate_content<'source>(
@@ -259,25 +265,22 @@ fn parse_subscriptions(
     });
     reject_unknown_fields(subscriptions, "subscriptions", path, diagnostics);
 
-    match enabled {
-        OptionalField::Missing | OptionalField::Valid(false) => {
-            Some(super::SubscriptionSettings::Disabled)
+    let enabled = match enabled {
+        OptionalField::Missing => false,
+        OptionalField::Valid(enabled) => enabled,
+        OptionalField::Invalid => return None,
+    };
+    match subscription_settings(enabled, revision) {
+        Ok(settings) => Some(settings),
+        Err(()) => {
+            diagnostics.push(ContentValidationError::new(
+                path.clone(),
+                "subscriptions.privacy_policy_revision",
+                ContentValidationCode::SubscriptionPrivacyRevisionRequired,
+                "an enabled subscription policy requires a privacy-policy revision",
+            ));
+            None
         }
-        OptionalField::Invalid => None,
-        OptionalField::Valid(true) => match revision {
-            Some(revision) => Some(super::SubscriptionSettings::Enabled {
-                privacy_policy_revision: revision,
-            }),
-            None => {
-                diagnostics.push(ContentValidationError::new(
-                    path.clone(),
-                    "subscriptions.privacy_policy_revision",
-                    ContentValidationCode::SubscriptionPrivacyRevisionRequired,
-                    "an enabled subscription policy requires a privacy-policy revision",
-                ));
-                None
-            }
-        },
     }
 }
 
@@ -319,30 +322,23 @@ fn parse_publication_tips(
 
     let minimum = required_tip_amount(minimum, "tips.minimum_sats", path, diagnostics);
     let maximum = required_tip_amount(maximum, "tips.maximum_sats", path, diagnostics);
-    let range = match (minimum, maximum) {
-        (Some(minimum), Some(maximum)) => match TipAmountRange::new(minimum, maximum) {
-            Some(range) => Some(range),
-            None => {
-                diagnostics.push(ContentValidationError::new(
-                    path.clone(),
-                    "tips.maximum_sats",
-                    ContentValidationCode::TipRangeInvalid,
-                    "maximum tip amount must be greater than or equal to the minimum",
-                ));
-                None
+    match (minimum, maximum) {
+        (Some(minimum), Some(maximum)) => {
+            match configured_publication_tips(enabled, minimum, maximum) {
+                Some(settings) => Some(settings),
+                None => {
+                    diagnostics.push(ContentValidationError::new(
+                        path.clone(),
+                        "tips.maximum_sats",
+                        ContentValidationCode::TipRangeInvalid,
+                        "maximum tip amount must be greater than or equal to the minimum",
+                    ));
+                    None
+                }
             }
-        },
+        }
         _ => None,
-    };
-
-    Some(PublicationTipSettings::Configured {
-        default: if enabled {
-            DefaultPostTipPolicy::Enabled
-        } else {
-            DefaultPostTipPolicy::Disabled
-        },
-        range: range?,
-    })
+    }
 }
 
 fn required_tip_amount(
@@ -454,7 +450,7 @@ fn parse_post(
     let updated_at =
         take_optional_datetime(&mut table, "updated_at", "updated_at", &path, diagnostics);
     if let (Some(authored_at), OptionalField::Valid(updated_at)) = (authored_at, updated_at)
-        && updated_at < authored_at
+        && !timestamps_are_ordered(authored_at, updated_at)
     {
         diagnostics.push(ContentValidationError::new(
             path.clone(),
@@ -505,9 +501,8 @@ fn parse_post(
     let authored_draft = take_optional_bool(&mut table, "draft", "draft", &path, diagnostics);
     let draft = resolve_draft_status(source.collection, authored_draft, &path, diagnostics);
     let tips = match take_optional_bool(&mut table, "tips", "tips", &path, diagnostics) {
-        OptionalField::Missing => Some(PostTipPolicy::InheritPublication),
-        OptionalField::Valid(true) => Some(PostTipPolicy::Enabled),
-        OptionalField::Valid(false) => Some(PostTipPolicy::Disabled),
+        OptionalField::Missing => Some(post_tip_policy(None)),
+        OptionalField::Valid(value) => Some(post_tip_policy(Some(value))),
         OptionalField::Invalid => None,
     };
     let distribution = parse_distribution(&mut table, &path, diagnostics);
@@ -674,28 +669,25 @@ fn parse_post_tags(
 }
 
 fn resolve_draft_status(
-    collection: super::PostCollection,
+    collection: PostCollection,
     authored: OptionalField<bool>,
     path: &LogicalContentPath,
     diagnostics: &mut DiagnosticCollector,
-) -> DraftStatus {
-    match (collection, authored) {
-        (super::PostCollection::Drafts, OptionalField::Valid(false)) => {
-            diagnostics.push(ContentValidationError::new(
-                path.clone(),
-                "draft",
-                ContentValidationCode::DraftDirectoryConflict,
-                "a post in drafts/ cannot set draft to false",
-            ));
-            DraftStatus::Draft
-        }
-        (super::PostCollection::Drafts, _) => DraftStatus::Draft,
-        (
-            super::PostCollection::Posts,
-            OptionalField::Missing | OptionalField::Valid(false) | OptionalField::Invalid,
-        ) => DraftStatus::Publishable,
-        (super::PostCollection::Posts, OptionalField::Valid(true)) => DraftStatus::Draft,
+) -> crate::domain::content::DraftStatus {
+    let authored = match authored {
+        OptionalField::Valid(authored) => Some(authored),
+        OptionalField::Missing | OptionalField::Invalid => None,
+    };
+    let resolution = resolve_authored_draft_status(collection, authored);
+    if resolution.conflicts_with_collection {
+        diagnostics.push(ContentValidationError::new(
+            path.clone(),
+            "draft",
+            ContentValidationCode::DraftDirectoryConflict,
+            "a post in drafts/ cannot set draft to false",
+        ));
     }
+    resolution.status
 }
 
 fn parse_distribution(
@@ -848,12 +840,6 @@ fn validate_post_identities(posts: &[PostCandidate], diagnostics: &mut Diagnosti
     }
 }
 
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-enum RouteKind {
-    Canonical,
-    Alias,
-}
-
 struct RouteLocation<'candidate> {
     post: &'candidate PostCandidate,
     field: String,
@@ -902,20 +888,24 @@ fn validate_post_routes(posts: &[PostCandidate], diagnostics: &mut DiagnosticCol
         });
         let anchor = &duplicates[0];
         for duplicate in duplicates.iter().skip(1) {
-            let (code, message) = match (anchor.kind, duplicate.kind) {
-                (RouteKind::Canonical, RouteKind::Canonical) => (
+            let (code, message) = match classify_route_conflict(
+                anchor.kind,
+                duplicate.kind,
+                anchor.post.source_index == duplicate.post.source_index,
+            ) {
+                RouteConflict::DuplicateSlug => (
                     ContentValidationCode::DuplicatePostSlug,
                     "canonical slug duplicates an earlier post slug",
                 ),
-                (RouteKind::Alias, RouteKind::Alias) => (
+                RouteConflict::DuplicateAlias => (
                     ContentValidationCode::DuplicatePostAlias,
                     "alias duplicates an earlier alias",
                 ),
-                _ if anchor.post.source_index == duplicate.post.source_index => (
+                RouteConflict::AliasMatchesSlug => (
                     ContentValidationCode::AliasMatchesSlug,
                     "alias matches its post's canonical slug",
                 ),
-                _ => (
+                RouteConflict::DuplicateRoute => (
                     ContentValidationCode::DuplicatePostRoute,
                     "post route conflicts with an earlier canonical slug or alias",
                 ),
@@ -944,11 +934,11 @@ fn validate_tip_configuration(
     let Some(publication_tips) = publication.tips else {
         return;
     };
-    if publication_tips.is_configured() {
-        return;
-    }
     for post in posts {
-        if post.tips == Some(PostTipPolicy::Enabled) {
+        if post
+            .tips
+            .is_some_and(|post_tips| !post_tips_are_supported(publication_tips, post_tips))
+        {
             diagnostics.push(ContentValidationError::new(
                 post.path.clone(),
                 "tips",

@@ -22,6 +22,7 @@ const PUBLICATION_ASSET_SOURCE_BINDING_CONTEXT: &str =
     "maincopy publication asset source binding v1";
 const ASSET_RESOLUTION_POLICY_BINDING_CONTEXT: &str = "maincopy asset resolution policy binding v1";
 const POST_REVISION_CONTEXT: &str = "maincopy post revision digest v1";
+const PREVIEW_CONTEXT: &str = "maincopy preview digest v1";
 const SITE_SHELL_OUTPUT_CONTEXT: &str = "maincopy site shell output digest v1";
 const SITE_SNAPSHOT_CONTEXT: &str = "maincopy site snapshot digest v1";
 
@@ -34,9 +35,12 @@ const MERMAID_PLACEHOLDER_TAG: u8 = 0;
 const POST_RENDERER_VERSION_TAG: u8 = 0;
 const SANITIZER_VERSION_TAG: u8 = 0;
 const SITE_SHELL_RENDERER_VERSION_TAG: u8 = 0;
+const LOCAL_PROFILE_KIND_TAG: u8 = 0;
+const LOCAL_PROFILE_SCHEMA_VERSION: u16 = 1;
 
 const ASSET_PREFIX: &str = "asset-b3-v1-";
 const POST_PREFIX: &str = "post-b3-v1-";
+const PREVIEW_PREFIX: &str = "preview-b3-v1-";
 const SITE_PREFIX: &str = "site-b3-v1-";
 const DIGEST_HEX_LENGTH: usize = 64;
 
@@ -45,6 +49,7 @@ const DIGEST_HEX_LENGTH: usize = 64;
 pub enum DigestKind {
     Asset,
     PostRevision,
+    Preview,
     SiteSnapshot,
 }
 
@@ -53,6 +58,7 @@ impl DigestKind {
         match self {
             Self::Asset => ASSET_PREFIX,
             Self::PostRevision => POST_PREFIX,
+            Self::Preview => PREVIEW_PREFIX,
             Self::SiteSnapshot => SITE_PREFIX,
         }
     }
@@ -146,6 +152,7 @@ macro_rules! public_digest_type {
 
 public_digest_type!(AssetDigest, DigestKind::Asset);
 public_digest_type!(PostRevisionDigest, DigestKind::PostRevision);
+public_digest_type!(PreviewDigest, DigestKind::Preview);
 public_digest_type!(SiteSnapshotDigest, DigestKind::SiteSnapshot);
 
 /// Canonical typed post content excluding resolver-owned asset-valued fields.
@@ -277,23 +284,23 @@ impl<'input> PostRevisionInput<'input> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublishedPostRevision {
-    pub(crate) post_id: PostId,
-    pub(crate) revision: PostRevisionDigest,
+/// Render-neutral inputs used to close a public snapshot identity.
+pub(crate) struct PublishedPostIdentityInput<'input> {
+    pub(crate) post_id: &'input PostId,
+    pub(crate) revision: &'input PostRevisionDigest,
     pub(crate) published_at: OffsetDateTime,
 }
 
-impl PublishedPostRevision {
-    pub fn new(
-        post_id: PostId,
-        revision: PostRevisionDigest,
+impl<'input> PublishedPostIdentityInput<'input> {
+    pub(crate) const fn new(
+        post_id: &'input PostId,
+        revision: &'input PostRevisionDigest,
         published_at: OffsetDateTime,
     ) -> Self {
         Self {
             post_id,
             revision,
-            published_at: published_at.to_offset(UtcOffset::UTC),
+            published_at,
         }
     }
 }
@@ -304,7 +311,7 @@ struct SiteSnapshotInput<'input> {
     assets: &'input ResolvedSiteAssets,
     renderer: &'input SiteShellRendererIdentity,
     pre_injection_shell: &'input SiteShellOutputDigest,
-    public_posts: &'input [PublishedPostRevision],
+    public_posts: &'input [PublishedPostIdentityInput<'input>],
 }
 
 impl<'input> SiteSnapshotInput<'input> {
@@ -313,7 +320,7 @@ impl<'input> SiteSnapshotInput<'input> {
         assets: &'input ResolvedSiteAssets,
         renderer: &'input SiteShellRendererIdentity,
         pre_injection_shell: &'input SiteShellOutputDigest,
-        public_posts: &'input [PublishedPostRevision],
+        public_posts: &'input [PublishedPostIdentityInput<'input>],
     ) -> Self {
         Self {
             publication,
@@ -477,6 +484,67 @@ pub(crate) fn finalize_post_revision(
     ))
 }
 
+/// Closes the exact production-preview inputs into a schedule-independent approval binding.
+///
+/// The retained content-tree digest is deliberately not an input: it locates the artifacts used
+/// to reproduce this binding, while unrelated files in the same tree cannot invalidate a preview.
+/// Activation timestamps are also excluded so an accepted preview remains valid at its due time.
+pub(crate) fn finalize_preview_digest(
+    input: PreviewDigestInput<'_>,
+) -> Result<PreviewDigest, RevisionIdentityError> {
+    if input.site_assets.source_binding != bind_publication_asset_source(input.publication) {
+        return Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
+            target: AssetBindingTarget::Publication,
+        });
+    }
+    let references = sorted_asset_references(&input.site_assets.references)?;
+    let allowed_origins = sorted_allowed_origins(&input.site_assets.allowed_origins)?;
+    let publication_content = digest_publication_content(input.publication);
+
+    let mut transcript = Transcript::new(PREVIEW_CONTEXT, b"maincopy-preview", 1);
+    transcript.tag(0);
+    transcript.fixed_bytes(input.post_id.as_uuid().as_bytes());
+    transcript.tag(1);
+    transcript.fixed_bytes(input.post_revision.as_bytes());
+    transcript.tag(2);
+    transcript.bytes(input.article_identity_html);
+    transcript.tag(3);
+    encode_post_renderer(&mut transcript, input.post_renderer);
+    transcript.tag(4);
+    transcript.fixed_bytes(&publication_content.0);
+    transcript.optional(input.site_assets.favicon.as_ref(), encode_asset_reference);
+    transcript.sequence_len(allowed_origins.len());
+    for origin in allowed_origins {
+        transcript.string(origin.as_str());
+    }
+    encode_asset_references(&mut transcript, &references);
+    transcript.tag(5);
+    encode_site_renderer(&mut transcript, input.site_renderer);
+    transcript.bytes(input.pre_injection_post_shell);
+    transcript.tag(6);
+    transcript.tag(LOCAL_PROFILE_KIND_TAG);
+    transcript
+        .0
+        .update(&LOCAL_PROFILE_SCHEMA_VERSION.to_be_bytes());
+    transcript.bytes(&[]);
+    transcript.tag(7);
+    transcript.string(input.canonical_url);
+    Ok(PreviewDigest::from_hash(transcript.finish()))
+}
+
+/// Renderer-owned inputs to one preview approval binding.
+pub(crate) struct PreviewDigestInput<'input> {
+    pub(crate) publication: &'input PublicationSettings,
+    pub(crate) site_assets: &'input ResolvedSiteAssets,
+    pub(crate) post_id: &'input PostId,
+    pub(crate) post_revision: &'input PostRevisionDigest,
+    pub(crate) post_renderer: &'input PostRendererIdentity,
+    pub(crate) article_identity_html: &'input [u8],
+    pub(crate) site_renderer: &'input SiteShellRendererIdentity,
+    pub(crate) pre_injection_post_shell: &'input [u8],
+    pub(crate) canonical_url: &'input str,
+}
+
 fn digest_site_snapshot(
     input: &SiteSnapshotInput<'_>,
 ) -> Result<SiteSnapshotDigest, RevisionIdentityError> {
@@ -518,7 +586,7 @@ pub(crate) fn finalize_site_snapshot(
     assets: &ResolvedSiteAssets,
     renderer: &SiteShellRendererIdentity,
     pre_injection_shell: &SiteShellOutputDigest,
-    public_posts: &[PublishedPostRevision],
+    public_posts: &[PublishedPostIdentityInput<'_>],
 ) -> Result<SiteSnapshotDigest, RevisionIdentityError> {
     digest_site_snapshot(&SiteSnapshotInput::new(
         publication,
@@ -785,8 +853,8 @@ fn encode_generated_assets(transcript: &mut Transcript, assets: &[&DigestedAsset
 }
 
 fn sorted_public_posts(
-    posts: &[PublishedPostRevision],
-) -> Result<Vec<&PublishedPostRevision>, RevisionIdentityError> {
+    posts: &[PublishedPostIdentityInput<'_>],
+) -> Result<Vec<&PublishedPostIdentityInput<'_>>, RevisionIdentityError> {
     let mut posts: Vec<_> = posts.iter().collect();
     posts.sort_by(|left, right| left.post_id.cmp(&right.post_id));
     for pair in posts.windows(2) {
@@ -803,6 +871,22 @@ fn sorted_public_posts(
 mod tests {
     use super::*;
     use crate::content::{ExternalAssetUrl, PostSource, PublicationSource, validate_content};
+    use crate::domain::publication::PublishedPostRevision;
+
+    fn published_identity_inputs(
+        posts: &[PublishedPostRevision],
+    ) -> Vec<PublishedPostIdentityInput<'_>> {
+        posts
+            .iter()
+            .map(|post| {
+                PublishedPostIdentityInput::new(
+                    &post.post_id,
+                    &post.revision,
+                    post.published_at,
+                )
+            })
+            .collect()
+    }
 
     const PUBLICATION: &str = r#"
 [site]
@@ -875,6 +959,10 @@ name = "Example Author"
                 DigestKind::PostRevision,
             ),
             (
+                format!("preview-b3-v1-{}", "ab".repeat(32)),
+                DigestKind::Preview,
+            ),
+            (
                 format!("site-b3-v1-{}", "ab".repeat(32)),
                 DigestKind::SiteSnapshot,
             ),
@@ -885,6 +973,9 @@ name = "Example Author"
                 }
                 DigestKind::PostRevision => {
                     PostRevisionDigest::parse(&valid).map(|value| value.as_str().to_owned())
+                }
+                DigestKind::Preview => {
+                    PreviewDigest::parse(&valid).map(|value| value.as_str().to_owned())
                 }
                 DigestKind::SiteSnapshot => {
                     SiteSnapshotDigest::parse(&valid).map(|value| value.as_str().to_owned())
@@ -917,6 +1008,10 @@ name = "Example Author"
             (
                 serde_json::to_value(DigestKind::PostRevision).unwrap(),
                 "post_revision",
+            ),
+            (
+                serde_json::to_value(DigestKind::Preview).unwrap(),
+                "preview",
             ),
             (
                 serde_json::to_value(DigestKind::SiteSnapshot).unwrap(),
@@ -964,6 +1059,101 @@ name = "Example Author"
         assert_ne!(
             digest_post_content(&first),
             digest_post_content(&markdown_changed)
+        );
+    }
+
+    #[test]
+    fn preview_digest_binds_article_shell_renderer_and_canonical_url() {
+        let (publication, post) = validate_post(&frontmatter("2026-08-29T12:00:00Z"), "# Body\n");
+        let site_assets = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
+        let post_id = post.metadata.id.clone();
+        let post_revision = PostRevisionDigest::from_bytes([0x11; 32]);
+        let post_renderer = renderer();
+        let site_renderer = SiteShellRendererIdentity::new(frontend_bundle(0x22));
+        let digest = |revision: &PostRevisionDigest,
+                      article: &[u8],
+                      renderer: &SiteShellRendererIdentity,
+                      shell: &[u8],
+                      canonical_url: &str| {
+            finalize_preview_digest(PreviewDigestInput {
+                publication: &publication,
+                site_assets: &site_assets,
+                post_id: &post_id,
+                post_revision: revision,
+                post_renderer: &post_renderer,
+                article_identity_html: article,
+                site_renderer: renderer,
+                pre_injection_post_shell: shell,
+                canonical_url,
+            })
+            .unwrap()
+        };
+        let baseline = digest(
+            &post_revision,
+            b"<p>Rendered article</p>",
+            &site_renderer,
+            b"<html>Production shell</html>",
+            "https://example.com/posts/example-post",
+        );
+        assert_eq!(
+            baseline,
+            digest(
+                &post_revision,
+                b"<p>Rendered article</p>",
+                &site_renderer,
+                b"<html>Production shell</html>",
+                "https://example.com/posts/example-post",
+            )
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                &PostRevisionDigest::from_bytes([0x33; 32]),
+                b"<p>Rendered article</p>",
+                &site_renderer,
+                b"<html>Production shell</html>",
+                "https://example.com/posts/example-post",
+            )
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                &post_revision,
+                b"<p>Changed article</p>",
+                &site_renderer,
+                b"<html>Production shell</html>",
+                "https://example.com/posts/example-post",
+            )
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                &post_revision,
+                b"<p>Rendered article</p>",
+                &SiteShellRendererIdentity::new(frontend_bundle(0x44)),
+                b"<html>Production shell</html>",
+                "https://example.com/posts/example-post",
+            )
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                &post_revision,
+                b"<p>Rendered article</p>",
+                &site_renderer,
+                b"<html>Changed shell</html>",
+                "https://example.com/posts/example-post",
+            )
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                &post_revision,
+                b"<p>Rendered article</p>",
+                &site_renderer,
+                b"<html>Production shell</html>",
+                "https://changed.example/posts/example-post",
+            )
         );
     }
 
@@ -1339,12 +1529,13 @@ name = "Example Author"
         let forward = [first.clone(), second.clone()];
         let reverse = [second, first.clone()];
         let digest = |posts: &[PublishedPostRevision]| {
+            let posts = published_identity_inputs(posts);
             digest_site_snapshot(&SiteSnapshotInput::new(
                 &publication,
                 &ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new()),
                 &site_renderer,
                 &shell_output(b"shell"),
-                posts,
+                &posts,
             ))
             .unwrap()
         };
@@ -1355,6 +1546,7 @@ name = "Example Author"
         );
 
         let duplicate = [first.clone(), first];
+        let duplicate = published_identity_inputs(&duplicate);
         assert!(matches!(
             digest_site_snapshot(&SiteSnapshotInput::new(
                 &publication,
@@ -1396,12 +1588,13 @@ name = "Example Author"
         let digest = |renderer: &SiteShellRendererIdentity,
                       shell: &'static [u8],
                       posts: &[PublishedPostRevision]| {
+            let posts = published_identity_inputs(posts);
             digest_site_snapshot(&SiteSnapshotInput::new(
                 &publication,
                 &ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new()),
                 renderer,
                 &shell_output(shell),
-                posts,
+                &posts,
             ))
             .unwrap()
         };

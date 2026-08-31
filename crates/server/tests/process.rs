@@ -2,17 +2,6 @@ use std::{fs, process::Command};
 
 use maincopy_server::{error::ProcessExit, frontend_assets::embedded_manifest};
 
-const TIPPED_PUBLICATION: &str = "[site]\n\
-title = \"Process Test\"\n\
-base_url = \"https://process.example.test\"\n\
-description = \"Process configuration contract.\"\n\
-[author]\n\
-name = \"Process Tester\"\n\
-[tips]\n\
-enabled = true\n\
-minimum_sats = 1\n\
-maximum_sats = 2\n";
-
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -99,7 +88,7 @@ fn invalid_server_configuration_fails_before_the_application_runs() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn server_uses_maincopy_toml_from_the_process_working_directory_by_default() {
+fn removed_payment_provider_in_the_default_host_file_is_rejected_before_discovery() {
     let working_directory = tempfile::tempdir().unwrap();
     let selected_content = working_directory.path().join("selected-content");
     let decoy_content = working_directory.path().join("content");
@@ -107,12 +96,13 @@ fn server_uses_maincopy_toml_from_the_process_working_directory_by_default() {
     fs::create_dir(&decoy_content).unwrap();
     fs::write(
         working_directory.path().join("maincopy.toml"),
-        "[paths]\ncontent_root = \"selected-content\"\n",
+        "[paths]\ncontent_root = \"selected-content\"\n\
+         [lightning]\nprovider = \"lexe\"\n",
     )
     .unwrap();
     fs::write(
         selected_content.join("publication.toml"),
-        TIPPED_PUBLICATION,
+        "unknown = true\n",
     )
     .unwrap();
     fs::write(decoy_content.join("publication.toml"), "unknown = true\n").unwrap();
@@ -127,8 +117,9 @@ fn server_uses_maincopy_toml_from_the_process_working_directory_by_default() {
         Some(ProcessExit::Configuration.code().into())
     );
     let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostic.contains("tip_provider_required"));
-    assert!(!diagnostic.contains("host_file_unreadable"));
+    assert!(diagnostic.contains("host_toml_invalid"));
+    assert!(!diagnostic.contains("selected-content"));
+    assert!(!diagnostic.contains("lexe"));
 }
 
 #[test]
@@ -172,7 +163,7 @@ fn selected_host_file_resolves_file_paths_from_its_parent() {
     .unwrap();
     fs::write(
         content_directory.join("publication.toml"),
-        TIPPED_PUBLICATION,
+        "unknown = true\n",
     )
     .unwrap();
     fs::write(
@@ -189,10 +180,10 @@ fn selected_host_file_resolves_file_paths_from_its_parent() {
 
     assert_eq!(
         output.status.code(),
-        Some(ProcessExit::Configuration.code().into())
+        Some(ProcessExit::Validation.code().into())
     );
     let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostic.contains("tip_provider_required"));
+    assert!(diagnostic.contains("content validation failed"));
 }
 
 #[test]
@@ -208,7 +199,7 @@ fn command_line_paths_resolve_from_the_process_working_directory() {
     fs::write(host_directory.join("selected.toml"), "").unwrap();
     fs::write(
         content_directory.join("publication.toml"),
-        TIPPED_PUBLICATION,
+        "unknown = true\n",
     )
     .unwrap();
     fs::write(
@@ -230,10 +221,10 @@ fn command_line_paths_resolve_from_the_process_working_directory() {
 
     assert_eq!(
         output.status.code(),
-        Some(ProcessExit::Configuration.code().into())
+        Some(ProcessExit::Validation.code().into())
     );
     let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostic.contains("tip_provider_required"));
+    assert!(diagnostic.contains("content validation failed"));
 }
 
 #[test]

@@ -133,19 +133,21 @@ impl_display!(ShutdownSignal {
 pub enum CriticalTaskName {
     PublicServer,
     AdminServer,
+    ContentSync,
+    PublicationCoordinator,
     DatabaseWriter,
     Scheduler,
     Worker,
-    Payments,
 }
 
 impl_display!(CriticalTaskName {
     Self::PublicServer => "public server",
     Self::AdminServer => "admin server",
+    Self::ContentSync => "content sync",
+    Self::PublicationCoordinator => "publication coordinator",
     Self::DatabaseWriter => "database writer",
     Self::Scheduler => "scheduler",
     Self::Worker => "worker",
-    Self::Payments => "payments actor",
 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,7 +157,6 @@ pub enum StartupStage {
     Database,
     Content,
     FrontendAssets,
-    Payments,
     Listeners,
 }
 
@@ -165,7 +166,6 @@ impl_display!(StartupStage {
     Self::Database => "database startup",
     Self::Content => "content compilation",
     Self::FrontendAssets => "frontend asset validation",
-    Self::Payments => "payment startup",
     Self::Listeners => "listener binding",
 });
 
@@ -262,16 +262,16 @@ mod tests {
             ShutdownSignal::Terminate => "terminate",
             CriticalTaskName::PublicServer => "public server",
             CriticalTaskName::AdminServer => "admin server",
+            CriticalTaskName::ContentSync => "content sync",
+            CriticalTaskName::PublicationCoordinator => "publication coordinator",
             CriticalTaskName::DatabaseWriter => "database writer",
             CriticalTaskName::Scheduler => "scheduler",
             CriticalTaskName::Worker => "worker",
-            CriticalTaskName::Payments => "payments actor",
             StartupStage::Configuration => "configuration",
             StartupStage::ProcessLock => "process lock",
             StartupStage::Database => "database startup",
             StartupStage::Content => "content compilation",
             StartupStage::FrontendAssets => "frontend asset validation",
-            StartupStage::Payments => "payment startup",
             StartupStage::Listeners => "listener binding",
         }
     }

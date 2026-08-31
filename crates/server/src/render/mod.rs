@@ -4,6 +4,7 @@ mod catalog;
 mod markdown;
 mod site;
 
+pub(crate) use catalog::CatalogRetentionError;
 pub use catalog::{
     CatalogBuildError, CatalogBuildErrorCode, ContentCatalog, compile_content_catalog,
 };
@@ -14,9 +15,15 @@ pub use markdown::{
     RenderedPost, render_markdown,
 };
 pub use site::{
-    CanonicalSiteUrl, PublicLedgerProjection, RenderedSiteShell, SiteSnapshot,
-    SiteSnapshotBuildError, SiteSnapshotBuildErrorCode, SiteSnapshotReader, SnapshotPublicAsset,
-    build_site_snapshot, render_site_shell,
+    CanonicalSiteUrl, RenderedSiteShell, SiteSnapshot, SiteSnapshotBuildError,
+    SiteSnapshotBuildErrorCode, SiteSnapshotReader, SnapshotPublicAsset, build_site_snapshot,
+    render_site_shell,
 };
 
-pub(crate) use site::{SiteSnapshotActivator, snapshot_store};
+// Temporary compatibility export while callers move to the owning domain.
+pub use crate::domain::publication::PublicLedgerProjection;
+
+pub(crate) use site::{
+    SiteSnapshotActivator, render_bound_post_preview, render_bound_post_revision_preview,
+    snapshot_store,
+};

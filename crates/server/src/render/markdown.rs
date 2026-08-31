@@ -96,6 +96,43 @@ impl RenderedPost {
             MAX_RENDERED_HTML_BYTES,
         )
     }
+
+    pub(super) fn project_for_preview(
+        &self,
+        preview_asset_endpoint: &str,
+        site_assets: &ResolvedSiteAssets,
+        local_assets: &ResolvedLocalAssetStore,
+    ) -> Result<String, MarkdownRenderError> {
+        if !self.assets.shares_policy_with(site_assets) {
+            return Err(MarkdownRenderError::new(
+                &self.document,
+                MarkdownRenderLocation::Document,
+                MarkdownRenderErrorCode::AssetPolicyMismatch,
+                "rendered post preview uses a different external-asset policy",
+            ));
+        }
+        if !preview_asset_endpoint.starts_with('/')
+            || preview_asset_endpoint.contains(['?', '#', '"'])
+        {
+            return Err(MarkdownRenderError::new(
+                &self.document,
+                MarkdownRenderLocation::Document,
+                MarkdownRenderErrorCode::RevisionIdentityRejected,
+                "preview asset endpoint is not a safe root-relative path",
+            ));
+        }
+        self.article.project_with_local_asset_urls(
+            &self.document.path,
+            local_assets,
+            MAX_RENDERED_HTML_BYTES,
+            |asset| {
+                Ok(format!(
+                    "{preview_asset_endpoint}?path={}",
+                    asset.path.as_str()
+                ))
+            },
+        )
+    }
 }
 
 /// A generated post asset whose digest was calculated from its owned bytes.
@@ -286,6 +323,26 @@ impl RenderedArticle {
         local_assets: &ResolvedLocalAssetStore,
         limit: usize,
     ) -> Result<String, MarkdownRenderError> {
+        self.project_with_local_asset_urls(path, local_assets, limit, |asset| {
+            SnapshotAssetPath::new(snapshot, &asset.path)
+                .map(|projected| projected.as_str().to_owned())
+                .map_err(|error| MarkdownRenderError {
+                    path: path.clone(),
+                    location: MarkdownRenderLocation::Document,
+                    code: MarkdownRenderErrorCode::RevisionIdentityRejected,
+                    navigation_rejection: None,
+                    message: error.to_string().into_boxed_str(),
+                })
+        })
+    }
+
+    fn project_with_local_asset_urls(
+        &self,
+        path: &LogicalContentPath,
+        local_assets: &ResolvedLocalAssetStore,
+        limit: usize,
+        mut project: impl FnMut(&DigestedAsset) -> Result<String, MarkdownRenderError>,
+    ) -> Result<String, MarkdownRenderError> {
         for chunk in &*self.plan {
             if let ArticleChunk::LocalAsset(asset) = chunk {
                 local_assets
@@ -298,24 +355,15 @@ impl RenderedArticle {
             let value = match chunk {
                 ArticleChunk::Literal(value) => value.as_ref(),
                 ArticleChunk::LocalAsset(asset) => {
-                    let projected =
-                        SnapshotAssetPath::new(snapshot, &asset.path).map_err(|error| {
-                            MarkdownRenderError {
-                                path: path.clone(),
-                                location: MarkdownRenderLocation::Document,
-                                code: MarkdownRenderErrorCode::RevisionIdentityRejected,
-                                navigation_rejection: None,
-                                message: error.to_string().into_boxed_str(),
-                            }
-                        })?;
+                    let projected = project(asset)?;
                     if output
                         .len()
-                        .checked_add(projected.as_str().len())
+                        .checked_add(projected.len())
                         .is_none_or(|size| size > limit)
                     {
                         return Err(rendered_html_limit_error(path));
                     }
-                    output.push_str(projected.as_str());
+                    output.push_str(&projected);
                     continue;
                 }
             };

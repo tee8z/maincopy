@@ -14,10 +14,13 @@ use super::{
     store::{DatabaseCommandError, DatabaseStore, Mutation},
 };
 use crate::domain::publication::store::{
-    BeginPublishNowResult, CreateTargetJobResult, FinishPublicationResult, FinishedPublication,
+    BeginPublishNowResult, BeginScheduledActivationResult, CreateTargetJobResult,
+    FinishPublicationResult, FinishedPublication, IndexContentCatalogResult,
     InstallStartupSnapshotResult, PublicationMutationError, PublicationStore, PublishNowState,
-    SiteHead, StartupSnapshotMutationError, StoredTargetJob, TargetJobMutationError,
-    begin_publish_now, create as create_target_job, finish_publication, install_startup,
+    SchedulePublicationResult, ScheduledPublication, SiteHead, StartupSnapshotMutationError,
+    StoredTargetJob, TargetJobMutationError, begin_publish_now, begin_scheduled_activation,
+    create as create_target_job, finish_publication, index_content_catalog, install_startup,
+    schedule_publication,
 };
 #[cfg(test)]
 use crate::domain::publication::store::{CommandIdempotencyKey, CreateTargetJob};
@@ -178,15 +181,21 @@ struct FailedMutation {
 
 enum MutationResponder {
     Startup(oneshot::Sender<InstallStartupSnapshotResult>),
+    ContentCatalog(oneshot::Sender<IndexContentCatalogResult>),
     Target(oneshot::Sender<CreateTargetJobResult>),
     BeginPublication(oneshot::Sender<BeginPublishNowResult>),
+    SchedulePublication(oneshot::Sender<SchedulePublicationResult>),
+    BeginScheduledActivation(oneshot::Sender<BeginScheduledActivationResult>),
     FinishPublication(oneshot::Sender<FinishPublicationResult>),
 }
 
 enum MutationOutput {
     Startup(SiteHead),
+    ContentCatalog,
     Target(StoredTargetJob),
     BeginPublication(PublishNowState),
+    ScheduledPublication(ScheduledPublication),
+    BegunScheduledPublication(crate::domain::publication::store::BegunPublication),
     FinishPublication(FinishedPublication),
 }
 
@@ -211,6 +220,16 @@ async fn apply_mutation(
                 .map(MutationOutput::Startup)
                 .map_err(ApplyError::startup),
         ),
+        Mutation::IndexContentCatalog {
+            command,
+            respond_to,
+        } => (
+            MutationResponder::ContentCatalog(respond_to),
+            index_content_catalog(transaction, command)
+                .await
+                .map(|()| MutationOutput::ContentCatalog)
+                .map_err(ApplyError::startup),
+        ),
         Mutation::CreateTargetJob {
             command,
             respond_to,
@@ -229,6 +248,26 @@ async fn apply_mutation(
             begin_publish_now(transaction, command)
                 .await
                 .map(MutationOutput::BeginPublication)
+                .map_err(ApplyError::publication),
+        ),
+        Mutation::SchedulePublication {
+            command,
+            respond_to,
+        } => (
+            MutationResponder::SchedulePublication(respond_to),
+            schedule_publication(transaction, command)
+                .await
+                .map(MutationOutput::ScheduledPublication)
+                .map_err(ApplyError::publication),
+        ),
+        Mutation::BeginScheduledActivation {
+            command,
+            respond_to,
+        } => (
+            MutationResponder::BeginScheduledActivation(respond_to),
+            begin_scheduled_activation(transaction, command)
+                .await
+                .map(MutationOutput::BegunScheduledPublication)
                 .map_err(ApplyError::publication),
         ),
         Mutation::FinishPublication {
@@ -254,10 +293,22 @@ impl MutationResponder {
             (Self::Startup(sender), MutationOutput::Startup(value)) => {
                 let _ = sender.send(Ok(value));
             }
+            (Self::ContentCatalog(sender), MutationOutput::ContentCatalog) => {
+                let _ = sender.send(Ok(()));
+            }
             (Self::Target(sender), MutationOutput::Target(value)) => {
                 let _ = sender.send(Ok(value));
             }
             (Self::BeginPublication(sender), MutationOutput::BeginPublication(value)) => {
+                let _ = sender.send(Ok(value));
+            }
+            (Self::SchedulePublication(sender), MutationOutput::ScheduledPublication(value)) => {
+                let _ = sender.send(Ok(value));
+            }
+            (
+                Self::BeginScheduledActivation(sender),
+                MutationOutput::BegunScheduledPublication(value),
+            ) => {
                 let _ = sender.send(Ok(value));
             }
             (Self::FinishPublication(sender), MutationOutput::FinishPublication(value)) => {
@@ -272,10 +323,19 @@ impl MutationResponder {
             Self::Startup(sender) => {
                 let _ = sender.send(Err(error));
             }
+            Self::ContentCatalog(sender) => {
+                let _ = sender.send(Err(error));
+            }
             Self::Target(sender) => {
                 let _ = sender.send(Err(error));
             }
             Self::BeginPublication(sender) => {
+                let _ = sender.send(Err(error));
+            }
+            Self::SchedulePublication(sender) => {
+                let _ = sender.send(Err(error));
+            }
+            Self::BeginScheduledActivation(sender) => {
                 let _ = sender.send(Err(error));
             }
             Self::FinishPublication(sender) => {
@@ -423,15 +483,19 @@ mod tests {
     use super::*;
     use crate::{
         config::{DatabaseBusyTimeout, DatabaseReadPoolSize, DatabaseWriterQueueCapacity},
-        content::{DraftStatus, PostId, PostRevisionDigest, PostSlug, SiteSnapshotDigest},
+        content::{
+            ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
+            SiteSnapshotDigest,
+        },
         database,
         domain::{
             distribution::{DistributionTarget, TargetPayload},
             publication::{
                 TargetJob, TargetJobStatus,
                 store::{
-                    BeginPublishNow, FinishPublication, InstallStartupSnapshot,
-                    ObservedPostRevision, PublishNowState, SiteHead,
+                    BeginPublishNow, BeginScheduledActivation, FinishPublication,
+                    InstallStartupSnapshot, ObservedPostRevision, PublishNowState,
+                    SchedulePublication, SiteHead,
                 },
             },
         },
@@ -476,13 +540,15 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO canonical_publications (\
-                publication_id, stable_post_id, pinned_post_digest, state, \
-                scheduled_at_ns, version\
-             ) VALUES (?, ?, ?, 'scheduled', 10, 1)",
+                publication_id, command_kind, stable_post_id, pinned_post_digest, state, \
+                scheduled_at_ns, version, content_tree_digest, accepted_preview_digest\
+             ) VALUES (?, 'scheduled', ?, ?, 'scheduled', 10, 1, ?, ?)",
         )
         .bind(uuid(PUBLICATION_ID).as_bytes().as_slice())
         .bind(uuid(POST_ID).as_bytes().as_slice())
         .bind(REVISION_BYTES.as_slice())
+        .bind(content_digest(0x44).as_bytes().as_slice())
+        .bind(preview_digest(0x55).as_bytes().as_slice())
         .execute(&mut database._writer)
         .await
         .unwrap();
@@ -552,6 +618,14 @@ mod tests {
         SiteSnapshotDigest::from_bytes([byte; 32])
     }
 
+    fn content_digest(byte: u8) -> ContentTreeDigest {
+        ContentTreeDigest::from_bytes([byte; 32])
+    }
+
+    fn preview_digest(byte: u8) -> PreviewDigest {
+        PreviewDigest::from_bytes([byte; 32])
+    }
+
     fn begin_publication(
         creation_key: &str,
         publication_id: &str,
@@ -567,8 +641,30 @@ mod tests {
             expected_revision: None,
             expected_site,
             source_commit: None,
+            content_digest: content_digest(0x44),
+            accepted_preview_digest: preview_digest(0x55),
             now: OffsetDateTime::from_unix_timestamp(now).unwrap(),
             candidate_site_digest: candidate,
+        }
+    }
+
+    fn schedule_command(
+        creation_key: &str,
+        publication_id: &str,
+        expected_site: SiteHead,
+        retained_content: ContentTreeDigest,
+    ) -> SchedulePublication {
+        SchedulePublication {
+            creation_key: CommandIdempotencyKey::new(uuid(creation_key)),
+            publication_id: uuid(publication_id),
+            stable_post_id: PostId::parse(POST_ID).unwrap(),
+            pinned_post_digest: PostRevisionDigest::from_bytes(REVISION_BYTES),
+            expected_revision: None,
+            expected_site,
+            source_commit: None,
+            content_digest: retained_content,
+            accepted_preview_digest: preview_digest(0x55),
+            scheduled_at: OffsetDateTime::from_unix_timestamp(30).unwrap(),
         }
     }
 
@@ -745,11 +841,40 @@ mod tests {
             20
         );
         assert_eq!(begun.candidate_site_digest, candidate);
+        assert_eq!(begun.content_digest, content_digest(0x44));
+        assert_eq!(begun.accepted_preview_digest, preview_digest(0x55));
+
+        let mut activating_replay = begin_publication(
+            COMMAND_ID,
+            OTHER_PUBLICATION_ID,
+            initial.clone(),
+            site_digest(0x99),
+            99,
+        );
+        activating_replay.content_digest = content_digest(0x99);
+        let PublishNowState::Activating(activating_replay) = store
+            .publications
+            .begin_publish_now(activating_replay)
+            .await
+            .unwrap()
+        else {
+            panic!("an activating retry must remain activating");
+        };
+        assert_eq!(activating_replay.content_digest, content_digest(0x44));
+        assert_eq!(
+            activating_replay.accepted_preview_digest,
+            preview_digest(0x55)
+        );
 
         let recovery = store.publications.startup_snapshot_state().await.unwrap();
         assert!(recovery.ledger.is_empty());
         assert_eq!(recovery.activating.len(), 1);
         assert_eq!(recovery.activating[0].candidate_site_digest, candidate);
+        assert_eq!(recovery.activating[0].content_digest, content_digest(0x44));
+        assert_eq!(
+            recovery.activating[0].accepted_preview_digest,
+            preview_digest(0x55)
+        );
 
         store
             .publications
@@ -783,6 +908,7 @@ mod tests {
         );
         assert_eq!(finished.site.digest, candidate);
         assert_eq!(finished.site.version, 2);
+        assert_eq!(finished.accepted_preview_digest, preview_digest(0x55));
 
         let job = store
             .publications
@@ -807,21 +933,43 @@ mod tests {
             .unwrap();
         assert_eq!(finish_retry, finished);
 
-        let begin_retry = store
-            .publications
-            .begin_publish_now(begin_publication(
-                COMMAND_ID,
-                OTHER_PUBLICATION_ID,
-                initial,
-                site_digest(0x99),
-                99,
-            ))
-            .await
-            .unwrap();
+        let mut replay = begin_publication(
+            COMMAND_ID,
+            OTHER_PUBLICATION_ID,
+            initial,
+            site_digest(0x99),
+            99,
+        );
+        replay.content_digest = content_digest(0x99);
+        let begin_retry = store.publications.begin_publish_now(replay).await.unwrap();
         let PublishNowState::Published(begin_retry) = begin_retry else {
             panic!("creation-key retry must return the committed publication");
         };
-        assert_eq!(begin_retry, finished);
+        let finished_view = finished.publication.view();
+        assert_eq!(begin_retry.publication_id, finished.publication_id);
+        assert_eq!(begin_retry.stable_post_id, finished_view.stable_post_id);
+        assert_eq!(begin_retry.revision, finished_view.pinned_post_digest);
+        assert_eq!(begin_retry.accepted_preview_digest, finished.accepted_preview_digest);
+        assert_eq!(begin_retry.published_at, finished_view.published_at.unwrap());
+        assert_eq!(begin_retry.site, finished.site);
+
+        let mut conflicting_replay = begin_publication(
+            COMMAND_ID,
+            OTHER_PUBLICATION_ID,
+            finished.site.clone(),
+            site_digest(0x98),
+            98,
+        );
+        conflicting_replay.accepted_preview_digest = preview_digest(0x56);
+        assert_eq!(
+            store
+                .publications
+                .begin_publish_now(conflicting_replay)
+                .await,
+            Err(DatabaseMutationError::Command(
+                DatabaseCommandError::IdempotencyConflict
+            ))
+        );
 
         stop_writer(shutdown, task).await;
         drop(store);
@@ -836,8 +984,9 @@ mod tests {
         assert_eq!(route.0, uuid(POST_ID).as_bytes());
         assert_eq!(route.1, REVISION_BYTES);
         assert_eq!(route.2, "post");
-        let canonical: (String, Vec<u8>, Vec<u8>) = sqlx::query_as(
-            "SELECT state, creation_key, activation_site_digest \
+        let canonical: (String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT state, creation_key, activation_site_digest, content_tree_digest, \
+                    accepted_preview_digest \
              FROM canonical_publications WHERE publication_id = ?",
         )
         .bind(uuid(PUBLICATION_ID).as_bytes().as_slice())
@@ -847,6 +996,113 @@ mod tests {
         assert_eq!(canonical.0, "published");
         assert_eq!(canonical.1, uuid(COMMAND_ID).as_bytes());
         assert_eq!(canonical.2, candidate.as_bytes());
+        assert_eq!(canonical.3, content_digest(0x44).as_bytes());
+        assert_eq!(canonical.4, preview_digest(0x55).as_bytes());
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_publication_replay_returns_the_original_retained_content_digest() {
+        let (_root, path, database) = empty_database().await;
+        let (store, writer) = database.into_store(8);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(writer.run(shutdown.clone()));
+
+        let initial = store
+            .publications
+            .install_startup_snapshot(startup_command(None, site_digest(0x21)))
+            .await
+            .unwrap();
+        let retained = content_digest(0x51);
+        let scheduled = store
+            .publications
+            .schedule_publication(schedule_command(
+                COMMAND_ID,
+                PUBLICATION_ID,
+                initial.clone(),
+                retained.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(scheduled.content_digest, retained);
+        assert_eq!(scheduled.accepted_preview_digest, preview_digest(0x55));
+
+        let replay = store
+            .publications
+            .schedule_publication(schedule_command(
+                COMMAND_ID,
+                OTHER_PUBLICATION_ID,
+                initial.clone(),
+                content_digest(0x52),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay, scheduled);
+        let mut preview_conflict = schedule_command(
+            COMMAND_ID,
+            OTHER_PUBLICATION_ID,
+            initial.clone(),
+            content_digest(0x53),
+        );
+        preview_conflict.accepted_preview_digest = preview_digest(0x56);
+        assert_eq!(
+            store
+                .publications
+                .schedule_publication(preview_conflict)
+                .await,
+            Err(DatabaseMutationError::Command(
+                DatabaseCommandError::IdempotencyConflict
+            ))
+        );
+        let mut conflicting = schedule_command(
+            COMMAND_ID,
+            OTHER_PUBLICATION_ID,
+            initial.clone(),
+            content_digest(0x53),
+        );
+        conflicting.scheduled_at = OffsetDateTime::from_unix_timestamp(31).unwrap();
+        assert_eq!(
+            store.publications.schedule_publication(conflicting).await,
+            Err(DatabaseMutationError::Command(
+                DatabaseCommandError::IdempotencyConflict
+            ))
+        );
+        let next = store
+            .publications
+            .next_scheduled_publication()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.content_digest, retained);
+        assert_eq!(next.accepted_preview_digest, preview_digest(0x55));
+
+        let begun = store
+            .publications
+            .begin_scheduled_activation(BeginScheduledActivation {
+                publication_id: uuid(PUBLICATION_ID),
+                expected_publication_version: 1,
+                expected_site: initial,
+                now: OffsetDateTime::from_unix_timestamp(30).unwrap(),
+                candidate_site_digest: site_digest(0x22),
+            })
+            .await
+            .unwrap();
+        assert_eq!(begun.content_digest, retained);
+        assert_eq!(begun.accepted_preview_digest, preview_digest(0x55));
+
+        stop_writer(shutdown, task).await;
+        drop(store);
+        let mut reopened = database::bootstrap(configuration(&path)).await.unwrap();
+        let persisted: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT content_tree_digest, accepted_preview_digest \
+             FROM canonical_publications WHERE publication_id = ?",
+        )
+        .bind(uuid(PUBLICATION_ID).as_bytes().as_slice())
+        .fetch_one(&mut reopened._writer)
+        .await
+        .unwrap();
+        assert_eq!(persisted.0, retained.as_bytes());
+        assert_eq!(persisted.1, preview_digest(0x55).as_bytes());
         reopened.close().await.unwrap();
     }
 

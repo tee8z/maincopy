@@ -1,0 +1,659 @@
+# Maincopy v1 system design
+
+Status: target architecture; implementation is incomplete
+
+Last reviewed: 2026-08-30
+
+Related documents: [project overview](../README.md),
+[implementation plan](implementation.md), and
+[engineering style guide](quality.md).
+
+## Purpose
+
+Maincopy is a self-hosted publishing engine for one site and canonical domain.
+The site can contain any number of articles. Git stores their canonical
+Markdown and source history.
+
+Maincopy controls when each approved article revision becomes public on the
+author's domain.
+
+This document defines the accepted V1 behavior and trust boundaries. The
+[implementation plan](implementation.md) defines delivery work and acceptance
+gates.
+
+The implementation plan must conform to this design. A product decision must
+update this document before it changes the plan.
+
+> [!WARNING]
+> Do not expose an admin listener before Maincopy authentication and
+> authorization are active. Network isolation and JSON do not grant authority.
+
+## V1 product boundary
+
+V1 operates one site, one canonical domain, one repository, one branch, and one
+content root. The repository can contain many articles.
+
+| Included in V1 | Deferred until after V1 |
+| --- | --- |
+| Managed read-only Git synchronization | Browser article editor and Git write-back |
+| Operator-managed external checkout | GitHub App, OAuth, and pull-request workflow |
+| Production-faithful draft previews | Multiple publications and tenants |
+| Scheduled initial and update releases | Explicit unpublish and retraction workflow |
+| Canonical website and RSS | Automatic social-network distribution |
+| Manual X and Substack Note share kits | Nostr article signing and relay submission |
+| Users, roles, profiles, and authenticated administration | Per-author publication identities |
+| Static Lightning Address tip handoff | Paid articles and access entitlements |
+| Double-opt-in subscription capture | Bulk newsletter campaigns |
+| Local SQLite and Litestream replication | High-availability database failover |
+| Nix package and NixOS module | Hosted multi-site control plane |
+
+V1 does not automate a third-party website through browser scripting. It does
+not claim that a manual share succeeded.
+
+## Terms
+
+| Term | Meaning |
+| --- | --- |
+| Site | One Maincopy instance, canonical domain, and Git content source |
+| Article | One Markdown post within that site |
+| Revision | One immutable compiled version of an article |
+| Release | A scheduled or immediate action that makes one revision public |
+
+Use `site` for the complete website. Do not use `publication` when it could
+mean either the site or one article release.
+
+## Product principles
+
+### Git owns articles
+
+Git owns each article body and its authored metadata. Maincopy never stores an
+editable article body in SQLite.
+
+The admin interface can preview and release an indexed Git revision. It cannot
+edit Markdown or commit to Git in V1.
+
+### The author's domain is canonical
+
+The complete article appears on the author's domain. RSS and manual share text
+link to that canonical URL.
+
+### Preview precedes visibility
+
+Every initial release and update binds one exact production preview. A sync
+cannot make an article public or replace its live revision.
+
+### External services cannot block reading
+
+Website publication does not wait for X, Substack, a Lightning Address service,
+or another distribution network.
+
+### Public reading needs no JavaScript
+
+Public pages use server-rendered HTML, CSS, and safe SVG. JavaScript can enhance
+an admin or login flow.
+
+Nostr extension login requires browser JavaScript. This exception does not
+affect public article reading.
+
+### Finite domains use strong types
+
+Use an enum for each finite state, kind, mode, version, channel, or outcome.
+Use a distinct type for each identifier, digest, token, and timestamp role.
+Put variant-specific data in typed enum payloads instead of parallel booleans
+or optional fields. Use typed errors at each fallible domain and application
+boundary.
+
+Parse external strings at their boundary. Domain functions accept only parsed,
+validated values.
+
+## System context
+
+```mermaid
+flowchart LR
+    Author[Author] -->|push Markdown| Git[Git repository]
+    Git --> Sync[Source sync]
+    Sync --> Compiler[Content compiler]
+    Compiler --> Artifacts[Retained revision artifacts]
+
+    Browser[Admin browser] --> Gateway[HTTPS admin gateway]
+    HumanCli[Human CLI] --> Gateway
+    Agent[Automation agent] --> Gateway
+    Gateway -->|loopback HTTP| Listener[Admin listener]
+    Listener --> Auth[Authentication and scopes]
+    Auth --> Admin[Admin API and UI]
+    Recovery[Offline bootstrap or recovery] --> Operations[Typed admin operations]
+
+    Admin --> Preview[Private preview builder]
+    Artifacts --> Preview
+    Admin --> Operations
+    Operations --> Writer[SQLite writer]
+    Writer --> DB[(SQLite WAL)]
+    DB --> Scheduler[Release scheduler]
+    Scheduler --> Activate[Snapshot activation]
+    Artifacts --> Activate
+    Activate --> Snapshot[Immutable site snapshot]
+
+    Snapshot --> Public[Public Axum service]
+    Public --> Reader[Reader]
+    Public --> RSS[RSS]
+
+    Admin --> Share[Manual share kit]
+    Snapshot --> Share
+    Share --> Person[Person posts to X or Substack]
+
+    DB --> Litestream[Litestream]
+    Litestream --> Replica[Database replica]
+```
+
+`maincopyd` serves public traffic and a loopback-only HTTP admin listener. A
+separate gateway provides the HTTPS admin origin.
+
+The public virtual host has no admin route or admin upstream. The loopback
+listener is not a public recovery interface. The gateway has no direct database
+or content-file access.
+
+Offline bootstrap and repair are finite process invocations. They create no
+recovery transport, recovery API, or continuing authentication bypass.
+
+## Source-of-truth boundaries
+
+| Data | Authority | Constraint |
+| --- | --- | --- |
+| Article body and authored metadata | Git repository | SQLite does not store an editable copy. |
+| Post tip enablement | Git repository | The post cannot select a recipient. |
+| Managed remote, branch, content root, and polling policy | SQLite | Host configuration selects managed mode. |
+| Canonical release schedule and current public revision | SQLite | Sync and reload cannot advance visibility. |
+| Users, roles, profiles, and active tip recipient | SQLite | Profile changes use resource versions. |
+| Password credentials | SQLite | Store only versioned Argon2id PHC strings. |
+| Nostr login and agent identities | SQLite | Store public keys and scoped metadata only. |
+| Browser session and CSRF records | SQLite | Store fixed-length token digests only. |
+| Runtime paths, listeners, limits, and source mode | Host configuration | Reject unknown configuration fields. |
+| SSH, TLS, email, and Litestream secrets | Protected host files | Do not place secret bytes in Git, SQLite, or Nix. |
+| Human and agent Nostr private keys | User or agent device | Maincopy never receives an `nsec` in V1. |
+| Current public representation | Immutable memory snapshot | Build it from Git artifacts and SQLite state. |
+| Lightning payment execution and truth | Reader wallet and address service | Maincopy keeps no payment ledger. |
+| Operational database backup | Litestream replica | Git and revision artifacts need separate backups. |
+
+## Configuration ownership
+
+Maincopy uses three configuration layers.
+
+`publication.toml` travels with the content repository. It contains public site
+metadata, asset policy, subscription policy, and authored feature choices.
+
+Post frontmatter contains article metadata and the optional tip enablement
+flag. It does not contain a Lightning Address or social credential.
+
+SQLite contains mutable control-plane state. This state includes source
+settings, users, profiles, releases, sessions, and audit records.
+
+Host configuration contains runtime paths, listener settings, hard limits,
+source mode, and named secret references. Secret values stay outside the host
+document.
+
+The effective precedence is built-in defaults, host file, then documented
+non-secret command-line overrides.
+
+## Content sources
+
+### Managed Git mode
+
+Managed mode uses one provider-neutral SSH remote and one branch. Maincopy owns
+a local mirror and fetches with a read-only deploy key.
+
+A periodic poll and an admin `Sync now` operation trigger fetch and reconcile.
+A future webhook can trigger a fetch, but it cannot supply trusted content.
+
+Managed mode requires the complete source commit. The database stores source
+settings and the last accepted commit.
+
+### External checkout mode
+
+External checkout mode reads an operator-maintained local content root. It does
+not fetch, pull, commit, or push.
+
+Source commit metadata is optional in this mode. The content digest remains
+required.
+
+### First-run bootstrap
+
+An empty managed installation starts in a restricted bootstrap state. It binds
+no public or admin listener.
+
+An operator runs typed, offline `maincopyd` bootstrap commands on the host.
+Each command acquires exclusive process ownership and uses domain transactions.
+The commands do not provide a raw SQLite console or accept arbitrary SQL.
+
+The identity step creates these records in one transaction:
+
+- stable `InstanceId`;
+- first owner and login credential; and
+- initial audit event.
+
+The source step then creates these records in one transaction:
+
+- managed remote and branch;
+- content root and polling policy; and
+- SSH credential reference.
+
+The source step validates the first fetch and compilation before it closes the
+bootstrap state. The `maincopy` client never writes SQLite directly.
+
+Offline recovery commands use the same typed invariant checks. They bind no
+listener and refuse to run while the daemon owns the process lock. These
+commands create no recovery transport or recovery API.
+
+## Instance identity and discovery
+
+Bootstrap generates one random `InstanceId` and stores it in SQLite. A restore
+preserves the identifier. A new database receives a new identifier.
+
+Unauthenticated admin discovery returns these bounded fields:
+
+- `InstanceId`;
+- expected public origin;
+- admin API versions; and
+- feature-contract versions.
+
+A remote context pins the admin origin, `InstanceId`, and public origin. The
+client loads a credential only after discovery matches all pins.
+
+An explicit offline recovery command can replace the identifier. This action
+invalidates every remote context and browser session.
+
+## Content compilation and retention
+
+The compiler confines all reads to the selected content root. It rejects links,
+special files, unsafe paths, mount crossings, and configured limit excesses.
+
+Compilation produces owned bytes in deterministic order. Later stages do not
+reopen the mutable source tree.
+
+Each revision uses a versioned, domain-separated digest. The digest binds
+authored content, resolved assets, renderer identity, and deterministic output.
+
+Maincopy retains an immutable artifact package for each current or non-terminal
+release revision. The package contains these required materials:
+
+- exact Markdown source bytes;
+- referenced local asset bytes and normalized external references;
+- effective typed metadata;
+- renderer and presentation identities;
+- deterministic rendered outputs; and
+- a checksummed manifest.
+
+The artifact package is operational retention, not an editable content store.
+Git remains authoritative.
+
+Write each package once under its content digest. Use an atomic rename after
+the package and manifest reach durable storage.
+
+Litestream does not back up this artifact store. The V1 backup procedure must
+capture it at a recovery point compatible with SQLite.
+
+## Article lifecycle
+
+A sync or reload validates and indexes a candidate. It never changes the
+current public article revision.
+
+A newer revision of a live article appears as `UnpublishedChange`. The UI label
+is `Unpublished changes`.
+
+```mermaid
+sequenceDiagram
+    participant G as Git
+    participant C as Compiler
+    participant A as Administrator
+    participant P as Preview builder
+    participant D as SQLite
+    participant S as Scheduler
+    participant W as Public snapshot
+
+    G->>C: New immutable revision
+    C->>D: Index revision and artifact
+    A->>P: Request production preview
+    P-->>A: Rendered preview and PreviewDigest
+    A->>D: Create release for exact digest and time
+    S->>D: Claim due release
+    S->>W: Atomically install exact revision
+    S->>D: Commit current published digest
+```
+
+`PreviewDigest` binds the post revision, rendered article, renderer, page shell,
+profile projection, and reviewed canonical URL.
+
+The browser UI must show the preview before confirmation. An API client can
+submit a reproducible digest without a prior preview request.
+
+One stable canonical publication stores the original `published_at` and
+`current_published_digest`. Historical release rows do not grant visibility.
+
+Each release has kind `Initial` or `Update`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Scheduled
+    Scheduled --> Activating: due or publish now
+    Scheduled --> Cancelled
+    Activating --> Published: snapshot and database commit
+    Activating --> Blocked: required input unavailable
+    Blocked --> Activating: approved retry
+    Blocked --> Cancelled
+    Published --> [*]
+    Cancelled --> [*]
+```
+
+An update preserves the original `published_at`. A cancelled or blocked update
+leaves the previous revision public.
+
+A Git deletion or draft change cannot retract a live article in V1. It creates
+an ineligible source change for administrator review.
+
+## Public web contract
+
+The public router serves the publication index, canonical articles, tags,
+archive, RSS, sitemap, robots policy, immutable assets, and health resources.
+
+Public pages include canonical links and structured metadata. Feeds use stable
+post identifiers and absolute canonical URLs.
+
+Request handlers read only the active immutable snapshot. They do not parse
+Markdown, inspect Git, or query mutable source files.
+
+Drafts, previews, scheduled revisions, and preview-only assets return `404 Not
+Found` on the public origin.
+
+## Rendering and assets
+
+Maud owns page structure. The Markdown renderer owns article content.
+
+The renderer escapes raw HTML and validates each link or image destination.
+Local assets use immutable snapshot URLs.
+
+An external content asset must use an allowlisted HTTPS origin. Maincopy never
+fetches, proxies, or checks that asset.
+
+Code highlighting and Mermaid rendering happen during compilation. Mermaid
+output crosses a strict SVG sanitization boundary.
+
+Public pages work without JavaScript. Application CSS and optional JavaScript
+use deterministic content-hashed bundles.
+
+## Admin control plane
+
+`maincopyd` binds the admin router to a dedicated loopback TCP address. The
+listener accepts HTTP only from the same host.
+
+The pre-v1 Unix-socket and Windows named-pipe transport is not a compatibility
+path. The authenticated cutover removes its server and client code, flags,
+defaults, service-unit wiring, and transport tests in one changeset. No build
+binds both transports or exposes an unauthenticated admin TCP listener.
+
+A separate gateway terminates Transport Layer Security (TLS) for the canonical
+admin origin. It forwards allowed paths to the loopback listener and removes
+untrusted identity headers.
+
+The public listener never mounts, forwards, or falls back to an admin route.
+Maincopy validates the configured admin host and exact request origin.
+
+Only pinned discovery, the login page, and login-session endpoints are
+available without a principal. Every other operation requires authentication
+and an allowed scope.
+
+Human login can use username and password, Nostr, or both. Passwords use
+Argon2id. Nostr login verifies a fresh signature without receiving a private
+key.
+
+The browser receives an opaque server-side session in a host-only `Secure`,
+`HttpOnly`, and `SameSite` cookie. SQLite stores only the session-token digest.
+V1 does not use a JSON Web Token (JWT) for a browser session.
+
+Each cookie-authenticated mutation requires a separate Cross-Site Request
+Forgery (CSRF) token. Maincopy also requires the exact configured `Origin`.
+
+The human CLI obtains a revocable login session. It stores the session in the
+operating system credential store, not in arguments, environment variables, or
+context files.
+
+Agent records contain one dedicated Nostr public key and typed scopes. Each
+request requires a fresh, replay-protected NIP-98 proof.
+
+V1 does not issue a long-lived bearer API token. A scoped `AgentCredential`
+fills the same integration niche as an app or robot credential. It uses
+proof-of-possession for every request instead of a reusable secret.
+
+V1 has three built-in roles. Each role maps to a fixed set of typed scopes.
+
+| Scope family | Owner | Administrator | Publisher |
+| --- | --- | --- | --- |
+| Content and status, including sync and reload | Allow | Allow | Allow |
+| Preview HTML and assets | Allow | Allow | Allow |
+| Release scheduling and activation | Allow | Allow | Allow |
+| Manual share kits | Allow | Allow | Allow |
+| Profiles and Lightning settings | Allow | Allow | Deny |
+| Users and credentials | Allow | Allow | Deny |
+| Role assignment | Allow | Deny | Deny |
+| Audit records | Allow | Allow | Deny |
+| Subscriber data | Allow | Allow | Deny |
+| Source and instance configuration | Allow | Deny | Deny |
+
+An `AgentCredential` can contain only a subset of its issuer's current scopes.
+A Publisher can trigger sync and reload, but cannot change source settings.
+A role or agent scope never grants Git write permission. Repository access,
+branch protection, and deploy permissions remain external to Maincopy.
+
+Admin resource endpoints use JSON. The login and admin UI use HTML. Protected
+preview endpoints return exact HTML and assets so the UI can render them.
+
+The public origin returns `404 Not Found` for every admin API and UI path.
+Network reachability alone grants no authority.
+
+## Manual share kits
+
+Maincopy creates a share kit only after canonical publication commits. The
+source revision must equal `current_published_digest`.
+
+The kit becomes unavailable while an update is `Activating`. This rule avoids
+a mismatch between SQLite and the public snapshot.
+
+V1 exposes exactly two named channels:
+
+- `x`; and
+- `substack_note`.
+
+Each entry contains the first eligible prose paragraph and canonical URL. A
+required description is the fallback excerpt.
+
+X uses a supported Web Intent. Substack opens its site so the user can choose
+`Create` and then `Note`.
+
+Copy and Open actions are manual. Maincopy stores no schedule, attempt, lease,
+completion, or delivery result for them.
+
+Share-kit generation makes no provider request. A provider outage cannot affect
+the public article.
+
+## Static Lightning Address tips
+
+SQLite stores one active recipient `UserId`. The recipient profile stores a
+versioned Lightning Address.
+
+Git stores only the post's tip enablement flag. A tip call-to-action appears
+when both the authored flag and active profile permit it.
+
+Maincopy derives the LUD-16 URL and LNURL value locally. It renders the visible
+address, wallet link, and QR code without an external QR service.
+
+Maincopy does not resolve the address, create an invoice, or confirm payment.
+It stores no payer, amount, invoice, hash, preimage, or settlement.
+
+The reader's wallet and Lightning Address service complete the payment. Paid
+article access requires a separate post-V1 entitlement design.
+
+## Subscription capture
+
+V1 can capture subscriptions through first-party double opt-in. It does not
+send bulk newsletter campaigns.
+
+SQLite stores subscriber consent and lifecycle state. These records contain
+personally identifiable information.
+
+The writer commits subscriber state and transactional email work together. An
+email worker performs network delivery outside the database transaction.
+
+SQLite stores token digests only. Logs, metrics, audit events, and errors must
+not contain raw addresses or tokens.
+
+Confirmation and unsubscribe changes require a POST. A GET can render a form
+without changing state.
+
+## Operational database
+
+SQLite stores operational state. It does not store editable Markdown or
+rendered article bodies.
+
+Exactly one Tokio task owns one SQLx write connection. Every runtime mutation
+uses one bounded command channel.
+
+Read handlers use a separate bounded, query-only pool. The database uses local
+storage and write-ahead logging.
+
+A network call cannot hold a database transaction. A committed writer reply
+means the transaction completed.
+
+Typed commands enforce idempotency, resource versions, legal transitions, and
+cross-table invariants. The schema enforces stable widths and basic integrity.
+
+The CLI and admin UI never open SQLite directly.
+
+## Startup and shutdown
+
+`crates/server/src/main.rs` remains a small process entry point.
+`crates/server/src/startup.rs` owns composition and lifecycle behavior.
+
+Normal startup follows this order:
+
+1. Validate host configuration and acquire process ownership.
+2. Open and verify SQLite through its single-writer bootstrap.
+3. Verify instance identity and authentication compatibility.
+4. Reconcile incomplete reloads and releases.
+5. Verify required revision artifacts.
+6. Build and install the canonical immutable snapshot.
+7. Bind the public listener and loopback admin listener.
+8. Start source polling, scheduling, email, and backup supervision.
+
+Bootstrap and recovery commands are offline process modes. They bind no network
+listener.
+
+Shutdown stops intake before workers. It drains accepted database work before
+it closes SQLite and releases both listener addresses.
+
+## Backup and restore
+
+Litestream replicates the local SQLite database. It does not back up Git,
+revision artifacts, host secrets, or runtime credentials.
+
+Production recovery requires these independent inputs:
+
+- Git repository backup or remote;
+- Litestream database replica;
+- compatible revision-artifact backup; and
+- protected host secret backup.
+
+Restore is an offline operation. Never restore over a non-empty live database.
+
+The restore verifier checks SQLite integrity, schema compatibility, release
+inputs, artifacts, profile state, subscriber retention, and logical digests.
+
+An accepted restore creates a one-use marker for that restored candidate. The
+first normal startup verifies and consumes the marker before ordinary writes.
+
+Ordinary restarts do not require a restore marker. Restored browser sessions
+are invalidated before the admin origin becomes available.
+
+## Workspace and deployment
+
+The root `Cargo.toml` defines one workspace:
+
+```text
+crates/
+|-- server/    # maincopyd and application domains
+|-- cli/       # maincopy operator client
+`-- shared/    # wire contracts and shared defaults
+```
+
+One Maincopy daemon owns one site with many articles. Production also runs an
+HTTPS gateway and Litestream as separate, least-privilege processes.
+
+The Nix flake provides packages, applications, checks, a development shell,
+and a formatter. The NixOS module is a V1 release requirement.
+
+## Pre-v1 compatibility transition
+
+The current source still contains superseded provider-backed tip code,
+distribution frontmatter, and target-job schema work. These features are not
+part of the V1 contract.
+
+Before the next persistent contract lands, the project must select these
+transition rules:
+
+- reset or migrate pre-v1 databases;
+- retain or replace the pre-release admin `v1` paths; and
+- retain or version existing post-digest encodings.
+
+Until those choices are fixed, pre-v1 databases and API responses have no
+upgrade guarantee.
+
+## Open design selections
+
+These selections must finish before their owning work starts:
+
+- pre-v1 database, API, and digest transition policy;
+- revision-artifact backup and retention implementation;
+- production HTTPS admin gateway;
+- Mermaid renderer and SVG sanitizer;
+- confirmation email transport and retention policy;
+- metrics export path; and
+- measured recovery point and recovery time targets.
+
+## Required release evidence
+
+V1 must prove these properties:
+
+- Invalid content cannot replace a working snapshot.
+- Sync cannot publish an initial article or update.
+- Every release binds its exact preview and canonical URL.
+- Draft and preview assets are absent from the public origin.
+- Historical releases cannot grant current visibility.
+- Public routing exposes no admin endpoint.
+- The loopback admin listener never serves an unprotected operation.
+- The authenticated cutover leaves no Unix-socket or named-pipe compatibility
+  transport, configuration, service unit, or test.
+- Remote users and agents receive only authorized results.
+- A Publisher cannot access profiles, Lightning settings, users, credentials,
+  audit records, or instance configuration.
+- Bootstrap and recovery create no recovery transport, bind no listener, and
+  accept no arbitrary SQL.
+- Manual share-kit generation makes no provider request.
+- Static tip rendering makes no LNURL request.
+- Every runtime SQLite write uses the shared writer task.
+- No network call holds a database transaction.
+- Subscriber secrets and personal data follow the privacy boundary.
+- Database and revision artifacts restore to one compatible recovery point.
+- A clean checkout passes the documented Nix and Rust checks.
+
+The [implementation plan](implementation.md) contains the complete work-package
+and failure-injection gates. The [engineering style guide](quality.md) defines
+code conventions and the manual CRAP score budget.
+
+## References
+
+- [SQLite write-ahead logging](https://sqlite.org/wal.html)
+- [Litestream operation](https://litestream.io/how-it-works/)
+- [Nostr HTTP Authentication, NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md)
+- [Argon2 recommendations, RFC 9106](https://www.rfc-editor.org/rfc/rfc9106.html)
+- [LNURL base specification, LUD-01](https://github.com/lnurl/luds/blob/luds/01.md)
+- [LNURL-pay, LUD-06](https://github.com/lnurl/luds/blob/luds/06.md)
+- [Lightning Address, LUD-16](https://github.com/lnurl/luds/blob/luds/16.md)
+- [X Post button and Web Intent](https://docs.x.com/x-for-websites/post-button/overview)
+- [Substack Notes workflow](https://support.substack.com/hc/en-us/articles/14564821756308-Getting-started-on-Substack-Notes)

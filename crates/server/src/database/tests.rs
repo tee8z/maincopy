@@ -500,11 +500,14 @@ async fn identifiers_and_hashes_use_blob_storage() {
     assert_eq!(
         columns,
         [
+            "canonical_publications.accepted_preview_digest:BLOB",
             "canonical_publications.activation_site_digest:BLOB",
+            "canonical_publications.content_tree_digest:BLOB",
             "canonical_publications.creation_key:BLOB",
             "canonical_publications.current_published_digest:BLOB",
             "canonical_publications.pinned_post_digest:BLOB",
             "canonical_publications.publication_id:BLOB",
+            "canonical_publications.requested_revision_digest:BLOB",
             "canonical_publications.source_commit:BLOB",
             "canonical_publications.stable_post_id:BLOB",
             "post_revisions.revision_digest:BLOB",
@@ -543,7 +546,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 10);
+    assert_eq!(compact_definitions.matches("check(").count(), 12);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",
@@ -555,6 +558,8 @@ async fn identifiers_and_hashes_use_blob_storage() {
         "check(length(idempotency_key)=16)",
         "check(length(publication_job_id)=16)",
         "check(length(reload_operation_id)=16)",
+        "check(length(content_tree_digest)=32)",
+        "check(length(accepted_preview_digest)=32)",
     ] {
         assert!(
             compact_definitions.contains(constraint),
@@ -583,6 +588,78 @@ async fn identifiers_and_hashes_use_blob_storage() {
     .await
     .unwrap();
     assert_eq!(stored, ("blob".into(), 16, "blob".into(), 32));
+
+    let publication_id = vec![12_u8; 16];
+    let content_digest = vec![13_u8; 32];
+    let accepted_preview_digest = vec![14_u8; 32];
+    sqlx::query(
+        "INSERT INTO canonical_publications (\
+            publication_id, command_kind, stable_post_id, pinned_post_digest, content_tree_digest, \
+            accepted_preview_digest, state, version, scheduled_at_ns\
+         ) VALUES (?, 'scheduled', ?, ?, ?, ?, 'scheduled', 1, 1)",
+    )
+    .bind(&publication_id)
+    .bind(&valid_id)
+    .bind(REVISION_A.as_slice())
+    .bind(&content_digest)
+    .bind(&accepted_preview_digest)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    let stored_bindings: (String, i64, String, i64) = sqlx::query_as(
+        "SELECT typeof(content_tree_digest), length(content_tree_digest), \
+                typeof(accepted_preview_digest), length(accepted_preview_digest) \
+         FROM canonical_publications WHERE publication_id = ?",
+    )
+    .bind(&publication_id)
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(stored_bindings, ("blob".into(), 32, "blob".into(), 32));
+
+    for statement in [
+        "UPDATE canonical_publications SET content_tree_digest = NULL WHERE publication_id = ?",
+        "UPDATE canonical_publications SET accepted_preview_digest = NULL WHERE publication_id = ?",
+    ] {
+        assert!(
+            sqlx::query(statement)
+                .bind(&publication_id)
+                .execute(&mut *connection)
+                .await
+                .is_err()
+        );
+    }
+    for (statement, malformed) in [
+        (
+            "UPDATE canonical_publications SET content_tree_digest = ? \
+             WHERE publication_id = ?",
+            vec![15_u8; 31],
+        ),
+        (
+            "UPDATE canonical_publications SET content_tree_digest = ? \
+             WHERE publication_id = ?",
+            vec![16_u8; 33],
+        ),
+        (
+            "UPDATE canonical_publications SET accepted_preview_digest = ? \
+             WHERE publication_id = ?",
+            vec![17_u8; 31],
+        ),
+        (
+            "UPDATE canonical_publications SET accepted_preview_digest = ? \
+             WHERE publication_id = ?",
+            vec![18_u8; 33],
+        ),
+    ] {
+        assert!(
+            sqlx::query(statement)
+                .bind(malformed)
+                .bind(&publication_id)
+                .execute(&mut *connection)
+                .await
+                .is_err()
+        );
+    }
 
     for invalid_id in [vec![8_u8; 15], vec![9_u8; 17]] {
         assert!(

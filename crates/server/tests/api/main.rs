@@ -1,4 +1,5 @@
 mod admin_capabilities;
+mod admin_posts;
 mod health;
 mod helpers;
 mod openapi;

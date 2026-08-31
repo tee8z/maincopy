@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use axum::{Extension, Router, middleware};
-use tokio::sync::Mutex;
 use utoipa::OpenApi;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use crate::domain::publication::activation::PublicationCoordinator;
+use crate::domain::publication::activation::PublicationCoordinatorHandle;
 
 mod capabilities;
 mod openapi;
@@ -24,6 +23,9 @@ pub fn admin_router() -> Router {
     let (router, document) = OpenApiRouter::<()>::with_openapi(AdminApi::openapi())
         .routes(routes!(capabilities::get_admin_capabilities))
         .routes(routes!(capabilities::get_capabilities))
+        .routes(crate::domain::publication::admin::list_routes())
+        .routes(crate::domain::publication::admin::preview_routes())
+        .routes(crate::domain::publication::admin::preview_asset_routes())
         .routes(crate::domain::publication::admin::routes())
         .routes(routes!(openapi::get_openapi))
         .split_for_parts();
@@ -34,6 +36,6 @@ pub fn admin_router() -> Router {
 }
 
 /// Builds the private administration router with live publication state.
-pub(crate) fn runtime_admin_router(publications: Arc<Mutex<PublicationCoordinator>>) -> Router {
+pub(crate) fn runtime_admin_router(publications: PublicationCoordinatorHandle) -> Router {
     admin_router().layer(Extension(publications))
 }

@@ -2,9 +2,11 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 
 use crate::domain::publication::store::{
-    BeginPublishNow, BeginPublishNowResult, CreateTargetJob, CreateTargetJobResult,
-    FinishPublication, FinishPublicationResult, InstallStartupSnapshot,
-    InstallStartupSnapshotResult, PublicationStore,
+    BeginPublishNow, BeginPublishNowResult, BeginScheduledActivation,
+    BeginScheduledActivationResult, CreateTargetJob, CreateTargetJobResult, FinishPublication,
+    FinishPublicationResult, IndexContentCatalog, IndexContentCatalogResult,
+    InstallStartupSnapshot, InstallStartupSnapshotResult, PublicationStore, SchedulePublication,
+    SchedulePublicationResult,
 };
 
 /// The server-facing database capability.
@@ -27,6 +29,10 @@ pub(crate) enum Mutation {
         command: InstallStartupSnapshot,
         respond_to: oneshot::Sender<InstallStartupSnapshotResult>,
     },
+    IndexContentCatalog {
+        command: IndexContentCatalog,
+        respond_to: oneshot::Sender<IndexContentCatalogResult>,
+    },
     CreateTargetJob {
         command: CreateTargetJob,
         respond_to: oneshot::Sender<CreateTargetJobResult>,
@@ -34,6 +40,14 @@ pub(crate) enum Mutation {
     BeginPublishNow {
         command: BeginPublishNow,
         respond_to: oneshot::Sender<BeginPublishNowResult>,
+    },
+    SchedulePublication {
+        command: SchedulePublication,
+        respond_to: oneshot::Sender<SchedulePublicationResult>,
+    },
+    BeginScheduledActivation {
+        command: BeginScheduledActivation,
+        respond_to: oneshot::Sender<BeginScheduledActivationResult>,
     },
     FinishPublication {
         command: FinishPublication,

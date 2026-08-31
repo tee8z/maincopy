@@ -5,8 +5,8 @@ use axum::{
     body::{Body, Bytes},
     extract::{Path, State, rejection::PathRejection},
     http::{
-        HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, ETAG},
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
     },
     response::Response,
     routing::get,
@@ -35,70 +35,73 @@ pub(crate) fn router(snapshots: SiteSnapshotReader) -> Router {
         .with_state(snapshots)
 }
 
-async fn index(State(snapshots): State<SiteSnapshotReader>) -> Response {
+async fn index(State(snapshots): State<SiteSnapshotReader>, headers: HeaderMap) -> Response {
     let snapshot = snapshots.load_full();
-    html_response(StatusCode::OK, snapshot.index_page())
+    html_response(StatusCode::OK, snapshot.index_page(), &snapshot, &headers)
 }
 
 async fn post(
     State(snapshots): State<SiteSnapshotReader>,
+    headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
 ) -> Response {
     let snapshot = snapshots.load_full();
     let Ok(Path(value)) = path else {
-        return not_found_response(&snapshot);
+        return not_found_response(&snapshot, &headers);
     };
     let Ok(slug) = PostSlug::parse(value) else {
-        return not_found_response(&snapshot);
+        return not_found_response(&snapshot, &headers);
     };
     snapshot.post_page(&slug).map_or_else(
-        || not_found_response(&snapshot),
-        |page| html_response(StatusCode::OK, page),
+        || not_found_response(&snapshot, &headers),
+        |page| html_response(StatusCode::OK, page, &snapshot, &headers),
     )
 }
 
 async fn tag(
     State(snapshots): State<SiteSnapshotReader>,
+    headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
 ) -> Response {
     let snapshot = snapshots.load_full();
     let Ok(Path(value)) = path else {
-        return not_found_response(&snapshot);
+        return not_found_response(&snapshot, &headers);
     };
     let Ok(tag) = PostTag::parse(value.clone()) else {
-        return not_found_response(&snapshot);
+        return not_found_response(&snapshot, &headers);
     };
     if tag.as_str() != value {
-        return not_found_response(&snapshot);
+        return not_found_response(&snapshot, &headers);
     }
     snapshot.tag_page(&tag).map_or_else(
-        || not_found_response(&snapshot),
-        |page| html_response(StatusCode::OK, page),
+        || not_found_response(&snapshot, &headers),
+        |page| html_response(StatusCode::OK, page, &snapshot, &headers),
     )
 }
 
-async fn archive(State(snapshots): State<SiteSnapshotReader>) -> Response {
+async fn archive(State(snapshots): State<SiteSnapshotReader>, headers: HeaderMap) -> Response {
     let snapshot = snapshots.load_full();
-    html_response(StatusCode::OK, snapshot.archive_page())
+    html_response(StatusCode::OK, snapshot.archive_page(), &snapshot, &headers)
 }
 
 async fn application_asset(
     State(snapshots): State<SiteSnapshotReader>,
+    headers: HeaderMap,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Response {
     let snapshot = snapshots.load_full();
     let Ok(Path((digest, name))) = path else {
-        return not_found_response(&snapshot);
+        return not_found_response(&snapshot, &headers);
     };
     let Ok(digest) = FrontendBundleDigest::from_str(&digest) else {
-        return not_found_response(&snapshot);
+        return not_found_response(&snapshot, &headers);
     };
     let Ok(name) = FrontendAssetName::parse(&name) else {
-        return not_found_response(&snapshot);
+        return not_found_response(&snapshot, &headers);
     };
     let manifest = snapshot.frontend;
     let Some(asset) = manifest.lookup(&digest, name) else {
-        return not_found_response(&snapshot);
+        return not_found_response(&snapshot, &headers);
     };
 
     let Ok(etag) = HeaderValue::from_str(&asset.etag()) else {
@@ -117,21 +120,31 @@ async fn application_asset(
     response
 }
 
-async fn not_found(State(snapshots): State<SiteSnapshotReader>) -> Response {
+async fn not_found(State(snapshots): State<SiteSnapshotReader>, headers: HeaderMap) -> Response {
     let snapshot = snapshots.load_full();
-    not_found_response(&snapshot)
+    not_found_response(&snapshot, &headers)
 }
 
-async fn method_not_allowed(State(snapshots): State<SiteSnapshotReader>) -> Response {
+async fn method_not_allowed(
+    State(snapshots): State<SiteSnapshotReader>,
+    headers: HeaderMap,
+) -> Response {
     let snapshot = snapshots.load_full();
     html_response(
         StatusCode::METHOD_NOT_ALLOWED,
         snapshot.method_not_allowed_page(),
+        &snapshot,
+        &headers,
     )
 }
 
-fn not_found_response(snapshot: &SiteSnapshot) -> Response {
-    html_response(StatusCode::NOT_FOUND, snapshot.not_found_page())
+fn not_found_response(snapshot: &SiteSnapshot, headers: &HeaderMap) -> Response {
+    html_response(
+        StatusCode::NOT_FOUND,
+        snapshot.not_found_page(),
+        snapshot,
+        headers,
+    )
 }
 
 struct HtmlBodyOwner(Arc<str>);
@@ -142,7 +155,25 @@ impl AsRef<[u8]> for HtmlBodyOwner {
     }
 }
 
-fn html_response(status: StatusCode, html: Arc<str>) -> Response {
+fn html_response(
+    status: StatusCode,
+    html: Arc<str>,
+    snapshot: &SiteSnapshot,
+    request_headers: &HeaderMap,
+) -> Response {
+    let Ok(etag) = HeaderValue::from_str(&format!("\"{}\"", snapshot.digest)) else {
+        return internal_error_response();
+    };
+    if status.is_success() && if_none_match(request_headers, &etag) {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response.headers_mut().insert(ETAG, etag);
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HTML_CACHE_POLICY);
+        return response;
+    }
+
     let mut response = Response::new(Body::from(Bytes::from_owner(HtmlBodyOwner(html))));
     *response.status_mut() = status;
     response
@@ -151,7 +182,54 @@ fn html_response(status: StatusCode, html: Arc<str>) -> Response {
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HTML_CACHE_POLICY);
+    response.headers_mut().insert(ETAG, etag);
     response
+}
+
+fn if_none_match(headers: &HeaderMap, current: &HeaderValue) -> bool {
+    let Some(current) = current.to_str().ok() else {
+        return false;
+    };
+    headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| if_none_match_value(value, current))
+}
+
+fn if_none_match_value(value: &str, current: &str) -> bool {
+    let mut quoted = false;
+    let mut token_start = 0;
+    let mut tokens = Vec::new();
+    for (index, byte) in value.bytes().enumerate() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b',' if !quoted => {
+                tokens.push(&value[token_start..index]);
+                token_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted {
+        return false;
+    }
+    tokens.push(&value[token_start..]);
+
+    tokens.into_iter().map(str::trim).any(|candidate| {
+        candidate == "*"
+            || entity_tag(candidate)
+                .is_some_and(|candidate| candidate.as_bytes() == current.as_bytes())
+    })
+}
+
+fn entity_tag(candidate: &str) -> Option<&str> {
+    let candidate = candidate.strip_prefix("W/").unwrap_or(candidate);
+    let opaque = candidate.strip_prefix('"')?.strip_suffix('"')?;
+    opaque
+        .bytes()
+        .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
+        .then_some(candidate)
 }
 
 fn internal_error_response() -> Response {
@@ -170,7 +248,7 @@ mod tests {
 
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, StatusCode},
+        http::{HeaderValue, Method, Request, StatusCode},
     };
     use time::OffsetDateTime;
     use tower::ServiceExt;
@@ -190,7 +268,13 @@ mod tests {
 
     fn published_example_state() -> PublicState {
         let root = FilePath::new(env!("CARGO_MANIFEST_DIR")).join("examples/content");
-        let tree = discover_content_tree(&root, ContentTreeLimits::default()).unwrap();
+        let mut tree = discover_content_tree(&root, ContentTreeLimits::default()).unwrap();
+        let source = tree.posts[0].source.replace(
+            "\n+++\n\n# Hello, Maincopy",
+            "\ntags = [\"rust\"]\n+++\n\n# Hello, Maincopy",
+        );
+        assert_ne!(source.as_str(), tree.posts[0].source.as_ref());
+        tree.posts[0].source = source.into_boxed_str();
         let content = tree.validate().unwrap();
         let assets = resolve_content_assets(&tree, &content).unwrap();
         let document = content.posts.first().unwrap();
@@ -216,10 +300,30 @@ mod tests {
     }
 
     async fn get(path: &str) -> Response {
+        request(Method::GET, path, &[]).await
+    }
+
+    async fn request(method: Method, path: &str, if_none_match: &[HeaderValue]) -> Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        for value in if_none_match {
+            request.headers_mut().append(IF_NONE_MATCH, value.clone());
+        }
         public_router(published_example_state())
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .oneshot(request)
             .await
             .unwrap()
+    }
+
+    fn etag(response: &Response) -> HeaderValue {
+        response
+            .headers()
+            .get(ETAG)
+            .expect("rendered HTML must carry an ETag")
+            .clone()
     }
 
     #[tokio::test]
@@ -238,6 +342,126 @@ mod tests {
         assert_eq!(
             get("/tags/not-published").await.status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn rendered_html_uses_the_active_snapshot_as_a_strong_etag() {
+        let mut expected = None;
+        for path in ["/", "/posts/hello-maincopy", "/tags/rust", "/archive"] {
+            let response = get(path).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL),
+                Some(&HTML_CACHE_POLICY)
+            );
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE),
+                Some(&HTML_CONTENT_TYPE)
+            );
+            let actual = etag(&response);
+            let encoded = actual.to_str().unwrap();
+            assert!(encoded.starts_with("\"site-b3-v1-"), "{encoded}");
+            assert!(encoded.ends_with('"'), "{encoded}");
+            assert!(!encoded.starts_with("W/"), "{encoded}");
+            if let Some(expected) = &expected {
+                assert_eq!(&actual, expected, "{path}");
+            } else {
+                expected = Some(actual);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_if_none_match_returns_an_empty_304() {
+        for path in ["/", "/posts/hello-maincopy", "/tags/rust", "/archive"] {
+            let current = etag(&get(path).await);
+            let encoded = current.to_str().unwrap();
+            let candidates = [
+                vec![current.clone()],
+                vec![HeaderValue::from_str(&format!("W/{encoded}")).unwrap()],
+                vec![HeaderValue::from_static("*")],
+                vec![HeaderValue::from_str(&format!("\"another\", {encoded}")).unwrap()],
+                vec![HeaderValue::from_static("\"another\""), current.clone()],
+            ];
+            for candidate in candidates {
+                let response = request(Method::GET, path, &candidate).await;
+
+                assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{path}");
+                assert_eq!(response.headers().get(ETAG), Some(&current));
+                assert_eq!(
+                    response.headers().get(CACHE_CONTROL),
+                    Some(&HTML_CACHE_POLICY)
+                );
+                assert!(response.headers().get(CONTENT_TYPE).is_none());
+                assert!(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_nonmatching_if_none_match_does_not_suppress_html() {
+        let current = etag(&get("/").await);
+        let candidates = [
+            HeaderValue::from_static("site-b3-v1-not-quoted"),
+            HeaderValue::from_static("\"another\""),
+            HeaderValue::from_static("W/\"another\""),
+            HeaderValue::from_static("\"unterminated"),
+            HeaderValue::from_static("\"invalid tag with spaces\""),
+        ];
+
+        for candidate in candidates {
+            let response = request(Method::GET, "/", std::slice::from_ref(&candidate)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{candidate:?}");
+            assert_eq!(etag(&response), current);
+            assert!(
+                !to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn html_error_pages_carry_validators_without_changing_error_semantics() {
+        let not_found = get("/not-found").await;
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            not_found.headers().get(CACHE_CONTROL),
+            Some(&HTML_CACHE_POLICY)
+        );
+        assert_eq!(
+            not_found.headers().get(CONTENT_TYPE),
+            Some(&HTML_CONTENT_TYPE)
+        );
+        let current = etag(&not_found);
+
+        let conditional = request(Method::GET, "/not-found", std::slice::from_ref(&current)).await;
+        assert_eq!(conditional.status(), StatusCode::NOT_FOUND);
+        assert_eq!(etag(&conditional), current);
+        assert!(
+            !to_bytes(conditional.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let method_not_allowed = request(Method::POST, "/", &[]).await;
+        assert_eq!(method_not_allowed.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(etag(&method_not_allowed), current);
+        assert_eq!(
+            method_not_allowed.headers().get(CACHE_CONTROL),
+            Some(&HTML_CACHE_POLICY)
+        );
+        assert_eq!(
+            method_not_allowed.headers().get(CONTENT_TYPE),
+            Some(&HTML_CONTENT_TYPE)
         );
     }
 }

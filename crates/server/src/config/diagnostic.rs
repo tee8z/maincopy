@@ -15,13 +15,10 @@ pub enum ConfigurationValidationCode {
     HostTomlInvalid,
     PathInvalid,
     SecretReferenceInvalid,
-    LexeCredentialsMustUseFile,
-    LexeConcurrencyInvalid,
     LimitOutOfRange,
     DurationInvalid,
     PageSizeInvalid,
     ContentLimitRelationshipInvalid,
-    TipProviderRequired,
 }
 
 impl ConfigurationValidationCode {
@@ -34,13 +31,10 @@ impl ConfigurationValidationCode {
             Self::HostTomlInvalid => "host_toml_invalid",
             Self::PathInvalid => "path_invalid",
             Self::SecretReferenceInvalid => "secret_reference_invalid",
-            Self::LexeCredentialsMustUseFile => "lexe_credentials_must_use_file",
-            Self::LexeConcurrencyInvalid => "lexe_concurrency_invalid",
             Self::LimitOutOfRange => "limit_out_of_range",
             Self::DurationInvalid => "duration_invalid",
             Self::PageSizeInvalid => "page_size_invalid",
             Self::ContentLimitRelationshipInvalid => "content_limit_relationship_invalid",
-            Self::TipProviderRequired => "tip_provider_required",
         }
     }
 }
@@ -196,14 +190,6 @@ mod tests {
                 "secret_reference_invalid",
             ),
             (
-                ConfigurationValidationCode::LexeCredentialsMustUseFile,
-                "lexe_credentials_must_use_file",
-            ),
-            (
-                ConfigurationValidationCode::LexeConcurrencyInvalid,
-                "lexe_concurrency_invalid",
-            ),
-            (
                 ConfigurationValidationCode::LimitOutOfRange,
                 "limit_out_of_range",
             ),
@@ -219,10 +205,6 @@ mod tests {
                 ConfigurationValidationCode::ContentLimitRelationshipInvalid,
                 "content_limit_relationship_invalid",
             ),
-            (
-                ConfigurationValidationCode::TipProviderRequired,
-                "tip_provider_required",
-            ),
         ];
 
         for (code, expected) in cases {
@@ -235,9 +217,9 @@ mod tests {
     fn diagnostics_are_sorted_and_do_not_contain_source_text() {
         let errors = ConfigurationErrors::from_diagnostics(vec![
             ConfigurationDiagnostic::new(
-                "lightning",
-                ConfigurationValidationCode::TipProviderRequired,
-                "configured publication tips require a provider",
+                "paths.content_root",
+                ConfigurationValidationCode::PathInvalid,
+                "configured path must not be empty",
             ),
             ConfigurationDiagnostic::new(
                 "$document",

@@ -2,8 +2,12 @@
 
 pub(crate) mod activation;
 pub(crate) mod admin;
+pub(crate) mod scheduler;
 pub(crate) mod store;
+mod visibility;
 pub(crate) mod web;
+
+pub use visibility::{PublicLedgerProjection, PublishedPostRevision};
 
 use std::marker::PhantomData;
 
@@ -26,6 +30,7 @@ pub enum CanonicalState {
     Activating,
     Blocked,
     Published,
+    Superseded,
     Cancelled,
 }
 
@@ -62,7 +67,7 @@ macro_rules! state_markers {
 
 state_markers! {
     /// Compile-time states for [`CanonicalPublication`].
-    canonical { Scheduled, Activating, Blocked, Published, Cancelled }
+    canonical { Scheduled, Activating, Blocked, Published, Superseded, Cancelled }
 }
 
 state_markers! {
@@ -120,6 +125,7 @@ pub enum CanonicalPublicationStatus {
     Activating(CanonicalPublication<canonical::Activating>),
     Blocked(CanonicalPublication<canonical::Blocked>),
     Published(CanonicalPublication<canonical::Published>),
+    Superseded(CanonicalPublication<canonical::Superseded>),
     Cancelled(CanonicalPublication<canonical::Cancelled>),
 }
 
@@ -135,6 +141,7 @@ impl TryFrom<CanonicalPublicationView> for CanonicalPublicationStatus {
             CanonicalState::Activating => Self::Activating(canonical_from_view(view)),
             CanonicalState::Blocked => Self::Blocked(canonical_from_view(view)),
             CanonicalState::Published => Self::Published(canonical_from_view(view)),
+            CanonicalState::Superseded => Self::Superseded(canonical_from_view(view)),
             CanonicalState::Cancelled => Self::Cancelled(canonical_from_view(view)),
         })
     }
@@ -153,6 +160,7 @@ impl CanonicalPublicationView {
             CanonicalState::Scheduled => 1,
             CanonicalState::Activating => 2,
             CanonicalState::Blocked | CanonicalState::Published => 3,
+            CanonicalState::Superseded => 4,
             CanonicalState::Cancelled => 2,
         };
         if self.version < minimum_version {
@@ -183,7 +191,10 @@ impl CanonicalPublicationView {
                 )
             }
             (Some(started), Some(published), Some(_), None) => {
-                self.state == CanonicalState::Published && started == published
+                matches!(
+                    self.state,
+                    CanonicalState::Published | CanonicalState::Superseded
+                ) && started == published
             }
             _ => false,
         };
@@ -284,6 +295,17 @@ impl CanonicalPublication<canonical::Activating> {
             Some(publication.entity.pinned_post_digest.clone());
         publication.entity.block_reason = None;
         Ok(publication.transition(CanonicalState::Published))
+    }
+}
+
+impl CanonicalPublication<canonical::Published> {
+    /// Records that a later approved release replaced this public revision.
+    pub fn supersede(
+        self,
+        expected_version: u64,
+    ) -> Result<CanonicalPublication<canonical::Superseded>, TransitionFailure<Self>> {
+        let publication = self.require_version(expected_version)?;
+        Ok(publication.transition(CanonicalState::Superseded))
     }
 }
 
@@ -1024,6 +1046,7 @@ mod tests {
                 CanonicalPublicationStatus::Activating(publication) => publication.into_view(),
                 CanonicalPublicationStatus::Blocked(publication) => publication.into_view(),
                 CanonicalPublicationStatus::Published(publication) => publication.into_view(),
+                CanonicalPublicationStatus::Superseded(publication) => publication.into_view(),
                 CanonicalPublicationStatus::Cancelled(publication) => publication.into_view(),
             };
             assert_eq!(actual.state, state);

@@ -4,9 +4,13 @@
 CREATE TABLE canonical_publications (
     publication_id BLOB PRIMARY KEY CHECK (length(publication_id) = 16),
     creation_key BLOB UNIQUE,
+    command_kind TEXT NOT NULL
+        CHECK (command_kind IN ('immediate', 'scheduled')),
     stable_post_id BLOB NOT NULL,
     requested_revision_digest BLOB,
     pinned_post_digest BLOB NOT NULL,
+    content_tree_digest BLOB NOT NULL CHECK (length(content_tree_digest) = 32),
+    accepted_preview_digest BLOB NOT NULL CHECK (length(accepted_preview_digest) = 32),
     state TEXT NOT NULL,
     version INTEGER NOT NULL,
     scheduled_at_ns INTEGER NOT NULL,

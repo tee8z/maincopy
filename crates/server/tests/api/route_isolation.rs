@@ -3,7 +3,7 @@ use maincopy_server::{
     admin::admin_router,
     web::{Readiness, public_router},
 };
-use maincopy_shared::{ADMIN_CAPABILITIES_PATH, publication::PUBLICATIONS_PATH};
+use maincopy_shared::{ADMIN_CAPABILITIES_PATH, posts::POSTS_PATH, publication::PUBLICATIONS_PATH};
 
 use crate::helpers::{get, public_state, request};
 
@@ -35,6 +35,39 @@ async fn public_router_does_not_expose_publication_commands() {
         public_router(public_state(Readiness::new(true))),
         Method::POST,
         PUBLICATIONS_PATH,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn public_router_does_not_expose_loaded_post_revisions() {
+    let response = get(
+        public_router(public_state(Readiness::new(true))),
+        POSTS_PATH,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn public_router_does_not_expose_candidate_post_previews() {
+    let response = get(
+        public_router(public_state(Readiness::new(true))),
+        &format!("{POSTS_PATH}/11111111-1111-4111-8111-111111111111/preview"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn public_router_does_not_expose_candidate_preview_assets() {
+    let response = get(
+        public_router(public_state(Readiness::new(true))),
+        "/api/admin/v1/preview-assets/content-b3-v1-4444444444444444444444444444444444444444444444444444444444444444?path=assets/preview.png",
     )
     .await;
 

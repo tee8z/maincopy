@@ -2,175 +2,122 @@
 
 **One canonical copy. Every channel.**
 
-Maincopy is a Git-native publishing engine for technical writers. It compiles
-canonical Markdown into a fast, server-rendered site and prepares each article
-for feeds and external distribution. Git owns the content. SQLite owns the
-publication schedule and delivery history.
+Maincopy is a self-hosted publishing engine for technical writers. Git stores
+the canonical Markdown. Maincopy renders and publishes approved revisions on
+the author's domain.
 
-Maincopy is in pre-v1 development. The repository is private while the first
-usable release is built.
+Maincopy is in pre-v1 development. It is not ready for a production deployment.
 
-## Why Maincopy
+## V1 direction
 
-- Keep the authoritative article and its authored metadata in a content repository.
-- Publish the complete article on a domain that the author controls.
-- Render Markdown, highlighted code, ASCII diagrams, and Mermaid on the server.
-- Use content-owned assets or images and files on an allowlisted HTTPS CDN.
-- Embed deterministic, content-hashed application CSS and optional JavaScript
-  without mixing them with author-owned assets.
-- Capture newsletter subscribers with first-party double opt-in.
-- Accept optional BOLT11 tips through a provider-neutral receive service. V1
-  uses Lexe without making article availability depend on payment health.
-- Schedule publication through one private API that works for people and agents.
-- Record operational state in SQLite with one serialized writer and WAL readers.
-- Replicate the SQLite database with Litestream without placing it on a network
-  filesystem.
-- Use RSS and target-specific representations without making an external network
-  part of the canonical publication path.
+Maincopy v1 targets one site and canonical domain on one server. That site can
+publish any number of Markdown articles from its Git repository.
+
+V1 has these product boundaries:
+
+- Git owns article bodies and authored metadata.
+- An administrator previews the exact rendered revision before publication.
+- An administrator can publish now or schedule canonical website visibility.
+- A Git sync cannot silently replace an already published revision.
+- The canonical website and RSS are the only automatic article outputs.
+- Maincopy prepares manual X and Substack Note share text after publication.
+- A user profile can provide a mutable Lightning Address for static tips.
+- Maincopy stores no tip invoice, payment, or settlement state in v1.
+- The remote admin site uses authenticated access on a separate origin.
+- The admin gateway forwards to a loopback-only HTTP listener in `maincopyd`.
+- Owner, Administrator, and Publisher roles map to fixed scopes.
+- Publisher access covers content, status, sync, reload, preview, release, and
+  share only.
+- Browser sessions are opaque server-side cookies with CSRF protection.
+- Automation uses scoped public-key credentials and fresh NIP-98 proofs.
+- Offline bootstrap and repair are finite process modes that bind no listener.
+- These modes create no recovery transport, recovery API, or authentication
+  bypass.
+
+Maincopy v1 does not include a browser article editor, Git write-back,
+multi-site hosting, paid articles, or automatic social-network publishing.
+Git write permission remains external to Maincopy roles and credentials.
+V1 uses neither JWT browser sessions nor long-lived bearer API tokens.
 
 ## Current status
 
-The repository contains the accepted v1 architecture, the ordered development
-plan, the process-composition scaffold, the canonical publication-job domain,
-the provider-neutral payment domain, the typed content contract, the bounded
-Linux content-tree loader, versioned content and snapshot identity primitives,
-the embedded core SQLite schema and bootstrap, and a locked Nix development
-environment. Most product slices remain under construction.
+The repository contains the workspace foundation, content compiler, immutable
+snapshot model, SQLite writer, an evolving admin API, and an evolving
+publication slice.
 
-- [DESIGN.md](DESIGN.md) defines system behavior and trust boundaries.
-- [IMPLEMENTATION.md](IMPLEMENTATION.md) defines the delivery order and exit
-  criteria.
-- [QUALITY.md](QUALITY.md) defines the reproducible Bash-only CRAP measurement
-  and the required score budget.
+Remote authentication, managed Git synchronization, the admin web interface,
+manual share kits, and profile-backed tips are incomplete.
+Some superseded payment-provider code remains during the pre-v1 transition.
+That code is not part of the V1 product contract.
 
-## Development environment
+The current server and CLI still use a pre-v1 Unix-socket or Windows named-pipe
+transport. The authenticated cutover removes its code, flags, defaults,
+service-unit wiring, and tests atomically. Bootstrap and repair create no
+recovery transport or recovery API. No supported build has both transports or
+an unauthenticated admin TCP listener.
 
-The supported path uses Nix:
+> [!CAUTION]
+> The current admin API does not implement the target login and session
+> boundary. Do not expose an admin listener until that boundary is complete.
+
+## Documentation
+
+- [System design](docs/design.md) defines the V1 architecture, trust
+  boundaries, and data ownership.
+- [Implementation plan](docs/implementation.md) defines delivery order,
+  dependencies, known transitions, and acceptance gates.
+- [Engineering style](docs/quality.md) defines Rust, testing, documentation,
+  and quality conventions. It also explains the manual CRAP report.
+
+The design and implementation documents describe target V1 behavior. They do
+not claim that every feature is implemented.
+
+## Workspace
+
+The root manifest defines one Cargo workspace with three crates:
+
+```text
+crates/
+|-- server/    # maincopyd service and application domains
+|-- cli/       # short-lived maincopy operator client
+`-- shared/    # wire contracts shared by the server and CLI
+```
+
+`maincopyd` owns the public service, loopback admin listener, database, and
+supervised tasks. `maincopy` sends typed HTTPS admin requests and exits.
+
+## Development
+
+The supported development environment uses Nix on Linux.
 
 ```console
 nix develop
-cargo test
-cargo run -p maincopy-server --bin maincopyd --
+cargo test --locked --workspace --all-targets --all-features
 ```
 
-While `maincopyd` runs, use another shell for an operator command:
+Run the included example in one Nix shell:
 
 ```console
-cargo run -p maincopy-cli --bin maincopy -- capabilities
+cargo run --locked -p maincopy-server --bin maincopyd -- \
+  --config /dev/null \
+  --content-root crates/server/examples/content \
+  --state-root target/maincopy-dev/state \
+  --runtime-root target/maincopy-dev/run
 ```
 
-Run the complete local quality gate with:
+The example starts the current public service. The authenticated HTTPS admin
+development profile is not complete. Do not expose the transitional admin API.
+Stop the server with `Ctrl+C`.
+
+Run the Linux continuous integration checks and build with:
 
 ```console
 nix flake check --print-build-logs
-nix build
+nix build --print-build-logs
 ```
 
-The flake currently supports `x86_64-linux` and `aarch64-linux`. Its development
-shell includes the pinned Rust toolchain, SQLite tools, Litestream, and the Nix
-formatter.
+GitHub Actions also checks the shared contracts, CLI, and server on Windows.
+The manual CRAP report is separate from these CI checks.
 
-## Architecture in one minute
-
-The root manifest defines one Cargo workspace with three crates. `maincopyd`
-from `crates/server` owns the listeners, scheduler, and database lifecycle.
-`maincopy` from `crates/cli` is a short-lived operator client.
-`crates/shared` contains wire contracts and transport defaults used by both.
-
-Exactly one task in `maincopyd` will own one SQLite write connection. All
-writers will use a shared bounded channel and receive a reply only after commit.
-Query handlers will use a separate, bounded, query-only pool against the same
-local write-ahead logging (WAL) database.
-
-The CLI, future admin UI, and other agents will use the same versioned admin
-API. They will never open the live SQLite database for writes.
-
-The private API uses HTTP/JSON over a Unix domain socket on Linux and macOS.
-On Windows, it uses a local named pipe that rejects remote clients. The pipe
-grants access only to its owner and Windows `SYSTEM`. Maincopy has no admin TCP
-fallback.
-
-The CLI transport cross-compiles and runs on Windows. This does not make the
-complete daemon a supported Windows target. Content discovery remains
-Linux-only, and the native frontend build backend supports Linux and macOS.
-
-The private API controls when a pinned article revision first becomes public.
-A content reload cannot expose an unpublished or scheduled post. Distribution
-jobs become eligible only after the canonical post is active.
-
-At startup, `maincopyd` compiles the pinned content tree and loads the durable
-`Published` projection. It installs that immutable snapshot before it binds the
-public listener. A fresh database serves the configured site shell with no
-published posts.
-
-Each content compilation pins the configured root once. It loads only
-`publication.toml`, `posts/`, `drafts/`, and `assets/` through confined
-descriptor-relative lookups. Descendant links, special files, mount crossings,
-unsafe names, and resource-limit excesses fail closed. Later compiler stages
-use owned bytes and never reopen the mutable source tree.
-
-Revision identities use domain-separated, versioned BLAKE3 transcripts rather
-than presentation serialization. Opaque resolved-asset inputs are bound to the
-post or publication that produced them. Final post and site calculators also
-require typed pre-injection renderer output and the public publication-ledger
-projection, so a partial compiler stage cannot mint a final identity.
-
-Maud templates remain Rust modules. A custom build script deterministically
-combines and minifies first-party CSS and optional JavaScript, writes typed
-generated metadata and bundles under `OUT_DIR`, and embeds those bundles in the
-server binary. The bundle digest changes the immutable asset URL, renderer
-identity, and site snapshot identity. Favicon, post-image, attachment, and CDN
-assets remain part of the separate content pipeline.
-
-`crates/server/src/main.rs` stays as a small process entry point.
-`crates/server/src/startup.rs` loads server configuration and owns dependency
-wiring, task supervision, and graceful shutdown. The separate CLI constructs a
-concrete admin client and does not construct the server. The public and admin
-router constructors remain independent. API tests call each router directly
-through Tower, and transport tests use real local endpoints only when needed.
-
-This startup-owned configuration choice is intentional for the exact
-no-argument call boundary; it can change only with an explicit signature
-change, not a global configuration singleton.
-
-V1 captures and confirms subscription addresses, but it does not send bulk
-newsletter campaigns. Litestream replicas contain that subscriber data, so the
-same access, encryption, retention, and deletion rules apply to both the live
-database and its replicas.
-
-V1 also exposes provider-neutral tip intent, invoice, and settlement contracts.
-A closed, cloneable provider enum delegates to the public crates.io Lexe SDK.
-The Lexe provider uses one bounded operation queue whose dispatcher owns a
-`JoinSet`; there is no semaphore admission path or second payment-service
-queue. When tips are enabled, the typed concurrency limit rejects values below
-two, so the one update subscriber cannot occupy the only provider slot.
-The operator provisions revocable client credentials with only `Receive`,
-`ReadPayments`, and `ReadInfo`, plus no explicit endpoint permissions;
-Maincopy has no spend operation. Lexe 0.1.22 does not expose these grants
-through the credential blob, so a separate operator audit remains required.
-Maincopy commits an intent before invoice creation and stores an opaque intent
-marker only in Lexe's payer-private
-`personal_note`. Because Lexe does not accept a provider idempotency key for
-invoice creation, an uncertain result must reconcile against remote payment
-indexes before any later creation decision.
-
-The remote Lexe node is authoritative. An optional SDK cache is disposable and
-is not part of Maincopy's Litestream backup. A long-lived payment-update
-subscriber uses Lexe's finite-wait tail API for prompt detection, then runs the
-same paged, cursor-backed reconciliation path used at startup and after a
-disconnect. Maincopy commits each tip decision with its opaque update cursor,
-so repeated or unrelated wallet updates cannot duplicate settlement or stall
-later updates. An idle wait is a normal heartbeat. A transport failure uses
-bounded backoff and degrades only payment health. A future LND adapter can use
-the same application contracts. Lexe outages disable tips, but they never gate
-article access or core article readiness.
-
-## Release direction
-
-The repository flake is the installation source during pre-v1 development. V1
-will use signed Semantic Versioning tags and GitHub Releases. The approved
-release workflow will publish the Rust packages to crates.io and the tagged
-flake to FlakeHub. A nixpkgs submission can follow when the project has stable
-users and a long-term maintainer.
-
-The default branch is `master`.
+The flake supports `x86_64-linux` and `aarch64-linux`. The default branch is
+`master`.

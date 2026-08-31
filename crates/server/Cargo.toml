@@ -11,10 +11,9 @@ path = "src/main.rs"
 [dependencies]
 arc-swap.workspace = true
 axum.workspace = true
+bech32.workspace = true
 blake3.workspace = true
 clap.workspace = true
-lexe.workspace = true
-lightning-invoice.workspace = true
 libsqlite3-sys.workspace = true
 maincopy-shared = { workspace = true, features = ["schema"] }
 maud.workspace = true
@@ -44,9 +43,6 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Authorization",
 ] }
 
-[features]
-test-utils = []
-
 [build-dependencies]
 blake3 = { version = "=1.8.7", default-features = false, features = ["std"] }
 lightningcss.workspace = true
@@ -56,7 +52,6 @@ thiserror.workspace = true
 rustix = { workspace = true, features = ["fs", "std"] }
 
 [dev-dependencies]
-bitcoin.workspace = true
 lightningcss.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true

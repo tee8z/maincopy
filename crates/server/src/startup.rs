@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
@@ -16,16 +17,22 @@ use tracing::Instrument as _;
 use crate::{
     admin::{AdminSocket, runtime_admin_router},
     cli::ServerArguments,
-    config::{HostConfiguration, HostConfigurationLoader, tip_provider_required},
+    config::{HostConfiguration, HostConfigurationLoader},
     content::{
-        ContentTreeLimits, ContentValidationErrors, DiscoveredContentTree, SourceCommit,
-        SourceCommitDiscovery, ValidatedContent, discover_content_tree, discover_source_commit,
-        resolve_content_assets,
+        ContentCandidateStore, ContentTreeDigest, ContentTreeLimits, ContentValidationErrors,
+        DiscoveredContentTree, PostId, PostRevisionDigest, SiteSnapshotDigest, SourceCommit,
+        SourceCommitDiscovery, ValidatedContent,
+        discover_content_tree, discover_source_commit, resolve_content_assets,
     },
+    content_sync::ContentSync,
     database::{self, DatabaseStore},
     domain::publication::{
-        activation::PublicationCoordinator,
-        store::{InstallStartupSnapshot, ObservedPostRevision},
+        PublicLedgerProjection, PublishedPostRevision,
+        activation::{
+            PublicationCoordinator, PublicationCoordinatorActor, PublicationCoordinatorHandle,
+        },
+        scheduler::PublicationScheduler,
+        store::{InstallStartupSnapshot, ObservedPostRevision, RecoverablePublicationActivation},
     },
     error::{
         ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal, StartupStage,
@@ -34,8 +41,8 @@ use crate::{
     observability::{initialize_logging, task_span},
     process_lock::{ProcessLock, ProcessLockError},
     render::{
-        ContentCatalog, build_site_snapshot, compile_content_catalog, render_site_shell,
-        snapshot_store,
+        ContentCatalog, SiteSnapshot, build_site_snapshot, compile_content_catalog,
+        render_site_shell, snapshot_store,
     },
     web::{PublicServer, PublicState, Readiness},
 };
@@ -44,6 +51,7 @@ type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), ApplicationError>> 
 type CriticalTaskFuture = Pin<Box<dyn Future<Output = CriticalTaskResult> + Send>>;
 type CriticalTaskResult = Result<(), CriticalTaskFailure>;
 type CriticalTaskFailure = Box<dyn std::error::Error + Send + Sync>;
+const PUBLICATION_COORDINATOR_QUEUE_CAPACITY: usize = 32;
 
 /// Owns Maincopy's process-level resources and lifecycle.
 ///
@@ -53,7 +61,7 @@ type CriticalTaskFailure = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) struct Application {
     _startup: StartupConfiguration,
     _database: DatabaseStore,
-    publication_coordinator: Arc<tokio::sync::Mutex<PublicationCoordinator>>,
+    publication_coordinator: PublicationCoordinatorHandle,
     runtime: ApplicationRuntime,
     #[cfg(test)]
     public_addr: std::net::SocketAddr,
@@ -79,11 +87,13 @@ struct CompiledStartupContent {
     catalog: Arc<ContentCatalog>,
     observed_posts: Vec<ObservedPostRevision>,
     source_commit: Option<SourceCommit>,
+    content_digest: ContentTreeDigest,
 }
 
 struct ServingState {
     readiness: Readiness,
-    publication_coordinator: Arc<tokio::sync::Mutex<PublicationCoordinator>>,
+    publication_coordinator: PublicationCoordinatorHandle,
+    publication_actor: PublicationCoordinatorActor,
     public_server: PublicServer,
     admin_router: axum::Router,
     admin_socket: AdminSocket,
@@ -117,9 +127,6 @@ impl StartupConfiguration {
         };
         let content_tree = discover(host_view.content_root, host_view.content_limits)?;
         let validated_content = content_tree.validate()?;
-        if validated_content.publication.tips.is_configured() && host_view.lightning.is_none() {
-            return Err(tip_provider_required().into());
-        }
 
         Ok(Self {
             _process_lock: process_lock,
@@ -183,6 +190,9 @@ impl Application {
     async fn build(startup: StartupConfiguration) -> Result<Self, ProcessError> {
         let cancellation = CancellationToken::new();
         let host = startup._host.view();
+        let content_root = host.content_root.to_path_buf();
+        let state_root = host.state_root.to_path_buf();
+        let content_limits = host.content_limits;
         let database_queue_capacity = host.database.writer_queue_capacity.get();
         let frontend = crate::frontend_assets::embedded_manifest();
         frontend.validate().map_err(|error| {
@@ -193,7 +203,25 @@ impl Application {
             )
         })?;
         let shutdown = install_termination_signal()?;
+        let candidate_store =
+            ContentCandidateStore::open(&state_root, content_limits).map_err(|error| {
+                startup_failure(
+                    StartupStage::Content,
+                    "open the retained content candidate store",
+                    error,
+                )
+            })?;
+        candidate_store
+            .retain(&startup._content_tree)
+            .map_err(|error| {
+                startup_failure(
+                    StartupStage::Content,
+                    "retain the startup content candidate",
+                    error,
+                )
+            })?;
         let compiled = compile_startup_content(&startup, host.content_root)?;
+        let active_content_digest = compiled.content_digest.clone();
 
         let database = match database::bootstrap(host.database).await {
             Ok(database) => database,
@@ -226,6 +254,7 @@ impl Application {
             host.public_bind,
             host.admin_socket,
             cancellation.clone(),
+            &candidate_store,
         )
         .await
         {
@@ -243,6 +272,7 @@ impl Application {
         let ServingState {
             readiness,
             publication_coordinator,
+            publication_actor,
             public_server,
             admin_router,
             admin_socket,
@@ -263,6 +293,41 @@ impl Application {
                 .await
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
+        let actor_cancellation = cancellation.clone();
+        let publication_actor_task =
+            CriticalTask::new(CriticalTaskName::PublicationCoordinator, async move {
+                publication_actor
+                    .run(actor_cancellation)
+                    .await
+                    .map_err(|error| Box::new(error) as CriticalTaskFailure)
+            });
+        let content_sync = ContentSync::new(
+            content_root,
+            content_limits,
+            candidate_store,
+            active_content_digest,
+            publication_coordinator.clone(),
+            cancellation.clone(),
+        );
+        let content_task = CriticalTask::new(CriticalTaskName::ContentSync, async move {
+            content_sync
+                .run()
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
+        let scheduler_wakeup = publication_coordinator.scheduler_wakeup();
+        let scheduler = PublicationScheduler::new(
+            database_store.publications.clone(),
+            publication_coordinator.clone(),
+            scheduler_wakeup,
+            cancellation.clone(),
+        );
+        let scheduler_task = CriticalTask::new(CriticalTaskName::Scheduler, async move {
+            scheduler
+                .run()
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
 
         Ok(Self {
             _startup: startup,
@@ -273,7 +338,13 @@ impl Application {
                 cancellation,
                 database_shutdown,
                 shutdown,
-                vec![public_task, admin_task],
+                vec![
+                    publication_actor_task,
+                    public_task,
+                    admin_task,
+                    content_task,
+                    scheduler_task,
+                ],
                 database_task,
             ),
             #[cfg(test)]
@@ -302,6 +373,7 @@ fn compile_startup_content(
     startup: &StartupConfiguration,
     content_root: &Path,
 ) -> Result<CompiledStartupContent, ProcessError> {
+    let content_digest = startup._content_tree.digest();
     let resolved_assets =
         resolve_content_assets(&startup._content_tree, &startup._validated_content).map_err(
             |error| startup_failure(StartupStage::Content, "resolve content assets", error),
@@ -331,7 +403,115 @@ fn compile_startup_content(
         catalog,
         observed_posts,
         source_commit,
+        content_digest,
     })
+}
+
+fn compile_retained_catalogs(
+    store: &ContentCandidateStore,
+) -> Result<BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>, Box<str>> {
+    store
+        .load_all()
+        .map_err(|error| error.to_string().into_boxed_str())?
+        .into_iter()
+        .map(|candidate| {
+            let digest = candidate.digest;
+            let content = candidate
+                .tree
+                .validate()
+                .map_err(|error| error.to_string().into_boxed_str())?;
+            let assets = resolve_content_assets(&candidate.tree, &content)
+                .map_err(|error| error.to_string().into_boxed_str())?;
+            compile_content_catalog(&content, &assets)
+                .map(|catalog| (digest, Arc::new(catalog)))
+                .map_err(|error| error.to_string().into_boxed_str())
+        })
+        .collect()
+}
+
+fn hydrate_catalog(
+    mut base: ContentCatalog,
+    retained: &BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>,
+    pins: impl IntoIterator<Item = (PostId, PostRevisionDigest)>,
+) -> Result<Arc<ContentCatalog>, Box<str>> {
+    for (post_id, revision) in pins {
+        if base.get(&post_id, &revision).is_some() {
+            continue;
+        }
+        let source = retained
+            .values()
+            .find(|catalog| catalog.get(&post_id, &revision).is_some())
+            .ok_or_else(|| {
+                format!("retained revision {revision} for post {post_id} is unavailable")
+                    .into_boxed_str()
+            })?;
+        base.retain_revisions_from(source, std::iter::once((post_id.clone(), revision.clone())))
+            .map_err(|error| error.to_string().into_boxed_str())?;
+    }
+    Ok(Arc::new(base))
+}
+
+fn find_retained_public_snapshot(
+    retained: &BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>,
+    ledger: &PublicLedgerProjection,
+    expected: &SiteSnapshotDigest,
+    frontend: &'static FrontendAssetManifest,
+) -> Result<SiteSnapshot, Box<str>> {
+    let pins = ledger
+        .published_posts()
+        .map(|published| (published.post_id.clone(), published.revision.clone()))
+        .collect::<Vec<_>>();
+    for base in retained.values() {
+        let catalog = hydrate_catalog(base.as_ref().clone(), retained, pins.clone())?;
+        let Ok(shell) = render_site_shell(catalog, frontend, ledger) else {
+            continue;
+        };
+        let Ok(snapshot) = build_site_snapshot(shell, ledger) else {
+            continue;
+        };
+        if &snapshot.digest == expected {
+            return Ok(snapshot);
+        }
+    }
+    Err(format!("no retained content candidate rebuilds durable site {expected}").into_boxed_str())
+}
+
+fn find_retained_activation_catalog(
+    retained: &BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>,
+    ledger: &PublicLedgerProjection,
+    activation: &RecoverablePublicationActivation,
+    frontend: &'static FrontendAssetManifest,
+) -> Result<Arc<ContentCatalog>, Box<str>> {
+    let view = activation.publication.view();
+    let activated_at = view.activation_started_at.ok_or_else(|| {
+        Box::<str>::from("the activating publication has no activation timestamp")
+    })?;
+    let candidate_ledger = ledger.with_approved(PublishedPostRevision::new(
+        view.stable_post_id.clone(),
+        view.pinned_post_digest.clone(),
+        activated_at,
+    ));
+    let pins = candidate_ledger
+        .published_posts()
+        .map(|published| (published.post_id.clone(), published.revision.clone()))
+        .collect::<Vec<_>>();
+    for base in retained.values() {
+        let catalog = hydrate_catalog(base.as_ref().clone(), retained, pins.clone())?;
+        let Ok(shell) = render_site_shell(Arc::clone(&catalog), frontend, &candidate_ledger) else {
+            continue;
+        };
+        let Ok(snapshot) = build_site_snapshot(shell, &candidate_ledger) else {
+            continue;
+        };
+        if snapshot.digest == activation.candidate_site_digest {
+            return Ok(catalog);
+        }
+    }
+    Err(format!(
+        "no retained content candidate rebuilds activating site {}",
+        activation.candidate_site_digest
+    )
+    .into_boxed_str())
 }
 
 async fn prepare_serving_state(
@@ -341,6 +521,7 @@ async fn prepare_serving_state(
     public_bind: std::net::SocketAddr,
     admin_socket: &Path,
     cancellation: CancellationToken,
+    candidate_store: &ContentCandidateStore,
 ) -> Result<ServingState, ProcessError> {
     let mut startup_state = database
         .publications
@@ -353,15 +534,73 @@ async fn prepare_serving_state(
                 error,
             )
         })?;
-    let shell = render_site_shell(
-        Arc::clone(&compiled.catalog),
-        frontend,
-        &startup_state.ledger,
-    )
-    .map_err(|error| startup_failure(StartupStage::Content, "render the site shell", error))?;
-    let snapshot = build_site_snapshot(shell, &startup_state.ledger).map_err(|error| {
-        startup_failure(StartupStage::Content, "build the site snapshot", error)
+    let ledger = startup_state.ledger.clone();
+    let retained_catalogs = compile_retained_catalogs(candidate_store).map_err(|error| {
+        startup_failure(
+            StartupStage::Content,
+            "compile retained content candidates",
+            error,
+        )
     })?;
+    let preview_pins = ledger
+        .published_posts()
+        .map(|published| (published.post_id.clone(), published.revision.clone()))
+        .chain(startup_state.scheduled.iter().map(|scheduled| {
+            let view = scheduled.publication.view();
+            (view.stable_post_id.clone(), view.pinned_post_digest.clone())
+        }))
+        .chain(startup_state.activating.iter().map(|activation| {
+            let view = activation.publication.view();
+            (view.stable_post_id.clone(), view.pinned_post_digest.clone())
+        }))
+        .collect::<Vec<_>>();
+    let preview_catalog = hydrate_catalog(
+        compiled.catalog.as_ref().clone(),
+        &retained_catalogs,
+        preview_pins,
+    )
+    .map_err(|error| {
+        startup_failure(
+            StartupStage::Content,
+            "hydrate the private preview catalog",
+            error,
+        )
+    })?;
+    let recovery_catalog = startup_state
+        .activating
+        .first()
+        .map(|activation| {
+            find_retained_activation_catalog(&retained_catalogs, &ledger, activation, frontend)
+        })
+        .transpose()
+        .map_err(|error| {
+            startup_failure(
+                StartupStage::Content,
+                "rebuild the activating publication candidate",
+                error,
+            )
+        })?;
+    let snapshot = match startup_state.site.as_ref() {
+        Some(expected) => {
+            find_retained_public_snapshot(&retained_catalogs, &ledger, &expected.digest, frontend)
+                .map_err(|error| {
+                startup_failure(
+                    StartupStage::Content,
+                    "rebuild the approved public site snapshot",
+                    error,
+                )
+            })?
+        }
+        None => {
+            let shell = render_site_shell(Arc::clone(&preview_catalog), frontend, &ledger)
+                .map_err(|error| {
+                    startup_failure(StartupStage::Content, "render the site shell", error)
+                })?;
+            build_site_snapshot(shell, &ledger).map_err(|error| {
+                startup_failure(StartupStage::Content, "build the site snapshot", error)
+            })?
+        }
+    };
     if !startup_state.activating.is_empty()
         && startup_state.site.as_ref().map(|site| &site.digest) != Some(&snapshot.digest)
     {
@@ -371,10 +610,19 @@ async fn prepare_serving_state(
             "the rebuilt base snapshot does not match the durable site head",
         ));
     }
+    if let Some(expected) = startup_state.site.as_ref()
+        && expected.digest != snapshot.digest
+    {
+        return Err(startup_failure(
+            StartupStage::Content,
+            "rebuild the approved public site snapshot",
+            "the retained public representation does not match the durable site head",
+        ));
+    }
     let installed_site = database
         .publications
         .install_startup_snapshot(InstallStartupSnapshot {
-            expected: startup_state.site,
+            expected: startup_state.site.clone(),
             candidate_digest: snapshot.digest.clone(),
             activated_at: OffsetDateTime::now_utc(),
             source_commit: compiled.source_commit.clone(),
@@ -392,13 +640,21 @@ async fn prepare_serving_state(
     let readiness = Readiness::default();
     let (snapshots, activator) = snapshot_store(snapshot);
     let mut publication_coordinator = PublicationCoordinator {
-        catalog: compiled.catalog,
-        ledger: startup_state.ledger,
+        catalog: recovery_catalog.unwrap_or_else(|| Arc::clone(&preview_catalog)),
+        content_digest: compiled.content_digest,
+        candidates: Arc::new(retained_catalogs),
+        ledger,
         site: installed_site,
         activator,
         store: database.publications.clone(),
         frontend,
         source_commit: compiled.source_commit,
+        scheduled: startup_state
+            .scheduled
+            .drain(..)
+            .map(|scheduled| (scheduled.publication_id, scheduled))
+            .collect(),
+        scheduler_wakeup: Arc::new(tokio::sync::Notify::new()),
         readiness: readiness.clone(),
         cancellation: cancellation.clone(),
     };
@@ -413,9 +669,11 @@ async fn prepare_serving_state(
                     error,
                 )
             })?;
+        publication_coordinator.catalog = preview_catalog;
     }
-    let publication_coordinator = Arc::new(tokio::sync::Mutex::new(publication_coordinator));
-    let admin_router = runtime_admin_router(Arc::clone(&publication_coordinator));
+    let (publication_coordinator, publication_actor) =
+        publication_coordinator.into_actor(PUBLICATION_COORDINATOR_QUEUE_CAPACITY);
+    let admin_router = runtime_admin_router(publication_coordinator.clone());
     let public_server = PublicServer::bind(
         public_bind,
         PublicState {
@@ -436,6 +694,7 @@ async fn prepare_serving_state(
     Ok(ServingState {
         readiness,
         publication_coordinator,
+        publication_actor,
         public_server,
         admin_router,
         admin_socket,
@@ -834,6 +1093,32 @@ Durable article body.\n";
         .unwrap();
     }
 
+    async fn admin_preview_digest(
+        client: &reqwest::Client,
+        post_id: uuid::Uuid,
+    ) -> maincopy_shared::publication::PreviewDigest {
+        use maincopy_shared::{
+            posts::POSTS_PATH,
+            publication::{PREVIEW_DIGEST_HEADER, PreviewDigest},
+        };
+
+        let response = client
+            .get(format!(
+                "http://maincopy.local{POSTS_PATH}/{post_id}/preview"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let encoded = response
+            .headers()
+            .get(PREVIEW_DIGEST_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        PreviewDigest::parse(encoded).unwrap()
+    }
+
     async fn stop_built_application(application: Application) {
         let Application {
             _startup: startup,
@@ -959,7 +1244,7 @@ path_bytes = 512\n";
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn configured_disabled_tip_range_still_requires_a_provider() {
+    fn authored_tips_do_not_require_a_payment_provider() {
         let publication = format!(
             "{VALID_PUBLICATION}[tips]\n\
              enabled = false\n\
@@ -968,25 +1253,15 @@ path_bytes = 512\n";
         );
         let (_root, arguments, _) = startup_fixture("", &publication);
 
-        let result = StartupConfiguration::load_with_discovery(arguments, discover_content_tree);
-        let Err(error) = result else {
-            panic!("a configured tip range must require a provider");
-        };
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
 
-        assert_eq!(error.exit(), ProcessExit::Configuration);
-        let ProcessError::Configuration(errors) = error else {
-            panic!("missing tip capability must be a host configuration error");
-        };
-        assert_eq!(errors.diagnostics().len(), 1);
-        assert_eq!(
-            errors.diagnostics()[0].code,
-            crate::config::ConfigurationValidationCode::TipProviderRequired
-        );
+        assert!(startup._validated_content.publication.tips.is_configured());
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn unconfigured_tips_do_not_activate_or_open_lexe_credentials() {
+    fn removed_provider_configuration_is_rejected_without_opening_credentials() {
         let host = "[lightning]\n\
 provider = \"lexe\"\n\
 network = \"signet\"\n\
@@ -994,10 +1269,19 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let (root, arguments, _) = startup_fixture(host, VALID_PUBLICATION);
         let credential_path = root.path().join("must-not-open.json");
 
-        let startup =
-            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let Err(error) =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree)
+        else {
+            panic!("removed provider configuration must fail host validation");
+        };
 
-        assert!(startup._host.view().lightning.is_some());
+        let ProcessError::Configuration(errors) = error else {
+            panic!("removed provider configuration must fail host validation");
+        };
+        assert_eq!(
+            errors.diagnostics()[0].code,
+            crate::config::ConfigurationValidationCode::HostTomlInvalid
+        );
         assert!(!credential_path.exists());
     }
 
@@ -1012,7 +1296,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let application = Application::build(startup).await.unwrap();
 
         assert!(socket_path.exists());
-        assert_eq!(application.runtime.critical_tasks.len(), 2);
+        assert_eq!(application.runtime.critical_tasks.len(), 5);
         assert!(application.runtime.database_writer.is_some());
         let response = reqwest::Client::builder()
             .no_proxy()
@@ -1051,9 +1335,12 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             .unix_socket(socket_path.clone())
             .build()
             .unwrap();
+        let post_id = uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap();
         let request = PublishNowRequest {
-            post_id: uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap(),
+            post_id,
+            preview_digest: admin_preview_digest(&client, post_id).await,
             expected_revision: None,
+            scheduled_for: None,
         };
         let creation_key = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
@@ -1144,60 +1431,456 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
-    async fn restart_serves_the_durable_published_revision() {
-        use sqlx::{ConnectOptions as _, Connection as _};
+    async fn edited_markdown_updates_private_preview_until_explicit_publication_approval() {
+        use maincopy_shared::{
+            posts::{ListPostsResponse, POSTS_PATH, PostPublicationState},
+            publication::{
+                IDEMPOTENCY_KEY_HEADER, PUBLICATIONS_PATH, PublishNowRequest, PublishNowResponse,
+            },
+        };
+
+        let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
+        let content_root = root.path().join("content");
+        write_durable_post(&content_root);
+        let post_path = content_root.join("posts/durable-publication.md");
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let socket_path = root.path().join("run/admin.sock");
+        let application = Application::build(startup).await.unwrap();
+        let admin = reqwest::Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path)
+            .build()
+            .unwrap();
+        let response = admin
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(
+                IDEMPOTENCY_KEY_HEADER,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            )
+            .json(&PublishNowRequest {
+                post_id: uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap(),
+                preview_digest: admin_preview_digest(
+                    &admin,
+                    uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap(),
+                )
+                .await,
+                expected_revision: None,
+                scheduled_for: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let published: PublishNowResponse = response.json().await.unwrap();
+
+        let public_url = format!(
+            "http://{}/posts/durable-publication",
+            application.public_addr
+        );
+        let public = reqwest::Client::builder().no_proxy().build().unwrap();
+        let initial = public.get(&public_url).send().await.unwrap();
+        let initial_etag = initial.headers()[reqwest::header::ETAG].clone();
+        assert!(
+            initial
+                .text()
+                .await
+                .unwrap()
+                .contains("Durable article body.")
+        );
+
+        let edited = DURABLE_POST.replace(
+            "Durable article body.",
+            "This edit appeared without restarting Maincopy.",
+        );
+        fs::write(&post_path, &edited).unwrap();
+
+        let edited_summary = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let posts: ListPostsResponse = admin
+                    .get(format!("http://maincopy.local{POSTS_PATH}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if let Some(summary) = posts.posts.into_iter().find(|summary| {
+                    summary.post_id.to_string() == DURABLE_POST_ID
+                        && summary.publication_state == PostPublicationState::UnpublishedChange
+                        && summary.revision != published.revision
+                }) {
+                    break summary;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a stable Markdown edit must enter the private preview catalog");
+        let preview_url = format!(
+            "http://maincopy.local{POSTS_PATH}/{}/preview",
+            edited_summary.post_id
+        );
+        let preview = admin.get(&preview_url).send().await.unwrap();
+        assert_eq!(preview.status(), reqwest::StatusCode::OK);
+        let preview_body = preview.text().await.unwrap();
+        assert!(preview_body.contains("This edit appeared without restarting Maincopy."));
+        assert!(!preview_body.contains("Durable article body."));
+
+        let still_pinned = public.get(&public_url).send().await.unwrap();
+        assert_eq!(still_pinned.headers()[reqwest::header::ETAG], initial_etag);
+        let still_pinned_body = still_pinned.text().await.unwrap();
+        assert!(still_pinned_body.contains("Durable article body."));
+        assert!(!still_pinned_body.contains("This edit appeared without restarting Maincopy."));
+
+        fs::write(&post_path, "+++\ninvalid = true\n").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        let posts: ListPostsResponse = admin
+            .get(format!("http://maincopy.local{POSTS_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let after_invalid = posts
+            .posts
+            .into_iter()
+            .find(|summary| summary.post_id == edited_summary.post_id)
+            .unwrap();
+        assert_eq!(after_invalid.revision, edited_summary.revision);
+        assert_eq!(
+            after_invalid.publication_state,
+            PostPublicationState::UnpublishedChange
+        );
+        let preview = admin.get(&preview_url).send().await.unwrap();
+        assert_eq!(preview.status(), reqwest::StatusCode::OK);
+        assert!(
+            preview
+                .text()
+                .await
+                .unwrap()
+                .contains("This edit appeared without restarting Maincopy.")
+        );
+        let after_invalid_public = public.get(&public_url).send().await.unwrap();
+        assert_eq!(
+            after_invalid_public.headers()[reqwest::header::ETAG],
+            initial_etag
+        );
+        let after_invalid_public_body = after_invalid_public.text().await.unwrap();
+        assert!(after_invalid_public_body.contains("Durable article body."));
+        assert!(
+            !after_invalid_public_body.contains("This edit appeared without restarting Maincopy.")
+        );
+
+        fs::write(&post_path, &edited).unwrap();
+        let response = admin
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(
+                IDEMPOTENCY_KEY_HEADER,
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            )
+            .json(&PublishNowRequest {
+                post_id: edited_summary.post_id,
+                preview_digest: admin_preview_digest(&admin, edited_summary.post_id).await,
+                expected_revision: Some(edited_summary.revision.clone()),
+                scheduled_for: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let approved: PublishNowResponse = response.json().await.unwrap();
+        assert_eq!(approved.revision, edited_summary.revision);
+
+        let updated_public = public.get(&public_url).send().await.unwrap();
+        assert_ne!(
+            updated_public.headers()[reqwest::header::ETAG],
+            initial_etag
+        );
+        let updated_body = updated_public.text().await.unwrap();
+        assert!(updated_body.contains("This edit appeared without restarting Maincopy."));
+        assert!(!updated_body.contains("Durable article body."));
+
+        stop_built_application(application).await;
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn a_new_markdown_file_becomes_publishable_without_restarting() {
+        use maincopy_shared::{
+            posts::{ListPostsResponse, POSTS_PATH},
+            publication::{IDEMPOTENCY_KEY_HEADER, PUBLICATIONS_PATH, PublishNowRequest},
+        };
+
+        let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
+        let content_root = root.path().join("content");
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let socket_path = root.path().join("run/admin.sock");
+        let application = Application::build(startup).await.unwrap();
+        let admin = reqwest::Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path)
+            .build()
+            .unwrap();
+
+        write_durable_post(&content_root);
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let posts: ListPostsResponse = admin
+                    .get(format!("http://maincopy.local{POSTS_PATH}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if let Some(post) = posts
+                    .posts
+                    .into_iter()
+                    .find(|post| post.post_id.to_string() == DURABLE_POST_ID)
+                {
+                    break post;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a stable new Markdown file must enter the live catalog");
+
+        let response = admin
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(
+                IDEMPOTENCY_KEY_HEADER,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            )
+            .json(&PublishNowRequest {
+                post_id: summary.post_id,
+                preview_digest: admin_preview_digest(&admin, summary.post_id).await,
+                expected_revision: Some(summary.revision),
+                scheduled_for: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let body = reqwest::get(format!(
+            "http://{}/posts/durable-publication",
+            application.public_addr
+        ))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+        assert!(body.contains("Durable article body."));
+
+        stop_built_application(application).await;
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn restart_keeps_public_revision_pinned_until_the_stopped_edit_is_approved() {
+        use maincopy_shared::{
+            posts::{ListPostsResponse, POSTS_PATH, PostPublicationState},
+            publication::{
+                IDEMPOTENCY_KEY_HEADER, PUBLICATIONS_PATH, PublishNowRequest, PublishNowResponse,
+            },
+        };
 
         let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
         let content_root = root.path().join("content");
         write_durable_post(&content_root);
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
-        let database_path = startup._host.view().database.path.to_owned();
-
-        stop_built_application(Application::build(startup).await.unwrap()).await;
-
-        let published_at = OffsetDateTime::from_unix_timestamp(1_777_734_400).unwrap();
-        let published_at_ns = i64::try_from(published_at.unix_timestamp_nanos()).unwrap();
-        let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&database_path)
-            .foreign_keys(true)
-            .connect()
+        let socket_path = root.path().join("run/admin.sock");
+        let application = Application::build(startup).await.unwrap();
+        let admin = reqwest::Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path)
+            .build()
+            .unwrap();
+        let response = admin
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(
+                IDEMPOTENCY_KEY_HEADER,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            )
+            .json(&PublishNowRequest {
+                post_id: uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap(),
+                preview_digest: admin_preview_digest(
+                    &admin,
+                    uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap(),
+                )
+                .await,
+                expected_revision: None,
+                scheduled_for: None,
+            })
+            .send()
             .await
             .unwrap();
-        let (stable_post_id, revision_digest): (Vec<u8>, Vec<u8>) = sqlx::query_as(
-            "SELECT stable_post_id, revision_digest FROM post_revisions WHERE slug = ?",
-        )
-        .bind("durable-publication")
-        .fetch_one(&mut connection)
-        .await
-        .unwrap();
-        assert_eq!(
-            stable_post_id.as_slice(),
-            uuid::Uuid::parse_str(DURABLE_POST_ID)
-                .unwrap()
-                .as_bytes()
-                .as_slice()
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let published: PublishNowResponse = response.json().await.unwrap();
+        let public = reqwest::Client::builder().no_proxy().build().unwrap();
+        let initial_public_url = format!(
+            "http://{}/posts/durable-publication",
+            application.public_addr
         );
-        let publication_id = uuid::Uuid::parse_str(DURABLE_PUBLICATION_ID)
-            .unwrap()
-            .into_bytes();
-        sqlx::query(
-            "INSERT INTO canonical_publications (\
-                publication_id, stable_post_id, pinned_post_digest, state, version, \
-                scheduled_at_ns, activation_at_ns, published_at_ns, current_published_digest\
-             ) VALUES (?, ?, ?, 'published', 3, ?, ?, ?, ?)",
+        let initial = public.get(&initial_public_url).send().await.unwrap();
+        let initial_etag = initial.headers()[reqwest::header::ETAG].clone();
+        assert!(
+            initial
+                .text()
+                .await
+                .unwrap()
+                .contains("Durable article body.")
+        );
+        stop_built_application(application).await;
+
+        fs::write(
+            content_root.join("posts/durable-publication.md"),
+            DURABLE_POST.replace(
+                "Durable article body.",
+                "This edit was made while Maincopy was stopped.",
+            ),
         )
-        .bind(publication_id.as_slice())
-        .bind(&stable_post_id)
-        .bind(&revision_digest)
-        .bind(published_at_ns - 1)
-        .bind(published_at_ns)
-        .bind(published_at_ns)
-        .bind(&revision_digest)
-        .execute(&mut connection)
-        .await
         .unwrap();
-        connection.close().await.unwrap();
+        let arguments = server_arguments_for(
+            &root.path().join("maincopy.toml"),
+            &root.path().join("content"),
+        );
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let restarted = Application::build(startup).await.unwrap();
+        let public_url = format!("http://{}/posts/durable-publication", restarted.public_addr);
+        let pinned = public.get(&public_url).send().await.unwrap();
+        assert_eq!(pinned.headers()[reqwest::header::ETAG], initial_etag);
+        let pinned_body = pinned.text().await.unwrap();
+        assert!(pinned_body.contains("Durable article body."));
+        assert!(!pinned_body.contains("This edit was made while Maincopy was stopped."));
+
+        let admin = reqwest::Client::builder()
+            .no_proxy()
+            .unix_socket(root.path().join("run/admin.sock"))
+            .build()
+            .unwrap();
+        let posts: ListPostsResponse = admin
+            .get(format!("http://maincopy.local{POSTS_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let edited_summary = posts
+            .posts
+            .into_iter()
+            .find(|summary| summary.post_id.to_string() == DURABLE_POST_ID)
+            .unwrap();
+        assert_eq!(
+            edited_summary.publication_state,
+            PostPublicationState::UnpublishedChange
+        );
+        assert_ne!(edited_summary.revision, published.revision);
+        let preview = admin
+            .get(format!(
+                "http://maincopy.local{POSTS_PATH}/{}/preview",
+                edited_summary.post_id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), reqwest::StatusCode::OK);
+        let preview_body = preview.text().await.unwrap();
+        assert!(preview_body.contains("This edit was made while Maincopy was stopped."));
+        assert!(!preview_body.contains("Durable article body."));
+
+        let response = admin
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(
+                IDEMPOTENCY_KEY_HEADER,
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            )
+            .json(&PublishNowRequest {
+                post_id: edited_summary.post_id,
+                preview_digest: admin_preview_digest(&admin, edited_summary.post_id).await,
+                expected_revision: Some(edited_summary.revision.clone()),
+                scheduled_for: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let approved: PublishNowResponse = response.json().await.unwrap();
+        assert_eq!(approved.revision, edited_summary.revision);
+
+        let updated = public.get(&public_url).send().await.unwrap();
+        assert_ne!(updated.headers()[reqwest::header::ETAG], initial_etag);
+        let updated_body = updated.text().await.unwrap();
+        assert!(updated_body.contains("This edit was made while Maincopy was stopped."));
+        assert!(!updated_body.contains("Durable article body."));
+
+        stop_built_application(restarted).await;
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn restart_serves_the_durable_published_revision() {
+        use maincopy_shared::{
+            posts::{ListPostsResponse, POSTS_PATH, PostPublicationState},
+            publication::{
+                IDEMPOTENCY_KEY_HEADER, PUBLICATIONS_PATH, PublishNowRequest, PublishNowResponse,
+            },
+        };
+
+        let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
+        let content_root = root.path().join("content");
+        write_durable_post(&content_root);
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let socket_path = root.path().join("run/admin.sock");
+        let application = Application::build(startup).await.unwrap();
+        let admin = reqwest::Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path.clone())
+            .build()
+            .unwrap();
+        let response = admin
+            .post(format!("http://maincopy.local{PUBLICATIONS_PATH}"))
+            .header(
+                IDEMPOTENCY_KEY_HEADER,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            )
+            .json(&PublishNowRequest {
+                post_id: uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap(),
+                preview_digest: admin_preview_digest(
+                    &admin,
+                    uuid::Uuid::parse_str(DURABLE_POST_ID).unwrap(),
+                )
+                .await,
+                expected_revision: None,
+                scheduled_for: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let published: PublishNowResponse = response.json().await.unwrap();
+        let published_at = published.published_at.unwrap();
+        let public = reqwest::Client::builder().no_proxy().build().unwrap();
+        let initial_url = format!(
+            "http://{}/posts/durable-publication",
+            application.public_addr
+        );
+        let initial = public.get(&initial_url).send().await.unwrap();
+        let initial_etag = initial.headers()[reqwest::header::ETAG].clone();
+        let initial_html = initial.text().await.unwrap();
+        assert!(initial_html.contains("Durable article body."));
+        assert!(initial_html.contains(&published_at.to_string()));
+
+        stop_built_application(application).await;
 
         let arguments = server_arguments_for(
             &root.path().join("maincopy.toml"),
@@ -1206,11 +1889,28 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
         let application = Application::build(startup).await.unwrap();
-        let response = reqwest::Client::builder()
+        let restarted_admin = reqwest::Client::builder()
             .no_proxy()
-            .timeout(std::time::Duration::from_secs(2))
+            .unix_socket(socket_path)
             .build()
+            .unwrap();
+        let posts: ListPostsResponse = restarted_admin
+            .get(format!("http://maincopy.local{POSTS_PATH}"))
+            .send()
+            .await
             .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let durable = posts
+            .posts
+            .into_iter()
+            .find(|summary| summary.post_id == published.post_id)
+            .unwrap();
+        assert_eq!(durable.publication_state, PostPublicationState::Published);
+        assert_eq!(durable.revision, published.revision);
+
+        let response = public
             .get(format!(
                 "http://{}/posts/durable-publication",
                 application.public_addr
@@ -1218,8 +1918,8 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             .send()
             .await
             .unwrap();
-
         assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()[reqwest::header::ETAG], initial_etag);
         let html = response.text().await.unwrap();
         assert!(html.contains("Durable article body."));
         assert!(html.contains(&published_at.to_string()));
@@ -1248,6 +1948,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let arguments = server_arguments_for(&root.path().join("maincopy.toml"), &content_root);
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
+        let content_digest = startup._content_tree.digest();
         let assets =
             resolve_content_assets(&startup._content_tree, &startup._validated_content).unwrap();
         let catalog =
@@ -1255,6 +1956,16 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let post_id = PostId::parse(DURABLE_POST_ID).unwrap();
         let rendered = catalog.current_post(&post_id).unwrap();
         let revision = rendered.revision.clone();
+        let accepted_preview_digest = crate::render::render_bound_post_preview(
+            &catalog,
+            crate::frontend_assets::embedded_manifest(),
+            &post_id,
+            "/api/admin/v1/preview-assets/recovery-fixture",
+            None,
+        )
+        .unwrap()
+        .unwrap()
+        .digest;
         let activation_at = OffsetDateTime::from_unix_timestamp(1_777_734_400).unwrap();
         let candidate_ledger = PublicLedgerProjection::empty()
             .with_published(PublishedPostRevision::new(
@@ -1287,9 +1998,10 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             .unwrap();
         sqlx::query(
             "INSERT INTO canonical_publications (\
-                publication_id, creation_key, stable_post_id, pinned_post_digest, state, version, \
-                scheduled_at_ns, activation_at_ns, activation_site_digest\
-             ) VALUES (?, ?, ?, ?, 'activating', 2, ?, ?, ?)",
+                publication_id, creation_key, command_kind, stable_post_id, pinned_post_digest, state, version, \
+                scheduled_at_ns, activation_at_ns, activation_site_digest, content_tree_digest, \
+                accepted_preview_digest\
+             ) VALUES (?, ?, 'immediate', ?, ?, 'activating', 2, ?, ?, ?, ?, ?)",
         )
         .bind(publication_id.as_slice())
         .bind(creation_key.as_slice())
@@ -1298,6 +2010,8 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         .bind(activation_at_ns)
         .bind(activation_at_ns)
         .bind(candidate_digest.as_bytes().as_slice())
+        .bind(content_digest.as_bytes().as_slice())
+        .bind(accepted_preview_digest.as_bytes().as_slice())
         .execute(&mut connection)
         .await
         .unwrap();
@@ -1305,9 +2019,9 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
 
         let application = Application::build(startup).await.unwrap();
         {
-            let coordinator = application.publication_coordinator.lock().await;
-            assert_eq!(coordinator.site.digest, candidate_digest);
-            assert_eq!(coordinator.ledger.len(), 1);
+            let projection = application.publication_coordinator.read();
+            assert_eq!(projection.site.digest, candidate_digest);
+            assert_eq!(projection.ledger.len(), 1);
         }
         let response = reqwest::Client::builder()
             .no_proxy()

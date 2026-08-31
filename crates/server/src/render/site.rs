@@ -6,16 +6,18 @@ use serde::Serialize;
 use thiserror::Error;
 use time::OffsetDateTime;
 
+use crate::domain::publication::{PublicLedgerProjection, PublishedPostRevision};
 use crate::frontend_assets::FrontendAssetManifest;
 
 use super::{ContentCatalog, GeneratedPostAsset, RenderedPost};
 use crate::content::identity::{
-    SiteShellOutputDigest, SiteShellOutputHasher, finalize_site_snapshot,
+    PreviewDigestInput, PublishedPostIdentityInput, SiteShellOutputDigest, SiteShellOutputHasher,
+    finalize_preview_digest, finalize_site_snapshot,
 };
 use crate::content::{
     AssetRevisionReference, DigestedAsset, DraftStatus, LogicalAssetPath, PostDescription, PostId,
-    PostRevisionDigest, PostSlug, PostTag, PostTitle, PublicationBaseUrl, PublicationSettings,
-    PublishedPostRevision, ResolvedLocalAssetStore, ResolvedPostAssets, RevisionIdentityError,
+    PostRevisionDigest, PostSlug, PostTag, PostTitle, PreviewDigest, PublicationBaseUrl,
+    PublicationSettings, ResolvedLocalAssetStore, ResolvedPostAssets, RevisionIdentityError,
     SiteShellRendererIdentity, SiteSnapshotDigest, SnapshotAssetPath,
 };
 
@@ -23,78 +25,22 @@ const MAX_PAGE_BYTES: usize = 40 * 1024 * 1024;
 const MAX_PUBLIC_ROUTES: usize = 50_000;
 const MAX_RETAINED_HTML_BYTES: usize = 512 * 1024 * 1024;
 
-/// An exact, storage-neutral view of revisions authorized for one public snapshot.
-///
-/// Persistence adapters and the snapshot-transition coordinator construct the
-/// entries inside the crate. Public callers can explicitly request an empty
-/// projection, but cannot infer publication from the content catalog.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublicLedgerProjection {
-    entries: Arc<[PublishedPostRevision]>,
-}
-
-impl PublicLedgerProjection {
-    pub fn empty() -> Self {
-        Self {
-            entries: Arc::from([]),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub(crate) fn try_from_exact_entries(
-        entries: impl IntoIterator<Item = PublishedPostRevision>,
-    ) -> Result<Self, PublicLedgerProjectionError> {
-        let mut entries: Vec<_> = entries.into_iter().collect();
-        entries.sort_by(|left, right| left.post_id.cmp(&right.post_id));
-        for pair in entries.windows(2) {
-            if pair[0].post_id == pair[1].post_id {
-                return Err(PublicLedgerProjectionError {
-                    post_id: pair[0].post_id.clone(),
-                });
-            }
-        }
-        Ok(Self {
-            entries: entries.into(),
-        })
-    }
-
-    pub(crate) fn with_published(
-        &self,
-        published: PublishedPostRevision,
-    ) -> Result<Self, PublicLedgerProjectionError> {
-        let insert_at = match self
-            .entries
-            .binary_search_by(|entry| entry.post_id.cmp(&published.post_id))
-        {
-            Ok(_) => {
-                return Err(PublicLedgerProjectionError {
-                    post_id: published.post_id,
-                });
-            }
-            Err(insert_at) => insert_at,
-        };
-
-        let mut entries = Vec::with_capacity(self.entries.len() + 1);
-        entries.extend_from_slice(&self.entries[..insert_at]);
-        entries.push(published);
-        entries.extend_from_slice(&self.entries[insert_at..]);
-        Ok(Self {
-            entries: entries.into(),
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("public ledger contains duplicate post {post_id}")]
-pub(crate) struct PublicLedgerProjectionError {
-    post_id: PostId,
+#[cfg(test)]
+fn render_post_preview(
+    catalog: &ContentCatalog,
+    frontend: &'static FrontendAssetManifest,
+    post_id: &PostId,
+    preview_asset_endpoint: &str,
+    published_at: Option<OffsetDateTime>,
+) -> Result<Option<String>, SiteSnapshotBuildError> {
+    render_bound_post_preview(
+        catalog,
+        frontend,
+        post_id,
+        preview_asset_endpoint,
+        published_at,
+    )
+    .map(|preview| preview.map(|preview| preview.html))
 }
 
 /// A canonical absolute URL derived only from validated publication settings.
@@ -207,7 +153,7 @@ impl fmt::Debug for RenderedSiteShell {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RenderedSiteShell")
-            .field("ledger_entries", &self.ledger.entries.len())
+            .field("ledger_entries", &self.ledger.len())
             .field("posts", &self.posts.len())
             .field("tags", &self.tags.len())
             .finish_non_exhaustive()
@@ -243,12 +189,129 @@ pub fn render_site_shell(
     })
 }
 
+/// One rendered private document and the exact presentation binding it exposes for approval.
+pub(crate) struct BoundPostPreview {
+    pub(crate) html: String,
+    pub(crate) digest: PreviewDigest,
+    pub(crate) revision: PostRevisionDigest,
+    pub(crate) canonical_url: CanonicalSiteUrl,
+}
+
+/// Renders and binds one current candidate without including its future activation time.
+pub(crate) fn render_bound_post_preview(
+    catalog: &ContentCatalog,
+    frontend: &'static FrontendAssetManifest,
+    post_id: &PostId,
+    preview_asset_endpoint: &str,
+    published_at: Option<OffsetDateTime>,
+) -> Result<Option<BoundPostPreview>, SiteSnapshotBuildError> {
+    let Some(rendered) = catalog.current_post(post_id) else {
+        return Ok(None);
+    };
+    render_bound_preview(
+        catalog,
+        frontend,
+        rendered,
+        catalog.local_assets.as_ref(),
+        preview_asset_endpoint,
+        published_at,
+    )
+    .map(Some)
+}
+
+/// Reproduces the approval binding for one exact retained post revision.
+pub(crate) fn render_bound_post_revision_preview(
+    catalog: &ContentCatalog,
+    frontend: &'static FrontendAssetManifest,
+    post_id: &PostId,
+    revision: &PostRevisionDigest,
+    preview_asset_endpoint: &str,
+    published_at: Option<OffsetDateTime>,
+) -> Result<Option<BoundPostPreview>, SiteSnapshotBuildError> {
+    let Some((rendered, local_assets)) = catalog.get_with_local_assets(post_id, revision) else {
+        return Ok(None);
+    };
+    render_bound_preview(
+        catalog,
+        frontend,
+        rendered,
+        local_assets,
+        preview_asset_endpoint,
+        published_at,
+    )
+    .map(Some)
+}
+
+fn render_bound_preview(
+    catalog: &ContentCatalog,
+    frontend: &'static FrontendAssetManifest,
+    rendered: &RenderedPost,
+    local_assets: &ResolvedLocalAssetStore,
+    preview_asset_endpoint: &str,
+    published_at: Option<OffsetDateTime>,
+) -> Result<BoundPostPreview, SiteSnapshotBuildError> {
+    frontend
+        .validate()
+        .map_err(|error| SiteSnapshotBuildError::frontend(error.to_string()))?;
+    let post_id = &rendered.document.metadata.id;
+    let article = rendered
+        .project_for_preview(preview_asset_endpoint, &catalog.site_assets, local_assets)
+        .map(ProjectedArticleHtml::new)
+        .map_err(|error| {
+            SiteSnapshotBuildError::post(
+                SiteSnapshotBuildErrorCode::ArticleProjectionFailed,
+                post_id.clone(),
+                error.to_string(),
+            )
+        })?;
+    let page = PostPageView::from_rendered(rendered, published_at);
+    let html = render_post(
+        &catalog.publication,
+        frontend,
+        page,
+        ArticleBody::Projected(&article),
+    )
+    .into_string();
+    validate_page_size(html.len())?;
+    let pre_injection_shell = render_post(
+        &catalog.publication,
+        frontend,
+        PostPageView::from_rendered(rendered, None),
+        ArticleBody::Omitted,
+    )
+    .into_string();
+    validate_page_size(pre_injection_shell.len())?;
+    let canonical_url = CanonicalSiteUrl::for_path(
+        &catalog.publication.site.base_url,
+        &PublicPagePath::post(&rendered.document.metadata.slug),
+    );
+    let renderer = SiteShellRendererIdentity::new(frontend.bundle_digest);
+    let digest = finalize_preview_digest(PreviewDigestInput {
+        publication: &catalog.publication,
+        site_assets: &catalog.site_assets,
+        post_id,
+        post_revision: &rendered.revision,
+        post_renderer: &rendered.renderer,
+        article_identity_html: rendered.article.identity_html.as_bytes(),
+        site_renderer: &renderer,
+        pre_injection_post_shell: pre_injection_shell.as_bytes(),
+        canonical_url: canonical_url.as_str(),
+    })
+    .map_err(SiteSnapshotBuildError::identity)?;
+    Ok(BoundPostPreview {
+        html,
+        digest,
+        revision: rendered.revision.clone(),
+        canonical_url,
+    })
+}
+
 fn select_public_posts(
     catalog: &ContentCatalog,
     ledger: &PublicLedgerProjection,
 ) -> Result<Vec<PublicPostView>, SiteSnapshotBuildError> {
-    let mut posts = Vec::with_capacity(ledger.entries.len());
-    for entry in &*ledger.entries {
+    let mut posts = Vec::with_capacity(ledger.len());
+    for entry in ledger.published_posts() {
         let Some(rendered) = catalog.get(&entry.post_id, &entry.revision) else {
             return Err(SiteSnapshotBuildError::post(
                 SiteSnapshotBuildErrorCode::RevisionUnavailable,
@@ -341,10 +404,13 @@ fn render_pre_injection_shell(
             PreInjectionPage::Archive => {
                 render_archive(publication, frontend, posts, chronology).into_string()
             }
-            PreInjectionPage::Post(index) => {
-                render_post(publication, frontend, &posts[index], ArticleBody::Omitted)
-                    .into_string()
-            }
+            PreInjectionPage::Post(index) => render_post(
+                publication,
+                frontend,
+                PostPageView::from_public(&posts[index]),
+                ArticleBody::Omitted,
+            )
+            .into_string(),
             PreInjectionPage::Tag(tag) => render_tag(
                 publication,
                 frontend,
@@ -378,12 +444,22 @@ pub fn build_site_snapshot(
     ledger: &PublicLedgerProjection,
 ) -> Result<SiteSnapshot, SiteSnapshotBuildError> {
     validate_snapshot_shell(&shell, ledger)?;
+    let public_posts: Vec<_> = ledger
+        .published_posts()
+        .map(|published| {
+            PublishedPostIdentityInput::new(
+                &published.post_id,
+                &published.revision,
+                published.published_at,
+            )
+        })
+        .collect();
     let digest = finalize_site_snapshot(
         &shell.catalog.publication,
         &shell.catalog.site_assets,
         &shell.renderer,
         &shell.pre_injection_output,
-        &ledger.entries,
+        &public_posts,
     )
     .map_err(SiteSnapshotBuildError::identity)?;
 
@@ -473,9 +549,9 @@ fn render_snapshot_pages(
     )?;
 
     for post in &*shell.posts {
-        let rendered = shell
+        let (rendered, local_assets) = shell
             .catalog
-            .get(&post.post_id, &post.revision)
+            .get_with_local_assets(&post.post_id, &post.revision)
             .ok_or_else(|| {
                 SiteSnapshotBuildError::post(
                     SiteSnapshotBuildErrorCode::RevisionUnavailable,
@@ -484,11 +560,7 @@ fn render_snapshot_pages(
                 )
             })?;
         let article = rendered
-            .project_for_snapshot(
-                digest,
-                &shell.catalog.site_assets,
-                &shell.catalog.local_assets,
-            )
+            .project_for_snapshot(digest, &shell.catalog.site_assets, local_assets)
             .map(ProjectedArticleHtml::new)
             .map_err(|error| {
                 SiteSnapshotBuildError::post(
@@ -503,7 +575,7 @@ fn render_snapshot_pages(
             render_post(
                 publication,
                 shell.frontend,
-                post,
+                PostPageView::from_public(post),
                 ArticleBody::Projected(&article),
             )
             .into_string(),
@@ -609,9 +681,9 @@ fn collect_public_assets(
     )?;
 
     for post in &*shell.posts {
-        let rendered = shell
+        let (rendered, local_assets) = shell
             .catalog
-            .get(&post.post_id, &post.revision)
+            .get_with_local_assets(&post.post_id, &post.revision)
             .ok_or_else(|| {
                 SiteSnapshotBuildError::post(
                     SiteSnapshotBuildErrorCode::RevisionUnavailable,
@@ -623,7 +695,7 @@ fn collect_public_assets(
             &mut selected,
             &rendered.assets,
             &rendered.generated_assets,
-            &shell.catalog.local_assets,
+            local_assets,
         )?;
     }
 
@@ -1061,10 +1133,45 @@ enum ArticleBody<'article> {
     Projected(&'article ProjectedArticleHtml),
 }
 
+#[derive(Clone, Copy)]
+struct PostPageView<'post> {
+    title: &'post PostTitle,
+    description: &'post PostDescription,
+    tags: &'post [PostTag],
+    authored_at: OffsetDateTime,
+    updated_at: Option<OffsetDateTime>,
+    published_at: Option<OffsetDateTime>,
+}
+
+impl<'post> PostPageView<'post> {
+    fn from_public(post: &'post PublicPostView) -> Self {
+        Self {
+            title: &post.title,
+            description: &post.description,
+            tags: &post.tags,
+            authored_at: post.authored_at,
+            updated_at: post.updated_at,
+            published_at: Some(post.published_at),
+        }
+    }
+
+    fn from_rendered(rendered: &'post RenderedPost, published_at: Option<OffsetDateTime>) -> Self {
+        let metadata = &rendered.document.metadata;
+        Self {
+            title: &metadata.title,
+            description: &metadata.description,
+            tags: &metadata.tags,
+            authored_at: metadata.authored_at,
+            updated_at: metadata.updated_at,
+            published_at,
+        }
+    }
+}
+
 fn render_post(
     publication: &PublicationSettings,
     frontend: &'static FrontendAssetManifest,
-    post: &PublicPostView,
+    post: PostPageView<'_>,
     article: ArticleBody<'_>,
 ) -> Markup {
     let content = html! {
@@ -1072,10 +1179,12 @@ fn render_post(
             header {
                 h1 { (post.title.as_str()) }
                 p { (post.description.as_str()) }
-                p class="publication-time" {
-                    "Published "
-                    time datetime=(post.published_at.to_string()) {
-                        (post.published_at.to_string())
+                @if let Some(published_at) = post.published_at {
+                    p class="publication-time" {
+                        "Published "
+                        time datetime=(published_at.to_string()) {
+                            (published_at.to_string())
+                        }
                     }
                 }
                 p class="author-time" {
@@ -1090,7 +1199,7 @@ fn render_post(
                 }
                 @if !post.tags.is_empty() {
                     ul class="post-tags" aria-label="Tags" {
-                        @for tag in &*post.tags {
+                        @for tag in post.tags {
                             li {
                                 a href=(format!("/tags/{}", tag.as_str())) { (tag.as_str()) }
                             }
@@ -1271,6 +1380,13 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with_first(
+            "# First\n<script>alert('body')</script>\n![public](assets/public.png)\n",
+            b"public",
+        )
+    }
+
+    fn fixture_with_first(first_body: &str, public_asset: &[u8]) -> Fixture {
         let publication_source = "[site]\n\
              title = \"Site <unsafe> & title\"\n\
              base_url = \"https://blog.example.com/\"\n\
@@ -1290,7 +1406,7 @@ mod tests {
                         "first-post",
                         &["rust"],
                         Some("assets/first-cover.png"),
-                        "# First\n<script>alert('body')</script>\n![public](assets/public.png)\n",
+                        first_body,
                         false,
                     ),
                 ),
@@ -1328,7 +1444,7 @@ mod tests {
                 ),
                 asset(
                     LogicalAssetPath::parse("assets/public.png").unwrap(),
-                    b"public".to_vec(),
+                    public_asset.to_vec(),
                 ),
                 asset(
                     LogicalAssetPath::parse("assets/first-cover.png").unwrap(),
@@ -1399,6 +1515,13 @@ mod tests {
         build_site_snapshot(shell, ledger)
     }
 
+    fn preview_asset_endpoint() -> String {
+        format!(
+            "/api/admin/v1/preview-assets/content-b3-v1-{}",
+            "88".repeat(32)
+        )
+    }
+
     fn catalog_asset(fixture: &Fixture, path: &str) -> DigestedAsset {
         fixture
             .catalog
@@ -1461,6 +1584,97 @@ mod tests {
     }
 
     #[test]
+    fn candidate_preview_uses_the_production_shell_for_every_publication_state() {
+        let fixture = fixture();
+        let asset_endpoint = preview_asset_endpoint();
+
+        let draft = render_post_preview(
+            &fixture.catalog,
+            embedded_manifest(),
+            &PostId::parse(DRAFT_ID).unwrap(),
+            &asset_endpoint,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(draft.starts_with("<!DOCTYPE html>"));
+        assert!(draft.contains("class=\"site-header\""));
+        assert!(draft.contains("<h1>Draft post</h1>"));
+        assert!(draft.contains("<h1>Draft</h1>"));
+        assert!(draft.contains(&format!("{asset_endpoint}?path=assets/draft.png")));
+        assert!(!draft.contains("class=\"publication-time\""));
+
+        let unpublished = render_post_preview(
+            &fixture.catalog,
+            embedded_manifest(),
+            &PostId::parse(SECOND_ID).unwrap(),
+            &asset_endpoint,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(unpublished.contains("<h1>Second post</h1>"));
+        assert!(unpublished.contains("<h1>Second</h1>"));
+        assert!(!unpublished.contains("class=\"publication-time\""));
+
+        let published = render_post_preview(
+            &fixture.catalog,
+            embedded_manifest(),
+            &PostId::parse(FIRST_ID).unwrap(),
+            &asset_endpoint,
+            Some(at(2_000)),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(published.contains("class=\"publication-time\""));
+        assert!(published.contains("1970-01-01 0:33:20.0 +00:00:00"));
+
+        assert!(
+            render_post_preview(
+                &fixture.catalog,
+                embedded_manifest(),
+                &PostId::parse("44444444-4444-4444-8444-444444444444").unwrap(),
+                &asset_endpoint,
+                None,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn preview_binding_excludes_activation_and_private_asset_transport_metadata() {
+        let fixture = fixture();
+        let post_id = PostId::parse(FIRST_ID).unwrap();
+        let first = render_bound_post_preview(
+            &fixture.catalog,
+            embedded_manifest(),
+            &post_id,
+            "/api/admin/v1/preview-assets/first-candidate",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let second = render_bound_post_preview(
+            &fixture.catalog,
+            embedded_manifest(),
+            &post_id,
+            "/api/admin/v1/preview-assets/second-candidate",
+            Some(at(9_000)),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_ne!(first.html, second.html);
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(first.revision, fixture.revisions[&post_id]);
+        assert_eq!(
+            first.canonical_url.as_str(),
+            "https://blog.example.com/posts/first-post"
+        );
+    }
+
+    #[test]
     fn exact_public_selection_controls_pages_chronology_and_reachable_assets() {
         let fixture = fixture();
         let ledger = projection([entry(&fixture, FIRST_ID, 2_000)]);
@@ -1505,6 +1719,40 @@ mod tests {
         );
         assert!(!snapshot.index_page().contains("Second post"));
         assert!(!snapshot.index_page().contains("Draft post"));
+    }
+
+    #[test]
+    fn mixed_ledger_projects_retained_body_and_assets_with_current_revisions() {
+        let prior = fixture_with_first(
+            "# Retained body\n![public](assets/public.png)\n",
+            b"retained public bytes",
+        );
+        let mut current = fixture_with_first(
+            "# Current unpublished body\n![public](assets/public.png)\n",
+            b"current public bytes",
+        );
+        let retained_first = entry(&prior, FIRST_ID, 1_000);
+        let current_second = entry(&current, SECOND_ID, 2_000);
+        let ledger = projection([retained_first, current_second]);
+        Arc::make_mut(&mut current.catalog)
+            .retain_ledger_revisions_from(&prior.catalog, &ledger)
+            .unwrap();
+
+        let snapshot = build_snapshot(&current, &ledger).unwrap();
+        let first = snapshot
+            .post_page(&PostSlug::parse("first-post").unwrap())
+            .unwrap();
+        assert!(first.contains("Retained body"));
+        assert!(!first.contains("Current unpublished body"));
+        let second = snapshot
+            .post_page(&PostSlug::parse("second-post").unwrap())
+            .unwrap();
+        assert!(second.contains("Second"));
+        let retained_asset = snapshot
+            .public_assets()
+            .find(|asset| asset.asset.path.as_str() == "assets/public.png")
+            .unwrap();
+        assert_eq!(retained_asset.bytes.as_ref(), b"retained public bytes");
     }
 
     #[test]

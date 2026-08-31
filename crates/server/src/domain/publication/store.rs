@@ -6,20 +6,20 @@ use uuid::Uuid;
 
 use crate::{
     content::{
-        DraftStatus, PostId, PostRevisionDigest, PostSlug, PublishedPostRevision,
+        ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
         SiteSnapshotDigest, SourceCommit,
     },
     database::store::{
         DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError, Mutation,
     },
     domain::distribution::{DistributionTarget, PayloadError, TargetPayload, TargetPayloadDigest},
-    render::PublicLedgerProjection,
 };
 
 use super::{
     ActivationBlockReason, CanonicalPublication, CanonicalPublicationStatus,
     CanonicalPublicationView, CanonicalState, RehydrationError, ReleasedTargetJob, TargetJob,
-    TargetJobState, TargetJobStatus, TargetJobView, canonical, target,
+    TargetJobState, TargetJobStatus, TargetJobView, PublicLedgerProjection,
+    PublishedPostRevision, canonical, target,
 };
 
 const MAX_STARTUP_POST_REVISIONS: usize = 10_000;
@@ -57,6 +57,7 @@ impl PublicationStore {
 
         let mut published = Vec::new();
         let mut activating = Vec::new();
+        let mut scheduled = Vec::new();
         for row in rows {
             let stored = decode_canonical_publication(row)?;
             match stored.status {
@@ -75,13 +76,24 @@ impl PublicationStore {
                         publication_id: stored.publication_id,
                         publication,
                         creation_key: stored.creation_key,
+                        content_digest: stored.content_digest,
+                        accepted_preview_digest: stored.accepted_preview_digest,
                         candidate_site_digest: stored
                             .activation_site_digest
                             .ok_or(StartupSnapshotLoadError::MissingActivationSiteDigest)?,
                     });
                 }
-                CanonicalPublicationStatus::Scheduled(_)
-                | CanonicalPublicationStatus::Blocked(_)
+                CanonicalPublicationStatus::Scheduled(publication) => {
+                    scheduled.push(ScheduledPublication {
+                        publication_id: stored.publication_id,
+                        publication,
+                        creation_key: stored.creation_key,
+                        content_digest: stored.content_digest,
+                        accepted_preview_digest: stored.accepted_preview_digest,
+                    });
+                }
+                CanonicalPublicationStatus::Blocked(_)
+                | CanonicalPublicationStatus::Superseded(_)
                 | CanonicalPublicationStatus::Cancelled(_) => {}
             }
         }
@@ -95,6 +107,7 @@ impl PublicationStore {
             site,
             ledger,
             activating,
+            scheduled,
         })
     }
 
@@ -106,6 +119,27 @@ impl PublicationStore {
         let (respond_to, response) = oneshot::channel();
         self.mutations
             .try_send(Mutation::InstallStartupSnapshot {
+                command,
+                respond_to,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
+            })?;
+        response
+            .await
+            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
+            .map_err(DatabaseMutationError::Command)
+    }
+
+    /// Records one compiler-produced preview candidate through the sole writer task.
+    pub(crate) async fn index_content_catalog(
+        &self,
+        command: IndexContentCatalog,
+    ) -> Result<(), DatabaseMutationError> {
+        let (respond_to, response) = oneshot::channel();
+        self.mutations
+            .try_send(Mutation::IndexContentCatalog {
                 command,
                 respond_to,
             })
@@ -142,6 +176,29 @@ impl PublicationStore {
         Ok(Some(state))
     }
 
+    /// Replays a previously accepted scheduled approval before catalog resolution.
+    pub(crate) async fn schedule_publication_replay(
+        &self,
+        command: LookupSchedulePublication,
+    ) -> Result<Option<SchedulePublicationReplay>, SchedulePublicationLookupError> {
+        let mut transaction = self.readers.begin().await?;
+        let stored = sqlx::query_as::<_, CanonicalPublicationRow>(LOAD_CANONICAL_BY_CREATION_KEY)
+            .bind(command.creation_key.0.as_bytes().as_slice())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(decode_canonical_publication)
+            .transpose()
+            .map_err(SchedulePublicationLookupError::from_load)?;
+        let Some(stored) = stored else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        validate_schedule_publication_fingerprint(&stored, &command)?;
+        let scheduled = load_replayed_schedule_publication(&mut transaction, stored).await?;
+        transaction.commit().await?;
+        Ok(Some(scheduled))
+    }
+
     /// Creates and claims one immediate canonical publication.
     pub(crate) async fn begin_publish_now(
         &self,
@@ -150,6 +207,78 @@ impl PublicationStore {
         let (respond_to, response) = oneshot::channel();
         self.mutations
             .try_send(Mutation::BeginPublishNow {
+                command,
+                respond_to,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
+            })?;
+        response
+            .await
+            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
+            .map_err(DatabaseMutationError::Command)
+    }
+
+    /// Persists one exact future publication approval.
+    pub(crate) async fn schedule_publication(
+        &self,
+        command: SchedulePublication,
+    ) -> Result<ScheduledPublication, DatabaseMutationError> {
+        let (respond_to, response) = oneshot::channel();
+        self.mutations
+            .try_send(Mutation::SchedulePublication {
+                command,
+                respond_to,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
+            })?;
+        response
+            .await
+            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
+            .map_err(DatabaseMutationError::Command)
+    }
+
+    /// Returns the earliest exact revision waiting for scheduled activation.
+    pub(crate) async fn next_scheduled_publication(
+        &self,
+    ) -> Result<Option<ScheduledPublication>, StartupSnapshotLoadError> {
+        let rows = sqlx::query_as::<_, CanonicalPublicationRow>(LOAD_CANONICAL_PUBLICATIONS)
+            .fetch_all(&self.readers)
+            .await?;
+        let mut scheduled = Vec::new();
+        for row in rows {
+            let stored = decode_canonical_publication(row)?;
+            if let CanonicalPublicationStatus::Scheduled(publication) = stored.status {
+                scheduled.push(ScheduledPublication {
+                    publication_id: stored.publication_id,
+                    publication,
+                    creation_key: stored.creation_key,
+                    content_digest: stored.content_digest,
+                    accepted_preview_digest: stored.accepted_preview_digest,
+                });
+            }
+        }
+        scheduled.sort_by(|left, right| {
+            left.publication
+                .view()
+                .scheduled_at
+                .cmp(&right.publication.view().scheduled_at)
+                .then_with(|| left.publication_id.cmp(&right.publication_id))
+        });
+        Ok(scheduled.into_iter().next())
+    }
+
+    /// Claims one due scheduled approval for canonical activation.
+    pub(crate) async fn begin_scheduled_activation(
+        &self,
+        command: BeginScheduledActivation,
+    ) -> Result<BegunPublication, DatabaseMutationError> {
+        let (respond_to, response) = oneshot::channel();
+        self.mutations
+            .try_send(Mutation::BeginScheduledActivation {
                 command,
                 respond_to,
             })
@@ -240,6 +369,7 @@ pub(crate) struct StartupSnapshotState {
     pub site: Option<SiteHead>,
     pub ledger: PublicLedgerProjection,
     pub activating: Vec<RecoverablePublicationActivation>,
+    pub scheduled: Vec<ScheduledPublication>,
 }
 
 /// One exact activation that startup must reconcile before listener binding.
@@ -248,6 +378,8 @@ pub(crate) struct RecoverablePublicationActivation {
     pub publication_id: Uuid,
     pub publication: CanonicalPublication<canonical::Activating>,
     pub creation_key: Option<CommandIdempotencyKey>,
+    pub content_digest: ContentTreeDigest,
+    pub accepted_preview_digest: PreviewDigest,
     pub candidate_site_digest: SiteSnapshotDigest,
 }
 
@@ -278,6 +410,15 @@ pub(crate) struct InstallStartupSnapshot {
 
 pub(crate) type InstallStartupSnapshotResult = Result<SiteHead, DatabaseCommandError>;
 
+/// One validated preview candidate whose revisions must be retained for approval.
+pub(crate) struct IndexContentCatalog {
+    pub observed_at: OffsetDateTime,
+    pub source_commit: Option<SourceCommit>,
+    pub posts: Vec<ObservedPostRevision>,
+}
+
+pub(crate) type IndexContentCatalogResult = Result<(), DatabaseCommandError>;
+
 /// One exact request to create and immediately claim a publication.
 pub(crate) struct BeginPublishNow {
     pub creation_key: CommandIdempotencyKey,
@@ -287,6 +428,48 @@ pub(crate) struct BeginPublishNow {
     pub expected_revision: Option<PostRevisionDigest>,
     pub expected_site: SiteHead,
     pub source_commit: Option<SourceCommit>,
+    pub content_digest: ContentTreeDigest,
+    pub accepted_preview_digest: PreviewDigest,
+    pub now: OffsetDateTime,
+    pub candidate_site_digest: SiteSnapshotDigest,
+}
+
+/// One exact future approval to retain without changing the public snapshot.
+pub(crate) struct SchedulePublication {
+    pub creation_key: CommandIdempotencyKey,
+    pub publication_id: Uuid,
+    pub stable_post_id: PostId,
+    pub pinned_post_digest: PostRevisionDigest,
+    pub expected_revision: Option<PostRevisionDigest>,
+    pub expected_site: SiteHead,
+    pub source_commit: Option<SourceCommit>,
+    pub content_digest: ContentTreeDigest,
+    pub accepted_preview_digest: PreviewDigest,
+    pub scheduled_at: OffsetDateTime,
+}
+
+/// One durable exact revision waiting for its activation time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScheduledPublication {
+    pub publication_id: Uuid,
+    pub publication: CanonicalPublication<canonical::Scheduled>,
+    pub creation_key: Option<CommandIdempotencyKey>,
+    pub content_digest: ContentTreeDigest,
+    pub accepted_preview_digest: PreviewDigest,
+}
+
+/// A prior scheduled-approval command resolved before current-catalog selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SchedulePublicationReplay {
+    Scheduled(ScheduledPublication),
+    Published(CompletedPublication),
+}
+
+/// One due scheduled approval to claim against the current public site head.
+pub(crate) struct BeginScheduledActivation {
+    pub publication_id: Uuid,
+    pub expected_publication_version: u64,
+    pub expected_site: SiteHead,
     pub now: OffsetDateTime,
     pub candidate_site_digest: SiteSnapshotDigest,
 }
@@ -296,13 +479,34 @@ pub(crate) struct LookupPublishNow {
     pub creation_key: CommandIdempotencyKey,
     pub stable_post_id: PostId,
     pub expected_revision: Option<PostRevisionDigest>,
+    pub accepted_preview_digest: PreviewDigest,
+}
+
+/// The wire-level identity of a possible scheduled-approval retry.
+pub(crate) struct LookupSchedulePublication {
+    pub creation_key: CommandIdempotencyKey,
+    pub stable_post_id: PostId,
+    pub expected_revision: Option<PostRevisionDigest>,
+    pub accepted_preview_digest: PreviewDigest,
+    pub scheduled_at: OffsetDateTime,
 }
 
 /// The durable state returned by an immediate-publication request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublishNowState {
     Activating(BegunPublication),
-    Published(FinishedPublication),
+    Published(CompletedPublication),
+}
+
+/// Historical result of one publication command, independent of its current canonical state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletedPublication {
+    pub publication_id: Uuid,
+    pub stable_post_id: PostId,
+    pub revision: PostRevisionDigest,
+    pub accepted_preview_digest: PreviewDigest,
+    pub published_at: OffsetDateTime,
+    pub site: SiteHead,
 }
 
 /// A publication claimed for one exact candidate snapshot.
@@ -311,6 +515,8 @@ pub(crate) struct BegunPublication {
     pub publication_id: Uuid,
     pub publication: CanonicalPublication<canonical::Activating>,
     pub site: SiteHead,
+    pub content_digest: ContentTreeDigest,
+    pub accepted_preview_digest: PreviewDigest,
     pub candidate_site_digest: SiteSnapshotDigest,
 }
 
@@ -329,9 +535,12 @@ pub(crate) struct FinishedPublication {
     pub publication_id: Uuid,
     pub publication: CanonicalPublication<canonical::Published>,
     pub site: SiteHead,
+    pub accepted_preview_digest: PreviewDigest,
 }
 
 pub(crate) type BeginPublishNowResult = Result<PublishNowState, DatabaseCommandError>;
+pub(crate) type SchedulePublicationResult = Result<ScheduledPublication, DatabaseCommandError>;
+pub(crate) type BeginScheduledActivationResult = Result<BegunPublication, DatabaseCommandError>;
 pub(crate) type FinishPublicationResult = Result<FinishedPublication, DatabaseCommandError>;
 
 const LOAD_SITE_HEAD: &str = "SELECT \
@@ -360,8 +569,11 @@ const LOAD_CANONICAL_PUBLICATIONS: &str = "SELECT \
     canonical.source_commit AS source_commit, \
     canonical.block_reason AS block_reason, \
     canonical.creation_key AS creation_key, \
+    canonical.command_kind AS command_kind, \
     canonical.activation_site_digest AS activation_site_digest, \
     canonical.requested_revision_digest AS requested_revision_digest, \
+    canonical.content_tree_digest AS content_tree_digest, \
+    canonical.accepted_preview_digest AS accepted_preview_digest, \
     pinned.publication_status AS pinned_publication_status, \
     pinned.slug AS pinned_slug, \
     current.publication_status AS current_publication_status \
@@ -387,8 +599,11 @@ const LOAD_CANONICAL_BY_CREATION_KEY: &str = "SELECT \
     canonical.source_commit AS source_commit, \
     canonical.block_reason AS block_reason, \
     canonical.creation_key AS creation_key, \
+    canonical.command_kind AS command_kind, \
     canonical.activation_site_digest AS activation_site_digest, \
     canonical.requested_revision_digest AS requested_revision_digest, \
+    canonical.content_tree_digest AS content_tree_digest, \
+    canonical.accepted_preview_digest AS accepted_preview_digest, \
     pinned.publication_status AS pinned_publication_status, \
     pinned.slug AS pinned_slug, \
     current.publication_status AS current_publication_status \
@@ -414,8 +629,11 @@ const LOAD_CANONICAL_BY_PUBLICATION_ID: &str = "SELECT \
     canonical.source_commit AS source_commit, \
     canonical.block_reason AS block_reason, \
     canonical.creation_key AS creation_key, \
+    canonical.command_kind AS command_kind, \
     canonical.activation_site_digest AS activation_site_digest, \
     canonical.requested_revision_digest AS requested_revision_digest, \
+    canonical.content_tree_digest AS content_tree_digest, \
+    canonical.accepted_preview_digest AS accepted_preview_digest, \
     pinned.publication_status AS pinned_publication_status, \
     pinned.slug AS pinned_slug, \
     current.publication_status AS current_publication_status \
@@ -453,8 +671,11 @@ struct CanonicalPublicationRow {
     source_commit: Option<Vec<u8>>,
     block_reason: Option<String>,
     creation_key: Option<Vec<u8>>,
+    command_kind: String,
     activation_site_digest: Option<Vec<u8>>,
     requested_revision_digest: Option<Vec<u8>>,
+    content_tree_digest: Vec<u8>,
+    accepted_preview_digest: Vec<u8>,
     pinned_publication_status: Option<String>,
     pinned_slug: Option<String>,
     current_publication_status: Option<String>,
@@ -517,11 +738,30 @@ fn validate_reload_states(states: &[String]) -> Result<(), StartupSnapshotLoadEr
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationCommandKind {
+    Immediate,
+    Scheduled,
+}
+
+impl PublicationCommandKind {
+    fn parse(value: &str) -> Result<Self, StartupSnapshotLoadError> {
+        match value {
+            "immediate" => Ok(Self::Immediate),
+            "scheduled" => Ok(Self::Scheduled),
+            _ => Err(StartupSnapshotLoadError::InvalidCommandKind),
+        }
+    }
+}
+
 struct StoredCanonicalPublication {
     publication_id: Uuid,
     creation_key: Option<CommandIdempotencyKey>,
+    command_kind: PublicationCommandKind,
     activation_site_digest: Option<SiteSnapshotDigest>,
     requested_revision_digest: Option<PostRevisionDigest>,
+    content_digest: ContentTreeDigest,
+    accepted_preview_digest: PreviewDigest,
     pinned_slug: PostSlug,
     status: CanonicalPublicationStatus,
 }
@@ -531,6 +771,7 @@ fn decode_canonical_publication(
 ) -> Result<StoredCanonicalPublication, StartupSnapshotLoadError> {
     let publication_id = Uuid::from_slice(&row.publication_id)
         .map_err(|_| StartupSnapshotLoadError::InvalidPublicationId)?;
+    let command_kind = PublicationCommandKind::parse(&row.command_kind)?;
     let activation_site_digest = row.activation_site_digest.map(site_digest).transpose()?;
     let (stable_post_id, pinned_post_digest, pinned_slug) = decode_pinned_revision(
         row.stable_post_id,
@@ -543,6 +784,8 @@ fn decode_canonical_publication(
         row.requested_revision_digest,
         &pinned_post_digest,
     )?;
+    let content_digest = content_tree_digest(row.content_tree_digest)?;
+    let accepted_preview_digest = preview_digest(row.accepted_preview_digest)?;
 
     let current_published_digest = row.current_published_digest.map(post_digest).transpose()?;
     if current_published_digest.is_some() {
@@ -585,8 +828,11 @@ fn decode_canonical_publication(
     Ok(StoredCanonicalPublication {
         publication_id,
         creation_key,
+        command_kind,
         activation_site_digest,
         requested_revision_digest,
+        content_digest,
+        accepted_preview_digest,
         pinned_slug,
         status,
     })
@@ -638,6 +884,7 @@ fn canonical_view(status: &CanonicalPublicationStatus) -> &CanonicalPublicationV
         CanonicalPublicationStatus::Activating(publication) => publication.view(),
         CanonicalPublicationStatus::Blocked(publication) => publication.view(),
         CanonicalPublicationStatus::Published(publication) => publication.view(),
+        CanonicalPublicationStatus::Superseded(publication) => publication.view(),
         CanonicalPublicationStatus::Cancelled(publication) => publication.view(),
     }
 }
@@ -646,10 +893,12 @@ fn publish_now_fingerprint_matches(
     stored: &StoredCanonicalPublication,
     post_id: &PostId,
     requested_revision: Option<&PostRevisionDigest>,
+    accepted_preview_digest: &PreviewDigest,
 ) -> bool {
     let view = canonical_view(&stored.status);
     &view.stable_post_id == post_id
         && stored.requested_revision_digest.as_ref() == requested_revision
+        && &stored.accepted_preview_digest == accepted_preview_digest
 }
 
 fn canonical_state(value: &str) -> Result<CanonicalState, StartupSnapshotLoadError> {
@@ -658,6 +907,7 @@ fn canonical_state(value: &str) -> Result<CanonicalState, StartupSnapshotLoadErr
         "activating" => Ok(CanonicalState::Activating),
         "blocked" => Ok(CanonicalState::Blocked),
         "published" => Ok(CanonicalState::Published),
+        "superseded" => Ok(CanonicalState::Superseded),
         "cancelled" => Ok(CanonicalState::Cancelled),
         _ => Err(StartupSnapshotLoadError::InvalidCanonicalState),
     }
@@ -685,6 +935,20 @@ fn post_digest(value: Vec<u8>) -> Result<PostRevisionDigest, StartupSnapshotLoad
         .try_into()
         .map(PostRevisionDigest::from_bytes)
         .map_err(|_| StartupSnapshotLoadError::InvalidPostDigest)
+}
+
+fn content_tree_digest(value: Vec<u8>) -> Result<ContentTreeDigest, StartupSnapshotLoadError> {
+    value
+        .try_into()
+        .map(ContentTreeDigest::from_bytes)
+        .map_err(|_| StartupSnapshotLoadError::InvalidContentTreeDigest)
+}
+
+fn preview_digest(value: Vec<u8>) -> Result<PreviewDigest, StartupSnapshotLoadError> {
+    value
+        .try_into()
+        .map(PreviewDigest::from_bytes)
+        .map_err(|_| StartupSnapshotLoadError::InvalidAcceptedPreviewDigest)
 }
 
 fn site_digest(value: Vec<u8>) -> Result<SiteSnapshotDigest, StartupSnapshotLoadError> {
@@ -755,10 +1019,16 @@ pub(crate) enum StartupSnapshotLoadError {
     InvalidPublicationId,
     #[error("a stored publication creation key is invalid")]
     InvalidCreationKey,
+    #[error("a stored publication command kind is invalid")]
+    InvalidCommandKind,
     #[error("a stored post ID is invalid")]
     InvalidPostId,
     #[error("a stored post digest is invalid")]
     InvalidPostDigest,
+    #[error("a stored content-tree digest is invalid")]
+    InvalidContentTreeDigest,
+    #[error("a stored accepted preview digest is invalid")]
+    InvalidAcceptedPreviewDigest,
     #[error("a requested revision is stored without an immediate-publication key")]
     OrphanedRequestedRevision,
     #[error("a requested revision differs from the canonical pinned revision")]
@@ -802,6 +1072,36 @@ pub(crate) enum PublishNowLookupError {
 }
 
 impl PublishNowLookupError {
+    fn from_load(error: StartupSnapshotLoadError) -> Self {
+        match error {
+            StartupSnapshotLoadError::Query(source) => Self::Query(source),
+            _ => Self::InvalidStoredState,
+        }
+    }
+
+    fn from_publication(error: PublicationMutationError) -> Self {
+        match error {
+            PublicationMutationError::Operation(source) => Self::Query(source),
+            PublicationMutationError::Command(_) | PublicationMutationError::CorruptStoredState => {
+                Self::InvalidStoredState
+            }
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum SchedulePublicationLookupError {
+    #[error("could not read a prior scheduled-publication request")]
+    Query(#[from] sqlx::Error),
+    #[error("the idempotency key is already bound to a different command")]
+    IdempotencyConflict,
+    #[error("the scheduled publication is currently activating")]
+    ActivationInProgress,
+    #[error("the stored scheduled-publication request is invalid")]
+    InvalidStoredState,
+}
+
+impl SchedulePublicationLookupError {
     fn from_load(error: StartupSnapshotLoadError) -> Self {
         match error {
             StartupSnapshotLoadError::Query(source) => Self::Query(source),
@@ -940,6 +1240,25 @@ pub(crate) async fn install_startup(
         digest: command.candidate_digest,
         version,
     })
+}
+
+/// Persists revision metadata for a validated private-preview candidate.
+///
+/// This operation deliberately does not alter the canonical publication ledger,
+/// published routes, retained public snapshots, or the durable site head.
+pub(crate) async fn index_content_catalog(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: IndexContentCatalog,
+) -> Result<(), StartupSnapshotMutationError> {
+    let mut snapshot = InstallStartupSnapshot {
+        expected: None,
+        candidate_digest: SiteSnapshotDigest::from_bytes([0; 32]),
+        activated_at: command.observed_at,
+        source_commit: command.source_commit,
+        posts: command.posts,
+    };
+    let observed_at_ns = validate_startup_command(&mut snapshot)?;
+    record_observed_posts(transaction, &snapshot, observed_at_ns).await
 }
 
 fn validate_startup_command(
@@ -1144,6 +1463,195 @@ impl StartupSnapshotMutationError {
     }
 }
 
+pub(crate) async fn schedule_publication(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: SchedulePublication,
+) -> Result<ScheduledPublication, PublicationMutationError> {
+    if let Some(stored) = load_canonical_by_creation_key(transaction, command.creation_key).await? {
+        if stored.command_kind != PublicationCommandKind::Scheduled
+            || !publish_now_fingerprint_matches(
+                &stored,
+                &command.stable_post_id,
+                command.expected_revision.as_ref(),
+                &command.accepted_preview_digest,
+            )
+            || canonical_view(&stored.status).scheduled_at
+                != command.scheduled_at.to_offset(UtcOffset::UTC)
+        {
+            return Err(PublicationMutationError::Command(
+                DatabaseCommandError::IdempotencyConflict,
+            ));
+        }
+        return match stored.status {
+            CanonicalPublicationStatus::Scheduled(publication) => Ok(ScheduledPublication {
+                publication_id: stored.publication_id,
+                publication,
+                creation_key: stored.creation_key,
+                content_digest: stored.content_digest,
+                accepted_preview_digest: stored.accepted_preview_digest,
+            }),
+            _ => Err(PublicationMutationError::Command(
+                DatabaseCommandError::Rejected,
+            )),
+        };
+    }
+
+    let actual = load_site_head(&mut **transaction)
+        .await
+        .map_err(PublicationMutationError::from_load)?;
+    if actual.as_ref() != Some(&command.expected_site)
+        || command
+            .expected_revision
+            .as_ref()
+            .is_some_and(|expected| expected != &command.pinned_post_digest)
+    {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    }
+    require_publishable_revision(
+        transaction,
+        &command.stable_post_id,
+        &command.pinned_post_digest,
+    )
+    .await?;
+    require_no_pending_publication(transaction, &command.stable_post_id).await?;
+
+    let publication = CanonicalPublication::schedule(
+        command.stable_post_id.clone(),
+        command.pinned_post_digest.clone(),
+        command.source_commit.clone(),
+        command.scheduled_at,
+    );
+    let view = publication.view();
+    let scheduled_at_ns = i64::try_from(view.scheduled_at.unix_timestamp_nanos())
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    sqlx::query(
+        "INSERT INTO canonical_publications (\
+            publication_id, command_kind, stable_post_id, requested_revision_digest, pinned_post_digest, \
+            state, version, scheduled_at_ns, source_commit, creation_key, content_tree_digest, \
+            accepted_preview_digest\
+         ) VALUES (?, 'scheduled', ?, ?, ?, 'scheduled', 1, ?, ?, ?, ?, ?)",
+    )
+    .bind(command.publication_id.as_bytes().as_slice())
+    .bind(view.stable_post_id.as_uuid().as_bytes().as_slice())
+    .bind(
+        command
+            .expected_revision
+            .as_ref()
+            .map(|digest| digest.as_bytes().as_slice()),
+    )
+    .bind(view.pinned_post_digest.as_bytes().as_slice())
+    .bind(scheduled_at_ns)
+    .bind(view.source_commit.as_ref().map(SourceCommit::as_bytes))
+    .bind(command.creation_key.0.as_bytes().as_slice())
+    .bind(command.content_digest.as_bytes().as_slice())
+    .bind(command.accepted_preview_digest.as_bytes().as_slice())
+    .execute(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::insert_sql)?;
+
+    Ok(ScheduledPublication {
+        publication_id: command.publication_id,
+        publication,
+        creation_key: Some(command.creation_key),
+        content_digest: command.content_digest,
+        accepted_preview_digest: command.accepted_preview_digest,
+    })
+}
+
+pub(crate) async fn begin_scheduled_activation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: BeginScheduledActivation,
+) -> Result<BegunPublication, PublicationMutationError> {
+    let stored = load_canonical_by_id(transaction, command.publication_id)
+        .await?
+        .ok_or(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ))?;
+    let content_digest = stored.content_digest;
+    let accepted_preview_digest = stored.accepted_preview_digest;
+    let CanonicalPublicationStatus::Scheduled(publication) = stored.status else {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    };
+    if publication.view().version != command.expected_publication_version {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    }
+    let actual = load_site_head(&mut **transaction)
+        .await
+        .map_err(PublicationMutationError::from_load)?;
+    if actual.as_ref() != Some(&command.expected_site)
+        || command.candidate_site_digest == command.expected_site.digest
+    {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    }
+    let another_activation: bool = sqlx::query_scalar(
+        "SELECT EXISTS(\
+            SELECT 1 FROM canonical_publications \
+            WHERE state = 'activating' AND publication_id != ?\
+         )",
+    )
+    .bind(command.publication_id.as_bytes().as_slice())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)?;
+    if another_activation {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    }
+    let activating = publication
+        .begin_activation(command.expected_publication_version, command.now)
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::Rejected))?;
+    let view = activating.view();
+    let activation_at_ns = i64::try_from(
+        view.activation_started_at
+            .expect("an activating schedule has a timestamp")
+            .unix_timestamp_nanos(),
+    )
+    .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    let version = i64::try_from(view.version)
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    let expected_version = i64::try_from(command.expected_publication_version)
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    let updated = sqlx::query(
+        "UPDATE canonical_publications \
+         SET state = 'activating', version = ?, activation_at_ns = ?, \
+             activation_site_digest = ? \
+         WHERE publication_id = ? AND state = 'scheduled' AND version = ? \
+           AND scheduled_at_ns <= ?",
+    )
+    .bind(version)
+    .bind(activation_at_ns)
+    .bind(command.candidate_site_digest.as_bytes().as_slice())
+    .bind(command.publication_id.as_bytes().as_slice())
+    .bind(expected_version)
+    .bind(activation_at_ns)
+    .execute(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)?;
+    if updated.rows_affected() != 1 {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    }
+
+    Ok(BegunPublication {
+        publication_id: command.publication_id,
+        publication: activating,
+        site: command.expected_site,
+        content_digest,
+        accepted_preview_digest,
+        candidate_site_digest: command.candidate_site_digest,
+    })
+}
+
 pub(crate) async fn begin_publish_now(
     transaction: &mut Transaction<'_, Sqlite>,
     command: BeginPublishNow,
@@ -1182,11 +1690,11 @@ pub(crate) async fn begin_publish_now(
 
     sqlx::query(
         "INSERT INTO canonical_publications (\
-            publication_id, stable_post_id, requested_revision_digest, pinned_post_digest, \
+            publication_id, command_kind, stable_post_id, requested_revision_digest, pinned_post_digest, \
             state, version, \
             scheduled_at_ns, activation_at_ns, source_commit, creation_key, \
-            activation_site_digest\
-         ) VALUES (?, ?, ?, ?, 'activating', ?, ?, ?, ?, ?, ?)",
+            activation_site_digest, content_tree_digest, accepted_preview_digest\
+         ) VALUES (?, 'immediate', ?, ?, ?, 'activating', ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(publication_id.as_slice())
     .bind(stable_post_id.as_slice())
@@ -1203,6 +1711,8 @@ pub(crate) async fn begin_publish_now(
     .bind(view.source_commit.as_ref().map(SourceCommit::as_bytes))
     .bind(command.creation_key.0.as_bytes().as_slice())
     .bind(command.candidate_site_digest.as_bytes().as_slice())
+    .bind(command.content_digest.as_bytes().as_slice())
+    .bind(command.accepted_preview_digest.as_bytes().as_slice())
     .execute(&mut **transaction)
     .await
     .map_err(PublicationMutationError::insert_sql)?;
@@ -1211,6 +1721,8 @@ pub(crate) async fn begin_publish_now(
         publication_id: command.publication_id,
         publication,
         site: command.expected_site,
+        content_digest: command.content_digest,
+        accepted_preview_digest: command.accepted_preview_digest,
         candidate_site_digest: command.candidate_site_digest,
     }))
 }
@@ -1234,25 +1746,12 @@ async fn require_new_publication_candidate(
         ));
     }
 
-    let stable_post_id = command.stable_post_id.as_uuid();
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT publication_status FROM post_revisions \
-         WHERE stable_post_id = ? AND revision_digest = ?",
+    require_publishable_revision(
+        transaction,
+        &command.stable_post_id,
+        &command.pinned_post_digest,
     )
-    .bind(stable_post_id.as_bytes().as_slice())
-    .bind(command.pinned_post_digest.as_bytes().as_slice())
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(PublicationMutationError::Operation)?;
-    match status.as_deref() {
-        Some("publishable") => {}
-        Some("draft") | None => {
-            return Err(PublicationMutationError::Command(
-                DatabaseCommandError::Rejected,
-            ));
-        }
-        Some(_) => return Err(PublicationMutationError::CorruptStoredState),
-    }
+    .await?;
 
     let activating: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM canonical_publications WHERE state = 'activating')",
@@ -1266,14 +1765,48 @@ async fn require_new_publication_candidate(
         ));
     }
 
+    require_no_pending_publication(transaction, &command.stable_post_id).await
+}
+
+async fn require_publishable_revision(
+    transaction: &mut Transaction<'_, Sqlite>,
+    post_id: &PostId,
+    revision: &PostRevisionDigest,
+) -> Result<(), PublicationMutationError> {
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT publication_status FROM post_revisions \
+         WHERE stable_post_id = ? AND revision_digest = ?",
+    )
+    .bind(post_id.as_uuid().as_bytes().as_slice())
+    .bind(revision.as_bytes().as_slice())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)?;
+    match status.as_deref() {
+        Some("publishable") => {}
+        Some("draft") | None => {
+            return Err(PublicationMutationError::Command(
+                DatabaseCommandError::Rejected,
+            ));
+        }
+        Some(_) => return Err(PublicationMutationError::CorruptStoredState),
+    }
+
+    Ok(())
+}
+
+async fn require_no_pending_publication(
+    transaction: &mut Transaction<'_, Sqlite>,
+    post_id: &PostId,
+) -> Result<(), PublicationMutationError> {
     let active_for_post: bool = sqlx::query_scalar(
         "SELECT EXISTS(\
             SELECT 1 FROM canonical_publications \
             WHERE stable_post_id = ? \
-              AND state IN ('scheduled', 'activating', 'blocked', 'published')\
+              AND state IN ('scheduled', 'activating', 'blocked')\
          )",
     )
-    .bind(stable_post_id.as_bytes().as_slice())
+    .bind(post_id.as_uuid().as_bytes().as_slice())
     .fetch_one(&mut **transaction)
     .await
     .map_err(PublicationMutationError::Operation)?;
@@ -1303,14 +1836,80 @@ fn validate_publish_now_fingerprint(
     stored: &StoredCanonicalPublication,
     command: &LookupPublishNow,
 ) -> Result<(), PublishNowLookupError> {
-    if publish_now_fingerprint_matches(
-        stored,
-        &command.stable_post_id,
-        command.expected_revision.as_ref(),
-    ) {
+    if stored.command_kind == PublicationCommandKind::Immediate
+        && publish_now_fingerprint_matches(
+            stored,
+            &command.stable_post_id,
+            command.expected_revision.as_ref(),
+            &command.accepted_preview_digest,
+        )
+    {
         Ok(())
     } else {
         Err(PublishNowLookupError::IdempotencyConflict)
+    }
+}
+
+fn validate_schedule_publication_fingerprint(
+    stored: &StoredCanonicalPublication,
+    command: &LookupSchedulePublication,
+) -> Result<(), SchedulePublicationLookupError> {
+    if stored.command_kind == PublicationCommandKind::Scheduled
+        && publish_now_fingerprint_matches(
+            stored,
+            &command.stable_post_id,
+            command.expected_revision.as_ref(),
+            &command.accepted_preview_digest,
+        )
+        && canonical_view(&stored.status).scheduled_at
+            == command.scheduled_at.to_offset(UtcOffset::UTC)
+    {
+        Ok(())
+    } else {
+        Err(SchedulePublicationLookupError::IdempotencyConflict)
+    }
+}
+
+async fn load_replayed_schedule_publication(
+    transaction: &mut Transaction<'_, Sqlite>,
+    stored: StoredCanonicalPublication,
+) -> Result<SchedulePublicationReplay, SchedulePublicationLookupError> {
+    match stored.status {
+        CanonicalPublicationStatus::Scheduled(publication) => {
+            Ok(SchedulePublicationReplay::Scheduled(ScheduledPublication {
+                publication_id: stored.publication_id,
+                publication,
+                creation_key: stored.creation_key,
+                content_digest: stored.content_digest,
+                accepted_preview_digest: stored.accepted_preview_digest,
+            }))
+        }
+        CanonicalPublicationStatus::Activating(_) => {
+            Err(SchedulePublicationLookupError::ActivationInProgress)
+        }
+        CanonicalPublicationStatus::Published(publication) => load_completed_publication(
+            transaction,
+            stored.publication_id,
+            publication.view(),
+            stored.activation_site_digest.as_ref(),
+            stored.accepted_preview_digest,
+        )
+        .await
+        .map(SchedulePublicationReplay::Published)
+        .map_err(SchedulePublicationLookupError::from_publication),
+        CanonicalPublicationStatus::Superseded(publication) => load_completed_publication(
+            transaction,
+            stored.publication_id,
+            publication.view(),
+            stored.activation_site_digest.as_ref(),
+            stored.accepted_preview_digest,
+        )
+        .await
+        .map(SchedulePublicationReplay::Published)
+        .map_err(SchedulePublicationLookupError::from_publication),
+        CanonicalPublicationStatus::Blocked(_) | CanonicalPublicationStatus::Cancelled(_) => {
+            Err(SchedulePublicationLookupError::InvalidStoredState)
+        }
     }
 }
 
@@ -1321,6 +1920,8 @@ async fn load_replayed_publish_now(
     let candidate_site_digest = stored
         .activation_site_digest
         .ok_or(PublishNowLookupError::InvalidStoredState)?;
+    let content_digest = stored.content_digest;
+    let accepted_preview_digest = stored.accepted_preview_digest;
     match stored.status {
         CanonicalPublicationStatus::Activating(publication) => {
             let site = load_site_head(&mut **transaction)
@@ -1331,25 +1932,63 @@ async fn load_replayed_publish_now(
                 publication_id: stored.publication_id,
                 publication,
                 site,
+                content_digest,
+                accepted_preview_digest,
                 candidate_site_digest,
             }))
         }
-        CanonicalPublicationStatus::Published(publication) => {
-            let site = load_retained_site_head(transaction, &candidate_site_digest)
-                .await
-                .map_err(PublishNowLookupError::from_publication)?;
-            Ok(PublishNowState::Published(FinishedPublication {
-                publication_id: stored.publication_id,
-                publication,
-                site,
-            }))
-        }
+        CanonicalPublicationStatus::Published(publication) => load_completed_publication(
+            transaction,
+            stored.publication_id,
+            publication.view(),
+            Some(&candidate_site_digest),
+            accepted_preview_digest,
+        )
+        .await
+        .map(PublishNowState::Published)
+        .map_err(PublishNowLookupError::from_publication),
+        CanonicalPublicationStatus::Superseded(publication) => load_completed_publication(
+            transaction,
+            stored.publication_id,
+            publication.view(),
+            Some(&candidate_site_digest),
+            accepted_preview_digest,
+        )
+        .await
+        .map(PublishNowState::Published)
+        .map_err(PublishNowLookupError::from_publication),
         CanonicalPublicationStatus::Scheduled(_)
         | CanonicalPublicationStatus::Blocked(_)
         | CanonicalPublicationStatus::Cancelled(_) => {
             Err(PublishNowLookupError::InvalidStoredState)
         }
     }
+}
+
+async fn load_completed_publication(
+    transaction: &mut Transaction<'_, Sqlite>,
+    publication_id: Uuid,
+    publication: &CanonicalPublicationView,
+    activation_site_digest: Option<&SiteSnapshotDigest>,
+    accepted_preview_digest: PreviewDigest,
+) -> Result<CompletedPublication, PublicationMutationError> {
+    let candidate_site_digest =
+        activation_site_digest.ok_or(PublicationMutationError::CorruptStoredState)?;
+    let published_at = publication
+        .published_at
+        .ok_or(PublicationMutationError::CorruptStoredState)?;
+    if publication.current_published_digest.as_ref() != Some(&publication.pinned_post_digest) {
+        return Err(PublicationMutationError::CorruptStoredState);
+    }
+    let site = load_retained_site_head(transaction, candidate_site_digest).await?;
+    Ok(CompletedPublication {
+        publication_id,
+        stable_post_id: publication.stable_post_id.clone(),
+        revision: publication.pinned_post_digest.clone(),
+        accepted_preview_digest,
+        published_at,
+        site,
+    })
 }
 
 async fn load_canonical_by_id(
@@ -1371,11 +2010,14 @@ async fn replay_publish_now(
     stored: StoredCanonicalPublication,
     command: &BeginPublishNow,
 ) -> Result<PublishNowState, PublicationMutationError> {
-    if !publish_now_fingerprint_matches(
-        &stored,
-        &command.stable_post_id,
-        command.expected_revision.as_ref(),
-    ) {
+    if stored.command_kind != PublicationCommandKind::Immediate
+        || !publish_now_fingerprint_matches(
+            &stored,
+            &command.stable_post_id,
+            command.expected_revision.as_ref(),
+            &command.accepted_preview_digest,
+        )
+    {
         return Err(PublicationMutationError::Command(
             DatabaseCommandError::IdempotencyConflict,
         ));
@@ -1383,6 +2025,8 @@ async fn replay_publish_now(
     let candidate_site_digest = stored
         .activation_site_digest
         .ok_or(PublicationMutationError::CorruptStoredState)?;
+    let content_digest = stored.content_digest;
+    let accepted_preview_digest = stored.accepted_preview_digest;
 
     match stored.status {
         CanonicalPublicationStatus::Activating(publication) => {
@@ -1394,17 +2038,29 @@ async fn replay_publish_now(
                 publication_id: stored.publication_id,
                 publication,
                 site,
+                content_digest,
+                accepted_preview_digest,
                 candidate_site_digest,
             }))
         }
-        CanonicalPublicationStatus::Published(publication) => {
-            let site = load_retained_site_head(transaction, &candidate_site_digest).await?;
-            Ok(PublishNowState::Published(FinishedPublication {
-                publication_id: stored.publication_id,
-                publication,
-                site,
-            }))
-        }
+        CanonicalPublicationStatus::Published(publication) => load_completed_publication(
+            transaction,
+            stored.publication_id,
+            publication.view(),
+            Some(&candidate_site_digest),
+            accepted_preview_digest,
+        )
+        .await
+        .map(PublishNowState::Published),
+        CanonicalPublicationStatus::Superseded(publication) => load_completed_publication(
+            transaction,
+            stored.publication_id,
+            publication.view(),
+            Some(&candidate_site_digest),
+            accepted_preview_digest,
+        )
+        .await
+        .map(PublishNowState::Published),
         CanonicalPublicationStatus::Scheduled(_)
         | CanonicalPublicationStatus::Blocked(_)
         | CanonicalPublicationStatus::Cancelled(_) => Err(PublicationMutationError::Command(
@@ -1431,16 +2087,32 @@ pub(crate) async fn finish_publication(
             DatabaseCommandError::Rejected,
         ));
     }
+    let accepted_preview_digest = stored.accepted_preview_digest;
 
     match stored.status {
         CanonicalPublicationStatus::Published(publication) => {
-            finish_retry(transaction, stored.publication_id, publication, &command).await
+            finish_retry(
+                transaction,
+                stored.publication_id,
+                publication,
+                accepted_preview_digest,
+                &command,
+            )
+            .await
         }
         CanonicalPublicationStatus::Activating(publication) => {
-            finish_activation(transaction, stored.publication_id, publication, command).await
+            finish_activation(
+                transaction,
+                stored.publication_id,
+                publication,
+                accepted_preview_digest,
+                command,
+            )
+            .await
         }
         CanonicalPublicationStatus::Scheduled(_)
         | CanonicalPublicationStatus::Blocked(_)
+        | CanonicalPublicationStatus::Superseded(_)
         | CanonicalPublicationStatus::Cancelled(_) => Err(PublicationMutationError::Command(
             DatabaseCommandError::Rejected,
         )),
@@ -1451,6 +2123,7 @@ async fn finish_retry(
     transaction: &mut Transaction<'_, Sqlite>,
     publication_id: Uuid,
     publication: CanonicalPublication<canonical::Published>,
+    accepted_preview_digest: PreviewDigest,
     command: &FinishPublication,
 ) -> Result<FinishedPublication, PublicationMutationError> {
     if command.expected_publication_version.checked_add(1) != Some(publication.view().version) {
@@ -1464,6 +2137,7 @@ async fn finish_retry(
         publication_id,
         publication,
         site,
+        accepted_preview_digest,
     })
 }
 
@@ -1471,6 +2145,7 @@ async fn finish_activation(
     transaction: &mut Transaction<'_, Sqlite>,
     publication_id: Uuid,
     publication: CanonicalPublication<canonical::Activating>,
+    accepted_preview_digest: PreviewDigest,
     command: FinishPublication,
 ) -> Result<FinishedPublication, PublicationMutationError> {
     if publication.view().version != command.expected_publication_version {
@@ -1513,6 +2188,8 @@ async fn finish_activation(
         published_at_ns,
     )
     .await?;
+    supersede_current_publication(transaction, publication_id, published.view()).await?;
+    advance_published_routes(transaction, published.view()).await?;
     claim_published_route(
         transaction,
         &command.slug,
@@ -1538,7 +2215,72 @@ async fn finish_activation(
             digest: command.candidate_site_digest,
             version,
         },
+        accepted_preview_digest,
     })
+}
+
+async fn supersede_current_publication(
+    transaction: &mut Transaction<'_, Sqlite>,
+    replacing_publication_id: Uuid,
+    replacement: &CanonicalPublicationView,
+) -> Result<(), PublicationMutationError> {
+    let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT publication_id, version FROM canonical_publications \
+         WHERE stable_post_id = ? AND state = 'published' AND publication_id != ?",
+    )
+    .bind(replacement.stable_post_id.as_uuid().as_bytes().as_slice())
+    .bind(replacing_publication_id.as_bytes().as_slice())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)?;
+    if rows.len() > 1 {
+        return Err(PublicationMutationError::CorruptStoredState);
+    }
+    let Some((publication_id, version)) = rows.into_iter().next() else {
+        return Ok(());
+    };
+    let version = u64::try_from(version)
+        .ok()
+        .filter(|version| *version >= 3)
+        .ok_or(PublicationMutationError::CorruptStoredState)?;
+    let next_version = version
+        .checked_add(1)
+        .and_then(|version| i64::try_from(version).ok())
+        .ok_or(PublicationMutationError::Command(
+            DatabaseCommandError::InvalidValue,
+        ))?;
+    let updated = sqlx::query(
+        "UPDATE canonical_publications SET state = 'superseded', version = ? \
+         WHERE publication_id = ? AND state = 'published' AND version = ?",
+    )
+    .bind(next_version)
+    .bind(publication_id)
+    .bind(i64::try_from(version).expect("validated publication version fits in i64"))
+    .execute(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)?;
+    if updated.rows_affected() != 1 {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    }
+    Ok(())
+}
+
+async fn advance_published_routes(
+    transaction: &mut Transaction<'_, Sqlite>,
+    replacement: &CanonicalPublicationView,
+) -> Result<(), PublicationMutationError> {
+    sqlx::query(
+        "UPDATE published_routes SET revision_digest = ? \
+         WHERE stable_post_id = ? AND kind = 'post'",
+    )
+    .bind(replacement.pinned_post_digest.as_bytes().as_slice())
+    .bind(replacement.stable_post_id.as_uuid().as_bytes().as_slice())
+    .execute(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)?;
+    Ok(())
 }
 
 async fn retain_new_publication_site_revision(
@@ -2106,13 +2848,17 @@ mod tests {
              ) STRICT",
             "CREATE TABLE canonical_publications (\
                 publication_id BLOB PRIMARY KEY, creation_key BLOB UNIQUE, \
+                command_kind TEXT NOT NULL, \
                 stable_post_id BLOB NOT NULL, \
                 requested_revision_digest BLOB, \
                 pinned_post_digest BLOB NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL, \
                 scheduled_at_ns INTEGER NOT NULL, activation_at_ns INTEGER, \
                 activation_site_digest BLOB, \
                 published_at_ns INTEGER, current_published_digest BLOB, source_commit BLOB, \
-                block_reason TEXT\
+                block_reason TEXT, \
+                content_tree_digest BLOB NOT NULL CHECK (length(content_tree_digest) = 32), \
+                accepted_preview_digest BLOB NOT NULL \
+                    CHECK (length(accepted_preview_digest) = 32)\
              ) STRICT",
             "CREATE TABLE reload_operations (\
                 reload_operation_id BLOB PRIMARY KEY, state TEXT NOT NULL\
@@ -2172,15 +2918,23 @@ mod tests {
             matches!(state, "activating" | "published").then_some([0x66_u8; 32]);
         let creation_key = matches!(state, "activating" | "published")
             .then(|| uuid_bytes("99999999-9999-4999-8999-999999999999"));
+        let content_digest = [0x77_u8; 32];
+        let accepted_preview_digest = [0x88_u8; 32];
+        let command_kind = if state == "scheduled" {
+            "scheduled"
+        } else {
+            "immediate"
+        };
         sqlx::query(
             "INSERT INTO canonical_publications (\
-                publication_id, creation_key, stable_post_id, pinned_post_digest, state, version, \
+                publication_id, creation_key, command_kind, stable_post_id, pinned_post_digest, state, version, \
                 scheduled_at_ns, activation_at_ns, activation_site_digest, published_at_ns, \
-                current_published_digest\
-             ) VALUES (?, ?, ?, ?, ?, ?, 100, ?, ?, ?, ?)",
+                current_published_digest, content_tree_digest, accepted_preview_digest\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 100, ?, ?, ?, ?, ?, ?)",
         )
         .bind(uuid_bytes(PUBLICATION_ID))
         .bind(creation_key)
+        .bind(command_kind)
         .bind(post_id)
         .bind(revision.as_slice())
         .bind(state)
@@ -2189,6 +2943,8 @@ mod tests {
         .bind(activation_site_digest.map(|digest| digest.to_vec()))
         .bind(published_at)
         .bind(current_digest)
+        .bind(content_digest.as_slice())
+        .bind(accepted_preview_digest.as_slice())
         .execute(pool)
         .await
         .unwrap();
@@ -2207,7 +2963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_snapshot_state_rehydrates_the_published_projection() {
+    async fn startup_snapshot_state_accepts_a_published_row_with_required_bindings() {
         let (store, pool) = startup_store().await;
         let site = [0x22_u8; 32];
         insert_site_head(&pool, &site, 1).await;
@@ -2221,22 +2977,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn published_replay_returns_the_immutable_pin_after_the_current_revision_advances() {
+    async fn superseded_immediate_replay_returns_the_historical_completion() {
         let (store, pool) = startup_store().await;
         insert_site_head(&pool, &[0x66_u8; 32], 1).await;
         insert_published_publication(&pool, "published").await;
-        sqlx::query(
-            "INSERT INTO post_revisions (\
-                stable_post_id, revision_digest, publication_status, first_observed_at_ns, slug\
-             ) VALUES (?, ?, 'publishable', 2, 'published-post')",
-        )
-        .bind(uuid_bytes(POST_ID))
-        .bind([0x22_u8; 32].as_slice())
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE canonical_publications SET current_published_digest = ?")
-            .bind([0x22_u8; 32].as_slice())
+        sqlx::query("UPDATE canonical_publications SET state = 'superseded', version = 4")
             .execute(&pool)
             .await
             .unwrap();
@@ -2248,6 +2993,7 @@ mod tests {
                 ),
                 stable_post_id: PostId::parse(POST_ID).unwrap(),
                 expected_revision: None,
+                accepted_preview_digest: PreviewDigest::from_bytes([0x88; 32]),
             })
             .await
             .unwrap()
@@ -2255,21 +3001,170 @@ mod tests {
         let PublishNowState::Published(finished) = replay else {
             panic!("published creation key must replay its stored result");
         };
-        assert_eq!(
-            finished.publication.view().pinned_post_digest.as_bytes(),
-            &[0x11; 32]
-        );
-        assert_eq!(
-            finished
-                .publication
-                .view()
-                .current_published_digest
-                .as_ref()
-                .unwrap()
-                .as_bytes(),
-            &[0x22; 32]
-        );
+        assert_eq!(finished.revision.as_bytes(), &[0x11; 32]);
         assert_eq!(finished.site.digest.as_bytes(), &[0x66; 32]);
+        assert_eq!(finished.accepted_preview_digest.as_bytes(), &[0x88; 32]);
+
+        assert!(matches!(
+            store
+                .schedule_publication_replay(LookupSchedulePublication {
+                    creation_key: CommandIdempotencyKey::new(
+                        Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap(),
+                    ),
+                    stable_post_id: PostId::parse(POST_ID).unwrap(),
+                    expected_revision: None,
+                    accepted_preview_digest: PreviewDigest::from_bytes([0x88; 32]),
+                    scheduled_at: OffsetDateTime::from_unix_timestamp_nanos(100).unwrap(),
+                })
+                .await,
+            Err(SchedulePublicationLookupError::IdempotencyConflict)
+        ));
+
+        let conflict = store
+            .publish_now_replay(LookupPublishNow {
+                creation_key: CommandIdempotencyKey::new(
+                    Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap(),
+                ),
+                stable_post_id: PostId::parse(POST_ID).unwrap(),
+                expected_revision: None,
+                accepted_preview_digest: PreviewDigest::from_bytes([0x89; 32]),
+            })
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(PublishNowLookupError::IdempotencyConflict)
+        ));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn scheduled_replay_returns_the_original_candidate_before_catalog_resolution() {
+        let (store, pool) = startup_store().await;
+        insert_published_publication(&pool, "scheduled").await;
+        let creation_key = Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        sqlx::query("UPDATE canonical_publications SET creation_key = ?")
+            .bind(creation_key.as_bytes().as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let scheduled_at = OffsetDateTime::from_unix_timestamp_nanos(100).unwrap();
+        let exact_lookup = || LookupSchedulePublication {
+            creation_key: CommandIdempotencyKey::new(creation_key),
+            stable_post_id: PostId::parse(POST_ID).unwrap(),
+            expected_revision: None,
+            accepted_preview_digest: PreviewDigest::from_bytes([0x88; 32]),
+            scheduled_at,
+        };
+
+        assert!(matches!(
+            store
+                .publish_now_replay(LookupPublishNow {
+                    creation_key: CommandIdempotencyKey::new(creation_key),
+                    stable_post_id: PostId::parse(POST_ID).unwrap(),
+                    expected_revision: None,
+                    accepted_preview_digest: PreviewDigest::from_bytes([0x88; 32]),
+                })
+                .await,
+            Err(PublishNowLookupError::IdempotencyConflict)
+        ));
+
+        assert!(
+            store
+                .schedule_publication_replay(LookupSchedulePublication {
+                    creation_key: CommandIdempotencyKey::new(
+                        Uuid::parse_str("88888888-8888-4888-8888-888888888888").unwrap(),
+                    ),
+                    ..exact_lookup()
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let replayed = store
+            .schedule_publication_replay(exact_lookup())
+            .await
+            .unwrap()
+            .unwrap();
+        let SchedulePublicationReplay::Scheduled(replayed) = replayed else {
+            panic!("the retained approval must still be scheduled");
+        };
+        let current_server_content_digest = ContentTreeDigest::from_bytes([0x99; 32]);
+        assert_eq!(replayed.content_digest.as_bytes(), &[0x77; 32]);
+        assert_ne!(replayed.content_digest, current_server_content_digest);
+        assert_eq!(replayed.accepted_preview_digest.as_bytes(), &[0x88; 32]);
+        assert_eq!(replayed.publication.view().scheduled_at, scheduled_at);
+
+        for conflict in [
+            LookupSchedulePublication {
+                stable_post_id: PostId::parse("22222222-2222-4222-8222-222222222222").unwrap(),
+                ..exact_lookup()
+            },
+            LookupSchedulePublication {
+                expected_revision: Some(PostRevisionDigest::from_bytes([0x11; 32])),
+                ..exact_lookup()
+            },
+            LookupSchedulePublication {
+                accepted_preview_digest: PreviewDigest::from_bytes([0x89; 32]),
+                ..exact_lookup()
+            },
+            LookupSchedulePublication {
+                scheduled_at: OffsetDateTime::from_unix_timestamp_nanos(101).unwrap(),
+                ..exact_lookup()
+            },
+        ] {
+            assert!(matches!(
+                store.schedule_publication_replay(conflict).await,
+                Err(SchedulePublicationLookupError::IdempotencyConflict)
+            ));
+        }
+
+        sqlx::query(
+            "UPDATE canonical_publications \
+             SET state = 'activating', version = 2, activation_at_ns = 200, \
+                 activation_site_digest = ?",
+        )
+        .bind([0x66_u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.schedule_publication_replay(exact_lookup()).await,
+            Err(SchedulePublicationLookupError::ActivationInProgress)
+        ));
+
+        insert_site_head(&pool, &[0x66_u8; 32], 1).await;
+        sqlx::query(
+            "UPDATE canonical_publications \
+             SET state = 'published', version = 3, published_at_ns = 200, \
+                 current_published_digest = pinned_post_digest",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for state in ["published", "superseded"] {
+            if state == "superseded" {
+                sqlx::query(
+                    "UPDATE canonical_publications SET state = 'superseded', version = 4",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let replay = store
+                .schedule_publication_replay(exact_lookup())
+                .await
+                .unwrap()
+                .unwrap();
+            let SchedulePublicationReplay::Published(completed) = replay else {
+                panic!("a completed scheduled approval must replay as published");
+            };
+            assert_eq!(completed.publication_id, Uuid::parse_str(PUBLICATION_ID).unwrap());
+            assert_eq!(completed.revision.as_bytes(), &[0x11; 32]);
+            assert_eq!(completed.accepted_preview_digest.as_bytes(), &[0x88; 32]);
+            assert_eq!(completed.published_at.unix_timestamp_nanos(), 200);
+            assert_eq!(completed.site.digest.as_bytes(), &[0x66; 32]);
+        }
         pool.close().await;
     }
 
@@ -2286,6 +3181,8 @@ mod tests {
             Uuid::parse_str(PUBLICATION_ID).unwrap()
         );
         assert_eq!(activation.candidate_site_digest.as_bytes(), &[0x66; 32]);
+        assert_eq!(activation.content_digest.as_bytes(), &[0x77; 32]);
+        assert_eq!(activation.accepted_preview_digest.as_bytes(), &[0x88; 32]);
         assert_eq!(
             activation.publication.view().state,
             CanonicalState::Activating
@@ -2306,6 +3203,75 @@ mod tests {
         assert!(matches!(
             store.startup_snapshot_state().await,
             Err(StartupSnapshotLoadError::UnreconciledReload)
+        ));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn canonical_schema_rejects_missing_or_malformed_required_bindings() {
+        let (store, pool) = startup_store().await;
+        insert_site_head(&pool, &[0x33_u8; 32], 1).await;
+        insert_published_publication(&pool, "activating").await;
+
+        assert!(
+            sqlx::query("UPDATE canonical_publications SET content_tree_digest = NULL")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+
+        assert!(
+            sqlx::query("UPDATE canonical_publications SET content_tree_digest = ?")
+                .bind([0x77_u8; 31].as_slice())
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE canonical_publications SET accepted_preview_digest = NULL")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE canonical_publications SET accepted_preview_digest = ?")
+                .bind([0x88_u8; 33].as_slice())
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.startup_snapshot_state().await.unwrap().activating[0]
+                .accepted_preview_digest
+                .as_bytes(),
+            &[0x88; 32]
+        );
+
+        pool.execute("PRAGMA ignore_check_constraints = ON")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE canonical_publications SET accepted_preview_digest = ?")
+            .bind([0x88_u8; 31].as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.startup_snapshot_state().await,
+            Err(StartupSnapshotLoadError::InvalidAcceptedPreviewDigest)
+        ));
+        sqlx::query("UPDATE canonical_publications SET accepted_preview_digest = ?")
+            .bind([0x88_u8; 32].as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE canonical_publications SET content_tree_digest = ?")
+            .bind([0x77_u8; 33].as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.startup_snapshot_state().await,
+            Err(StartupSnapshotLoadError::InvalidContentTreeDigest)
         ));
         pool.close().await;
     }
@@ -2362,10 +3328,12 @@ mod tests {
             .unwrap();
         sqlx::query(
             "INSERT INTO canonical_publications (\
-                publication_id, stable_post_id, pinned_post_digest, state, version, \
-                scheduled_at_ns, activation_at_ns, activation_site_digest\
-             ) SELECT ?, stable_post_id, pinned_post_digest, state, version, \
-                      scheduled_at_ns, activation_at_ns, activation_site_digest \
+                publication_id, command_kind, stable_post_id, pinned_post_digest, state, version, \
+                scheduled_at_ns, activation_at_ns, activation_site_digest, content_tree_digest, \
+                accepted_preview_digest\
+             ) SELECT ?, command_kind, stable_post_id, pinned_post_digest, state, version, \
+                      scheduled_at_ns, activation_at_ns, activation_site_digest, \
+                      content_tree_digest, accepted_preview_digest \
                FROM canonical_publications LIMIT 1",
         )
         .bind(
