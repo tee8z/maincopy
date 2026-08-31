@@ -4,7 +4,7 @@
 //! that implements operations on those models. Top-level infrastructure
 //! modules provide shared mechanisms and compose the domain adapters.
 
-pub mod content;
+pub(crate) mod auth;
 pub mod distribution;
+pub(crate) mod profile;
 pub mod publication;
-pub mod tips;

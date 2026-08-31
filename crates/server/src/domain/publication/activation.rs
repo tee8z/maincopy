@@ -1,6 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::ArcSwap;
+use markdown_compiler::{
+    ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
+    SiteSnapshotDigest,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -8,21 +12,26 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    content::{
-        ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
-        SiteSnapshotDigest, SourceCommit,
-    },
     database::store::{DatabaseCommandError, DatabaseMutationError},
+    domain::{
+        auth::store::{
+            AuthCommandError, AuthMutationError, AuthStore, SetUserStatus, UserMutationResult,
+        },
+        profile::{
+            ProfileCommandError, ProfileLoadError, ProfileMutationError, ProfileStore,
+            SetTipRecipient, StoredTipRecipientSetting, StoredUserProfile, TipRecipientProjection,
+            UpdateProfile,
+        },
+    },
     frontend_assets::FrontendAssetManifest,
     render::{
         CatalogRetentionError, ContentCatalog, SiteSnapshot, SiteSnapshotActivator,
-        SiteSnapshotBuildError, build_site_snapshot,
-        render_bound_post_revision_preview, render_site_shell,
+        SiteSnapshotBuildError, build_site_snapshot, render_bound_post_revision_preview,
+        render_site_shell,
     },
     web::Readiness,
 };
 
-use super::{PublicLedgerProjection, PublishedPostRevision};
 use super::store::{
     BeginPublishNow, BeginScheduledActivation, BegunPublication, CommandIdempotencyKey,
     CompletedPublication, FinishPublication, FinishedPublication, IndexContentCatalog,
@@ -30,6 +39,7 @@ use super::store::{
     PublishNowLookupError, PublishNowState, RecoverablePublicationActivation, SchedulePublication,
     SchedulePublicationLookupError, SchedulePublicationReplay, ScheduledPublication, SiteHead,
 };
+use super::{PublicLedgerProjection, PublishedPostRevision, SourceCommit};
 
 /// Owns the serialized transition from durable publication intent to public visibility.
 pub(crate) struct PublicationCoordinator {
@@ -40,6 +50,8 @@ pub(crate) struct PublicationCoordinator {
     pub site: SiteHead,
     pub activator: SiteSnapshotActivator,
     pub store: PublicationStore,
+    pub profiles: ProfileStore,
+    pub tip_recipient: Option<TipRecipientProjection>,
     pub frontend: &'static FrontendAssetManifest,
     pub source_commit: Option<SourceCommit>,
     pub scheduled: BTreeMap<Uuid, ScheduledPublication>,
@@ -106,6 +118,7 @@ pub(crate) struct PublicationReadProjection {
     pub ledger: PublicLedgerProjection,
     pub site: SiteHead,
     pub frontend: &'static FrontendAssetManifest,
+    pub tip_recipient: Option<TipRecipientProjection>,
 }
 
 /// Cloneable bounded command capability for the single publication coordinator actor.
@@ -142,6 +155,19 @@ enum PublicationCoordinatorCommand {
         publication_id: Uuid,
         now: OffsetDateTime,
         respond_to: oneshot::Sender<Result<PublishedPublication, PublicationActivationError>>,
+    },
+    UpdateProfile {
+        command: UpdateProfile,
+        respond_to: oneshot::Sender<Result<StoredUserProfile, ProfileTransitionError>>,
+    },
+    SetTipRecipient {
+        command: SetTipRecipient,
+        respond_to: oneshot::Sender<Result<StoredTipRecipientSetting, ProfileTransitionError>>,
+    },
+    SetUserStatus {
+        store: AuthStore,
+        command: SetUserStatus,
+        respond_to: oneshot::Sender<Result<UserMutationResult, UserStatusTransitionError>>,
     },
 }
 
@@ -180,6 +206,7 @@ impl PublicationCoordinator {
             ledger: self.ledger.clone(),
             site: self.site.clone(),
             frontend: self.frontend,
+            tip_recipient: self.tip_recipient.clone(),
         }
     }
 }
@@ -250,6 +277,46 @@ impl PublicationCoordinatorHandle {
         )
         .await
         .map_err(PublicationActivationError::from)?
+    }
+
+    pub(crate) async fn update_profile(
+        &self,
+        command: UpdateProfile,
+    ) -> Result<StoredUserProfile, ProfileTransitionError> {
+        self.request(|respond_to| PublicationCoordinatorCommand::UpdateProfile {
+            command,
+            respond_to,
+        })
+        .await
+        .map_err(ProfileTransitionError::from)?
+    }
+
+    pub(crate) async fn set_tip_recipient(
+        &self,
+        command: SetTipRecipient,
+    ) -> Result<StoredTipRecipientSetting, ProfileTransitionError> {
+        self.request(
+            |respond_to| PublicationCoordinatorCommand::SetTipRecipient {
+                command,
+                respond_to,
+            },
+        )
+        .await
+        .map_err(ProfileTransitionError::from)?
+    }
+
+    pub(crate) async fn set_user_status(
+        &self,
+        store: AuthStore,
+        command: SetUserStatus,
+    ) -> Result<UserMutationResult, UserStatusTransitionError> {
+        self.request(|respond_to| PublicationCoordinatorCommand::SetUserStatus {
+            store,
+            command,
+            respond_to,
+        })
+        .await
+        .map_err(UserStatusTransitionError::from)?
     }
 
     async fn request<Response>(
@@ -341,6 +408,67 @@ impl PublicationCoordinatorActor {
                 }
                 let _ = respond_to.send(result);
             }
+            PublicationCoordinatorCommand::UpdateProfile {
+                command,
+                respond_to,
+            } => {
+                let mut safety = FailClosedGuard::new(
+                    &self.coordinator.readiness,
+                    &self.coordinator.cancellation,
+                );
+                let result = self.coordinator.update_profile(command).await;
+                if result.is_ok() {
+                    self.publish_read_projection();
+                    safety.disarm();
+                } else if result
+                    .as_ref()
+                    .is_err_and(profile_transition_definitely_uncommitted)
+                {
+                    safety.disarm();
+                }
+                let _ = respond_to.send(result);
+            }
+            PublicationCoordinatorCommand::SetTipRecipient {
+                command,
+                respond_to,
+            } => {
+                let mut safety = FailClosedGuard::new(
+                    &self.coordinator.readiness,
+                    &self.coordinator.cancellation,
+                );
+                let result = self.coordinator.set_tip_recipient(command).await;
+                if result.is_ok() {
+                    self.publish_read_projection();
+                    safety.disarm();
+                } else if result
+                    .as_ref()
+                    .is_err_and(profile_transition_definitely_uncommitted)
+                {
+                    safety.disarm();
+                }
+                let _ = respond_to.send(result);
+            }
+            PublicationCoordinatorCommand::SetUserStatus {
+                store,
+                command,
+                respond_to,
+            } => {
+                let mut safety = FailClosedGuard::new(
+                    &self.coordinator.readiness,
+                    &self.coordinator.cancellation,
+                );
+                let result = self.coordinator.set_user_status(&store, command).await;
+                if result.is_ok() {
+                    self.publish_read_projection();
+                    safety.disarm();
+                } else if result
+                    .as_ref()
+                    .is_err_and(user_status_transition_definitely_uncommitted)
+                {
+                    safety.disarm();
+                }
+                let _ = respond_to.send(result);
+            }
         }
     }
 
@@ -359,12 +487,121 @@ pub(crate) enum PublicationCoordinatorUnavailable {
 }
 
 #[derive(Debug, Error)]
+pub(crate) enum ProfileTransitionError {
+    #[error(transparent)]
+    Coordinator(#[from] PublicationCoordinatorUnavailable),
+    #[error(transparent)]
+    Mutation(#[from] ProfileMutationError),
+    #[error(transparent)]
+    Load(#[from] ProfileLoadError),
+    #[error(transparent)]
+    Snapshot(#[from] SiteSnapshotBuildError),
+    #[error("the active presentation snapshot changed during the profile transition")]
+    SnapshotActivationConflict,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum UserStatusTransitionError {
+    #[error(transparent)]
+    Coordinator(#[from] PublicationCoordinatorUnavailable),
+    #[error(transparent)]
+    Mutation(#[from] AuthMutationError),
+    #[error(transparent)]
+    Presentation(#[from] ProfileTransitionError),
+}
+
+fn user_status_transition_definitely_uncommitted(error: &UserStatusTransitionError) -> bool {
+    match error {
+        UserStatusTransitionError::Mutation(AuthMutationError::Admission(_)) => true,
+        UserStatusTransitionError::Mutation(AuthMutationError::Command(
+            AuthCommandError::OutcomeUnknown,
+        ))
+        | UserStatusTransitionError::Coordinator(_)
+        | UserStatusTransitionError::Presentation(_) => false,
+        UserStatusTransitionError::Mutation(AuthMutationError::Command(
+            AuthCommandError::AlreadyBootstrapped
+            | AuthCommandError::BootstrapRequired
+            | AuthCommandError::NotFound
+            | AuthCommandError::Conflict
+            | AuthCommandError::StaleVersion
+            | AuthCommandError::NoLoginProvider
+            | AuthCommandError::EnabledUserRequiresCredential
+            | AuthCommandError::LastEnabledOwner
+            | AuthCommandError::ScopeEscalation
+            | AuthCommandError::InvalidChallenge
+            | AuthCommandError::ChallengeCapacity
+            | AuthCommandError::ReplayCapacity
+            | AuthCommandError::SessionCapacity
+            | AuthCommandError::AgentCredentialCapacity
+            | AuthCommandError::ReplayedProof
+            | AuthCommandError::IdempotencyConflict
+            | AuthCommandError::InvalidValue,
+        )) => true,
+    }
+}
+
+fn profile_transition_definitely_uncommitted(error: &ProfileTransitionError) -> bool {
+    matches!(
+        error,
+        ProfileTransitionError::Mutation(ProfileMutationError::Admission(_))
+            | ProfileTransitionError::Mutation(ProfileMutationError::Command(
+                ProfileCommandError::NotFound
+                    | ProfileCommandError::Conflict
+                    | ProfileCommandError::Forbidden
+                    | ProfileCommandError::StaleVersion
+                    | ProfileCommandError::IdempotencyConflict
+                    | ProfileCommandError::InvalidValue
+            ))
+    )
+}
+
+#[derive(Debug, Error)]
 pub(crate) enum PublicationCoordinatorActorError {
     #[error("all publication coordinator handles were dropped")]
     HandlesDropped,
 }
 
 impl PublicationCoordinator {
+    async fn set_user_status(
+        &mut self,
+        store: &AuthStore,
+        command: SetUserStatus,
+    ) -> Result<UserMutationResult, UserStatusTransitionError> {
+        let result = store.set_user_status(command).await?;
+        self.refresh_tip_presentation().await?;
+        Ok(result)
+    }
+
+    async fn update_profile(
+        &mut self,
+        command: UpdateProfile,
+    ) -> Result<StoredUserProfile, ProfileTransitionError> {
+        let profile = self.profiles.update_profile(command).await?;
+        self.refresh_tip_presentation().await?;
+        Ok(profile)
+    }
+
+    async fn set_tip_recipient(
+        &mut self,
+        command: SetTipRecipient,
+    ) -> Result<StoredTipRecipientSetting, ProfileTransitionError> {
+        let setting = self.profiles.set_tip_recipient(command).await?;
+        self.refresh_tip_presentation().await?;
+        Ok(setting)
+    }
+
+    async fn refresh_tip_presentation(&mut self) -> Result<(), ProfileTransitionError> {
+        let tip_recipient = self.profiles.effective_tip_recipient().await?;
+        let shell = render_site_shell(Arc::clone(&self.catalog), self.frontend, &self.ledger)?
+            .bind_tip_recipient(tip_recipient.clone());
+        let snapshot = build_site_snapshot(shell, &self.ledger)?;
+        self.activator
+            .activate(&self.site.digest, snapshot)
+            .map_err(|_| ProfileTransitionError::SnapshotActivationConflict)?;
+        self.tip_recipient = tip_recipient;
+        Ok(())
+    }
+
     /// Installs one validated candidate as the private preview without changing public state.
     pub(crate) async fn apply_content_catalog(
         &mut self,
@@ -374,7 +611,7 @@ impl PublicationCoordinator {
     ) -> Result<SiteHead, ContentReloadError> {
         let retained_candidate = Arc::clone(&catalog);
         let mut candidate = catalog.as_ref().clone();
-        candidate.retain_ledger_revisions_from(&self.catalog, &self.ledger)?;
+        candidate.retain_revisions_from(&self.catalog, self.ledger.revision_keys())?;
         candidate.retain_revisions_from(
             &self.catalog,
             self.scheduled.values().map(|scheduled| {
@@ -429,7 +666,13 @@ impl PublicationCoordinator {
                 let catalog = self.catalog_for_content_digest(&begun.content_digest)?;
                 let selected = select_stored_post(&catalog, begun.publication.view())?;
                 require_accepted_preview(
-                    reproduce_preview_digest(&catalog, self.frontend, &self.ledger, &selected)?,
+                    reproduce_preview_digest(
+                        &catalog,
+                        self.frontend,
+                        &self.ledger,
+                        self.tip_recipient.as_ref(),
+                        &selected,
+                    )?,
                     &begun.accepted_preview_digest,
                 )?;
                 let candidate = self.candidate_for_begun(
@@ -453,7 +696,13 @@ impl PublicationCoordinator {
         )?;
         require_update_precondition(&self.ledger, &selected, command.expected_revision.as_ref())?;
         require_accepted_preview(
-            reproduce_preview_digest(&self.catalog, self.frontend, &self.ledger, &selected)?,
+            reproduce_preview_digest(
+                &self.catalog,
+                self.frontend,
+                &self.ledger,
+                self.tip_recipient.as_ref(),
+                &selected,
+            )?,
             &command.accepted_preview_digest,
         )?;
         let now = OffsetDateTime::now_utc();
@@ -461,6 +710,7 @@ impl PublicationCoordinator {
             Arc::clone(&self.catalog),
             self.frontend,
             &self.ledger,
+            self.tip_recipient.as_ref(),
             &selected,
             now,
         )?;
@@ -579,7 +829,13 @@ impl PublicationCoordinator {
         )?;
         require_update_precondition(&self.ledger, &selected, command.expected_revision.as_ref())?;
         require_accepted_preview(
-            reproduce_preview_digest(&self.catalog, self.frontend, &self.ledger, &selected)?,
+            reproduce_preview_digest(
+                &self.catalog,
+                self.frontend,
+                &self.ledger,
+                self.tip_recipient.as_ref(),
+                &selected,
+            )?,
             &command.accepted_preview_digest,
         )?;
         let scheduled = self
@@ -627,7 +883,13 @@ impl PublicationCoordinator {
         let catalog = self.catalog_for_content_digest(&scheduled.content_digest)?;
         let selected = select_stored_post(&catalog, scheduled.publication.view())?;
         require_accepted_preview(
-            reproduce_preview_digest(&catalog, self.frontend, &self.ledger, &selected)?,
+            reproduce_preview_digest(
+                &catalog,
+                self.frontend,
+                &self.ledger,
+                self.tip_recipient.as_ref(),
+                &selected,
+            )?,
             &scheduled.accepted_preview_digest,
         )?;
 
@@ -671,15 +933,28 @@ impl PublicationCoordinator {
             .ok_or(PublicationActivationError::DurableStateMismatch)?;
         let mut catalog = retained.as_ref().clone();
         catalog
-            .retain_ledger_revisions_from(&self.catalog, &self.ledger)
+            .retain_revisions_from(&self.catalog, self.ledger.revision_keys())
             .map_err(|_| PublicationActivationError::DurableStateMismatch)?;
         let catalog = Arc::new(catalog);
         let selected = select_stored_post(&catalog, view)?;
         require_accepted_preview(
-            reproduce_preview_digest(&catalog, self.frontend, &self.ledger, &selected)?,
+            reproduce_preview_digest(
+                &catalog,
+                self.frontend,
+                &self.ledger,
+                self.tip_recipient.as_ref(),
+                &selected,
+            )?,
             &scheduled.accepted_preview_digest,
         )?;
-        let prebuilt = build_candidate(catalog, self.frontend, &self.ledger, &selected, now)?;
+        let prebuilt = build_candidate(
+            catalog,
+            self.frontend,
+            &self.ledger,
+            self.tip_recipient.as_ref(),
+            &selected,
+            now,
+        )?;
         if prebuilt.already_published {
             return Err(PublicationActivationError::DurableStateMismatch);
         }
@@ -732,7 +1007,13 @@ impl PublicationCoordinator {
         let catalog = self.catalog_for_content_digest(&activation.content_digest)?;
         let selected = select_stored_post(&catalog, view)?;
         require_accepted_preview(
-            reproduce_preview_digest(&catalog, self.frontend, &self.ledger, &selected)?,
+            reproduce_preview_digest(
+                &catalog,
+                self.frontend,
+                &self.ledger,
+                self.tip_recipient.as_ref(),
+                &selected,
+            )?,
             &activation.accepted_preview_digest,
         )?;
         let candidate = self.candidate_for_begun(
@@ -778,7 +1059,14 @@ impl PublicationCoordinator {
             {
                 prebuilt
             }
-            _ => build_candidate(catalog, self.frontend, &self.ledger, selected, published_at)?,
+            _ => build_candidate(
+                catalog,
+                self.frontend,
+                &self.ledger,
+                self.tip_recipient.as_ref(),
+                selected,
+                published_at,
+            )?,
         };
         if candidate.already_published {
             return Err(PublicationActivationError::DurableStateMismatch);
@@ -797,7 +1085,7 @@ impl PublicationCoordinator {
             .ok_or(PublicationActivationError::DurableStateMismatch)?;
         let mut catalog = retained.as_ref().clone();
         catalog
-            .retain_ledger_revisions_from(&self.catalog, &self.ledger)
+            .retain_revisions_from(&self.catalog, self.ledger.revision_keys())
             .map_err(|_| PublicationActivationError::DurableStateMismatch)?;
         Ok(Arc::new(catalog))
     }
@@ -935,6 +1223,7 @@ fn reproduce_preview_digest(
     catalog: &ContentCatalog,
     frontend: &'static FrontendAssetManifest,
     ledger: &PublicLedgerProjection,
+    tip_recipient: Option<&TipRecipientProjection>,
     selected: &SelectedPost,
 ) -> Result<PreviewDigest, PublicationActivationError> {
     let published_at = ledger
@@ -945,6 +1234,7 @@ fn reproduce_preview_digest(
         frontend,
         &selected.stable_post_id,
         &selected.revision,
+        tip_recipient,
         "/api/admin/v1/preview-assets/reproduce",
         published_at,
     )?
@@ -980,6 +1270,7 @@ fn build_candidate(
     catalog: Arc<ContentCatalog>,
     frontend: &'static FrontendAssetManifest,
     current: &PublicLedgerProjection,
+    tip_recipient: Option<&TipRecipientProjection>,
     selected: &SelectedPost,
     published_at: OffsetDateTime,
 ) -> Result<CandidateSnapshot, PublicationActivationError> {
@@ -995,7 +1286,8 @@ fn build_candidate(
             published_at,
         ))
     };
-    let shell = render_site_shell(catalog, frontend, &ledger)?;
+    let shell =
+        render_site_shell(catalog, frontend, &ledger)?.bind_tip_recipient(tip_recipient.cloned());
     let snapshot = build_site_snapshot(shell, &ledger)?;
     let digest = snapshot.digest.clone();
     Ok(CandidateSnapshot {
@@ -1194,8 +1486,15 @@ pub(crate) enum ContentReloadError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{collections::BTreeSet, path::Path};
 
+    use maincopy_shared::{
+        auth::{
+            AdminAuditEventId, AdminSessionId, HumanLoginProvider, InstanceId, LoginChallengeId,
+            UserId, UserRole, UserStatus,
+        },
+        profile::{LightningAddress, ProfileDisplayName, ProfileVersion},
+    };
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use tokio::task::JoinHandle;
 
@@ -1205,19 +1504,36 @@ mod tests {
             DatabaseBusyTimeout, DatabaseConfigurationView, DatabaseReadPoolSize,
             DatabaseWriterQueueCapacity,
         },
-        content::{
-            DiscoveredContentTree, DiscoveredPost, LogicalAssetPath, PostCollection,
-            resolve_content_assets,
-            tree::{asset, post, publication},
-        },
         database,
-        domain::publication::store::{InstallStartupSnapshot, ObservedPostRevision},
+        domain::{
+            auth::{
+                CsrfTokenDigest, LoginChallengeDigest, Nip98EventId, NostrPublicKey,
+                SessionTokenDigest,
+                store::{
+                    AdminMutationKey, AuditPrincipalReference, BootstrapIdentity,
+                    ConfiguredLoginProviders, CreateBrowserSession, CreateLoginChallenge,
+                    CreateUser, MutationAuditContext, NewHumanCredential, SessionAuditContext,
+                    SessionAuthenticationEvidence,
+                },
+            },
+            profile::ProfilePrecondition,
+            publication::store::{InstallStartupSnapshot, ObservedPostRevision},
+        },
         frontend_assets::embedded_manifest,
-        render::{compile_content_catalog, snapshot_store},
+        render::{SiteSnapshotReader, compile_content_catalog, snapshot_store},
     };
+    use markdown_compiler::{
+        DiscoveredPost, LogicalAssetPath, PostCollection, resolve_content_assets,
+    };
+
+    use crate::content_fixtures::{asset, content_tree, post, publication};
 
     const PUBLISHABLE_ID: &str = "11111111-1111-4111-8111-111111111111";
     const DRAFT_ID: &str = "22222222-2222-4222-8222-222222222222";
+    const OWNER_NOSTR_KEY: &str =
+        "63fe6318dc58583cfe16810f86dd09e18bfd76aabc24a0081ce2856f330504ed";
+    const RECIPIENT_NOSTR_KEY: &str =
+        "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
 
     fn catalog() -> Arc<ContentCatalog> {
         compile_catalog(vec![
@@ -1258,8 +1574,38 @@ mod tests {
         ])
     }
 
+    fn tips_catalog(body: &str) -> Arc<ContentCatalog> {
+        let tree = content_tree(
+            publication(
+                "publication.toml",
+                "[site]\n\
+                 title = \"Activation tips tests\"\n\
+                 base_url = \"https://example.com/\"\n\
+                 description = \"Activation tips tests.\"\n\
+                 [author]\n\
+                 name = \"Example Author\"\n\
+                 [tips]\n\
+                 enabled = true\n\
+                 [assets]\n\
+                 allowed_https_origins = []\n"
+                    .to_owned(),
+            ),
+            vec![post(
+                "posts/publishable.md",
+                PostCollection::Posts,
+                post_source(PUBLISHABLE_ID, "publishable", false)
+                    .replace("Publication body.", body),
+            )],
+            Vec::new(),
+            0,
+        );
+        let content = tree.validate().unwrap();
+        let assets = resolve_content_assets(&tree, &content).unwrap();
+        Arc::new(compile_content_catalog(&content, &assets).unwrap())
+    }
+
     fn compile_catalog(posts: Vec<DiscoveredPost>) -> Arc<ContentCatalog> {
-        let tree = DiscoveredContentTree::new(
+        let tree = content_tree(
             publication(
                 "publication.toml",
                 "[site]\n\
@@ -1282,7 +1628,7 @@ mod tests {
     }
 
     fn catalog_with_site_candidate(title: &str, favicon_bytes: &[u8]) -> Arc<ContentCatalog> {
-        let tree = DiscoveredContentTree::new(
+        let tree = content_tree(
             publication(
                 "publication.toml",
                 format!(
@@ -1357,6 +1703,8 @@ mod tests {
     ) -> (
         tempfile::TempDir,
         PublicationStore,
+        ProfileStore,
+        AuthStore,
         SiteHead,
         CancellationToken,
         JoinHandle<()>,
@@ -1372,6 +1720,8 @@ mod tests {
         let task = tokio::spawn(async move {
             writer.run(writer_shutdown).await.unwrap();
         });
+        let auth = store.auth;
+        let profiles = store.profiles;
         let publications = store.publications;
         let head = publications
             .install_startup_snapshot(InstallStartupSnapshot {
@@ -1383,7 +1733,51 @@ mod tests {
             })
             .await
             .unwrap();
-        (root, publications, head, shutdown, task)
+        (root, publications, profiles, auth, head, shutdown, task)
+    }
+
+    async fn profile_transition_fixture(
+        catalog: Arc<ContentCatalog>,
+    ) -> (
+        tempfile::TempDir,
+        PublicationCoordinator,
+        AuthStore,
+        SiteSnapshotReader,
+        CancellationToken,
+        JoinHandle<()>,
+    ) {
+        let ledger = PublicLedgerProjection::empty();
+        let initial = snapshot(&catalog, &ledger);
+        let initial_digest = initial.digest.clone();
+        let (root, store, profiles, auth, head, writer_shutdown, writer_task) =
+            start_store(&catalog, initial_digest).await;
+        let (reader, activator) = snapshot_store(initial);
+        let content_digest = ContentTreeDigest::from_bytes([0x11; 32]);
+        let coordinator = PublicationCoordinator {
+            catalog: Arc::clone(&catalog),
+            content_digest: content_digest.clone(),
+            candidates: candidate_catalogs(&catalog, content_digest),
+            ledger,
+            site: head,
+            activator,
+            store,
+            profiles,
+            tip_recipient: None,
+            frontend: embedded_manifest(),
+            source_commit: None,
+            scheduled: BTreeMap::new(),
+            scheduler_wakeup: Arc::new(Notify::new()),
+            readiness: Readiness::new(true),
+            cancellation: CancellationToken::new(),
+        };
+        (
+            root,
+            coordinator,
+            auth,
+            reader,
+            writer_shutdown,
+            writer_task,
+        )
     }
 
     fn database_configuration(path: &Path) -> DatabaseConfigurationView<'_> {
@@ -1392,6 +1786,180 @@ mod tests {
             busy_timeout: DatabaseBusyTimeout::from_milliseconds(1_000).unwrap(),
             writer_queue_capacity: DatabaseWriterQueueCapacity::new(8).unwrap(),
             read_pool_size: DatabaseReadPoolSize::new(2).unwrap(),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TipStatusUsers {
+        owner: UserId,
+        recipient: UserId,
+        providers: ConfiguredLoginProviders,
+    }
+
+    fn fixture_uuid(discriminator: u128) -> Uuid {
+        Uuid::from_u128(0xaaaa_aaaa_aaaa_4aaa_8aaa_0000_0000_0000 | discriminator)
+    }
+
+    fn fixture_time(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(seconds).unwrap()
+    }
+
+    fn mutation_audit(actor: UserId, discriminator: u128) -> MutationAuditContext {
+        MutationAuditContext {
+            audit_event_id: AdminAuditEventId::from_uuid(fixture_uuid(100 + discriminator)),
+            principal: AuditPrincipalReference::BrowserSession {
+                user_id: actor,
+                session_id: actor_session_id(actor),
+            },
+            request_id: Some(fixture_uuid(300 + discriminator)),
+            idempotency_key: AdminMutationKey(fixture_uuid(400 + discriminator)),
+        }
+    }
+
+    fn actor_session_id(actor: UserId) -> AdminSessionId {
+        let discriminator = if actor.as_uuid() == &fixture_uuid(1) {
+            201
+        } else {
+            202
+        };
+        AdminSessionId::from_uuid(fixture_uuid(discriminator))
+    }
+
+    async fn create_nostr_session(
+        auth: &AuthStore,
+        user_id: UserId,
+        discriminator: u8,
+        authenticated_at: OffsetDateTime,
+    ) {
+        let challenge_id =
+            LoginChallengeId::from_uuid(fixture_uuid(700 + u128::from(discriminator)));
+        let challenge_digest = LoginChallengeDigest::parse_bytes(&[discriminator; 32]).unwrap();
+        auth.create_login_challenge(CreateLoginChallenge {
+            challenge_id,
+            provider: HumanLoginProvider::Nostr,
+            challenge_digest,
+            created_at: authenticated_at - time::Duration::seconds(10),
+            expires_at: authenticated_at + time::Duration::minutes(1),
+        })
+        .await
+        .unwrap();
+        auth.create_browser_session(CreateBrowserSession {
+            session_id: actor_session_id(user_id),
+            user_id,
+            expected_user_version: 1,
+            session_token_digest: SessionTokenDigest::parse_bytes(&[discriminator + 10; 32])
+                .unwrap(),
+            csrf_token_digest: CsrfTokenDigest::parse_bytes(&[discriminator + 20; 32]).unwrap(),
+            evidence: SessionAuthenticationEvidence::Nostr {
+                expected_credential_version: 1,
+                challenge_id,
+                challenge_digest,
+                event_id: Nip98EventId::parse_bytes(&[discriminator + 30; 32]).unwrap(),
+                proof_created_at: authenticated_at,
+            },
+            authenticated_at,
+            fresh_until: authenticated_at + time::Duration::hours(1),
+            expires_at: authenticated_at + time::Duration::hours(2),
+            audit: SessionAuditContext {
+                audit_event_id: AdminAuditEventId::from_uuid(fixture_uuid(
+                    800 + u128::from(discriminator),
+                )),
+                request_id: Some(fixture_uuid(900 + u128::from(discriminator))),
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn seed_tip_recipient(
+        coordinator: &mut PublicationCoordinator,
+        auth: &AuthStore,
+    ) -> TipStatusUsers {
+        let owner = UserId::from_uuid(fixture_uuid(1));
+        let recipient = UserId::from_uuid(fixture_uuid(2));
+        let providers = ConfiguredLoginProviders::new(false, true).unwrap();
+        auth.bootstrap_identity(BootstrapIdentity {
+            instance_id: InstanceId::from_uuid(fixture_uuid(3)),
+            owner_user_id: owner,
+            credential: NewHumanCredential::Nostr {
+                public_key: NostrPublicKey::parse(OWNER_NOSTR_KEY).unwrap(),
+            },
+            configured_providers: providers,
+            occurred_at: fixture_time(2_000),
+            audit_event_id: AdminAuditEventId::from_uuid(fixture_uuid(4)),
+        })
+        .await
+        .unwrap();
+        create_nostr_session(auth, owner, 1, fixture_time(2_050)).await;
+        auth.create_user(CreateUser {
+            user_id: recipient,
+            created_by_user_id: owner,
+            status: UserStatus::Enabled,
+            roles: BTreeSet::from([UserRole::Administrator]),
+            credentials: vec![NewHumanCredential::Nostr {
+                public_key: NostrPublicKey::parse(RECIPIENT_NOSTR_KEY).unwrap(),
+            }],
+            configured_providers: providers,
+            occurred_at: fixture_time(2_100),
+            audit: mutation_audit(owner, 1),
+        })
+        .await
+        .unwrap();
+        create_nostr_session(auth, recipient, 2, fixture_time(2_150)).await;
+        coordinator
+            .update_profile(UpdateProfile {
+                user_id: recipient,
+                precondition: ProfilePrecondition::Create,
+                display_name: Some(ProfileDisplayName::parse("Tip Recipient").unwrap()),
+                lightning_address: Some(LightningAddress::parse("tips@example.com").unwrap()),
+                tips_enabled: true,
+                occurred_at: fixture_time(2_200),
+                audit: mutation_audit(recipient, 2),
+            })
+            .await
+            .unwrap();
+        coordinator
+            .set_tip_recipient(SetTipRecipient {
+                expected_version: ProfileVersion::new(1).unwrap(),
+                recipient_user_id: Some(recipient),
+                occurred_at: fixture_time(2_300),
+                audit: mutation_audit(owner, 3),
+            })
+            .await
+            .unwrap();
+        assert!(coordinator.tip_recipient.is_some());
+        TipStatusUsers {
+            owner,
+            recipient,
+            providers,
+        }
+    }
+
+    fn disable_recipient(users: TipStatusUsers, discriminator: u128) -> SetUserStatus {
+        SetUserStatus {
+            user_id: users.recipient,
+            changed_by_user_id: users.owner,
+            expected_version: 1,
+            status: UserStatus::Disabled,
+            configured_providers: users.providers,
+            occurred_at: fixture_time(2_400),
+            audit: mutation_audit(users.owner, discriminator),
+        }
+    }
+
+    fn replace_recipient_address(
+        users: TipStatusUsers,
+        address: &str,
+        discriminator: u128,
+    ) -> UpdateProfile {
+        UpdateProfile {
+            user_id: users.recipient,
+            precondition: ProfilePrecondition::Replace(ProfileVersion::new(1).unwrap()),
+            display_name: Some(ProfileDisplayName::parse("Tip Recipient").unwrap()),
+            lightning_address: Some(LightningAddress::parse(address).unwrap()),
+            tips_enabled: true,
+            occurred_at: fixture_time(2_500),
+            audit: mutation_audit(users.recipient, discriminator),
         }
     }
 
@@ -1430,7 +1998,7 @@ mod tests {
 
     fn preview_digest(catalog: &ContentCatalog, ledger: &PublicLedgerProjection) -> PreviewDigest {
         let selected = select_post(catalog, &PostId::parse(PUBLISHABLE_ID).unwrap(), None).unwrap();
-        reproduce_preview_digest(catalog, embedded_manifest(), ledger, &selected).unwrap()
+        reproduce_preview_digest(catalog, embedded_manifest(), ledger, None, &selected).unwrap()
     }
 
     async fn coordinator_fixture(
@@ -1445,7 +2013,7 @@ mod tests {
         let ledger = PublicLedgerProjection::empty();
         let initial = snapshot(&catalog, &ledger);
         let initial_digest = initial.digest.clone();
-        let (root, store, head, writer_shutdown, writer_task) =
+        let (root, store, profiles, _auth, head, writer_shutdown, writer_task) =
             start_store(&catalog, initial_digest).await;
         let (_, activator) = snapshot_store(initial);
         let content_digest = ContentTreeDigest::from_bytes([0x11; 32]);
@@ -1458,6 +2026,8 @@ mod tests {
             site: head,
             activator,
             store,
+            profiles,
+            tip_recipient: None,
             frontend: embedded_manifest(),
             source_commit: None,
             scheduled: BTreeMap::new(),
@@ -1475,13 +2045,20 @@ mod tests {
     }
 
     async fn wait_for_full_mailbox(handle: &PublicationCoordinatorHandle) {
+        wait_for_mailbox_capacity(handle, 0).await;
+    }
+
+    async fn wait_for_mailbox_capacity(
+        handle: &PublicationCoordinatorHandle,
+        expected_capacity: usize,
+    ) {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while handle.commands.capacity() != 0 {
+            while handle.commands.capacity() != expected_capacity {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("a command should fill the bounded actor mailbox");
+        .expect("commands should reach the expected bounded mailbox capacity");
     }
 
     #[tokio::test]
@@ -1643,6 +2220,342 @@ mod tests {
         drop(root);
     }
 
+    #[tokio::test]
+    async fn status_post_commit_presentation_failure_marks_the_service_unready_and_cancels_it() {
+        let catalog = catalog();
+        let ledger = PublicLedgerProjection::empty();
+        let initial = snapshot(&catalog, &ledger);
+        let initial_digest = initial.digest.clone();
+        let (root, store, profiles, auth, head, writer_shutdown, writer_task) =
+            start_store(&catalog, initial_digest).await;
+        let (_, activator) = snapshot_store(initial);
+        let content_digest = ContentTreeDigest::from_bytes([0x11; 32]);
+        let mut coordinator = PublicationCoordinator {
+            catalog: Arc::clone(&catalog),
+            content_digest: content_digest.clone(),
+            candidates: candidate_catalogs(&catalog, content_digest),
+            ledger,
+            site: head,
+            activator,
+            store,
+            profiles,
+            tip_recipient: None,
+            frontend: embedded_manifest(),
+            source_commit: None,
+            scheduled: BTreeMap::new(),
+            scheduler_wakeup: Arc::new(Notify::new()),
+            readiness: Readiness::new(true),
+            cancellation: CancellationToken::new(),
+        };
+        let users = seed_tip_recipient(&mut coordinator, &auth).await;
+        let readiness = coordinator.readiness.clone();
+        let cancellation = coordinator.cancellation.clone();
+        let conflicting_catalog = catalog_with_site_candidate("Conflicting site", b"different");
+        let conflicting_snapshot = snapshot(&conflicting_catalog, &PublicLedgerProjection::empty());
+        let (_, conflicting_activator) = snapshot_store(conflicting_snapshot);
+        coordinator.activator = conflicting_activator;
+
+        let (handle, actor) = coordinator.into_actor(1);
+        let actor_task = tokio::spawn(actor.run(cancellation.clone()));
+
+        assert!(matches!(
+            handle
+                .set_user_status(auth.clone(), disable_recipient(users, 4))
+                .await,
+            Err(UserStatusTransitionError::Presentation(
+                ProfileTransitionError::SnapshotActivationConflict
+            ))
+        ));
+        assert_eq!(
+            auth.user(users.recipient).await.unwrap().unwrap().status,
+            UserStatus::Disabled
+        );
+        assert!(!readiness.is_ready());
+        assert!(cancellation.is_cancelled());
+
+        actor_task.await.unwrap().unwrap();
+        drop(handle);
+        writer_shutdown.cancel();
+        writer_task.await.unwrap();
+        drop(auth);
+        drop(root);
+    }
+
+    #[tokio::test]
+    async fn disabling_selected_recipient_is_a_fifo_barrier_for_reload_and_activation() {
+        let catalog = tips_catalog("Publication body.");
+        let ledger = PublicLedgerProjection::empty();
+        let initial = snapshot(&catalog, &ledger);
+        let initial_digest = initial.digest.clone();
+        let (root, store, profiles, auth, head, writer_shutdown, writer_task) =
+            start_store(&catalog, initial_digest).await;
+        let (reader, activator) = snapshot_store(initial);
+        let content_digest = ContentTreeDigest::from_bytes([0x11; 32]);
+        let mut coordinator = PublicationCoordinator {
+            catalog: Arc::clone(&catalog),
+            content_digest: content_digest.clone(),
+            candidates: candidate_catalogs(&catalog, content_digest),
+            ledger,
+            site: head,
+            activator,
+            store,
+            profiles,
+            tip_recipient: None,
+            frontend: embedded_manifest(),
+            source_commit: None,
+            scheduled: BTreeMap::new(),
+            scheduler_wakeup: Arc::new(Notify::new()),
+            readiness: Readiness::new(true),
+            cancellation: CancellationToken::new(),
+        };
+        let users = seed_tip_recipient(&mut coordinator, &auth).await;
+        let selected = select_post(
+            &coordinator.catalog,
+            &PostId::parse(PUBLISHABLE_ID).unwrap(),
+            None,
+        )
+        .unwrap();
+        let accepted_preview_digest = reproduce_preview_digest(
+            &coordinator.catalog,
+            embedded_manifest(),
+            &coordinator.ledger,
+            coordinator.tip_recipient.as_ref(),
+            &selected,
+        )
+        .unwrap();
+        let stable_post_id = selected.stable_post_id.clone();
+        let published_slug = selected.slug.clone();
+        coordinator
+            .publish_now(PublishNow {
+                creation_key: fixture_uuid(500),
+                publication_id: fixture_uuid(501),
+                stable_post_id,
+                expected_revision: None,
+                accepted_preview_digest,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reader
+                .load_full()
+                .post_page(&published_slug)
+                .unwrap()
+                .contains("class=\"tip-cta\"")
+        );
+
+        let revised = tips_catalog("Revised publication body.");
+        let revised_digest = ContentTreeDigest::from_bytes([0x22; 32]);
+        let mut retained = revised.as_ref().clone();
+        retained
+            .retain_revisions_from(&coordinator.catalog, coordinator.ledger.revision_keys())
+            .unwrap();
+        let retained = Arc::new(retained);
+        let selected =
+            select_post(&retained, &PostId::parse(PUBLISHABLE_ID).unwrap(), None).unwrap();
+        let accepted_preview_digest = reproduce_preview_digest(
+            &retained,
+            embedded_manifest(),
+            &coordinator.ledger,
+            None,
+            &selected,
+        )
+        .unwrap();
+        let update = PublishNow {
+            creation_key: fixture_uuid(502),
+            publication_id: fixture_uuid(503),
+            stable_post_id: selected.stable_post_id.clone(),
+            expected_revision: Some(selected.revision.clone()),
+            accepted_preview_digest,
+        };
+        let readiness = coordinator.readiness.clone();
+        let service_cancellation = coordinator.cancellation.clone();
+        let (handle, actor) = coordinator.into_actor(2);
+
+        let status = tokio::spawn({
+            let handle = handle.clone();
+            let auth = auth.clone();
+            async move {
+                handle
+                    .set_user_status(auth, disable_recipient(users, 5))
+                    .await
+            }
+        });
+        wait_for_mailbox_capacity(&handle, 1).await;
+        let reload = tokio::spawn({
+            let handle = handle.clone();
+            let revised_digest = revised_digest.clone();
+            async move {
+                handle
+                    .apply_content_catalog(revised, revised_digest, None)
+                    .await
+            }
+        });
+        wait_for_full_mailbox(&handle).await;
+        let activation = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.publish_now(update).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!activation.is_finished());
+
+        let actor_cancellation = CancellationToken::new();
+        let actor_task = tokio::spawn(actor.run(actor_cancellation.clone()));
+        let result = status.await.unwrap().unwrap();
+        assert_eq!(result.user_id, users.recipient);
+        assert_eq!(result.version, 2);
+        reload.await.unwrap().unwrap();
+        activation.await.unwrap().unwrap();
+
+        let projection = handle.read();
+        assert!(projection.tip_recipient.is_none());
+        assert!(
+            !reader
+                .load_full()
+                .post_page(&published_slug)
+                .unwrap()
+                .contains("class=\"tip-cta\"")
+        );
+        assert!(readiness.is_ready());
+        assert!(!service_cancellation.is_cancelled());
+
+        actor_cancellation.cancel();
+        actor_task.await.unwrap().unwrap();
+        drop(handle);
+        writer_shutdown.cancel();
+        writer_task.await.unwrap();
+        drop(auth);
+        drop(root);
+    }
+
+    #[tokio::test]
+    async fn selected_address_replacement_changes_only_public_presentation_identity() {
+        let catalog = tips_catalog("Publication body.");
+        let (root, mut coordinator, auth, reader, writer_shutdown, writer_task) =
+            profile_transition_fixture(catalog).await;
+        let users = seed_tip_recipient(&mut coordinator, &auth).await;
+        let selected = select_post(
+            &coordinator.catalog,
+            &PostId::parse(PUBLISHABLE_ID).unwrap(),
+            None,
+        )
+        .unwrap();
+        let accepted_preview_digest = reproduce_preview_digest(
+            &coordinator.catalog,
+            embedded_manifest(),
+            &coordinator.ledger,
+            coordinator.tip_recipient.as_ref(),
+            &selected,
+        )
+        .unwrap();
+        let stable_post_id = selected.stable_post_id.clone();
+        let slug = selected.slug.clone();
+        let published = coordinator
+            .publish_now(PublishNow {
+                creation_key: fixture_uuid(510),
+                publication_id: fixture_uuid(511),
+                stable_post_id: stable_post_id.clone(),
+                expected_revision: None,
+                accepted_preview_digest,
+            })
+            .await
+            .unwrap();
+        let before = reader.load_full();
+        let before_site_digest = before.digest.clone();
+        let before_presentation_digest = before.presentation_digest;
+        assert!(
+            before
+                .post_page(&slug)
+                .unwrap()
+                .contains("tips@example.com")
+        );
+
+        let readiness = coordinator.readiness.clone();
+        let service_cancellation = coordinator.cancellation.clone();
+        let (handle, actor) = coordinator.into_actor(1);
+        let actor_cancellation = CancellationToken::new();
+        let actor_task = tokio::spawn(actor.run(actor_cancellation.clone()));
+        let updated = handle
+            .update_profile(replace_recipient_address(
+                users,
+                "recipient@new.example.com",
+                6,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.version, ProfileVersion::new(2).unwrap());
+
+        let after = reader.load_full();
+        let html = after.post_page(&slug).unwrap();
+        assert!(html.contains("recipient@new.example.com"));
+        assert!(!html.contains("tips@example.com"));
+        assert_eq!(after.digest, before_site_digest);
+        assert_ne!(after.presentation_digest, before_presentation_digest);
+        assert_eq!(
+            handle
+                .read()
+                .ledger
+                .published_post(&stable_post_id)
+                .unwrap()
+                .revision,
+            published.revision
+        );
+        assert!(readiness.is_ready());
+        assert!(!service_cancellation.is_cancelled());
+
+        actor_cancellation.cancel();
+        actor_task.await.unwrap().unwrap();
+        drop(handle);
+        writer_shutdown.cancel();
+        writer_task.await.unwrap();
+        drop(auth);
+        drop(root);
+    }
+
+    #[tokio::test]
+    async fn profile_post_commit_presentation_failure_keeps_durable_edit_and_fails_closed() {
+        let catalog = catalog();
+        let (root, mut coordinator, auth, _reader, writer_shutdown, writer_task) =
+            profile_transition_fixture(catalog).await;
+        let users = seed_tip_recipient(&mut coordinator, &auth).await;
+        let profiles = coordinator.profiles.clone();
+        let readiness = coordinator.readiness.clone();
+        let cancellation = coordinator.cancellation.clone();
+        let conflicting_catalog = catalog_with_site_candidate("Conflicting site", b"different");
+        let conflicting_snapshot = snapshot(&conflicting_catalog, &PublicLedgerProjection::empty());
+        let (_, conflicting_activator) = snapshot_store(conflicting_snapshot);
+        coordinator.activator = conflicting_activator;
+
+        let (handle, actor) = coordinator.into_actor(1);
+        let actor_task = tokio::spawn(actor.run(cancellation.clone()));
+        assert!(matches!(
+            handle
+                .update_profile(replace_recipient_address(
+                    users,
+                    "durable@new.example.com",
+                    7,
+                ))
+                .await,
+            Err(ProfileTransitionError::SnapshotActivationConflict)
+        ));
+
+        let durable = profiles.profile(users.recipient).await.unwrap().unwrap();
+        assert_eq!(durable.version, ProfileVersion::new(2).unwrap());
+        assert_eq!(
+            durable.lightning_address.unwrap().as_str(),
+            "durable@new.example.com"
+        );
+        assert!(!readiness.is_ready());
+        assert!(cancellation.is_cancelled());
+
+        actor_task.await.unwrap().unwrap();
+        drop(handle);
+        writer_shutdown.cancel();
+        writer_task.await.unwrap();
+        drop(profiles);
+        drop(auth);
+        drop(root);
+    }
+
     #[test]
     fn catalog_selection_rejects_missing_draft_and_stale_posts() {
         let catalog = catalog();
@@ -1676,7 +2589,8 @@ mod tests {
         let ledger = PublicLedgerProjection::empty();
         let initial = snapshot(&catalog, &ledger);
         let initial_digest = initial.digest.clone();
-        let (_root, store, head, shutdown, task) = start_store(&catalog, initial_digest).await;
+        let (_root, store, profiles, _auth, head, shutdown, task) =
+            start_store(&catalog, initial_digest).await;
         let (reader, activator) = snapshot_store(initial);
         let readiness = Readiness::new(true);
         let cancellation = CancellationToken::new();
@@ -1689,6 +2603,8 @@ mod tests {
             site: head,
             activator,
             store: store.clone(),
+            profiles,
+            tip_recipient: None,
             frontend: embedded_manifest(),
             source_commit: None,
             scheduled: BTreeMap::new(),
@@ -1768,7 +2684,8 @@ mod tests {
         let ledger = PublicLedgerProjection::empty();
         let initial = snapshot(&catalog, &ledger);
         let initial_digest = initial.digest.clone();
-        let (_root, store, head, shutdown, task) = start_store(&catalog, initial_digest).await;
+        let (_root, store, profiles, _auth, head, shutdown, task) =
+            start_store(&catalog, initial_digest).await;
 
         let selected =
             select_post(&catalog, &PostId::parse(PUBLISHABLE_ID).unwrap(), None).unwrap();
@@ -1776,6 +2693,7 @@ mod tests {
             Arc::clone(&catalog),
             embedded_manifest(),
             &ledger,
+            None,
             &selected,
             OffsetDateTime::from_unix_timestamp(2_000).unwrap(),
         )
@@ -1793,6 +2711,8 @@ mod tests {
             site: head,
             activator: wrong_activator,
             store: store.clone(),
+            profiles: profiles.clone(),
+            tip_recipient: None,
             frontend: embedded_manifest(),
             source_commit: None,
             scheduled: BTreeMap::new(),
@@ -1823,6 +2743,8 @@ mod tests {
             site: durable.site.unwrap(),
             activator,
             store: store.clone(),
+            profiles,
+            tip_recipient: None,
             frontend: embedded_manifest(),
             source_commit: None,
             scheduled: BTreeMap::new(),
@@ -1854,7 +2776,8 @@ mod tests {
         let ledger = PublicLedgerProjection::empty();
         let initial = snapshot(&catalog, &ledger);
         let initial_digest = initial.digest.clone();
-        let (_root, store, head, shutdown, task) = start_store(&catalog, initial_digest).await;
+        let (_root, store, profiles, _auth, head, shutdown, task) =
+            start_store(&catalog, initial_digest).await;
         let (_reader, activator) = snapshot_store(initial);
         let readiness = Readiness::new(true);
         let cancellation = CancellationToken::new();
@@ -1867,6 +2790,8 @@ mod tests {
             site: head,
             activator,
             store: store.clone(),
+            profiles,
+            tip_recipient: None,
             frontend: embedded_manifest(),
             source_commit: None,
             scheduled: BTreeMap::new(),
@@ -1964,6 +2889,7 @@ mod tests {
             Arc::clone(&candidate_a),
             embedded_manifest(),
             &ledger,
+            None,
             &selected_a,
             scheduled_at,
         )
@@ -1972,6 +2898,7 @@ mod tests {
             Arc::clone(&candidate_b),
             embedded_manifest(),
             &ledger,
+            None,
             &selected_b,
             scheduled_at,
         )
@@ -1984,7 +2911,8 @@ mod tests {
 
         let initial = snapshot(&candidate_a, &ledger);
         let initial_digest = initial.digest.clone();
-        let (_root, store, head, shutdown, task) = start_store(&candidate_a, initial_digest).await;
+        let (_root, store, profiles, _auth, head, shutdown, task) =
+            start_store(&candidate_a, initial_digest).await;
         let (reader, activator) = snapshot_store(initial);
         let content_a = ContentTreeDigest::from_bytes([0x31; 32]);
         let content_b = ContentTreeDigest::from_bytes([0x32; 32]);
@@ -1996,6 +2924,8 @@ mod tests {
             site: head,
             activator,
             store: store.clone(),
+            profiles,
+            tip_recipient: None,
             frontend: embedded_manifest(),
             source_commit: None,
             scheduled: BTreeMap::new(),
@@ -2071,7 +3001,8 @@ mod tests {
         let ledger = PublicLedgerProjection::empty();
         let initial = snapshot(&catalog, &ledger);
         let initial_digest = initial.digest.clone();
-        let (root, store, head, shutdown, task) = start_store(&catalog, initial_digest).await;
+        let (root, store, profiles, _auth, head, shutdown, task) =
+            start_store(&catalog, initial_digest).await;
         let (_reader, activator) = snapshot_store(initial);
         let content_digest = ContentTreeDigest::from_bytes([0x11; 32]);
         let mut coordinator = PublicationCoordinator {
@@ -2082,6 +3013,8 @@ mod tests {
             site: head,
             activator,
             store: store.clone(),
+            profiles,
+            tip_recipient: None,
             frontend: embedded_manifest(),
             source_commit: None,
             scheduled: BTreeMap::new(),

@@ -1,19 +1,21 @@
-use std::{str::FromStr, sync::Arc};
+use std::{convert::Infallible, str::FromStr, sync::Arc};
 
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{Path, State, rejection::PathRejection},
+    extract::{FromRequestParts, Path},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
+        request::Parts,
     },
     response::Response,
     routing::get,
 };
+use markdown_compiler::{PostSlug, PostTag};
+use serde::de::DeserializeOwned;
 
 use crate::{
-    content::{PostSlug, PostTag},
     frontend_assets::{FrontendAssetName, FrontendBundleDigest, IMMUTABLE_CACHE_CONTROL},
     render::{SiteSnapshot, SiteSnapshotReader},
 };
@@ -35,20 +37,67 @@ pub(crate) fn router(snapshots: SiteSnapshotReader) -> Router {
         .with_state(snapshots)
 }
 
-async fn index(State(snapshots): State<SiteSnapshotReader>, headers: HeaderMap) -> Response {
-    let snapshot = snapshots.load_full();
+/// One coherent view of the active rendering and the request validators.
+struct PublicRequest {
+    snapshot: Arc<SiteSnapshot>,
+    headers: HeaderMap,
+}
+
+impl FromRequestParts<SiteSnapshotReader> for PublicRequest {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        snapshots: &SiteSnapshotReader,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self {
+            snapshot: snapshots.load_full(),
+            headers: parts.headers.clone(),
+        })
+    }
+}
+
+/// Snapshot-bound public path that turns Axum path failures into the site's 404.
+struct PublicPath<T> {
+    snapshot: Arc<SiteSnapshot>,
+    headers: HeaderMap,
+    value: T,
+}
+
+impl<T> FromRequestParts<SiteSnapshotReader> for PublicPath<T>
+where
+    T: DeserializeOwned + Send,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        snapshots: &SiteSnapshotReader,
+    ) -> Result<Self, Self::Rejection> {
+        let snapshot = snapshots.load_full();
+        let headers = parts.headers.clone();
+        let Path(value) = Path::<T>::from_request_parts(parts, snapshots)
+            .await
+            .map_err(|_| not_found_response(&snapshot, &headers))?;
+        Ok(Self {
+            snapshot,
+            headers,
+            value,
+        })
+    }
+}
+
+async fn index(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
     html_response(StatusCode::OK, snapshot.index_page(), &snapshot, &headers)
 }
 
 async fn post(
-    State(snapshots): State<SiteSnapshotReader>,
-    headers: HeaderMap,
-    path: Result<Path<String>, PathRejection>,
+    PublicPath {
+        snapshot,
+        headers,
+        value,
+    }: PublicPath<String>,
 ) -> Response {
-    let snapshot = snapshots.load_full();
-    let Ok(Path(value)) = path else {
-        return not_found_response(&snapshot, &headers);
-    };
     let Ok(slug) = PostSlug::parse(value) else {
         return not_found_response(&snapshot, &headers);
     };
@@ -59,14 +108,12 @@ async fn post(
 }
 
 async fn tag(
-    State(snapshots): State<SiteSnapshotReader>,
-    headers: HeaderMap,
-    path: Result<Path<String>, PathRejection>,
+    PublicPath {
+        snapshot,
+        headers,
+        value,
+    }: PublicPath<String>,
 ) -> Response {
-    let snapshot = snapshots.load_full();
-    let Ok(Path(value)) = path else {
-        return not_found_response(&snapshot, &headers);
-    };
     let Ok(tag) = PostTag::parse(value.clone()) else {
         return not_found_response(&snapshot, &headers);
     };
@@ -79,20 +126,17 @@ async fn tag(
     )
 }
 
-async fn archive(State(snapshots): State<SiteSnapshotReader>, headers: HeaderMap) -> Response {
-    let snapshot = snapshots.load_full();
+async fn archive(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
     html_response(StatusCode::OK, snapshot.archive_page(), &snapshot, &headers)
 }
 
 async fn application_asset(
-    State(snapshots): State<SiteSnapshotReader>,
-    headers: HeaderMap,
-    path: Result<Path<(String, String)>, PathRejection>,
+    PublicPath {
+        snapshot,
+        headers,
+        value: (digest, name),
+    }: PublicPath<(String, String)>,
 ) -> Response {
-    let snapshot = snapshots.load_full();
-    let Ok(Path((digest, name))) = path else {
-        return not_found_response(&snapshot, &headers);
-    };
     let Ok(digest) = FrontendBundleDigest::from_str(&digest) else {
         return not_found_response(&snapshot, &headers);
     };
@@ -120,16 +164,11 @@ async fn application_asset(
     response
 }
 
-async fn not_found(State(snapshots): State<SiteSnapshotReader>, headers: HeaderMap) -> Response {
-    let snapshot = snapshots.load_full();
+async fn not_found(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
     not_found_response(&snapshot, &headers)
 }
 
-async fn method_not_allowed(
-    State(snapshots): State<SiteSnapshotReader>,
-    headers: HeaderMap,
-) -> Response {
-    let snapshot = snapshots.load_full();
+async fn method_not_allowed(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
     html_response(
         StatusCode::METHOD_NOT_ALLOWED,
         snapshot.method_not_allowed_page(),
@@ -161,7 +200,7 @@ fn html_response(
     snapshot: &SiteSnapshot,
     request_headers: &HeaderMap,
 ) -> Response {
-    let Ok(etag) = HeaderValue::from_str(&format!("\"{}\"", snapshot.digest)) else {
+    let Ok(etag) = HeaderValue::from_str(&format!("\"{}\"", snapshot.presentation_digest)) else {
         return internal_error_response();
     };
     if status.is_success() && if_none_match(request_headers, &etag) {
@@ -255,16 +294,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        content::{
-            ContentTreeLimits, PublishedPostRevision, discover_content_tree, resolve_content_assets,
-        },
+        domain::publication::{PublicLedgerProjection, PublishedPostRevision},
         frontend_assets::embedded_manifest,
         render::{
-            PublicLedgerProjection, SiteSnapshotReader, build_site_snapshot,
-            compile_content_catalog, render_markdown, render_site_shell,
+            SiteSnapshotReader, build_site_snapshot, compile_content_catalog, render_markdown,
+            render_site_shell,
         },
         web::{PublicState, Readiness, public_router},
     };
+    use markdown_compiler::{ContentTreeLimits, discover_content_tree, resolve_content_assets};
 
     fn published_example_state() -> PublicState {
         let root = FilePath::new(env!("CARGO_MANIFEST_DIR")).join("examples/content");
@@ -346,6 +384,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_path_parameters_use_the_snapshot_backed_not_found_page() {
+        let expected = get("/not-found").await;
+        let expected_etag = etag(&expected);
+        let expected_body = to_bytes(expected.into_body(), usize::MAX).await.unwrap();
+
+        for path in [
+            "/posts/%FF",
+            "/tags/%FF",
+            "/app-assets/%FF/site.css",
+            "/app-assets/frontend-b3-v1-deadbeef/%FF",
+        ] {
+            let response = get(path).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE),
+                Some(&HTML_CONTENT_TYPE)
+            );
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL),
+                Some(&HTML_CACHE_POLICY)
+            );
+            assert_eq!(response.headers().get(ETAG), Some(&expected_etag));
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                expected_body,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn rendered_html_uses_the_active_snapshot_as_a_strong_etag() {
         let mut expected = None;
         for path in ["/", "/posts/hello-maincopy", "/tags/rust", "/archive"] {
@@ -361,7 +430,7 @@ mod tests {
             );
             let actual = etag(&response);
             let encoded = actual.to_str().unwrap();
-            assert!(encoded.starts_with("\"site-b3-v1-"), "{encoded}");
+            assert!(encoded.starts_with("\"presentation-b3-v1-"), "{encoded}");
             assert!(encoded.ends_with('"'), "{encoded}");
             assert!(!encoded.starts_with("W/"), "{encoded}");
             if let Some(expected) = &expected {

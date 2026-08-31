@@ -1,18 +1,22 @@
 #[path = "../build_support/frontend_digest.rs"]
 mod frontend_digest_contract;
 
-pub mod admin;
+mod admin;
 mod cli;
 pub mod config;
-pub mod content;
+#[cfg(test)]
+mod content_fixtures;
 mod content_sync;
 mod database;
 pub mod domain;
 pub mod error;
 pub mod frontend_assets;
 mod observability;
+mod offline_identity;
+mod password_executor;
 mod process_lock;
 pub mod render;
+mod source_provenance;
 pub mod startup;
 pub mod web;
 

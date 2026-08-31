@@ -1,25 +1,33 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fmt::{self, Write as _},
+    sync::Arc,
+};
 
 use arc_swap::ArcSwap;
+use markdown_compiler::identity::{
+    PreviewDigestInput, PublishedPostIdentityInput, SiteShellOutputDigest, SiteShellOutputHasher,
+    finalize_preview_digest, finalize_site_snapshot,
+};
+use markdown_compiler::{
+    AssetRevisionReference, DefaultPostTipPolicy, DigestedAsset, DraftStatus, LogicalAssetPath,
+    PostDescription, PostId, PostRevisionDigest, PostSlug, PostTag, PostTipPolicy, PostTitle,
+    PreviewDigest, PublicationSettings, ResolvedLocalAssetStore, ResolvedPostAssets,
+    RevisionIdentityError, SiteShellRendererIdentity, SiteSnapshotDigest,
+};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
+use qrcode::{QrCode, types::Color};
 use serde::Serialize;
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::domain::publication::{PublicLedgerProjection, PublishedPostRevision};
+use crate::domain::profile::TipRecipientProjection;
+use crate::domain::publication::{
+    CanonicalSiteUrl, PublicLedgerProjection, PublicPagePath, PublishedPostRevision,
+};
 use crate::frontend_assets::FrontendAssetManifest;
 
-use super::{ContentCatalog, GeneratedPostAsset, RenderedPost};
-use crate::content::identity::{
-    PreviewDigestInput, PublishedPostIdentityInput, SiteShellOutputDigest, SiteShellOutputHasher,
-    finalize_preview_digest, finalize_site_snapshot,
-};
-use crate::content::{
-    AssetRevisionReference, DigestedAsset, DraftStatus, LogicalAssetPath, PostDescription, PostId,
-    PostRevisionDigest, PostSlug, PostTag, PostTitle, PreviewDigest, PublicationBaseUrl,
-    PublicationSettings, ResolvedLocalAssetStore, ResolvedPostAssets, RevisionIdentityError,
-    SiteShellRendererIdentity, SiteSnapshotDigest, SnapshotAssetPath,
-};
+use super::{ContentCatalog, GeneratedPostAsset, RenderedPost, SnapshotAssetPath};
 
 const MAX_PAGE_BYTES: usize = 40 * 1024 * 1024;
 const MAX_PUBLIC_ROUTES: usize = 50_000;
@@ -37,60 +45,11 @@ fn render_post_preview(
         catalog,
         frontend,
         post_id,
+        None,
         preview_asset_endpoint,
         published_at,
     )
     .map(|preview| preview.map(|preview| preview.html))
-}
-
-/// A canonical absolute URL derived only from validated publication settings.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct CanonicalSiteUrl(Box<str>);
-
-impl CanonicalSiteUrl {
-    fn for_path(base: &PublicationBaseUrl, path: &PublicPagePath) -> Self {
-        let mut url = base.as_url().clone();
-        url.set_path(path.as_str());
-        url.set_query(None);
-        url.set_fragment(None);
-        Self(url.as_str().into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for CanonicalSiteUrl {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct PublicPagePath(Box<str>);
-
-impl PublicPagePath {
-    fn index() -> Self {
-        Self("/".into())
-    }
-
-    fn archive() -> Self {
-        Self("/archive".into())
-    }
-
-    fn post(slug: &PostSlug) -> Self {
-        Self(format!("/posts/{}", slug.as_str()).into_boxed_str())
-    }
-
-    fn tag(tag: &PostTag) -> Self {
-        Self(format!("/tags/{}", tag.as_str()).into_boxed_str())
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,6 +64,7 @@ struct PublicPostView {
     updated_at: Option<OffsetDateTime>,
     published_at: OffsetDateTime,
     canonical_url: CanonicalSiteUrl,
+    tips: PostTipPolicy,
 }
 
 impl PublicPostView {
@@ -126,6 +86,7 @@ impl PublicPostView {
             updated_at: metadata.updated_at,
             published_at: entry.published_at,
             canonical_url: CanonicalSiteUrl::for_path(&publication.site.base_url, &path),
+            tips: metadata.tips,
         }
     }
 
@@ -147,6 +108,7 @@ pub struct RenderedSiteShell {
     chronology: Arc<[usize]>,
     tags: BTreeMap<PostTag, Arc<[usize]>>,
     pre_injection_output: SiteShellOutputDigest,
+    tip_recipient: Option<TipRecipientProjection>,
 }
 
 impl fmt::Debug for RenderedSiteShell {
@@ -173,7 +135,7 @@ pub fn render_site_shell(
     let tags = tag_index(&posts, &chronology);
     validate_route_count(posts.len(), tags.len())?;
 
-    let renderer = SiteShellRendererIdentity::new(frontend.bundle_digest);
+    let renderer = SiteShellRendererIdentity::new(*frontend.bundle_digest.as_bytes());
     let pre_injection_output =
         render_pre_injection_shell(&catalog.publication, frontend, &posts, &chronology, &tags)?;
 
@@ -186,7 +148,15 @@ pub fn render_site_shell(
         chronology: chronology.into(),
         tags,
         pre_injection_output,
+        tip_recipient: None,
     })
+}
+
+impl RenderedSiteShell {
+    pub(crate) fn bind_tip_recipient(mut self, recipient: Option<TipRecipientProjection>) -> Self {
+        self.tip_recipient = recipient;
+        self
+    }
 }
 
 /// One rendered private document and the exact presentation binding it exposes for approval.
@@ -202,6 +172,7 @@ pub(crate) fn render_bound_post_preview(
     catalog: &ContentCatalog,
     frontend: &'static FrontendAssetManifest,
     post_id: &PostId,
+    tip_recipient: Option<&TipRecipientProjection>,
     preview_asset_endpoint: &str,
     published_at: Option<OffsetDateTime>,
 ) -> Result<Option<BoundPostPreview>, SiteSnapshotBuildError> {
@@ -212,6 +183,7 @@ pub(crate) fn render_bound_post_preview(
         catalog,
         frontend,
         rendered,
+        tip_recipient,
         catalog.local_assets.as_ref(),
         preview_asset_endpoint,
         published_at,
@@ -225,6 +197,7 @@ pub(crate) fn render_bound_post_revision_preview(
     frontend: &'static FrontendAssetManifest,
     post_id: &PostId,
     revision: &PostRevisionDigest,
+    tip_recipient: Option<&TipRecipientProjection>,
     preview_asset_endpoint: &str,
     published_at: Option<OffsetDateTime>,
 ) -> Result<Option<BoundPostPreview>, SiteSnapshotBuildError> {
@@ -235,6 +208,7 @@ pub(crate) fn render_bound_post_revision_preview(
         catalog,
         frontend,
         rendered,
+        tip_recipient,
         local_assets,
         preview_asset_endpoint,
         published_at,
@@ -246,6 +220,7 @@ fn render_bound_preview(
     catalog: &ContentCatalog,
     frontend: &'static FrontendAssetManifest,
     rendered: &RenderedPost,
+    tip_recipient: Option<&TipRecipientProjection>,
     local_assets: &ResolvedLocalAssetStore,
     preview_asset_endpoint: &str,
     published_at: Option<OffsetDateTime>,
@@ -265,11 +240,18 @@ fn render_bound_preview(
             )
         })?;
     let page = PostPageView::from_rendered(rendered, published_at);
+    let tips_enabled = page.tips_enabled(&catalog.publication);
+    let tip_handoff = if tips_enabled {
+        tip_recipient.map(TipHandoff::new).transpose()?
+    } else {
+        None
+    };
     let html = render_post(
         &catalog.publication,
         frontend,
         page,
         ArticleBody::Projected(&article),
+        tip_handoff.as_ref(),
     )
     .into_string();
     validate_page_size(html.len())?;
@@ -278,6 +260,7 @@ fn render_bound_preview(
         frontend,
         PostPageView::from_rendered(rendered, None),
         ArticleBody::Omitted,
+        None,
     )
     .into_string();
     validate_page_size(pre_injection_shell.len())?;
@@ -285,7 +268,14 @@ fn render_bound_preview(
         &catalog.publication.site.base_url,
         &PublicPagePath::post(&rendered.document.metadata.slug),
     );
-    let renderer = SiteShellRendererIdentity::new(frontend.bundle_digest);
+    let renderer = SiteShellRendererIdentity::new(*frontend.bundle_digest.as_bytes());
+    let profile_projection = if tips_enabled {
+        tip_recipient
+            .map(TipRecipientProjection::identity_bytes)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let digest = finalize_preview_digest(PreviewDigestInput {
         publication: &catalog.publication,
         site_assets: &catalog.site_assets,
@@ -295,6 +285,7 @@ fn render_bound_preview(
         article_identity_html: rendered.article.identity_html.as_bytes(),
         site_renderer: &renderer,
         pre_injection_post_shell: pre_injection_shell.as_bytes(),
+        profile_projection: &profile_projection,
         canonical_url: canonical_url.as_str(),
     })
     .map_err(SiteSnapshotBuildError::identity)?;
@@ -386,11 +377,11 @@ fn render_pre_injection_shell(
         pages.insert(PublicPagePath::tag(tag), PreInjectionPage::Tag(tag));
     }
     pages.insert(
-        PublicPagePath("<not-found>".into()),
+        PublicPagePath::error_identity_marker("not-found"),
         PreInjectionPage::Error(PublicErrorPage::NotFound),
     );
     pages.insert(
-        PublicPagePath("<method-not-allowed>".into()),
+        PublicPagePath::error_identity_marker("method-not-allowed"),
         PreInjectionPage::Error(PublicErrorPage::MethodNotAllowed),
     );
 
@@ -409,6 +400,7 @@ fn render_pre_injection_shell(
                 frontend,
                 PostPageView::from_public(&posts[index]),
                 ArticleBody::Omitted,
+                None,
             )
             .into_string(),
             PreInjectionPage::Tag(tag) => render_tag(
@@ -464,7 +456,12 @@ pub fn build_site_snapshot(
     .map_err(SiteSnapshotBuildError::identity)?;
 
     let mut retained = RetainedHtmlBudget::new();
-    let pages = render_snapshot_pages(&shell, &digest, &mut retained)?;
+    let tip_handoff = shell
+        .tip_recipient
+        .as_ref()
+        .map(TipHandoff::new)
+        .transpose()?;
+    let pages = render_snapshot_pages(&shell, &digest, tip_handoff.as_ref(), &mut retained)?;
     let publication = &shell.catalog.publication;
     let not_found = rendered_error_page(
         publication,
@@ -479,9 +476,11 @@ pub fn build_site_snapshot(
         &mut retained,
     )?;
     let assets = collect_public_assets(&shell, &digest)?;
+    let presentation_digest = presentation_digest(&pages, &not_found, &method_not_allowed);
 
     Ok(SiteSnapshot {
         digest,
+        presentation_digest,
         pages,
         not_found,
         method_not_allowed,
@@ -506,7 +505,7 @@ fn validate_snapshot_shell(
         .frontend
         .validate()
         .map_err(|error| SiteSnapshotBuildError::frontend(error.to_string()))?;
-    if shell.renderer.frontend_bundle != shell.frontend.bundle_digest {
+    if shell.renderer.frontend_bundle != *shell.frontend.bundle_digest.as_bytes() {
         return Err(SiteSnapshotBuildError::new(
             SiteSnapshotBuildErrorCode::FrontendMismatch,
             None,
@@ -528,6 +527,7 @@ fn validate_snapshot_shell(
 fn render_snapshot_pages(
     shell: &RenderedSiteShell,
     digest: &SiteSnapshotDigest,
+    tip_handoff: Option<&TipHandoff<'_>>,
     retained: &mut RetainedHtmlBudget,
 ) -> Result<BTreeMap<PageRoute, RenderedPage>, SiteSnapshotBuildError> {
     let publication = &shell.catalog.publication;
@@ -577,6 +577,7 @@ fn render_snapshot_pages(
                 shell.frontend,
                 PostPageView::from_public(post),
                 ArticleBody::Projected(&article),
+                tip_handoff,
             )
             .into_string(),
             publication,
@@ -704,7 +705,7 @@ fn collect_public_assets(
 
 fn collect_site_global_assets(
     selected: &mut BTreeMap<LogicalAssetPath, SelectedAsset>,
-    site_assets: &crate::content::ResolvedSiteAssets,
+    site_assets: &markdown_compiler::ResolvedSiteAssets,
     local_assets: &ResolvedLocalAssetStore,
 ) -> Result<(), SiteSnapshotBuildError> {
     if let Some(AssetRevisionReference::Local(asset)) = &site_assets.favicon {
@@ -835,6 +836,42 @@ struct RenderedPage {
     canonical_url: CanonicalSiteUrl,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PresentationDigest([u8; 32]);
+
+impl fmt::Display for PresentationDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "presentation-b3-v1-{}",
+            blake3::Hash::from_bytes(self.0).to_hex()
+        )
+    }
+}
+
+fn presentation_digest(
+    pages: &BTreeMap<PageRoute, RenderedPage>,
+    not_found: &RenderedPage,
+    method_not_allowed: &RenderedPage,
+) -> PresentationDigest {
+    let mut hasher = blake3::Hasher::new_derive_key("maincopy presentation snapshot v1");
+    hash_presentation_part(&mut hasher, &(pages.len() as u64).to_be_bytes());
+    for (route, page) in pages {
+        hash_presentation_part(&mut hasher, route.public_path().as_str().as_bytes());
+        hash_presentation_part(&mut hasher, page.html.as_bytes());
+    }
+    hash_presentation_part(&mut hasher, b"not-found");
+    hash_presentation_part(&mut hasher, not_found.html.as_bytes());
+    hash_presentation_part(&mut hasher, b"method-not-allowed");
+    hash_presentation_part(&mut hasher, method_not_allowed.html.as_bytes());
+    PresentationDigest(*hasher.finalize().as_bytes())
+}
+
+fn hash_presentation_part(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotPublicAsset {
     pub path: SnapshotAssetPath,
@@ -845,6 +882,7 @@ pub struct SnapshotPublicAsset {
 /// Complete immutable request-facing state for one canonical publication.
 pub struct SiteSnapshot {
     pub(crate) digest: SiteSnapshotDigest,
+    pub(crate) presentation_digest: PresentationDigest,
     pages: BTreeMap<PageRoute, RenderedPage>,
     not_found: RenderedPage,
     method_not_allowed: RenderedPage,
@@ -858,6 +896,7 @@ impl fmt::Debug for SiteSnapshot {
         formatter
             .debug_struct("SiteSnapshot")
             .field("digest", &self.digest)
+            .field("presentation_digest", &self.presentation_digest)
             .field("pages", &self.pages.len())
             .field("assets", &self.assets.len())
             .field("retained_html_bytes", &self.retained_html_bytes)
@@ -962,7 +1001,8 @@ impl SiteSnapshotActivator {
                 actual: current.digest.clone(),
             });
         }
-        if current.digest == next.digest {
+        if current.digest == next.digest && current.presentation_digest == next.presentation_digest
+        {
             return Ok(SnapshotActivationOutcome::AlreadyActive);
         }
         self.active.store(Arc::new(next));
@@ -1000,6 +1040,7 @@ pub enum SiteSnapshotBuildErrorCode {
     AssetUnavailable,
     AssetCollision,
     ArticleProjectionFailed,
+    QrCodeGenerationFailed,
     IdentityRejected,
 }
 
@@ -1045,6 +1086,14 @@ impl SiteSnapshotBuildError {
             SiteSnapshotBuildErrorCode::IdentityRejected,
             None,
             error.to_string(),
+        )
+    }
+
+    fn qr_code(message: impl Into<Box<str>>) -> Self {
+        Self::new(
+            SiteSnapshotBuildErrorCode::QrCodeGenerationFailed,
+            None,
+            message,
         )
     }
 
@@ -1141,6 +1190,7 @@ struct PostPageView<'post> {
     authored_at: OffsetDateTime,
     updated_at: Option<OffsetDateTime>,
     published_at: Option<OffsetDateTime>,
+    tips: PostTipPolicy,
 }
 
 impl<'post> PostPageView<'post> {
@@ -1152,6 +1202,7 @@ impl<'post> PostPageView<'post> {
             authored_at: post.authored_at,
             updated_at: post.updated_at,
             published_at: Some(post.published_at),
+            tips: post.tips,
         }
     }
 
@@ -1164,6 +1215,86 @@ impl<'post> PostPageView<'post> {
             authored_at: metadata.authored_at,
             updated_at: metadata.updated_at,
             published_at,
+            tips: metadata.tips,
+        }
+    }
+
+    fn tips_enabled(self, publication: &PublicationSettings) -> bool {
+        match self.tips {
+            PostTipPolicy::Enabled => true,
+            PostTipPolicy::Disabled => false,
+            PostTipPolicy::InheritPublication => match publication.tips {
+                DefaultPostTipPolicy::Enabled => true,
+                DefaultPostTipPolicy::Disabled => false,
+            },
+        }
+    }
+}
+
+struct TipHandoff<'recipient> {
+    recipient: &'recipient TipRecipientProjection,
+    qr: Markup,
+}
+
+impl<'recipient> TipHandoff<'recipient> {
+    fn new(recipient: &'recipient TipRecipientProjection) -> Result<Self, SiteSnapshotBuildError> {
+        let view = recipient.as_view();
+        let code = QrCode::new(view.lnurl.as_bytes())
+            .map_err(|error| SiteSnapshotBuildError::qr_code(error.to_string()))?;
+        Ok(Self {
+            recipient,
+            qr: render_tip_qr(&code, view.address, view.lnurl),
+        })
+    }
+}
+
+fn render_tip_qr(code: &QrCode, address: &str, lnurl: &str) -> Markup {
+    const QUIET_ZONE_MODULES: usize = 4;
+
+    let dimension = code.width() + 2 * QUIET_ZONE_MODULES;
+    let mut path = String::new();
+    for y in 0..code.width() {
+        for x in 0..code.width() {
+            if code[(x, y)] == Color::Dark {
+                let _ = write!(
+                    path,
+                    "M{} {}h1v1h-1z",
+                    x + QUIET_ZONE_MODULES,
+                    y + QUIET_ZONE_MODULES
+                );
+            }
+        }
+    }
+    let label = format!("QR code for tipping {address} with Lightning");
+    html! {
+        svg class="tip-qr" xmlns="http://www.w3.org/2000/svg"
+            viewBox=(format!("0 0 {dimension} {dimension}")) role="img"
+            aria-label=(label) data-lnurl=(lnurl) {
+            rect width="100%" height="100%" fill="white" {}
+            path d=(path) fill="black" {}
+        }
+    }
+}
+
+fn render_tip_cta(handoff: &TipHandoff<'_>) -> Markup {
+    let view = handoff.recipient.as_view();
+    let recipient = view.display_name.unwrap_or(view.address);
+    html! {
+        aside class="tip-cta" aria-labelledby="tip-heading" {
+            h2 id="tip-heading" { "Enjoyed this article?" }
+            p { "Send a tip to " (recipient) "." }
+            p {
+                a class="tip-action" href=(view.wallet_link) { "Tip with Lightning" }
+            }
+            p class="tip-recipient" {
+                "Lightning Address: " code { (view.address) }
+                " "
+                button type="button" class="tip-copy" hidden
+                    data-copy-lightning-address=(view.address) { "Copy" }
+            }
+            (handoff.qr.clone())
+            p { "Your wallet will ask for the amount and apply the recipient service's limits." }
+            p { "Tips are voluntary and are handled by your wallet and the recipient's Lightning service." }
         }
     }
 }
@@ -1173,7 +1304,9 @@ fn render_post(
     frontend: &'static FrontendAssetManifest,
     post: PostPageView<'_>,
     article: ArticleBody<'_>,
+    tip_handoff: Option<&TipHandoff<'_>>,
 ) -> Markup {
+    let tips_enabled = post.tips_enabled(publication);
     let content = html! {
         article {
             header {
@@ -1210,6 +1343,11 @@ fn render_post(
             section class="post-content" {
                 @if let ArticleBody::Projected(article) = article {
                     (trusted_article_markup(article))
+                }
+            }
+            @if tips_enabled {
+                @if let Some(tip_handoff) = tip_handoff {
+                    (render_tip_cta(tip_handoff))
                 }
             }
         }
@@ -1291,6 +1429,9 @@ fn render_layout(
                 meta name="description" content=(site.description.as_str());
                 title { (full_title) }
                 link rel="stylesheet" href=(frontend.css.public_path);
+                @if let Some(javascript) = &frontend.javascript {
+                    script src=(javascript.public_path) defer {}
+                }
             }
             body {
                 header class="site-header" {
@@ -1328,16 +1469,19 @@ fn trusted_article_markup(article: &ProjectedArticleHtml) -> Markup {
 mod tests {
     use std::{collections::BTreeMap, sync::Barrier, thread};
 
+    use maincopy_shared::profile::{LightningAddress, ProfileDisplayName};
+
     use super::*;
     use crate::{
-        content::{
-            DiscoveredContentTree, LogicalAssetPath, PostCollection, ResolvedPostAssets,
-            ResolvedSiteAssets, digest_asset, resolve_content_assets,
-            tree::{asset, post, publication},
-        },
         frontend_assets::embedded_manifest,
         render::{compile_content_catalog, render_markdown},
     };
+    use markdown_compiler::{
+        LogicalAssetPath, PostCollection, ResolvedPostAssets, ResolvedSiteAssets, digest_asset,
+        resolve_content_assets,
+    };
+
+    use crate::content_fixtures::{asset, content_tree, post, publication};
 
     const FIRST_ID: &str = "11111111-1111-4111-8111-111111111111";
     const SECOND_ID: &str = "22222222-2222-4222-8222-222222222222";
@@ -1394,7 +1538,7 @@ mod tests {
              favicon = \"assets/favicon.png\"\n\
              [author]\n\
              name = \"Author <unsafe>\"\n";
-        let tree = DiscoveredContentTree::new(
+        let tree = content_tree(
             publication("publication.toml", publication_source.to_owned()),
             vec![
                 post(
@@ -1522,6 +1666,14 @@ mod tests {
         )
     }
 
+    fn tip_projection(display_name: Option<&str>, address: &str) -> TipRecipientProjection {
+        TipRecipientProjection::from_validated_profile(
+            display_name.map(|value| ProfileDisplayName::parse(value).unwrap()),
+            LightningAddress::parse(address).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn catalog_asset(fixture: &Fixture, path: &str) -> DigestedAsset {
         fixture
             .catalog
@@ -1539,8 +1691,8 @@ mod tests {
         let first = entry(&fixture, FIRST_ID, 1_000);
         let error =
             PublicLedgerProjection::try_from_exact_entries([first.clone(), first]).unwrap_err();
-        assert_eq!(error.post_id.as_str(), FIRST_ID);
-        assert!(PublicLedgerProjection::empty().entries.is_empty());
+        assert_eq!(error.post_id().as_str(), FIRST_ID);
+        assert!(PublicLedgerProjection::empty().is_empty());
     }
 
     #[test]
@@ -1556,15 +1708,13 @@ mod tests {
             .unwrap();
 
         let post_ids: Vec<_> = published
-            .entries
-            .iter()
+            .published_posts()
             .map(|entry| entry.post_id.as_str())
             .collect();
         assert_eq!(post_ids, [FIRST_ID, SECOND_ID, DRAFT_ID]);
         assert_eq!(
             original
-                .entries
-                .iter()
+                .published_posts()
                 .map(|entry| entry.post_id.as_str())
                 .collect::<Vec<_>>(),
             [FIRST_ID, DRAFT_ID]
@@ -1580,7 +1730,7 @@ mod tests {
             .with_published(entry(&fixture, FIRST_ID, 2_000))
             .unwrap_err();
 
-        assert_eq!(error.post_id.as_str(), FIRST_ID);
+        assert_eq!(error.post_id().as_str(), FIRST_ID);
     }
 
     #[test]
@@ -1650,6 +1800,7 @@ mod tests {
             &fixture.catalog,
             embedded_manifest(),
             &post_id,
+            None,
             "/api/admin/v1/preview-assets/first-candidate",
             None,
         )
@@ -1659,6 +1810,7 @@ mod tests {
             &fixture.catalog,
             embedded_manifest(),
             &post_id,
+            None,
             "/api/admin/v1/preview-assets/second-candidate",
             Some(at(9_000)),
         )
@@ -1672,6 +1824,112 @@ mod tests {
             first.canonical_url.as_str(),
             "https://blog.example.com/posts/first-post"
         );
+    }
+
+    #[test]
+    fn tip_handoff_renders_exact_accessible_copy_and_escapes_the_display_name() {
+        let projection = tip_projection(Some("Alice <Writer> & Company"), "alice@example.com");
+        let handoff = TipHandoff::new(&projection).unwrap();
+        let html = render_tip_cta(&handoff).into_string();
+
+        assert!(html.contains("<h2 id=\"tip-heading\">Enjoyed this article?</h2>"));
+        assert!(html.contains("Send a tip to Alice &lt;Writer&gt; &amp; Company."));
+        assert!(html.contains(">Tip with Lightning</a>"));
+        assert!(html.contains("Lightning Address: <code>alice@example.com</code>"));
+        assert!(html.contains(
+            "<button type=\"button\" class=\"tip-copy\" hidden data-copy-lightning-address=\"alice@example.com\">Copy</button>"
+        ));
+        assert!(html.contains(
+            "Your wallet will ask for the amount and apply the recipient service's limits."
+        ));
+        assert!(html.contains("Tips are voluntary"));
+        assert!(html.contains("role=\"img\""));
+        assert!(
+            html.contains("aria-label=\"QR code for tipping alice@example.com with Lightning\"")
+        );
+        assert!(!html.contains("<form"));
+        assert!(!html.contains("<input"));
+        assert!(!html.contains("invoice"));
+        assert!(!html.contains("payment status"));
+        assert!(!html.contains("success"));
+    }
+
+    #[test]
+    fn tip_handoff_falls_back_to_the_address_and_qr_matches_the_wallet_payload() {
+        let projection = tip_projection(None, "alice@example.com");
+        let view = projection.as_view();
+        let first = TipHandoff::new(&projection).unwrap();
+        let second = TipHandoff::new(&projection).unwrap();
+        let html = render_tip_cta(&first).into_string();
+
+        assert!(html.contains("Send a tip to alice@example.com."));
+        assert!(html.contains(&format!("href=\"{}\"", view.wallet_link)));
+        assert!(html.contains(&format!("data-lnurl=\"{}\"", view.lnurl)));
+        assert_eq!(first.qr.0, second.qr.0);
+        let code = QrCode::new(view.lnurl.as_bytes()).unwrap();
+        let mut dark_modules = 0;
+        for y in 0..code.width() {
+            for x in 0..code.width() {
+                if code[(x, y)] == Color::Dark {
+                    dark_modules += 1;
+                    assert!(
+                        first
+                            .qr
+                            .0
+                            .contains(&format!("M{} {}h1v1h-1z", x + 4, y + 4))
+                    );
+                }
+            }
+        }
+        assert_eq!(first.qr.0.matches('z').count(), dark_modules);
+    }
+
+    #[test]
+    fn authored_tip_policy_controls_the_profile_handoff() {
+        let fixture = fixture();
+        let rendered = fixture
+            .catalog
+            .current_post(&PostId::parse(FIRST_ID).unwrap())
+            .unwrap();
+        let mut publication = fixture.catalog.publication.clone();
+        let projection = tip_projection(Some("Alice"), "alice@example.com");
+        let handoff = TipHandoff::new(&projection).unwrap();
+        let mut page = PostPageView::from_rendered(rendered, None);
+
+        publication.tips = DefaultPostTipPolicy::Disabled;
+        page.tips = PostTipPolicy::InheritPublication;
+        let inherited_disabled = render_post(
+            &publication,
+            embedded_manifest(),
+            page,
+            ArticleBody::Omitted,
+            Some(&handoff),
+        )
+        .into_string();
+        assert!(!inherited_disabled.contains("class=\"tip-cta\""));
+
+        page.tips = PostTipPolicy::Enabled;
+        let post_enabled = render_post(
+            &publication,
+            embedded_manifest(),
+            page,
+            ArticleBody::Omitted,
+            Some(&handoff),
+        )
+        .into_string();
+        assert!(post_enabled.contains("class=\"tip-cta\""));
+
+        publication.tips = DefaultPostTipPolicy::Enabled;
+        page.tips = PostTipPolicy::Disabled;
+        let post_disabled = render_post(
+            &publication,
+            embedded_manifest(),
+            page,
+            ArticleBody::Omitted,
+            Some(&handoff),
+        )
+        .into_string();
+        assert!(!post_disabled.contains("class=\"tip-cta\""));
     }
 
     #[test]
@@ -1735,7 +1993,7 @@ mod tests {
         let current_second = entry(&current, SECOND_ID, 2_000);
         let ledger = projection([retained_first, current_second]);
         Arc::make_mut(&mut current.catalog)
-            .retain_ledger_revisions_from(&prior.catalog, &ledger)
+            .retain_revisions_from(&prior.catalog, ledger.revision_keys())
             .unwrap();
 
         let snapshot = build_snapshot(&current, &ledger).unwrap();
@@ -1874,6 +2132,41 @@ mod tests {
     }
 
     #[test]
+    fn profile_only_presentation_change_activates_without_changing_content_identity() {
+        let fixture = fixture();
+        let post_id = PostId::parse(FIRST_ID).unwrap();
+        let ledger = projection([entry(&fixture, FIRST_ID, 2_000)]);
+        let old = build_snapshot(&fixture, &ledger).unwrap();
+        let content_digest = old.digest.clone();
+        let old_presentation = old.presentation_digest;
+        let revision = fixture.revisions[&post_id].clone();
+        let mut next = build_snapshot(&fixture, &ledger).unwrap();
+        let projection = tip_projection(Some("Alice"), "alice@example.com");
+        let handoff = TipHandoff::new(&projection).unwrap();
+        let page = next
+            .pages
+            .get_mut(&PageRoute::Post(PostSlug::parse("first-post").unwrap()))
+            .unwrap();
+        let mut html = page.html.to_string();
+        html.push_str(&render_tip_cta(&handoff).into_string());
+        page.html = html.into();
+        next.presentation_digest =
+            presentation_digest(&next.pages, &next.not_found, &next.method_not_allowed);
+
+        assert_eq!(next.digest, content_digest);
+        assert_eq!(fixture.revisions[&post_id], revision);
+        assert_ne!(next.presentation_digest, old_presentation);
+
+        let (reader, mut activator) = snapshot_store(old);
+        assert_eq!(
+            activator.activate(&content_digest, next).unwrap(),
+            SnapshotActivationOutcome::Activated
+        );
+        assert_ne!(reader.load_full().presentation_digest, old_presentation);
+        assert_eq!(reader.load_full().digest, content_digest);
+    }
+
+    #[test]
     fn missing_and_draft_revisions_fail_closed() {
         let fixture = fixture();
         let missing_id = PostId::parse(FIRST_ID).unwrap();
@@ -1992,6 +2285,27 @@ mod tests {
             activator.activate(&new_digest, same).unwrap(),
             SnapshotActivationOutcome::AlreadyActive
         );
+    }
+
+    #[test]
+    fn activation_installs_a_new_content_identity_even_when_rendered_bytes_match() {
+        let fixture = fixture();
+        let ledger = PublicLedgerProjection::empty();
+        let old = build_snapshot(&fixture, &ledger).unwrap();
+        let old_digest = old.digest.clone();
+        let old_presentation = old.presentation_digest;
+        let mut next = build_snapshot(&fixture, &ledger).unwrap();
+        let new_digest =
+            SiteSnapshotDigest::parse(&format!("site-b3-v1-{}", "66".repeat(32))).unwrap();
+        next.digest = new_digest.clone();
+
+        let (reader, mut activator) = snapshot_store(old);
+        assert_eq!(next.presentation_digest, old_presentation);
+        assert_eq!(
+            activator.activate(&old_digest, next).unwrap(),
+            SnapshotActivationOutcome::Activated
+        );
+        assert_eq!(reader.load_full().digest, new_digest);
     }
 
     #[test]

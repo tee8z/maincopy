@@ -1,16 +1,16 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use markdown_compiler::{
+    LogicalAssetPath, LogicalContentPath, PostId, PostRevisionDigest, PublicationSettings,
+    ResolvedContentAssets, ResolvedLocalAssetStore, ResolvedPostAssetLookupError,
+    ResolvedSiteAssets, ValidatedContent,
+};
 use serde::Serialize;
 use thiserror::Error;
 
 #[cfg(test)]
 use super::GeneratedPostAsset;
-use super::{MarkdownRenderError, PublicLedgerProjection, RenderedPost, render_markdown};
-use crate::content::{
-    LogicalAssetPath, LogicalContentPath, PostId, PostRevisionDigest, PublicationSettings,
-    ResolvedContentAssets, ResolvedLocalAssetStore, ResolvedPostAssetLookupError,
-    ResolvedSiteAssets, ValidatedContent,
-};
+use super::{MarkdownRenderError, RenderedPost, render_markdown};
 
 /// Compile one validated candidate into a self-contained immutable catalog.
 pub fn compile_content_catalog(
@@ -123,24 +123,6 @@ impl ContentCatalog {
             .flat_map(|post| post.generated_assets.iter())
             .find(|generated| &generated.asset.path == path)
             .map(|generated| Arc::clone(&generated.bytes))
-    }
-
-    /// Retains the prior catalog inputs selected by the durable public ledger.
-    ///
-    /// The operation is atomic: if any selected revision is unavailable, this
-    /// catalog remains unchanged. Current candidate keys always keep their own
-    /// rendered revision and asset store.
-    pub(crate) fn retain_ledger_revisions_from(
-        &mut self,
-        prior: &Self,
-        ledger: &PublicLedgerProjection,
-    ) -> Result<(), CatalogRetentionError> {
-        self.retain_revisions_from(
-            prior,
-            ledger
-                .published_posts()
-                .map(|selected| (selected.post_id.clone(), selected.revision.clone())),
-        )
     }
 
     /// Atomically retains an explicit set of exact historical revision inputs.
@@ -306,11 +288,14 @@ fn validate_generated_path_sets<'asset, 'path>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::tree::{asset, post, publication};
-    use crate::content::{
-        DiscoveredContentTree, LogicalAssetPath, PostCollection, PublishedPostRevision,
-        SiteSnapshotDigest, resolve_content_assets,
+    use crate::domain::publication::PublicLedgerProjection;
+    use crate::domain::publication::PublishedPostRevision;
+    use markdown_compiler::{
+        DiscoveredContentTree, LogicalAssetPath, PostCollection, SiteSnapshotDigest,
+        resolve_content_assets,
     };
+
+    use crate::content_fixtures::{asset, content_tree, post, publication, validated_content};
 
     const FIRST_ID: &str = "4f054633-2d09-4b05-97d0-c6f0011a5199";
     const SECOND_ID: &str = "7d97b17a-686d-46f4-ad77-234f4973c69a";
@@ -375,7 +360,7 @@ mod tests {
                 b"second".to_vec(),
             ));
         }
-        DiscoveredContentTree::new(
+        content_tree(
             publication("publication.toml", publication_source(title, origins)),
             posts,
             assets,
@@ -416,7 +401,7 @@ mod tests {
         let rendered = revision.rendered.as_ref();
         assert_eq!(
             rendered.document.metadata.draft,
-            crate::content::DraftStatus::Draft
+            markdown_compiler::DraftStatus::Draft
         );
         assert!(
             catalog
@@ -432,7 +417,7 @@ mod tests {
     #[test]
     fn retained_revision_keeps_its_exact_render_and_local_asset_store() {
         fn candidate(body: &str, cover: &[u8]) -> ContentCatalog {
-            compile_tree(DiscoveredContentTree::new(
+            compile_tree(content_tree(
                 publication("publication.toml", publication_source("Catalog", &[])),
                 vec![post(
                     "posts/first.md",
@@ -464,7 +449,7 @@ mod tests {
         .unwrap();
 
         current
-            .retain_ledger_revisions_from(&prior, &ledger)
+            .retain_revisions_from(&prior, ledger.revision_keys())
             .unwrap();
 
         assert_eq!(current.revisions.len(), 2);
@@ -521,7 +506,7 @@ mod tests {
                 .assets
                 .contains_key(&LogicalAssetPath::parse("assets/second.pdf").unwrap())
         );
-        let subset = ValidatedContent::new(
+        let subset = validated_content(
             full_content.publication.clone(),
             vec![full_content.posts[0].clone()],
         );
@@ -536,7 +521,7 @@ mod tests {
         let source_content = source.validate().unwrap();
         let source_assets = resolve_content_assets(&source, &source_content).unwrap();
 
-        let changed = DiscoveredContentTree::new(
+        let changed = content_tree(
             publication("publication.toml", publication_source("Catalog", &[])),
             vec![post(
                 "drafts/first.md",
@@ -581,7 +566,7 @@ mod tests {
         let source = tree("Catalog", &[], true);
         let full_content = source.validate().unwrap();
         let full_assets = resolve_content_assets(&source, &full_content).unwrap();
-        let subset = ValidatedContent::new(
+        let subset = validated_content(
             full_content.publication.clone(),
             vec![full_content.posts[0].clone()],
         );

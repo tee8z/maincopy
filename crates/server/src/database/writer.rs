@@ -13,17 +13,25 @@ use super::{
     BootstrappedDatabase,
     store::{DatabaseCommandError, DatabaseStore, Mutation},
 };
-use crate::domain::publication::store::{
-    BeginPublishNowResult, BeginScheduledActivationResult, CreateTargetJobResult,
-    FinishPublicationResult, FinishedPublication, IndexContentCatalogResult,
-    InstallStartupSnapshotResult, PublicationMutationError, PublicationStore, PublishNowState,
-    SchedulePublicationResult, ScheduledPublication, SiteHead, StartupSnapshotMutationError,
-    StoredTargetJob, TargetJobMutationError, begin_publish_now, begin_scheduled_activation,
-    create as create_target_job, finish_publication, index_content_catalog, install_startup,
-    schedule_publication,
+use crate::domain::auth::store::{
+    AuthApplyError, AuthCommandError, AuthStore, accept_agent_proof,
+    bootstrap_identity as apply_bootstrap_identity, create_browser_session, create_login_challenge,
+    create_user, put_human_credential, record_admin_audit_failure, register_agent_credential,
+    remove_human_credential, replace_agent_scopes, replace_user_roles, revoke_agent_credential,
+    revoke_browser_session, set_user_status,
+};
+use crate::domain::profile::store::{
+    ProfileApplyError, ProfileCommandError, ProfileStore, apply_set_tip_recipient,
+    apply_update_profile,
 };
 #[cfg(test)]
 use crate::domain::publication::store::{CommandIdempotencyKey, CreateTargetJob};
+use crate::domain::publication::store::{
+    PublicationMutationError, PublicationStore, StartupSnapshotMutationError,
+    TargetJobMutationError, begin_publish_now, begin_scheduled_activation,
+    create as create_target_job, finish_publication, index_content_catalog, install_startup,
+    schedule_publication,
+};
 
 pub(crate) struct DatabaseWriter {
     connection: SqliteConnection,
@@ -43,7 +51,11 @@ impl BootstrappedDatabase {
         } = self;
         let (mutations, receiver) = mpsc::channel(capacity);
         (
-            DatabaseStore::new(PublicationStore::new(readers.clone(), mutations)),
+            DatabaseStore::new(
+                AuthStore::new(readers.clone(), mutations.clone()),
+                ProfileStore::new(readers.clone(), mutations.clone()),
+                PublicationStore::new(readers.clone(), mutations),
+            ),
             DatabaseWriter {
                 connection,
                 readers,
@@ -148,55 +160,35 @@ impl DatabaseWriter {
         };
 
         #[cfg(test)]
-        if applied.output.is_target_creation() {
+        if applied.is_crash_test_candidate() {
             abort_at(WriterCrashPoint::AfterApplyBeforeCommit);
         }
 
         if let Err(source) = transaction.commit().await {
-            applied
-                .responder
-                .send_error(DatabaseCommandError::OutcomeUnknown);
+            applied.send_outcome_unknown();
             return Err(DatabaseWriterError::Commit { source });
         }
 
         #[cfg(test)]
-        if applied.output.is_target_creation() {
+        if applied.is_crash_test_candidate() {
             abort_at(WriterCrashPoint::AfterCommitBeforeReply);
         }
 
-        applied.responder.send_success(applied.output);
+        applied.send_success();
         Ok(())
     }
 }
 
 struct AppliedMutation {
-    responder: MutationResponder,
-    output: MutationOutput,
+    respond: Box<dyn FnOnce(bool) + Send>,
+    #[cfg(test)]
+    crash_test_candidate: bool,
 }
 
-struct FailedMutation {
-    responder: MutationResponder,
-    error: ApplyError,
-}
-
-enum MutationResponder {
-    Startup(oneshot::Sender<InstallStartupSnapshotResult>),
-    ContentCatalog(oneshot::Sender<IndexContentCatalogResult>),
-    Target(oneshot::Sender<CreateTargetJobResult>),
-    BeginPublication(oneshot::Sender<BeginPublishNowResult>),
-    SchedulePublication(oneshot::Sender<SchedulePublicationResult>),
-    BeginScheduledActivation(oneshot::Sender<BeginScheduledActivationResult>),
-    FinishPublication(oneshot::Sender<FinishPublicationResult>),
-}
-
-enum MutationOutput {
-    Startup(SiteHead),
-    ContentCatalog,
-    Target(StoredTargetJob),
-    BeginPublication(PublishNowState),
-    ScheduledPublication(ScheduledPublication),
-    BegunScheduledPublication(crate::domain::publication::store::BegunPublication),
-    FinishPublication(FinishedPublication),
+enum FailedMutation {
+    Command(Box<dyn FnOnce() + Send>),
+    Operation(sqlx::Error),
+    Corrupt(&'static str),
 }
 
 enum ApplyError {
@@ -209,147 +201,282 @@ async fn apply_mutation(
     transaction: &mut Transaction<'_, Sqlite>,
     mutation: Mutation,
 ) -> Result<AppliedMutation, FailedMutation> {
-    let (responder, result) = match mutation {
+    match mutation {
+        Mutation::RecordAdminAuditFailure {
+            command,
+            respond_to,
+        } => auth_response(
+            respond_to,
+            record_admin_audit_failure(transaction, command).await,
+        ),
+        Mutation::BootstrapIdentity {
+            command,
+            respond_to,
+        } => auth_response(
+            respond_to,
+            apply_bootstrap_identity(transaction, command).await,
+        ),
+        Mutation::CreateUser {
+            command,
+            respond_to,
+        } => auth_response(respond_to, create_user(transaction, command).await),
+        Mutation::SetUserStatus {
+            command,
+            respond_to,
+        } => auth_response(respond_to, set_user_status(transaction, command).await),
+        Mutation::ReplaceUserRoles {
+            command,
+            respond_to,
+        } => auth_response(respond_to, replace_user_roles(transaction, command).await),
+        Mutation::PutHumanCredential {
+            command,
+            respond_to,
+        } => auth_response(respond_to, put_human_credential(transaction, command).await),
+        Mutation::RemoveHumanCredential {
+            command,
+            respond_to,
+        } => auth_response(
+            respond_to,
+            remove_human_credential(transaction, command).await,
+        ),
+        Mutation::CreateLoginChallenge {
+            command,
+            respond_to,
+        } => auth_response(
+            respond_to,
+            create_login_challenge(transaction, command).await,
+        ),
+        Mutation::CreateBrowserSession {
+            command,
+            respond_to,
+        } => auth_response(
+            respond_to,
+            create_browser_session(transaction, command).await,
+        ),
+        Mutation::RevokeBrowserSession {
+            command,
+            respond_to,
+        } => auth_response(
+            respond_to,
+            revoke_browser_session(transaction, command).await,
+        ),
+        Mutation::RegisterAgentCredential {
+            command,
+            respond_to,
+        } => auth_response(
+            respond_to,
+            register_agent_credential(transaction, command).await,
+        ),
+        Mutation::ReplaceAgentScopes {
+            command,
+            respond_to,
+        } => auth_response(respond_to, replace_agent_scopes(transaction, command).await),
+        Mutation::RevokeAgentCredential {
+            command,
+            respond_to,
+        } => auth_response(
+            respond_to,
+            revoke_agent_credential(transaction, command).await,
+        ),
+        Mutation::AcceptAgentProof {
+            command,
+            respond_to,
+        } => auth_response(respond_to, accept_agent_proof(transaction, command).await),
+        Mutation::UpdateProfile {
+            command,
+            respond_to,
+        } => profile_response(respond_to, apply_update_profile(transaction, command).await),
+        Mutation::SetTipRecipient {
+            command,
+            respond_to,
+        } => profile_response(
+            respond_to,
+            apply_set_tip_recipient(transaction, command).await,
+        ),
         Mutation::InstallStartupSnapshot {
             command,
             respond_to,
-        } => (
-            MutationResponder::Startup(respond_to),
+        } => database_response(
+            respond_to,
             install_startup(transaction, command)
                 .await
-                .map(MutationOutput::Startup)
                 .map_err(ApplyError::startup),
+            false,
         ),
         Mutation::IndexContentCatalog {
             command,
             respond_to,
-        } => (
-            MutationResponder::ContentCatalog(respond_to),
+        } => database_response(
+            respond_to,
             index_content_catalog(transaction, command)
                 .await
-                .map(|()| MutationOutput::ContentCatalog)
                 .map_err(ApplyError::startup),
+            false,
         ),
         Mutation::CreateTargetJob {
             command,
             respond_to,
-        } => (
-            MutationResponder::Target(respond_to),
+        } => database_response(
+            respond_to,
             create_target_job(transaction, command)
                 .await
-                .map(MutationOutput::Target)
                 .map_err(ApplyError::target),
+            true,
         ),
         Mutation::BeginPublishNow {
             command,
             respond_to,
-        } => (
-            MutationResponder::BeginPublication(respond_to),
+        } => database_response(
+            respond_to,
             begin_publish_now(transaction, command)
                 .await
-                .map(MutationOutput::BeginPublication)
                 .map_err(ApplyError::publication),
+            false,
         ),
         Mutation::SchedulePublication {
             command,
             respond_to,
-        } => (
-            MutationResponder::SchedulePublication(respond_to),
+        } => database_response(
+            respond_to,
             schedule_publication(transaction, command)
                 .await
-                .map(MutationOutput::ScheduledPublication)
                 .map_err(ApplyError::publication),
+            false,
         ),
         Mutation::BeginScheduledActivation {
             command,
             respond_to,
-        } => (
-            MutationResponder::BeginScheduledActivation(respond_to),
+        } => database_response(
+            respond_to,
             begin_scheduled_activation(transaction, command)
                 .await
-                .map(MutationOutput::BegunScheduledPublication)
                 .map_err(ApplyError::publication),
+            false,
         ),
         Mutation::FinishPublication {
             command,
             respond_to,
-        } => (
-            MutationResponder::FinishPublication(respond_to),
+        } => database_response(
+            respond_to,
             finish_publication(transaction, command)
                 .await
-                .map(MutationOutput::FinishPublication)
                 .map_err(ApplyError::publication),
+            false,
         ),
-    };
-    match result {
-        Ok(output) => Ok(AppliedMutation { responder, output }),
-        Err(error) => Err(FailedMutation { responder, error }),
     }
 }
 
-impl MutationResponder {
-    fn send_success(self, output: MutationOutput) {
-        match (self, output) {
-            (Self::Startup(sender), MutationOutput::Startup(value)) => {
-                let _ = sender.send(Ok(value));
-            }
-            (Self::ContentCatalog(sender), MutationOutput::ContentCatalog) => {
-                let _ = sender.send(Ok(()));
-            }
-            (Self::Target(sender), MutationOutput::Target(value)) => {
-                let _ = sender.send(Ok(value));
-            }
-            (Self::BeginPublication(sender), MutationOutput::BeginPublication(value)) => {
-                let _ = sender.send(Ok(value));
-            }
-            (Self::SchedulePublication(sender), MutationOutput::ScheduledPublication(value)) => {
-                let _ = sender.send(Ok(value));
-            }
-            (
-                Self::BeginScheduledActivation(sender),
-                MutationOutput::BegunScheduledPublication(value),
-            ) => {
-                let _ = sender.send(Ok(value));
-            }
-            (Self::FinishPublication(sender), MutationOutput::FinishPublication(value)) => {
-                let _ = sender.send(Ok(value));
-            }
-            _ => unreachable!("mutation responder and output were constructed together"),
+impl AppliedMutation {
+    fn new<Output, CommandError>(
+        respond_to: oneshot::Sender<Result<Output, CommandError>>,
+        output: Output,
+        outcome_unknown: CommandError,
+        _crash_test_candidate: bool,
+    ) -> Self
+    where
+        Output: Send + 'static,
+        CommandError: Send + 'static,
+    {
+        Self {
+            respond: Box::new(move |committed| {
+                let result = if committed {
+                    Ok(output)
+                } else {
+                    Err(outcome_unknown)
+                };
+                let _ = respond_to.send(result);
+            }),
+            #[cfg(test)]
+            crash_test_candidate: _crash_test_candidate,
         }
     }
 
-    fn send_error(self, error: DatabaseCommandError) {
-        match self {
-            Self::Startup(sender) => {
-                let _ = sender.send(Err(error));
-            }
-            Self::ContentCatalog(sender) => {
-                let _ = sender.send(Err(error));
-            }
-            Self::Target(sender) => {
-                let _ = sender.send(Err(error));
-            }
-            Self::BeginPublication(sender) => {
-                let _ = sender.send(Err(error));
-            }
-            Self::SchedulePublication(sender) => {
-                let _ = sender.send(Err(error));
-            }
-            Self::BeginScheduledActivation(sender) => {
-                let _ = sender.send(Err(error));
-            }
-            Self::FinishPublication(sender) => {
-                let _ = sender.send(Err(error));
-            }
-        }
+    fn send_success(self) {
+        (self.respond)(true);
     }
-}
 
-impl MutationOutput {
+    fn send_outcome_unknown(self) {
+        (self.respond)(false);
+    }
+
     #[cfg(test)]
-    const fn is_target_creation(&self) -> bool {
-        matches!(self, Self::Target(_))
+    const fn is_crash_test_candidate(&self) -> bool {
+        self.crash_test_candidate
     }
+}
+
+fn auth_response<Output>(
+    respond_to: oneshot::Sender<Result<Output, AuthCommandError>>,
+    result: Result<Output, AuthApplyError>,
+) -> Result<AppliedMutation, FailedMutation>
+where
+    Output: Send + 'static,
+{
+    match result {
+        Ok(output) => Ok(AppliedMutation::new(
+            respond_to,
+            output,
+            AuthCommandError::OutcomeUnknown,
+            false,
+        )),
+        Err(AuthApplyError::Command(error)) => Err(command_failure(respond_to, error)),
+        Err(AuthApplyError::Operation(source)) => Err(FailedMutation::Operation(source)),
+        Err(AuthApplyError::CorruptStoredState) => Err(FailedMutation::Corrupt("admin identity")),
+    }
+}
+
+fn profile_response<Output>(
+    respond_to: oneshot::Sender<Result<Output, ProfileCommandError>>,
+    result: Result<Output, ProfileApplyError>,
+) -> Result<AppliedMutation, FailedMutation>
+where
+    Output: Send + 'static,
+{
+    match result {
+        Ok(output) => Ok(AppliedMutation::new(
+            respond_to,
+            output,
+            ProfileCommandError::OutcomeUnknown,
+            true,
+        )),
+        Err(ProfileApplyError::Command(error)) => Err(command_failure(respond_to, error)),
+        Err(ProfileApplyError::Operation(source)) => Err(FailedMutation::Operation(source)),
+        Err(ProfileApplyError::CorruptStoredState) => Err(FailedMutation::Corrupt("user profile")),
+    }
+}
+
+fn database_response<Output>(
+    respond_to: oneshot::Sender<Result<Output, DatabaseCommandError>>,
+    result: Result<Output, ApplyError>,
+    crash_test_candidate: bool,
+) -> Result<AppliedMutation, FailedMutation>
+where
+    Output: Send + 'static,
+{
+    match result {
+        Ok(output) => Ok(AppliedMutation::new(
+            respond_to,
+            output,
+            DatabaseCommandError::OutcomeUnknown,
+            crash_test_candidate,
+        )),
+        Err(ApplyError::Command(error)) => Err(command_failure(respond_to, error)),
+        Err(ApplyError::Operation(source)) => Err(FailedMutation::Operation(source)),
+        Err(ApplyError::Corrupt(entity)) => Err(FailedMutation::Corrupt(entity)),
+    }
+}
+
+fn command_failure<Output, CommandError>(
+    respond_to: oneshot::Sender<Result<Output, CommandError>>,
+    error: CommandError,
+) -> FailedMutation
+where
+    Output: Send + 'static,
+    CommandError: Send + 'static,
+{
+    FailedMutation::Command(Box::new(move || {
+        let _ = respond_to.send(Err(error));
+    }))
 }
 
 impl ApplyError {
@@ -382,13 +509,13 @@ impl ApplyError {
 
 impl FailedMutation {
     fn finish(self) -> Result<(), DatabaseWriterError> {
-        match self.error {
-            ApplyError::Command(error) => {
-                self.responder.send_error(error);
+        match self {
+            Self::Command(respond) => {
+                respond();
                 Ok(())
             }
-            ApplyError::Operation(source) => Err(DatabaseWriterError::Operation { source }),
-            ApplyError::Corrupt(entity) => Err(DatabaseWriterError::CorruptData { entity }),
+            Self::Operation(source) => Err(DatabaseWriterError::Operation { source }),
+            Self::Corrupt(entity) => Err(DatabaseWriterError::CorruptData { entity }),
         }
     }
 }
@@ -483,10 +610,6 @@ mod tests {
     use super::*;
     use crate::{
         config::{DatabaseBusyTimeout, DatabaseReadPoolSize, DatabaseWriterQueueCapacity},
-        content::{
-            ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
-            SiteSnapshotDigest,
-        },
         database,
         domain::{
             distribution::{DistributionTarget, TargetPayload},
@@ -499,6 +622,10 @@ mod tests {
                 },
             },
         },
+    };
+    use markdown_compiler::{
+        ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
+        SiteSnapshotDigest,
     };
 
     const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -949,8 +1076,14 @@ mod tests {
         assert_eq!(begin_retry.publication_id, finished.publication_id);
         assert_eq!(begin_retry.stable_post_id, finished_view.stable_post_id);
         assert_eq!(begin_retry.revision, finished_view.pinned_post_digest);
-        assert_eq!(begin_retry.accepted_preview_digest, finished.accepted_preview_digest);
-        assert_eq!(begin_retry.published_at, finished_view.published_at.unwrap());
+        assert_eq!(
+            begin_retry.accepted_preview_digest,
+            finished.accepted_preview_digest
+        );
+        assert_eq!(
+            begin_retry.published_at,
+            finished_view.published_at.unwrap()
+        );
         assert_eq!(begin_retry.site, finished.site);
 
         let mut conflicting_replay = begin_publication(

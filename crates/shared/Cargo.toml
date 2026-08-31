@@ -11,6 +11,7 @@ serde.workspace = true
 time.workspace = true
 utoipa = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["serde"] }
+zeroize = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
 serde_json.workspace = true

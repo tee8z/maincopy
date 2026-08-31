@@ -4,6 +4,7 @@
   --page-foreground: #24231f;
   --muted-foreground: #68645b;
   --accent: #9b3f26;
+  --accent-contrast: #ffffff;
   --surface: #ffffff;
   --border: #d9d4c9;
   font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif;
@@ -43,6 +44,12 @@ a {
   text-underline-offset: 0.18em;
 }
 
+a:focus-visible,
+button:focus-visible {
+  outline: 0.2rem solid var(--accent);
+  outline-offset: 0.2rem;
+}
+
 img,
 svg {
   height: auto;
@@ -77,12 +84,44 @@ time {
   width: 1px;
 }
 
+.tip-cta {
+  border-block-start: 1px solid var(--border);
+  margin-block-start: 2.5rem;
+  padding-block-start: 1.5rem;
+}
+
+.tip-action {
+  background: var(--accent);
+  border-radius: 0.25rem;
+  color: var(--accent-contrast);
+  display: inline-block;
+  font-weight: 700;
+  padding: 0.6rem 0.9rem;
+  text-decoration: none;
+}
+
+.tip-recipient code {
+  user-select: all;
+}
+
+.tip-copy {
+  cursor: pointer;
+  font: inherit;
+  margin-inline-start: 0.4rem;
+}
+
+.tip-qr {
+  display: block;
+  inline-size: min(14rem, 100%);
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     --page-background: #1d1c19;
     --page-foreground: #ece8de;
     --muted-foreground: #b4aea2;
     --accent: #e28a6b;
+    --accent-contrast: #1d1c19;
     --surface: #292722;
     --border: #48443b;
   }

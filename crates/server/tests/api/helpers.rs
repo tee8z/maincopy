@@ -8,14 +8,12 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use maincopy_server::{
-    content::{ContentTreeLimits, discover_content_tree, resolve_content_assets},
+    domain::publication::PublicLedgerProjection,
     frontend_assets::embedded_manifest,
-    render::{
-        PublicLedgerProjection, SiteSnapshotReader, build_site_snapshot, compile_content_catalog,
-        render_site_shell,
-    },
+    render::{SiteSnapshotReader, build_site_snapshot, compile_content_catalog, render_site_shell},
     web::{PublicState, Readiness},
 };
+use markdown_compiler::{ContentTreeLimits, discover_content_tree, resolve_content_assets};
 
 pub fn public_state(readiness: Readiness) -> PublicState {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/content");

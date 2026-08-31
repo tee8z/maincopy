@@ -39,9 +39,15 @@ not precedent. Reviews must approve and document exceptions.
 
 ## Modules and imports
 
-- Organize business code by capability under `domain`. Keep shared mechanisms
-  at the server root, wire contracts in `maincopy-shared`, and CLI behavior in
-  `maincopy-cli`.
+- Organize business code by capability under `domain`. Keep wire contracts in
+  `maincopy-shared` and operator CLI behavior in `maincopy-cli`.
+- Keep authored content types, validation, and compilation in
+  `markdown-compiler`. Keep server composition and publication policy in
+  `maincopy-server`.
+- Name each root mechanism for the operation that it performs. Do not give a
+  root mechanism the same capability name as a domain module. For example,
+  keep Git provenance discovery in `source_provenance` and presentation
+  mechanics in `render`.
 - Keep items private by default. Export only the required caller boundary and
   re-export the intentional module surface.
 - Do not expose an implementation only for a test. Keep `main.rs` small and

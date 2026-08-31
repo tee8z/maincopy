@@ -13,6 +13,8 @@ pub enum ConfigurationValidationCode {
     HostDocumentTooLarge,
     HostTextInvalidUtf8,
     HostTomlInvalid,
+    AdminBindInvalid,
+    AdminOriginInvalid,
     PathInvalid,
     SecretReferenceInvalid,
     LimitOutOfRange,
@@ -29,6 +31,8 @@ impl ConfigurationValidationCode {
             Self::HostDocumentTooLarge => "host_document_too_large",
             Self::HostTextInvalidUtf8 => "host_text_invalid_utf8",
             Self::HostTomlInvalid => "host_toml_invalid",
+            Self::AdminBindInvalid => "admin_bind_invalid",
+            Self::AdminOriginInvalid => "admin_origin_invalid",
             Self::PathInvalid => "path_invalid",
             Self::SecretReferenceInvalid => "secret_reference_invalid",
             Self::LimitOutOfRange => "limit_out_of_range",
@@ -184,6 +188,14 @@ mod tests {
                 ConfigurationValidationCode::HostTomlInvalid,
                 "host_toml_invalid",
             ),
+            (
+                ConfigurationValidationCode::AdminBindInvalid,
+                "admin_bind_invalid",
+            ),
+            (
+                ConfigurationValidationCode::AdminOriginInvalid,
+                "admin_origin_invalid",
+            ),
             (ConfigurationValidationCode::PathInvalid, "path_invalid"),
             (
                 ConfigurationValidationCode::SecretReferenceInvalid,
@@ -255,17 +267,18 @@ mod tests {
 
     #[test]
     fn toml_locations_use_one_based_unicode_scalar_columns() {
-        #[allow(dead_code)]
         #[derive(Debug, Deserialize)]
         struct Document {
-            root: Root,
+            #[serde(rename = "root")]
+            _root: Root,
         }
 
-        #[allow(dead_code)]
         #[derive(Debug, Deserialize)]
         struct Root {
-            label: String,
-            count: u64,
+            #[serde(rename = "label")]
+            _label: String,
+            #[serde(rename = "count")]
+            _count: u64,
         }
 
         let source = "root = { label = \"é\", count = \"bad\" }\n";

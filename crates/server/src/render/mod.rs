@@ -1,9 +1,11 @@
 //! Deterministic rendering capabilities consumed by immutable snapshots.
 
+mod asset_path;
 mod catalog;
 mod markdown;
 mod site;
 
+pub use asset_path::{SnapshotAssetPath, SnapshotAssetPathError};
 pub(crate) use catalog::CatalogRetentionError;
 pub use catalog::{
     CatalogBuildError, CatalogBuildErrorCode, ContentCatalog, compile_content_catalog,
@@ -15,13 +17,9 @@ pub use markdown::{
     RenderedPost, render_markdown,
 };
 pub use site::{
-    CanonicalSiteUrl, RenderedSiteShell, SiteSnapshot, SiteSnapshotBuildError,
-    SiteSnapshotBuildErrorCode, SiteSnapshotReader, SnapshotPublicAsset, build_site_snapshot,
-    render_site_shell,
+    RenderedSiteShell, SiteSnapshot, SiteSnapshotBuildError, SiteSnapshotBuildErrorCode,
+    SiteSnapshotReader, SnapshotPublicAsset, build_site_snapshot, render_site_shell,
 };
-
-// Temporary compatibility export while callers move to the owning domain.
-pub use crate::domain::publication::PublicLedgerProjection;
 
 pub(crate) use site::{
     SiteSnapshotActivator, render_bound_post_preview, render_bound_post_revision_preview,

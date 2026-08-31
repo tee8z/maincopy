@@ -324,13 +324,20 @@ mod tests {
     fn generated_manifest_matches_every_embedded_byte_and_path() {
         let manifest = embedded_manifest();
         manifest.validate().unwrap();
-        assert!(manifest.javascript.is_none());
         assert_eq!(manifest.css.name(), FrontendAssetName::Stylesheet);
         assert_eq!(manifest.css.kind, FrontendAssetKind::Css);
         assert!(!manifest.css.bytes.is_empty());
         assert_eq!(
             manifest.css.public_path,
             format!("/app-assets/{}/site.css", manifest.bundle_digest)
+        );
+        let javascript = manifest.javascript.as_ref().unwrap();
+        assert_eq!(javascript.name(), FrontendAssetName::JavaScript);
+        assert_eq!(javascript.kind, FrontendAssetKind::JavaScript);
+        assert!(!javascript.bytes.is_empty());
+        assert_eq!(
+            javascript.public_path,
+            format!("/app-assets/{}/site.js", manifest.bundle_digest)
         );
     }
 
@@ -341,10 +348,9 @@ mod tests {
             manifest.lookup(&manifest.bundle_digest, FrontendAssetName::Stylesheet),
             Some(&manifest.css)
         );
-        assert!(
-            manifest
-                .lookup(&manifest.bundle_digest, FrontendAssetName::JavaScript)
-                .is_none()
+        assert_eq!(
+            manifest.lookup(&manifest.bundle_digest, FrontendAssetName::JavaScript),
+            manifest.javascript.as_ref()
         );
         let different = FrontendBundleDigest([0x55; 32]);
         assert!(

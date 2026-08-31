@@ -1,8 +1,9 @@
 use std::{fmt, process::Termination};
 
+use markdown_compiler::ContentValidationErrors;
 use thiserror::Error;
 
-use crate::{config::ConfigurationErrors, content::ContentValidationErrors};
+use crate::config::ConfigurationErrors;
 
 macro_rules! impl_display {
     ($name:ty { $($pattern:pat => $value:literal),+ $(,)? }) => {
@@ -50,6 +51,12 @@ pub enum ProcessError {
     #[error("another process already owns a required Maincopy resource")]
     AlreadyRunning,
 
+    #[error("identity bootstrap is already complete")]
+    IdentityAlreadyBootstrapped,
+
+    #[error("owner credential input is invalid")]
+    IdentityCredentialInvalid,
+
     #[error(transparent)]
     Application(#[from] ApplicationError),
 }
@@ -58,8 +65,8 @@ impl ProcessError {
     pub const fn exit(&self) -> ProcessExit {
         match self {
             Self::Configuration(_) => ProcessExit::Configuration,
-            Self::Validation(_) => ProcessExit::Validation,
-            Self::AlreadyRunning => ProcessExit::Conflict,
+            Self::Validation(_) | Self::IdentityCredentialInvalid => ProcessExit::Validation,
+            Self::AlreadyRunning | Self::IdentityAlreadyBootstrapped => ProcessExit::Conflict,
             Self::Application(_) => ProcessExit::Internal,
         }
     }
@@ -67,8 +74,8 @@ impl ProcessError {
     pub const fn category(&self) -> &'static str {
         match self {
             Self::Configuration(_) => "configuration",
-            Self::Validation(_) => "validation",
-            Self::AlreadyRunning => "conflict",
+            Self::Validation(_) | Self::IdentityCredentialInvalid => "validation",
+            Self::AlreadyRunning | Self::IdentityAlreadyBootstrapped => "conflict",
             Self::Application(_) => "internal",
         }
     }
@@ -114,8 +121,15 @@ pub enum ApplicationError {
     #[error("the critical task supervisor became empty unexpectedly")]
     TaskSupervisorEmpty,
 
-    #[error("application construction failed during {stage}")]
-    Startup { stage: StartupStage },
+    #[error(
+        "application construction failed during {stage} while attempting to {operation}: {source}"
+    )]
+    Startup {
+        stage: StartupStage,
+        operation: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +169,7 @@ pub enum StartupStage {
     Configuration,
     ProcessLock,
     Database,
+    Identity,
     Content,
     FrontendAssets,
     Listeners,
@@ -164,6 +179,7 @@ impl_display!(StartupStage {
     Self::Configuration => "configuration",
     Self::ProcessLock => "process lock",
     Self::Database => "database startup",
+    Self::Identity => "identity bootstrap",
     Self::Content => "content compilation",
     Self::FrontendAssets => "frontend asset validation",
     Self::Listeners => "listener binding",
@@ -172,20 +188,21 @@ impl_display!(StartupStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ConfigurationDiagnostic, ConfigurationValidationCode};
 
     fn configuration_errors() -> ConfigurationErrors {
-        ConfigurationErrors::from_diagnostics(vec![crate::config::ConfigurationDiagnostic::new(
+        ConfigurationErrors::from_diagnostics(vec![ConfigurationDiagnostic::new(
             "$document",
-            crate::config::ConfigurationValidationCode::HostTomlInvalid,
+            ConfigurationValidationCode::HostTomlInvalid,
             "host TOML does not match the schema",
         )])
     }
 
     fn validation_errors() -> ContentValidationErrors {
         let root = tempfile::tempdir().unwrap();
-        crate::content::discover_content_tree(
+        markdown_compiler::discover_content_tree(
             &root.path().join("missing"),
-            crate::content::ContentTreeLimits::default(),
+            markdown_compiler::ContentTreeLimits::default(),
         )
         .unwrap_err()
     }
@@ -203,8 +220,18 @@ mod tests {
             ),
             (ProcessError::AlreadyRunning, ProcessExit::Conflict),
             (
+                ProcessError::IdentityAlreadyBootstrapped,
+                ProcessExit::Conflict,
+            ),
+            (
+                ProcessError::IdentityCredentialInvalid,
+                ProcessExit::Validation,
+            ),
+            (
                 ProcessError::Application(ApplicationError::Startup {
                     stage: StartupStage::Configuration,
+                    operation: "load test configuration",
+                    source: Box::new(std::io::Error::other("test startup failure")),
                 }),
                 ProcessExit::Internal,
             ),
@@ -234,9 +261,13 @@ mod tests {
             ),
             (ProcessError::Validation(validation_errors()), "validation"),
             (ProcessError::AlreadyRunning, "conflict"),
+            (ProcessError::IdentityAlreadyBootstrapped, "conflict"),
+            (ProcessError::IdentityCredentialInvalid, "validation"),
             (
                 ProcessError::Application(ApplicationError::Startup {
                     stage: StartupStage::Configuration,
+                    operation: "load test configuration",
+                    source: Box::new(std::io::Error::other("test startup failure")),
                 }),
                 "internal",
             ),
@@ -258,6 +289,10 @@ mod tests {
         assert_display! {
             ProcessError::AlreadyRunning =>
                 "another process already owns a required Maincopy resource",
+            ProcessError::IdentityAlreadyBootstrapped =>
+                "identity bootstrap is already complete",
+            ProcessError::IdentityCredentialInvalid =>
+                "owner credential input is invalid",
             ShutdownSignal::Interrupt => "interrupt",
             ShutdownSignal::Terminate => "terminate",
             CriticalTaskName::PublicServer => "public server",
@@ -270,6 +305,7 @@ mod tests {
             StartupStage::Configuration => "configuration",
             StartupStage::ProcessLock => "process lock",
             StartupStage::Database => "database startup",
+            StartupStage::Identity => "identity bootstrap",
             StartupStage::Content => "content compilation",
             StartupStage::FrontendAssets => "frontend asset validation",
             StartupStage::Listeners => "listener binding",

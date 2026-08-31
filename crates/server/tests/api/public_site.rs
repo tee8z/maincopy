@@ -80,6 +80,19 @@ async fn application_assets_require_an_exact_typed_manifest_lookup() {
     );
     assert_eq!(body_bytes(response).await.as_ref(), stylesheet.bytes);
 
+    let javascript = manifest.javascript.as_ref().unwrap();
+    let response = get(app.clone(), javascript.public_path).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        javascript.mime()
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        IMMUTABLE_CACHE_CONTROL
+    );
+    assert_eq!(body_bytes(response).await.as_ref(), javascript.bytes);
+
     let digest = &manifest.bundle_digest;
     for path in [
         format!("/app-assets/{digest}/SITE.CSS"),

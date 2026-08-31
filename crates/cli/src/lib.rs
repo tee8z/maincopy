@@ -1,7 +1,10 @@
-//! Concrete client for Maincopy's private local admin API.
+//! Command-side contracts for Maincopy's administration API.
 
-#[cfg(any(unix, windows))]
 mod client;
+mod credentials;
+mod models;
+mod nip98;
+mod startup;
+mod transport;
 
-#[cfg(any(unix, windows))]
-pub use client::{AdminClient, AdminClientError, AdminProblem, PostPreview};
+pub use startup::run;

@@ -2,10 +2,9 @@
 
 use std::{fmt, str::FromStr};
 
+use markdown_compiler::{PostId, PostRevisionDigest};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
-
-use crate::content::{PostId, PostRevisionDigest};
 
 pub const CURRENT_PAYLOAD_VERSION: u16 = 1;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;

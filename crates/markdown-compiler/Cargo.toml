@@ -1,0 +1,33 @@
+[package]
+name = "markdown-compiler"
+version.workspace = true
+edition.workspace = true
+autobins = false
+
+[lib]
+name = "markdown_compiler"
+
+[[bin]]
+name = "markdowncompiler"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+clap.workspace = true
+pulldown-cmark.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+toml.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { workspace = true, features = ["fs", "process", "std"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+rustix = { workspace = true, features = ["fs", "process", "std"] }

@@ -1,20 +1,23 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use markdown_compiler::{
+    ContentCandidateStore, ContentCandidateStoreError, ContentTreeDigest, ContentTreeLimits,
+    DiscoveredContentTree, discover_content_tree, resolve_content_assets,
+};
 use thiserror::Error;
 use tokio::{task::JoinError, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    content::{
-        ContentCandidateStore, ContentCandidateStoreError, ContentTreeDigest, ContentTreeLimits,
-        DiscoveredContentTree, SourceCommit, SourceCommitDiscovery, discover_content_tree,
-        discover_source_commit, resolve_content_assets,
-    },
     database::store::{DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError},
-    domain::publication::activation::{
-        ContentReloadError, PublicationCoordinatorHandle, PublicationCoordinatorUnavailable,
+    domain::publication::{
+        SourceCommit,
+        activation::{
+            ContentReloadError, PublicationCoordinatorHandle, PublicationCoordinatorUnavailable,
+        },
     },
     render::{ContentCatalog, compile_content_catalog},
+    source_provenance::{SourceCommitDiscovery, discover_source_commit},
 };
 
 const CONTENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -340,10 +343,9 @@ pub(crate) enum ContentSyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::{
-        PostCollection,
-        tree::{post, publication},
-    };
+    use markdown_compiler::PostCollection;
+
+    use crate::content_fixtures::{content_tree, post, publication};
 
     fn compiled_candidate() -> CompiledCandidate {
         let publication_source = "[site]\n\
@@ -366,7 +368,7 @@ mod tests {
             Exact retained Markdown body.\n"
             .to_owned();
         let total_bytes = (publication_source.len() + post_source.len()) as u64;
-        let tree = DiscoveredContentTree::new(
+        let tree = content_tree(
             publication("publication.toml", publication_source),
             vec![post(
                 "posts/retained-post.md",

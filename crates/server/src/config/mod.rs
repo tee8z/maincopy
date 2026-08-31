@@ -5,11 +5,7 @@ mod host;
 pub(crate) mod secret;
 
 pub use diagnostic::{ConfigurationDiagnostic, ConfigurationErrors, ConfigurationValidationCode};
-pub(crate) use host::HostConfigurationOverrides;
-pub use host::{
-    DatabaseBusyTimeout, DatabaseConfigurationView, DatabaseReadPoolSize,
-    DatabaseWriterQueueCapacity, HostConfiguration, HostConfigurationLoader, HostConfigurationView,
-};
+#[cfg(test)]
+pub(crate) use host::{DatabaseBusyTimeout, DatabaseReadPoolSize, DatabaseWriterQueueCapacity};
+pub(crate) use host::{DatabaseConfigurationView, HostConfiguration, HostConfigurationLoader};
 pub use secret::{SecretFileReference, SensitivePath};
-
-pub const DEFAULT_HOST_CONFIGURATION_FILE: &str = "maincopy.toml";

@@ -10,16 +10,26 @@ path = "src/main.rs"
 
 [dependencies]
 arc-swap.workspace = true
+argon2.workspace = true
 axum.workspace = true
-bech32.workspace = true
+base64.workspace = true
+bech32 = { workspace = true, features = ["std"] }
 blake3.workspace = true
 clap.workspace = true
+getrandom.workspace = true
 libsqlite3-sys.workspace = true
+k256.workspace = true
 maincopy-shared = { workspace = true, features = ["schema"] }
+markdown-compiler.workspace = true
 maud.workspace = true
 pulldown-cmark.workspace = true
+qrcode.workspace = true
+rpassword.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -35,13 +45,6 @@ zeroize = { workspace = true, default-features = false, features = ["alloc"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 rustix = { workspace = true, features = ["fs", "process", "std"] }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-] }
 
 [build-dependencies]
 blake3 = { version = "=1.8.7", default-features = false, features = ["std"] }

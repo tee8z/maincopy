@@ -1,8 +1,9 @@
 use std::fmt;
 
 use axum::{
-    extract::Request,
-    http::{HeaderMap, HeaderValue},
+    Extension,
+    extract::{FromRequestParts, Request, rejection::ExtensionRejection},
+    http::{HeaderMap, HeaderValue, request::Parts},
     middleware::Next,
     response::Response,
 };
@@ -14,7 +15,7 @@ pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 ///
 /// This type never retains an invalid or otherwise untrusted header value.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct RequestId(Uuid);
+pub(crate) struct RequestId(pub(crate) Uuid);
 
 impl RequestId {
     fn from_headers(headers: &HeaderMap) -> Self {
@@ -44,6 +45,18 @@ impl fmt::Display for RequestId {
     }
 }
 
+impl<S> FromRequestParts<S> for RequestId
+where
+    S: Send + Sync,
+{
+    type Rejection = ExtensionRejection;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Extension(request_id) = Extension::<Self>::from_request_parts(parts, state).await?;
+        Ok(request_id)
+    }
+}
+
 pub(super) async fn assign(mut request: Request, next: Next) -> Response {
     let request_id = RequestId::from_headers(request.headers());
     request.extensions_mut().insert(request_id);
@@ -57,7 +70,7 @@ pub(super) async fn assign(mut request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::{Extension, Router, http::StatusCode, middleware, routing::get};
+    use axum::{Router, http::StatusCode, middleware, routing::get};
     use tower::ServiceExt;
 
     use super::*;
@@ -66,7 +79,7 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_stores_the_typed_request_id_in_extensions() {
-        async fn handler(Extension(request_id): Extension<RequestId>) -> StatusCode {
+        async fn handler(request_id: RequestId) -> StatusCode {
             assert_eq!(request_id.to_string(), CANONICAL_REQUEST_ID);
             StatusCode::NO_CONTENT
         }
@@ -83,5 +96,25 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn missing_request_id_remains_a_server_wiring_error() {
+        async fn handler(_: RequestId) -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+
+        let response = Router::new()
+            .route("/", get(handler))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

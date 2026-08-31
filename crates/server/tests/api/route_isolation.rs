@@ -1,9 +1,11 @@
 use axum::http::{Method, StatusCode};
-use maincopy_server::{
-    admin::admin_router,
-    web::{Readiness, public_router},
+use maincopy_server::web::{Readiness, public_router};
+use maincopy_shared::{
+    ADMIN_CAPABILITIES_PATH,
+    posts::POSTS_PATH,
+    profile_api::{ACTIVE_TIP_RECIPIENT_PATH, CURRENT_USER_PROFILE_PATH},
+    publication::PUBLICATIONS_PATH,
 };
-use maincopy_shared::{ADMIN_CAPABILITIES_PATH, posts::POSTS_PATH, publication::PUBLICATIONS_PATH};
 
 use crate::helpers::{get, public_state, request};
 
@@ -27,6 +29,16 @@ async fn public_router_does_not_expose_admin_routes() {
     .await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn public_router_does_not_expose_profile_or_tip_recipient_resources() {
+    let app = public_router(public_state(Readiness::new(true)));
+
+    for path in [CURRENT_USER_PROFILE_PATH, ACTIVE_TIP_RECIPIENT_PATH] {
+        let response = get(app.clone(), path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
 }
 
 #[tokio::test]
@@ -81,13 +93,6 @@ async fn public_router_does_not_expose_admin_openapi() {
         "/api/admin/v1/openapi.json",
     )
     .await;
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn admin_router_does_not_expose_public_routes() {
-    let response = get(admin_router(), "/health/live").await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

@@ -1,17 +1,18 @@
 use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 
+use markdown_compiler::identity::finalize_post_revision;
+use markdown_compiler::{
+    AssetRevisionReference, DigestedAsset, LogicalAssetPath, LogicalContentPath,
+    MarkdownDestinationKind, MarkdownDestinationOrdinal, PostDocument, PostRendererIdentity,
+    PostRevisionDigest, ResolvedLocalAssetLookupError, ResolvedLocalAssetStore, ResolvedPostAssets,
+    ResolvedSiteAssets, RevisionIdentityError, SiteSnapshotDigest, digest_asset,
+};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::Serialize;
 use thiserror::Error;
 use url::{Position, Url};
 
-use crate::content::identity::finalize_post_revision;
-use crate::content::{
-    AssetRevisionReference, DigestedAsset, LogicalAssetPath, LogicalContentPath,
-    MarkdownDestinationKind, MarkdownDestinationOrdinal, PostDocument, PostRendererIdentity,
-    PostRevisionDigest, ResolvedLocalAssetLookupError, ResolvedLocalAssetStore, ResolvedPostAssets,
-    ResolvedSiteAssets, RevisionIdentityError, SiteSnapshotDigest, SnapshotAssetPath, digest_asset,
-};
+use super::SnapshotAssetPath;
 
 const MAX_RENDERED_HTML_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MERMAID_SOURCE_BYTES: usize = 256 * 1024;
@@ -1254,11 +1255,11 @@ fn rendered_html_limit_error(path: &LogicalContentPath) -> MarkdownRenderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::tree::{asset, post, publication};
-    use crate::content::{
-        DiscoveredContentTree, PostCollection, ResolvedContentAssets, ValidatedContent,
-        resolve_content_assets,
+    use markdown_compiler::{
+        PostCollection, ResolvedContentAssets, ValidatedContent, resolve_content_assets,
     };
+
+    use crate::content_fixtures::{asset, content_tree, post, publication};
 
     const POST_ID: &str = "4f054633-2d09-4b05-97d0-c6f0011a5199";
 
@@ -1301,7 +1302,7 @@ mod tests {
         draft: bool,
         asset_paths: &[&str],
     ) -> (ValidatedContent, ResolvedContentAssets) {
-        let tree = DiscoveredContentTree::new(
+        let tree = content_tree(
             publication("publication.toml", publication_source(title, origins)),
             vec![post(
                 if draft {
@@ -1345,7 +1346,7 @@ mod tests {
                 )]
             })
             .unwrap_or_default();
-        let tree = DiscoveredContentTree::new(
+        let tree = content_tree(
             publication("publication.toml", publication_source("Renderer", &[])),
             vec![post(
                 "posts/rendered.md",

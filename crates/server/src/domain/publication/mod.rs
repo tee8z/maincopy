@@ -2,25 +2,28 @@
 
 pub(crate) mod activation;
 pub(crate) mod admin;
+mod provenance;
+mod routes;
 pub(crate) mod scheduler;
 pub(crate) mod store;
 mod visibility;
 pub(crate) mod web;
 
+pub use provenance::{SourceCommit, SourceCommitAlgorithm, SourceCommitParseError};
+pub use routes::CanonicalSiteUrl;
+pub(crate) use routes::PublicPagePath;
 pub use visibility::{PublicLedgerProjection, PublishedPostRevision};
 
 use std::marker::PhantomData;
 
+use markdown_compiler::{PostId, PostRevisionDigest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
 
-use crate::{
-    content::{PostId, PostRevisionDigest, SourceCommit},
-    domain::distribution::{
-        DistributionTarget, TargetIdempotencyKey, TargetPayload, TargetPayloadDigest,
-        target_idempotency_key,
-    },
+use crate::domain::distribution::{
+    DistributionTarget, TargetIdempotencyKey, TargetPayload, TargetPayloadDigest,
+    target_idempotency_key,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

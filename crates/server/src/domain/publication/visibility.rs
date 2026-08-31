@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
+use markdown_compiler::{PostId, PostRevisionDigest};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
-
-use crate::content::{PostId, PostRevisionDigest};
 
 /// The exact post revision and committed publication time authorized for public use.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +62,15 @@ impl PublicLedgerProjection {
     /// Iterates the exact durable posts represented by this public projection.
     pub(crate) fn published_posts(&self) -> impl ExactSizeIterator<Item = &PublishedPostRevision> {
         self.entries.iter()
+    }
+
+    /// Returns the exact catalog keys that durable public visibility retains.
+    pub(crate) fn revision_keys(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (PostId, PostRevisionDigest)> + '_ {
+        self.entries
+            .iter()
+            .map(|entry| (entry.post_id.clone(), entry.revision.clone()))
     }
 
     pub(crate) fn try_from_exact_entries(
@@ -125,4 +133,11 @@ impl PublicLedgerProjection {
 #[error("public ledger contains duplicate post {post_id}")]
 pub(crate) struct PublicLedgerProjectionError {
     post_id: PostId,
+}
+
+impl PublicLedgerProjectionError {
+    #[cfg(test)]
+    pub(crate) fn post_id(&self) -> &PostId {
+        &self.post_id
+    }
 }

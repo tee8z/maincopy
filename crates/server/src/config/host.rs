@@ -7,14 +7,13 @@ use std::{
     time::Duration,
 };
 
-#[cfg(windows)]
-use maincopy_shared::{DEFAULT_WINDOWS_ADMIN_PIPE, is_valid_windows_admin_pipe_name};
-use serde::Deserialize;
-
-use crate::content::{
+use markdown_compiler::{
     ContentDepthLimit, ContentEntryLimit, ContentFileByteLimit, ContentPathByteLimit,
     ContentTreeByteLimit, ContentTreeLimits,
 };
+use serde::Deserialize;
+
+use crate::admin::origin::{AdminBind, AdminOrigin};
 
 use super::diagnostic::{
     ConfigurationDiagnostic, ConfigurationErrors, ConfigurationValidationCode, DiagnosticCollector,
@@ -25,36 +24,16 @@ const MAX_HOST_DOCUMENT_BYTES: u64 = 1024 * 1024;
 const DEFAULT_CONTENT_ROOT: &str = "content";
 const DEFAULT_STATE_ROOT: &str = "state";
 const DEFAULT_RUNTIME_ROOT: &str = "run";
-const DEFAULT_ADMIN_SOCKET_NAME: &str = "admin.sock";
 const DEFAULT_DATABASE_FILE_NAME: &str = "maincopy.db";
 const DEFAULT_PUBLIC_PORT: u16 = 3000;
+const DEFAULT_ADMIN_PORT: u16 = 3001;
+const DEFAULT_ADMIN_ORIGIN: &str = "https://admin.localhost";
 const DEFAULT_BUSY_TIMEOUT_MILLISECONDS: u64 = 5_000;
 const DEFAULT_WRITER_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_READ_POOL_SIZE: usize = 4;
 const MAX_DATABASE_BUSY_TIMEOUT_MILLISECONDS: u64 = 300_000;
 const MAX_DATABASE_WRITER_QUEUE_CAPACITY: usize = 65_536;
 const MAX_DATABASE_READ_POOL_SIZE: usize = 256;
-
-/// Non-secret command-line overrides for `maincopyd`.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct HostConfigurationOverrides {
-    pub(crate) content_root: Option<PathBuf>,
-    pub(crate) state_root: Option<PathBuf>,
-    pub(crate) runtime_root: Option<PathBuf>,
-    pub(crate) database_path: Option<PathBuf>,
-    pub(crate) public_bind: Option<SocketAddr>,
-    pub(crate) admin_socket: Option<PathBuf>,
-    pub(crate) database_busy_timeout_ms: Option<u64>,
-    pub(crate) database_writer_queue_capacity: Option<u64>,
-    pub(crate) database_read_pool_size: Option<u64>,
-    pub(crate) content_publication_file_bytes: Option<u64>,
-    pub(crate) content_post_file_bytes: Option<u64>,
-    pub(crate) content_asset_file_bytes: Option<u64>,
-    pub(crate) content_total_tree_bytes: Option<u64>,
-    pub(crate) content_entries: Option<u64>,
-    pub(crate) content_depth: Option<u64>,
-    pub(crate) content_path_bytes: Option<u64>,
-}
 
 macro_rules! bounded_usize_setting {
     ($name:ident, $minimum:expr, $maximum:expr) => {
@@ -131,7 +110,8 @@ pub struct HostConfiguration {
     runtime_root: PathBuf,
     content_limits: ContentTreeLimits,
     public_bind: SocketAddr,
-    admin_socket: PathBuf,
+    admin_bind: AdminBind,
+    admin_origin: AdminOrigin,
     database: DatabaseConfiguration,
 }
 
@@ -143,7 +123,8 @@ pub struct HostConfigurationView<'configuration> {
     pub runtime_root: &'configuration Path,
     pub content_limits: ContentTreeLimits,
     pub public_bind: SocketAddr,
-    pub admin_socket: &'configuration Path,
+    pub admin_bind: AdminBind,
+    pub admin_origin: &'configuration AdminOrigin,
     pub database: DatabaseConfigurationView<'configuration>,
 }
 
@@ -155,7 +136,8 @@ impl HostConfiguration {
             runtime_root: &self.runtime_root,
             content_limits: self.content_limits,
             public_bind: self.public_bind,
-            admin_socket: &self.admin_socket,
+            admin_bind: self.admin_bind,
+            admin_origin: &self.admin_origin,
             database: DatabaseConfigurationView {
                 path: &self.database.path,
                 busy_timeout: self.database.busy_timeout,
@@ -184,7 +166,7 @@ impl HostConfigurationLoader {
         Self::new(working_directory)
     }
 
-    pub fn new(working_directory: PathBuf) -> Result<Self, ConfigurationErrors> {
+    fn new(working_directory: PathBuf) -> Result<Self, ConfigurationErrors> {
         if !working_directory.is_absolute() {
             return Err(single_error(host_diagnostic(
                 "$working_directory",
@@ -196,14 +178,6 @@ impl HostConfigurationLoader {
     }
 
     pub fn load(&self, config_path: &Path) -> Result<HostConfiguration, ConfigurationErrors> {
-        self.load_with_overrides(config_path, HostConfigurationOverrides::default())
-    }
-
-    pub(crate) fn load_with_overrides(
-        &self,
-        config_path: &Path,
-        overrides: HostConfigurationOverrides,
-    ) -> Result<HostConfiguration, ConfigurationErrors> {
         let config_path = resolve_path(&self.working_directory, config_path).ok_or_else(|| {
             single_error(host_diagnostic(
                 "$config_file",
@@ -226,7 +200,7 @@ impl HostConfigurationLoader {
             }
             single_error(diagnostic)
         })?;
-        finalize_host(candidate, overrides, &self.working_directory, file_base)
+        finalize_host(candidate, &self.working_directory, file_base)
     }
 }
 
@@ -269,7 +243,8 @@ struct PublicCandidate {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AdminCandidate {
-    socket: Option<PathBuf>,
+    bind: Option<SocketAddr>,
+    origin: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -318,15 +293,13 @@ fn read_host_source(path: &Path) -> Result<String, ConfigurationErrors> {
 
 fn finalize_host(
     candidate: HostCandidate,
-    overrides: HostConfigurationOverrides,
     working_directory: &Path,
     file_base: &Path,
 ) -> Result<HostConfiguration, ConfigurationErrors> {
     let mut diagnostics = DiagnosticCollector::default();
-    let content_limits = validate_content_limits(candidate.content, &overrides, &mut diagnostics);
+    let content_limits = validate_content_limits(candidate.content, &mut diagnostics);
 
     let content_root = select_path(
-        overrides.content_root,
         candidate.paths.content_root,
         working_directory,
         file_base,
@@ -335,7 +308,6 @@ fn finalize_host(
         &mut diagnostics,
     );
     let state_root = select_path(
-        overrides.state_root,
         candidate.paths.state_root,
         working_directory,
         file_base,
@@ -344,7 +316,6 @@ fn finalize_host(
         &mut diagnostics,
     );
     let runtime_root = select_path(
-        overrides.runtime_root,
         candidate.paths.runtime_root,
         working_directory,
         file_base,
@@ -353,49 +324,42 @@ fn finalize_host(
         &mut diagnostics,
     );
 
-    let admin_socket = select_admin_socket(
-        overrides.admin_socket,
-        candidate.admin.socket,
-        working_directory,
-        file_base,
-        runtime_root.as_deref(),
-        &mut diagnostics,
-    );
-    let database_path = match overrides.database_path {
+    let database_path = match candidate.database.path {
         Some(path) => validate_resolved_path(
-            resolve_path(working_directory, &path),
+            resolve_path(file_base, &path),
             "database.path",
             &mut diagnostics,
         ),
-        None => match candidate.database.path {
-            Some(path) => validate_resolved_path(
-                resolve_path(file_base, &path),
-                "database.path",
-                &mut diagnostics,
-            ),
-            None => state_root
-                .as_ref()
-                .map(|root| root.join(DEFAULT_DATABASE_FILE_NAME)),
-        },
+        None => state_root
+            .as_ref()
+            .map(|root| root.join(DEFAULT_DATABASE_FILE_NAME)),
     };
-    let public_bind = overrides
-        .public_bind
-        .or(candidate.public.bind)
-        .unwrap_or_else(default_public_bind);
+    let public_bind = candidate.public.bind.unwrap_or_else(default_public_bind);
+    let admin_bind = validate_admin_bind(
+        candidate.admin.bind.unwrap_or_else(default_admin_bind),
+        &mut diagnostics,
+    );
+    let admin_origin = validate_admin_origin(
+        candidate
+            .admin
+            .origin
+            .unwrap_or_else(|| DEFAULT_ADMIN_ORIGIN.to_owned()),
+        &mut diagnostics,
+    );
 
     let busy_timeout = validate_duration::<DatabaseBusyTimeout>(
-        overrides
-            .database_busy_timeout_ms
-            .or(candidate.database.busy_timeout_ms)
+        candidate
+            .database
+            .busy_timeout_ms
             .unwrap_or(DEFAULT_BUSY_TIMEOUT_MILLISECONDS),
         "database.busy_timeout_ms",
         DatabaseBusyTimeout::from_milliseconds,
         &mut diagnostics,
     );
     let writer_queue_capacity = validate_usize::<DatabaseWriterQueueCapacity>(
-        overrides
-            .database_writer_queue_capacity
-            .or(candidate.database.writer_queue_capacity)
+        candidate
+            .database
+            .writer_queue_capacity
             .unwrap_or(DEFAULT_WRITER_QUEUE_CAPACITY as u64),
         "database.writer_queue_capacity",
         ConfigurationValidationCode::LimitOutOfRange,
@@ -403,9 +367,9 @@ fn finalize_host(
         &mut diagnostics,
     );
     let read_pool_size = validate_usize::<DatabaseReadPoolSize>(
-        overrides
-            .database_read_pool_size
-            .or(candidate.database.read_pool_size)
+        candidate
+            .database
+            .read_pool_size
             .unwrap_or(DEFAULT_READ_POOL_SIZE as u64),
         "database.read_pool_size",
         ConfigurationValidationCode::LimitOutOfRange,
@@ -417,30 +381,33 @@ fn finalize_host(
         content_root,
         state_root,
         runtime_root,
-        admin_socket,
         database_path,
         busy_timeout,
         writer_queue_capacity,
         read_pool_size,
         content_limits,
+        admin_bind,
+        admin_origin,
     ) {
         (
             Some(content_root),
             Some(state_root),
             Some(runtime_root),
-            Some(admin_socket),
             Some(database_path),
             Some(busy_timeout),
             Some(writer_queue_capacity),
             Some(read_pool_size),
             Some(content),
+            Some(admin_bind),
+            Some(admin_origin),
         ) => Ok(HostConfiguration {
             content_root,
             state_root,
             runtime_root,
             content_limits: content,
             public_bind,
-            admin_socket,
+            admin_bind,
+            admin_origin,
             database: DatabaseConfiguration {
                 path: database_path,
                 busy_timeout,
@@ -456,101 +423,45 @@ fn finalize_host(
     }
 }
 
-#[cfg(not(windows))]
-fn select_admin_socket(
-    command_line: Option<PathBuf>,
-    file: Option<PathBuf>,
-    working_directory: &Path,
-    file_base: &Path,
-    runtime_root: Option<&Path>,
-    diagnostics: &mut DiagnosticCollector,
-) -> Option<PathBuf> {
-    match command_line {
-        Some(path) => validate_resolved_path(
-            resolve_path(working_directory, &path),
-            "admin.socket",
-            diagnostics,
-        ),
-        None => match file {
-            Some(path) => {
-                validate_resolved_path(resolve_path(file_base, &path), "admin.socket", diagnostics)
-            }
-            None => runtime_root.map(|root| root.join(DEFAULT_ADMIN_SOCKET_NAME)),
-        },
-    }
-}
-
-#[cfg(windows)]
-fn select_admin_socket(
-    command_line: Option<PathBuf>,
-    file: Option<PathBuf>,
-    _working_directory: &Path,
-    _file_base: &Path,
-    _runtime_root: Option<&Path>,
-    diagnostics: &mut DiagnosticCollector,
-) -> Option<PathBuf> {
-    let pipe = command_line
-        .or(file)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_WINDOWS_ADMIN_PIPE));
-    if pipe.to_str().is_some_and(is_valid_windows_admin_pipe_name) {
-        Some(pipe)
-    } else {
-        diagnostics.push(host_diagnostic(
-            "admin.socket",
-            ConfigurationValidationCode::PathInvalid,
-            "configured Windows admin socket must be a canonical local named-pipe name",
-        ));
-        None
-    }
-}
-
 fn validate_content_limits(
     candidate: ContentCandidate,
-    overrides: &HostConfigurationOverrides,
     diagnostics: &mut DiagnosticCollector,
 ) -> Option<ContentTreeLimits> {
     let defaults = ContentTreeLimits::default();
     let publication_file_bytes = validate_content_file_limit(
-        overrides
-            .content_publication_file_bytes
-            .or(candidate.publication_file_bytes)
+        candidate
+            .publication_file_bytes
             .unwrap_or(defaults.publication_file_bytes.get()),
         defaults.publication_file_bytes.get(),
         "content.publication_file_bytes",
         diagnostics,
     );
     let post_file_bytes = validate_content_file_limit(
-        overrides
-            .content_post_file_bytes
-            .or(candidate.post_file_bytes)
+        candidate
+            .post_file_bytes
             .unwrap_or(defaults.post_file_bytes.get()),
         defaults.post_file_bytes.get(),
         "content.post_file_bytes",
         diagnostics,
     );
     let asset_file_bytes = validate_content_file_limit(
-        overrides
-            .content_asset_file_bytes
-            .or(candidate.asset_file_bytes)
+        candidate
+            .asset_file_bytes
             .unwrap_or(defaults.asset_file_bytes.get()),
         defaults.asset_file_bytes.get(),
         "content.asset_file_bytes",
         diagnostics,
     );
     let total_tree_bytes = validate_content_tree_limit(
-        overrides
-            .content_total_tree_bytes
-            .or(candidate.total_tree_bytes)
+        candidate
+            .total_tree_bytes
             .unwrap_or(defaults.total_tree_bytes.get()),
         defaults.total_tree_bytes.get(),
         "content.total_tree_bytes",
         diagnostics,
     );
     let entries = validate_usize(
-        overrides
-            .content_entries
-            .or(candidate.entries)
-            .unwrap_or(defaults.entries.get() as u64),
+        candidate.entries.unwrap_or(defaults.entries.get() as u64),
         "content.entries",
         ConfigurationValidationCode::LimitOutOfRange,
         |value| {
@@ -563,10 +474,7 @@ fn validate_content_limits(
         diagnostics,
     );
     let depth = validate_usize(
-        overrides
-            .content_depth
-            .or(candidate.depth)
-            .unwrap_or(defaults.depth.get() as u64),
+        candidate.depth.unwrap_or(defaults.depth.get() as u64),
         "content.depth",
         ConfigurationValidationCode::LimitOutOfRange,
         |value| {
@@ -579,9 +487,8 @@ fn validate_content_limits(
         diagnostics,
     );
     let path_bytes = validate_usize(
-        overrides
-            .content_path_bytes
-            .or(candidate.path_bytes)
+        candidate
+            .path_bytes
             .unwrap_or(defaults.path_bytes.get() as u64),
         "content.path_bytes",
         ConfigurationValidationCode::LimitOutOfRange,
@@ -679,9 +586,7 @@ fn validate_content_tree_limit(
     parsed
 }
 
-#[allow(clippy::too_many_arguments)]
 fn select_path(
-    command_line: Option<PathBuf>,
     file: Option<PathBuf>,
     working_directory: &Path,
     file_base: &Path,
@@ -689,12 +594,9 @@ fn select_path(
     field: &'static str,
     diagnostics: &mut DiagnosticCollector,
 ) -> Option<PathBuf> {
-    let resolved = match command_line {
-        Some(path) => resolve_path(working_directory, &path),
-        None => match file {
-            Some(path) => resolve_path(file_base, &path),
-            None => resolve_path(working_directory, default),
-        },
+    let resolved = match file {
+        Some(path) => resolve_path(file_base, &path),
+        None => resolve_path(working_directory, default),
     };
     validate_resolved_path(resolved, field, diagnostics)
 }
@@ -764,7 +666,45 @@ fn default_public_bind() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_PUBLIC_PORT)
 }
 
-pub(crate) fn resolve_path(base: &Path, path: &Path) -> Option<PathBuf> {
+fn default_admin_bind() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_ADMIN_PORT)
+}
+
+fn validate_admin_bind(
+    value: SocketAddr,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<AdminBind> {
+    match AdminBind::new(value) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            diagnostics.push(host_diagnostic(
+                "admin.bind",
+                ConfigurationValidationCode::AdminBindInvalid,
+                "admin.bind must use a loopback address",
+            ));
+            None
+        }
+    }
+}
+
+fn validate_admin_origin(
+    value: String,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<AdminOrigin> {
+    match AdminOrigin::parse(&value) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            diagnostics.push(host_diagnostic(
+                "admin.origin",
+                ConfigurationValidationCode::AdminOriginInvalid,
+                "admin.origin must be one canonical HTTPS origin",
+            ));
+            None
+        }
+    }
+}
+
+fn resolve_path(base: &Path, path: &Path) -> Option<PathBuf> {
     if path.as_os_str().is_empty() {
         return None;
     }
@@ -810,8 +750,12 @@ mod tests {
             "127.0.0.1:3000".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(
-            config.view().admin_socket,
-            root.path().join("run/admin.sock")
+            config.view().admin_bind.into_socket_addr(),
+            "127.0.0.1:3001".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            config.view().admin_origin.as_str(),
+            "https://admin.localhost"
         );
         assert_eq!(
             config.view().database.path,
@@ -827,33 +771,51 @@ mod tests {
     }
 
     #[test]
-    fn complete_content_limit_schema_and_command_line_precedence_are_typed() {
+    fn checked_in_example_configuration_points_at_checked_in_content() {
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = loader(&crate_root)
+            .load(Path::new("examples/maincopy.toml"))
+            .unwrap();
+
+        assert_eq!(
+            config.view().content_root,
+            crate_root.join("examples/content")
+        );
+        assert!(
+            config
+                .view()
+                .content_root
+                .join("publication.toml")
+                .is_file()
+        );
+        assert_eq!(
+            config.view().state_root,
+            crate_root.join("examples/../../../target/maincopy-dev/state")
+        );
+        assert_eq!(
+            config.view().runtime_root,
+            crate_root.join("examples/../../../target/maincopy-dev/run")
+        );
+    }
+
+    #[test]
+    fn complete_content_limit_schema_is_typed() {
         let root = tempdir().unwrap();
         write_config(
             root.path(),
             "maincopy.toml",
             "[content]\n\
-             publication_file_bytes = 1\n\
-             post_file_bytes = 2\n\
-             asset_file_bytes = 3\n\
-             total_tree_bytes = 4\n\
-             entries = 5\n\
-             depth = 6\n\
-             path_bytes = 7\n",
+             publication_file_bytes = 10\n\
+             post_file_bytes = 20\n\
+             asset_file_bytes = 30\n\
+             total_tree_bytes = 40\n\
+             entries = 50\n\
+             depth = 7\n\
+             path_bytes = 70\n",
         );
-        let overrides = HostConfigurationOverrides {
-            content_publication_file_bytes: Some(10),
-            content_post_file_bytes: Some(20),
-            content_asset_file_bytes: Some(30),
-            content_total_tree_bytes: Some(40),
-            content_entries: Some(50),
-            content_depth: Some(7),
-            content_path_bytes: Some(70),
-            ..HostConfigurationOverrides::default()
-        };
 
         let config = loader(root.path())
-            .load_with_overrides(Path::new("maincopy.toml"), overrides)
+            .load(Path::new("maincopy.toml"))
             .unwrap();
         let limits = config.view().content_limits;
 
@@ -867,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn content_limit_file_values_map_without_command_line_overrides() {
+    fn content_limit_file_values_map_to_typed_limits() {
         let root = tempdir().unwrap();
         write_config(
             root.path(),
@@ -1003,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn file_and_command_line_precedence_use_distinct_path_bases() {
+    fn relative_file_paths_resolve_from_the_configuration_parent() {
         let root = tempdir().unwrap();
         write_config(
             root.path(),
@@ -1015,36 +977,38 @@ mod tests {
              [public]\n\
              bind = \"127.0.0.1:3001\"\n\
              [admin]\n\
-             socket = \"file-admin.sock\"\n\
+             bind = \"127.0.0.1:3002\"\n\
+             origin = \"https://file-admin.example.test\"\n\
              [database]\n\
              path = \"file.db\"\n\
              busy_timeout_ms = 6000\n\
              writer_queue_capacity = 129\n\
              read_pool_size = 5\n",
         );
-        let overrides = HostConfigurationOverrides {
-            content_root: Some(PathBuf::from("cli-content")),
-            runtime_root: Some(PathBuf::from("cli-run")),
-            public_bind: Some("127.0.0.1:4000".parse().unwrap()),
-            database_busy_timeout_ms: Some(7_000),
-            database_writer_queue_capacity: Some(130),
-            database_read_pool_size: Some(6),
-            ..HostConfigurationOverrides::default()
-        };
         let config = loader(root.path())
-            .load_with_overrides(Path::new("host/maincopy.toml"), overrides)
+            .load(Path::new("host/maincopy.toml"))
             .unwrap();
 
-        assert_eq!(config.view().content_root, root.path().join("cli-content"));
+        assert_eq!(
+            config.view().content_root,
+            root.path().join("host/file-content")
+        );
         assert_eq!(
             config.view().state_root,
             root.path().join("host/file-state")
         );
-        assert_eq!(config.view().runtime_root, root.path().join("cli-run"));
-        assert_eq!(config.view().public_bind.port(), 4_000);
         assert_eq!(
-            config.view().admin_socket,
-            root.path().join("host/file-admin.sock")
+            config.view().runtime_root,
+            root.path().join("host/file-run")
+        );
+        assert_eq!(config.view().public_bind.port(), 3_001);
+        assert_eq!(
+            config.view().admin_bind.into_socket_addr(),
+            "127.0.0.1:3002".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            config.view().admin_origin.as_str(),
+            "https://file-admin.example.test"
         );
         assert_eq!(
             config.view().database.path,
@@ -1052,33 +1016,28 @@ mod tests {
         );
         assert_eq!(
             config.view().database.busy_timeout.get(),
-            Duration::from_secs(7)
+            Duration::from_secs(6)
         );
-        assert_eq!(config.view().database.writer_queue_capacity.get(), 130);
-        assert_eq!(config.view().database.read_pool_size.get(), 6);
+        assert_eq!(config.view().database.writer_queue_capacity.get(), 129);
+        assert_eq!(config.view().database.read_pool_size.get(), 5);
     }
 
     #[test]
-    fn derived_defaults_follow_effective_cli_roots() {
+    fn derived_database_default_follows_the_effective_state_root() {
         let root = tempdir().unwrap();
-        write_config(root.path(), "host/maincopy.toml", "");
-        let overrides = HostConfigurationOverrides {
-            state_root: Some(PathBuf::from("cli-state")),
-            runtime_root: Some(PathBuf::from("cli-runtime")),
-            ..HostConfigurationOverrides::default()
-        };
+        write_config(
+            root.path(),
+            "host/maincopy.toml",
+            "[paths]\nstate_root = \"file-state\"\n",
+        );
         let config = loader(root.path())
-            .load_with_overrides(Path::new("host/maincopy.toml"), overrides)
+            .load(Path::new("host/maincopy.toml"))
             .unwrap();
 
         assert_eq!(config.view().content_root, root.path().join("content"));
         assert_eq!(
             config.view().database.path,
-            root.path().join("cli-state/maincopy.db")
-        );
-        assert_eq!(
-            config.view().admin_socket,
-            root.path().join("cli-runtime/admin.sock")
+            root.path().join("host/file-state/maincopy.db")
         );
     }
 
@@ -1105,6 +1064,61 @@ mod tests {
         let diagnostic_view = format!("{errors:?} {errors}");
         for protected in ["credential.json", "private/cache"] {
             assert!(!diagnostic_view.contains(protected));
+        }
+    }
+
+    #[test]
+    fn removed_admin_socket_configuration_is_rejected_as_unknown() {
+        let root = tempdir().unwrap();
+        write_config(
+            root.path(),
+            "host/maincopy.toml",
+            "[admin]\nsocket = \"admin.sock\"\n",
+        );
+
+        let errors = loader(root.path())
+            .load(Path::new("host/maincopy.toml"))
+            .unwrap_err();
+
+        assert_eq!(
+            errors.diagnostics()[0].code,
+            ConfigurationValidationCode::HostTomlInvalid
+        );
+    }
+
+    #[test]
+    fn admin_listener_and_origin_reject_unsafe_values() {
+        let root = tempdir().unwrap();
+        for (index, (field, value, code)) in [
+            (
+                "bind",
+                "0.0.0.0:3001",
+                ConfigurationValidationCode::AdminBindInvalid,
+            ),
+            (
+                "origin",
+                "http://admin.example.test",
+                ConfigurationValidationCode::AdminOriginInvalid,
+            ),
+            (
+                "origin",
+                "https://admin.example.test/path",
+                ConfigurationValidationCode::AdminOriginInvalid,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("unsafe-admin-{index}.toml");
+            write_config(
+                root.path(),
+                &name,
+                &format!("[admin]\n{field} = \"{value}\"\n"),
+            );
+
+            let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
+            assert_eq!(errors.diagnostics().len(), 1);
+            assert_eq!(errors.diagnostics()[0].code, code);
         }
     }
 

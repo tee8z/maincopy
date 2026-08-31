@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use axum::{
-    Extension, Json,
+    Json,
     body::{Body, Bytes},
-    extract::{
-        DefaultBodyLimit, Path, Query,
-        rejection::{JsonRejection, PathRejection, QueryRejection},
-    },
+    extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, LINK},
+        header::{
+            CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, LINK,
+            X_CONTENT_TYPE_OPTIONS,
+        },
+        request::Parts,
     },
     response::{Html, IntoResponse as _, Response},
 };
@@ -18,9 +19,11 @@ use maincopy_shared::publication::{
     CONTENT_DIGEST_HEADER, IDEMPOTENCY_KEY_HEADER, POST_REVISION_HEADER, PREVIEW_DIGEST_HEADER,
     PublicationApprovalState, PublishNowRequest, PublishNowResponse,
 };
-use serde::{Deserialize, Serialize};
-use time::UtcOffset;
-use utoipa::ToSchema;
+use markdown_compiler::{
+    ContentTreeDigest, DraftStatus, LogicalAssetPath, PostId, PostRevisionDigest, PreviewDigest,
+};
+use serde::Deserialize;
+use time::{OffsetDateTime, UtcOffset};
 use utoipa_axum::{
     router::{UtoipaMethodRouter, UtoipaMethodRouterExt as _},
     routes,
@@ -28,9 +31,9 @@ use utoipa_axum::{
 use uuid::Uuid;
 
 use crate::{
-    admin::request_id::RequestId,
-    content::{
-        ContentTreeDigest, DraftStatus, LogicalAssetPath, PostId, PostRevisionDigest, PreviewDigest,
+    admin::{
+        problem::{AdminProblem, AdminProblemEnvelope, problem_response},
+        request_id::RequestId,
     },
     database::store::{DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError},
     render::{ContentCatalog, render_bound_post_preview},
@@ -51,6 +54,12 @@ const MAX_POST_PAGE_LIMIT: u16 = 100;
 const PREVIEW_ASSETS_PATH: &str = "/api/admin/v1/preview-assets";
 const PREVIEW_CACHE_POLICY: HeaderValue = HeaderValue::from_static("private, no-store");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
+const PREVIEW_DOCUMENT_SANDBOX: HeaderValue = HeaderValue::from_static(
+    "sandbox; default-src 'none'; script-src 'none'; connect-src 'none'; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; img-src 'self' data:; style-src 'self'; font-src 'self'; media-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; navigate-to 'none'",
+);
+const ASSET_SANDBOX: HeaderValue = HeaderValue::from_static("sandbox; default-src 'none'");
+const DOWNLOAD_ASSET: HeaderValue =
+    HeaderValue::from_static("attachment; filename=\"preview-asset\"");
 
 pub(crate) fn list_routes() -> UtoipaMethodRouter {
     routes!(list_posts)
@@ -88,6 +97,345 @@ struct PostPreviewQuery {
     content_digest: Option<Box<str>>,
 }
 
+struct PostsPage {
+    cursor: Option<Uuid>,
+    limit: usize,
+}
+
+impl<S> FromRequestParts<S> for PostsPage
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = publication_request_id(parts, state).await?;
+        let Query(query) = Query::<ListPostsQuery>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                problem(
+                    ErrorSpec::bad_request(
+                        "invalid_posts_query",
+                        "cursor and limit must use valid pagination values",
+                    ),
+                    request_id,
+                )
+            })?;
+        let limit = query.limit.unwrap_or(DEFAULT_POST_PAGE_LIMIT);
+        if !(1..=MAX_POST_PAGE_LIMIT).contains(&limit) {
+            return Err(problem(
+                ErrorSpec::bad_request("invalid_posts_limit", "limit must be between 1 and 100"),
+                request_id,
+            ));
+        }
+
+        Ok(Self {
+            cursor: query.cursor,
+            limit: usize::from(limit),
+        })
+    }
+}
+
+struct PostPreviewInput {
+    post_id: PostId,
+    expected_revision: Option<PostRevisionDigest>,
+    expected_content_digest: Option<ContentTreeDigest>,
+}
+
+impl<S> FromRequestParts<S> for PostPreviewInput
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = publication_request_id(parts, state).await?;
+        let Path(encoded_post_id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                preview_problem(
+                    ErrorSpec::bad_request(
+                        "invalid_post_id",
+                        "post_id must be a canonical lowercase UUID",
+                    ),
+                    request_id,
+                )
+            })?;
+        let post_id = PostId::parse(&encoded_post_id).map_err(|_| {
+            preview_problem(
+                ErrorSpec::bad_request(
+                    "invalid_post_id",
+                    "post_id must be a canonical lowercase UUID",
+                ),
+                request_id,
+            )
+        })?;
+
+        let Query(query) = Query::<PostPreviewQuery>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                preview_problem(
+                    ErrorSpec::bad_request(
+                        "invalid_preview_query",
+                        "revision and content_digest must use valid preview preconditions",
+                    ),
+                    request_id,
+                )
+            })?;
+        let expected_revision = query
+            .revision
+            .as_deref()
+            .map(PostRevisionDigest::parse)
+            .transpose()
+            .map_err(|_| {
+                preview_problem(
+                    ErrorSpec::bad_request(
+                        "invalid_preview_revision",
+                        "revision must be a complete Maincopy post revision digest",
+                    ),
+                    request_id,
+                )
+            })?;
+        let expected_content_digest = query
+            .content_digest
+            .as_deref()
+            .map(ContentTreeDigest::parse)
+            .transpose()
+            .map_err(|_| {
+                preview_problem(
+                    ErrorSpec::bad_request(
+                        "invalid_preview_content_digest",
+                        "content_digest must be a complete Maincopy content digest",
+                    ),
+                    request_id,
+                )
+            })?;
+
+        Ok(Self {
+            post_id,
+            expected_revision,
+            expected_content_digest,
+        })
+    }
+}
+
+struct PreviewAssetInput {
+    content_digest: ContentTreeDigest,
+    asset_path: LogicalAssetPath,
+    delivery: PreviewAssetDelivery,
+}
+
+impl<S> FromRequestParts<S> for PreviewAssetInput
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = publication_request_id(parts, state).await?;
+        let Path(content_digest) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                preview_problem(
+                    ErrorSpec::bad_request(
+                        "invalid_preview_asset_namespace",
+                        "the preview asset namespace must include a content digest",
+                    ),
+                    request_id,
+                )
+            })?;
+        let content_digest = ContentTreeDigest::parse(&content_digest).map_err(|_| {
+            preview_problem(
+                ErrorSpec::bad_request(
+                    "invalid_preview_asset_namespace",
+                    "the preview asset namespace must be a complete Maincopy content digest",
+                ),
+                request_id,
+            )
+        })?;
+        let Query(query) = Query::<PreviewAssetQuery>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                preview_problem(
+                    ErrorSpec::bad_request(
+                        "invalid_preview_asset_query",
+                        "the preview asset request must contain one logical path",
+                    ),
+                    request_id,
+                )
+            })?;
+        let asset_path = LogicalAssetPath::parse(&query.path).map_err(|_| {
+            preview_problem(
+                ErrorSpec::bad_request(
+                    "invalid_preview_asset_path",
+                    "the preview asset path must be a portable path below assets/",
+                ),
+                request_id,
+            )
+        })?;
+        let delivery = preview_asset_delivery(&asset_path).map_err(|()| {
+            preview_problem(
+                ErrorSpec::new(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "active_preview_asset_rejected",
+                    "active document formats cannot be served from the authenticated admin origin",
+                ),
+                request_id,
+            )
+        })?;
+
+        Ok(Self {
+            content_digest,
+            asset_path,
+            delivery,
+        })
+    }
+}
+
+struct AvailablePublication(PublicationCoordinatorHandle);
+
+impl<S> FromRequestParts<S> for AvailablePublication
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = publication_request_id(parts, state).await?;
+        parts
+            .extensions
+            .get::<PublicationCoordinatorHandle>()
+            .cloned()
+            .map(Self)
+            .ok_or_else(|| problem(publication_unavailable(), request_id))
+    }
+}
+
+struct AvailablePreviewPublication(PublicationCoordinatorHandle);
+
+impl<S> FromRequestParts<S> for AvailablePreviewPublication
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = publication_request_id(parts, state).await?;
+        parts
+            .extensions
+            .get::<PublicationCoordinatorHandle>()
+            .cloned()
+            .map(Self)
+            .ok_or_else(|| preview_problem(publication_unavailable(), request_id))
+    }
+}
+
+pub(crate) struct PublicationCommand {
+    request_id: RequestId,
+    coordinator: PublicationCoordinatorHandle,
+    creation_key: Uuid,
+    stable_post_id: PostId,
+    expected_revision: Option<PostRevisionDigest>,
+    accepted_preview_digest: PreviewDigest,
+    scheduled_for: Option<OffsetDateTime>,
+}
+
+impl<S> FromRequest<S> for PublicationCommand
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (mut parts, body) = request.into_parts();
+        let request_id = publication_request_id(&mut parts, state).await?;
+        let headers = parts.headers.clone();
+        let coordinator = parts
+            .extensions
+            .get::<PublicationCoordinatorHandle>()
+            .cloned();
+        let request = Request::from_parts(parts, body);
+        let Json(request) = Json::<PublishNowRequest>::from_request(request, state)
+            .await
+            .map_err(|rejection| {
+                if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    problem(
+                        ErrorSpec::new(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request_body_too_large",
+                            "the request body must not exceed 4096 bytes",
+                        ),
+                        request_id,
+                    )
+                } else {
+                    problem(
+                        ErrorSpec::bad_request(
+                            "invalid_request_body",
+                            "the request body must be valid publication JSON",
+                        ),
+                        request_id,
+                    )
+                }
+            })?;
+        let creation_key = idempotency_key(&headers).map_err(|spec| problem(spec, request_id))?;
+        let expected_revision = request
+            .expected_revision
+            .as_deref()
+            .map(PostRevisionDigest::parse)
+            .transpose()
+            .map_err(|_| {
+                problem(
+                    ErrorSpec::bad_request(
+                        "invalid_expected_revision",
+                        "expected_revision must be a complete Maincopy post revision digest",
+                    ),
+                    request_id,
+                )
+            })?;
+        let accepted_preview_digest = PreviewDigest::parse(request.preview_digest.as_str())
+            .map_err(|_| {
+                problem(
+                    ErrorSpec::bad_request(
+                        "invalid_preview_digest",
+                        "preview_digest must be a complete Maincopy preview digest",
+                    ),
+                    request_id,
+                )
+            })?;
+        let stable_post_id =
+            PostId::parse(&request.post_id.hyphenated().to_string()).map_err(|_| {
+                problem(
+                    ErrorSpec::bad_request(
+                        "invalid_post_id",
+                        "post_id must be a canonical lowercase UUID",
+                    ),
+                    request_id,
+                )
+            })?;
+        let coordinator =
+            coordinator.ok_or_else(|| problem(publication_unavailable(), request_id))?;
+
+        Ok(Self {
+            request_id,
+            coordinator,
+            creation_key,
+            stable_post_id,
+            expected_revision,
+            accepted_preview_digest,
+            scheduled_for: request.scheduled_for,
+        })
+    }
+}
+
+async fn publication_request_id<S>(parts: &mut Parts, state: &S) -> Result<RequestId, Response>
+where
+    S: Send + Sync,
+{
+    RequestId::from_request_parts(parts, state)
+        .await
+        .map_err(|rejection| rejection.into_response())
+}
+
 #[utoipa::path(
     get,
     path = "/api/admin/v1/posts",
@@ -98,48 +446,25 @@ struct PostPreviewQuery {
     responses(
         (status = OK, description = "Posts loaded in the current immutable content catalog", body = ListPostsResponse,
             headers(("x-request-id" = Uuid, description = "Request correlation ID"))),
-        (status = BAD_REQUEST, description = "Pagination parameters are invalid", body = PublicationErrorEnvelope,
+        (status = BAD_REQUEST, description = "Pagination parameters are invalid", body = AdminProblemEnvelope,
             headers(("x-request-id" = Uuid, description = "Request correlation ID"))),
-        (status = SERVICE_UNAVAILABLE, description = "Publication state is unavailable", body = PublicationErrorEnvelope,
+        (status = SERVICE_UNAVAILABLE, description = "Publication state is unavailable", body = AdminProblemEnvelope,
             headers(("x-request-id" = Uuid, description = "Request correlation ID")))
     ),
     tag = "Posts"
 )]
 async fn list_posts(
-    Extension(request_id): Extension<RequestId>,
-    coordinator: Option<Extension<PublicationCoordinatorHandle>>,
-    query: Result<Query<ListPostsQuery>, QueryRejection>,
+    PostsPage { cursor, limit }: PostsPage,
+    AvailablePublication(coordinator): AvailablePublication,
 ) -> Response {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => {
-            return problem(
-                ErrorSpec::bad_request(
-                    "invalid_posts_query",
-                    "cursor and limit must use valid pagination values",
-                ),
-                request_id,
-            );
-        }
-    };
-    let limit = query.limit.unwrap_or(DEFAULT_POST_PAGE_LIMIT);
-    if !(1..=MAX_POST_PAGE_LIMIT).contains(&limit) {
-        return problem(
-            ErrorSpec::bad_request("invalid_posts_limit", "limit must be between 1 and 100"),
-            request_id,
-        );
-    }
-    let Some(Extension(coordinator)) = coordinator else {
-        return problem(publication_unavailable(), request_id);
-    };
     let coordinator = coordinator.read();
     Json(posts_page(
         &coordinator.catalog,
         &coordinator.content_digest,
         &coordinator.ledger,
         &coordinator.site,
-        query.cursor,
-        usize::from(limit),
+        cursor,
+        limit,
     ))
     .into_response()
 }
@@ -163,22 +488,22 @@ async fn list_posts(
                 ("link" = String, description = "Exact reviewed canonical URL with rel=canonical"),
                 ("x-request-id" = Uuid, description = "Request correlation ID")
             )),
-        (status = BAD_REQUEST, description = "The post UUID is invalid", body = PublicationErrorEnvelope,
+        (status = BAD_REQUEST, description = "The post UUID is invalid", body = AdminProblemEnvelope,
             headers(
                 ("cache-control" = String, description = "Always private, no-store"),
                 ("x-request-id" = Uuid, description = "Request correlation ID")
             )),
-        (status = NOT_FOUND, description = "The post is not present in the current candidate catalog", body = PublicationErrorEnvelope,
+        (status = NOT_FOUND, description = "The post is not present in the current candidate catalog", body = AdminProblemEnvelope,
             headers(
                 ("cache-control" = String, description = "Always private, no-store"),
                 ("x-request-id" = Uuid, description = "Request correlation ID")
             )),
-        (status = INTERNAL_SERVER_ERROR, description = "The candidate preview could not be rendered", body = PublicationErrorEnvelope,
+        (status = INTERNAL_SERVER_ERROR, description = "The candidate preview could not be rendered", body = AdminProblemEnvelope,
             headers(
                 ("cache-control" = String, description = "Always private, no-store"),
                 ("x-request-id" = Uuid, description = "Request correlation ID")
             )),
-        (status = SERVICE_UNAVAILABLE, description = "Candidate publication state is unavailable", body = PublicationErrorEnvelope,
+        (status = SERVICE_UNAVAILABLE, description = "Candidate publication state is unavailable", body = AdminProblemEnvelope,
             headers(
                 ("cache-control" = String, description = "Always private, no-store"),
                 ("x-request-id" = Uuid, description = "Request correlation ID")
@@ -187,86 +512,14 @@ async fn list_posts(
     tag = "Posts"
 )]
 async fn get_post_preview(
-    Extension(request_id): Extension<RequestId>,
-    coordinator: Option<Extension<PublicationCoordinatorHandle>>,
-    path: Result<Path<String>, PathRejection>,
-    query: Result<Query<PostPreviewQuery>, QueryRejection>,
+    request_id: RequestId,
+    PostPreviewInput {
+        post_id,
+        expected_revision,
+        expected_content_digest,
+    }: PostPreviewInput,
+    AvailablePreviewPublication(coordinator): AvailablePreviewPublication,
 ) -> Response {
-    let Path(encoded_post_id) = match path {
-        Ok(path) => path,
-        Err(_) => {
-            return preview_problem(
-                ErrorSpec::bad_request(
-                    "invalid_post_id",
-                    "post_id must be a canonical lowercase UUID",
-                ),
-                request_id,
-            );
-        }
-    };
-    let parsed = Uuid::parse_str(&encoded_post_id).ok();
-    let Some(post_id) =
-        parsed.filter(|post_id| post_id.hyphenated().to_string() == encoded_post_id)
-    else {
-        return preview_problem(
-            ErrorSpec::bad_request(
-                "invalid_post_id",
-                "post_id must be a canonical lowercase UUID",
-            ),
-            request_id,
-        );
-    };
-    let post_id = PostId::parse(&post_id.hyphenated().to_string())
-        .expect("a UUID has one canonical lowercase hyphenated representation");
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => {
-            return preview_problem(
-                ErrorSpec::bad_request(
-                    "invalid_preview_query",
-                    "revision and content_digest must use valid preview preconditions",
-                ),
-                request_id,
-            );
-        }
-    };
-    let expected_revision = match query
-        .revision
-        .as_deref()
-        .map(PostRevisionDigest::parse)
-        .transpose()
-    {
-        Ok(revision) => revision,
-        Err(_) => {
-            return preview_problem(
-                ErrorSpec::bad_request(
-                    "invalid_preview_revision",
-                    "revision must be a complete Maincopy post revision digest",
-                ),
-                request_id,
-            );
-        }
-    };
-    let expected_content_digest = match query
-        .content_digest
-        .as_deref()
-        .map(ContentTreeDigest::parse)
-        .transpose()
-    {
-        Ok(digest) => digest,
-        Err(_) => {
-            return preview_problem(
-                ErrorSpec::bad_request(
-                    "invalid_preview_content_digest",
-                    "content_digest must be a complete Maincopy content digest",
-                ),
-                request_id,
-            );
-        }
-    };
-    let Some(Extension(coordinator)) = coordinator else {
-        return preview_problem(publication_unavailable(), request_id);
-    };
     let coordinator = coordinator.read();
     let (content_digest, catalog) = match expected_content_digest {
         Some(digest) => {
@@ -311,19 +564,32 @@ async fn get_post_preview(
         &catalog,
         frontend,
         &post_id,
+        coordinator.tip_recipient.as_ref(),
         &preview_asset_endpoint,
         published_at,
     ) {
         Ok(Some(preview)) => {
-            let preview_digest = HeaderValue::from_str(preview.digest.as_str())
-                .expect("a typed preview digest is a valid header value");
-            let revision = HeaderValue::from_str(preview.revision.as_str())
-                .expect("a typed post revision is a valid header value");
-            let content_digest = HeaderValue::from_str(&content_digest.to_string())
-                .expect("a typed content digest is a valid header value");
+            let preview_digest = HeaderValue::from_str(preview.digest.as_str());
+            let revision = HeaderValue::from_str(preview.revision.as_str());
+            let content_digest = HeaderValue::from_str(&content_digest.to_string());
             let canonical =
-                HeaderValue::from_str(&format!("<{}>; rel=\"canonical\"", preview.canonical_url))
-                    .expect("a validated canonical URL is a valid link header");
+                HeaderValue::from_str(&format!("<{}>; rel=\"canonical\"", preview.canonical_url));
+            let (Ok(preview_digest), Ok(revision), Ok(content_digest), Ok(canonical)) =
+                (preview_digest, revision, content_digest, canonical)
+            else {
+                tracing::error!(
+                    request_id = %request_id,
+                    post_id = %post_id,
+                    "typed preview metadata could not be represented as HTTP headers"
+                );
+                return preview_problem(
+                    ErrorSpec::internal(
+                        "preview_metadata_invalid",
+                        "the selected post preview could not be represented safely",
+                    ),
+                    request_id,
+                );
+            };
             let mut response = Html(preview.html).into_response();
             response
                 .headers_mut()
@@ -341,6 +607,9 @@ async fn get_post_preview(
             response
                 .headers_mut()
                 .insert("x-content-type-options", NOSNIFF);
+            response
+                .headers_mut()
+                .insert(CONTENT_SECURITY_POLICY, PREVIEW_DOCUMENT_SANDBOX);
             response
         }
         Ok(None) => preview_problem(
@@ -384,17 +653,22 @@ async fn get_post_preview(
                 ("x-request-id" = Uuid, description = "Request correlation ID"),
                 ("x-content-type-options" = String, description = "Always nosniff")
             )),
-        (status = BAD_REQUEST, description = "The asset query is invalid", body = PublicationErrorEnvelope,
+        (status = BAD_REQUEST, description = "The asset query is invalid", body = AdminProblemEnvelope,
             headers(
                 ("cache-control" = String, description = "Always private, no-store"),
                 ("x-request-id" = Uuid, description = "Request correlation ID")
             )),
-        (status = NOT_FOUND, description = "The candidate namespace is stale or the asset is absent", body = PublicationErrorEnvelope,
+        (status = NOT_FOUND, description = "The candidate namespace is stale or the asset is absent", body = AdminProblemEnvelope,
             headers(
                 ("cache-control" = String, description = "Always private, no-store"),
                 ("x-request-id" = Uuid, description = "Request correlation ID")
             )),
-        (status = SERVICE_UNAVAILABLE, description = "Candidate publication state is unavailable", body = PublicationErrorEnvelope,
+        (status = UNSUPPORTED_MEDIA_TYPE, description = "The authored asset is an active document format that cannot share the admin origin", body = AdminProblemEnvelope,
+            headers(
+                ("cache-control" = String, description = "Always private, no-store"),
+                ("x-request-id" = Uuid, description = "Request correlation ID")
+            )),
+        (status = SERVICE_UNAVAILABLE, description = "Candidate publication state is unavailable", body = AdminProblemEnvelope,
             headers(
                 ("cache-control" = String, description = "Always private, no-store"),
                 ("x-request-id" = Uuid, description = "Request correlation ID")
@@ -403,56 +677,14 @@ async fn get_post_preview(
     tag = "Posts"
 )]
 async fn get_preview_asset(
-    Extension(request_id): Extension<RequestId>,
-    coordinator: Option<Extension<PublicationCoordinatorHandle>>,
-    path: Result<Path<String>, PathRejection>,
-    query: Result<Query<PreviewAssetQuery>, QueryRejection>,
+    request_id: RequestId,
+    PreviewAssetInput {
+        content_digest,
+        asset_path,
+        delivery,
+    }: PreviewAssetInput,
+    AvailablePreviewPublication(coordinator): AvailablePreviewPublication,
 ) -> Response {
-    let Path(content_digest) = match path {
-        Ok(path) => path,
-        Err(_) => {
-            return preview_problem(
-                ErrorSpec::bad_request(
-                    "invalid_preview_asset_namespace",
-                    "the preview asset namespace must include a content digest",
-                ),
-                request_id,
-            );
-        }
-    };
-    let Ok(content_digest) = ContentTreeDigest::parse(&content_digest) else {
-        return preview_problem(
-            ErrorSpec::bad_request(
-                "invalid_preview_asset_namespace",
-                "the preview asset namespace must be a complete Maincopy content digest",
-            ),
-            request_id,
-        );
-    };
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => {
-            return preview_problem(
-                ErrorSpec::bad_request(
-                    "invalid_preview_asset_query",
-                    "the preview asset request must contain one logical path",
-                ),
-                request_id,
-            );
-        }
-    };
-    let Ok(asset_path) = LogicalAssetPath::parse(&query.path) else {
-        return preview_problem(
-            ErrorSpec::bad_request(
-                "invalid_preview_asset_path",
-                "the preview asset path must be a portable path below assets/",
-            ),
-            request_id,
-        );
-    };
-    let Some(Extension(coordinator)) = coordinator else {
-        return preview_problem(publication_unavailable(), request_id);
-    };
     let bytes = {
         let coordinator = coordinator.read();
         let Some(catalog) = coordinator.candidates.get(&content_digest) else {
@@ -482,60 +714,86 @@ async fn get_preview_asset(
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_static(preview_asset_content_type(&asset_path)),
+        HeaderValue::from_static(delivery.content_type()),
     );
+    if matches!(delivery, PreviewAssetDelivery::Download) {
+        response
+            .headers_mut()
+            .insert(CONTENT_DISPOSITION, DOWNLOAD_ASSET);
+    }
     response
         .headers_mut()
         .insert(CACHE_CONTROL, PREVIEW_CACHE_POLICY);
     response
         .headers_mut()
-        .insert("x-content-type-options", NOSNIFF);
+        .insert(X_CONTENT_TYPE_OPTIONS, NOSNIFF);
+    response
+        .headers_mut()
+        .insert(CONTENT_SECURITY_POLICY, ASSET_SANDBOX);
     response
 }
 
-fn preview_asset_content_type(path: &LogicalAssetPath) -> &'static str {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewAssetDelivery {
+    Inline(&'static str),
+    Download,
+}
+
+impl PreviewAssetDelivery {
+    const fn content_type(self) -> &'static str {
+        match self {
+            Self::Inline(content_type) => content_type,
+            Self::Download => "application/octet-stream",
+        }
+    }
+}
+
+fn preview_asset_delivery(path: &LogicalAssetPath) -> Result<PreviewAssetDelivery, ()> {
     let extension = path
         .as_str()
         .rsplit_once('.')
         .map_or("", |(_, extension)| extension);
     if extension.eq_ignore_ascii_case("png") {
-        "image/png"
+        Ok(PreviewAssetDelivery::Inline("image/png"))
     } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
-        "image/jpeg"
+        Ok(PreviewAssetDelivery::Inline("image/jpeg"))
     } else if extension.eq_ignore_ascii_case("gif") {
-        "image/gif"
+        Ok(PreviewAssetDelivery::Inline("image/gif"))
     } else if extension.eq_ignore_ascii_case("webp") {
-        "image/webp"
+        Ok(PreviewAssetDelivery::Inline("image/webp"))
     } else if extension.eq_ignore_ascii_case("avif") {
-        "image/avif"
+        Ok(PreviewAssetDelivery::Inline("image/avif"))
     } else if extension.eq_ignore_ascii_case("ico") {
-        "image/x-icon"
-    } else if extension.eq_ignore_ascii_case("svg") {
-        "image/svg+xml"
-    } else if extension.eq_ignore_ascii_case("pdf") {
-        "application/pdf"
+        Ok(PreviewAssetDelivery::Inline("image/x-icon"))
     } else if extension.eq_ignore_ascii_case("mp4") {
-        "video/mp4"
+        Ok(PreviewAssetDelivery::Inline("video/mp4"))
     } else if extension.eq_ignore_ascii_case("webm") {
-        "video/webm"
+        Ok(PreviewAssetDelivery::Inline("video/webm"))
     } else if extension.eq_ignore_ascii_case("mp3") {
-        "audio/mpeg"
+        Ok(PreviewAssetDelivery::Inline("audio/mpeg"))
     } else if extension.eq_ignore_ascii_case("wav") {
-        "audio/wav"
+        Ok(PreviewAssetDelivery::Inline("audio/wav"))
     } else if extension.eq_ignore_ascii_case("ogg") {
-        "audio/ogg"
+        Ok(PreviewAssetDelivery::Inline("audio/ogg"))
     } else if extension.eq_ignore_ascii_case("woff") {
-        "font/woff"
+        Ok(PreviewAssetDelivery::Inline("font/woff"))
     } else if extension.eq_ignore_ascii_case("woff2") {
-        "font/woff2"
+        Ok(PreviewAssetDelivery::Inline("font/woff2"))
+    } else if [
+        "svg", "svgz", "pdf", "html", "htm", "xhtml", "xml", "js", "mjs", "css",
+    ]
+    .iter()
+    .any(|active| extension.eq_ignore_ascii_case(active))
+    {
+        Err(())
     } else {
-        "application/octet-stream"
+        Ok(PreviewAssetDelivery::Download)
     }
 }
 
 fn posts_page(
     catalog: &ContentCatalog,
-    content_digest: &crate::content::ContentTreeDigest,
+    content_digest: &ContentTreeDigest,
     ledger: &PublicLedgerProjection,
     site: &SiteHead,
     cursor: Option<Uuid>,
@@ -594,78 +852,36 @@ fn posts_page(
     responses(
         (status = OK, description = "Publication completed or an earlier result was replayed", body = PublishNowResponse,
             headers(("x-request-id" = Uuid, description = "Request correlation ID"))),
-        (status = BAD_REQUEST, description = "The command header or revision is invalid", body = PublicationErrorEnvelope,
+        (status = BAD_REQUEST, description = "The command header or revision is invalid", body = AdminProblemEnvelope,
             headers(("x-request-id" = Uuid, description = "Request correlation ID"))),
-        (status = NOT_FOUND, description = "The selected post does not exist", body = PublicationErrorEnvelope,
+        (status = NOT_FOUND, description = "The selected post does not exist", body = AdminProblemEnvelope,
             headers(("x-request-id" = Uuid, description = "Request correlation ID"))),
-        (status = CONFLICT, description = "The command conflicts with publication state", body = PublicationErrorEnvelope,
+        (status = CONFLICT, description = "The command conflicts with publication state", body = AdminProblemEnvelope,
             headers(("x-request-id" = Uuid, description = "Request correlation ID"))),
-        (status = PRECONDITION_FAILED, description = "The selected post revision is stale", body = PublicationErrorEnvelope,
+        (status = PRECONDITION_FAILED, description = "The selected post revision is stale", body = AdminProblemEnvelope,
             headers(("x-request-id" = Uuid, description = "Request correlation ID"))),
-        (status = PAYLOAD_TOO_LARGE, description = "The request body exceeds 4096 bytes", body = PublicationErrorEnvelope,
+        (status = PAYLOAD_TOO_LARGE, description = "The request body exceeds 4096 bytes", body = AdminProblemEnvelope,
             headers(("x-request-id" = Uuid, description = "Request correlation ID"))),
-        (status = INTERNAL_SERVER_ERROR, description = "Publication snapshot construction failed", body = PublicationErrorEnvelope,
+        (status = INTERNAL_SERVER_ERROR, description = "Publication snapshot construction failed", body = AdminProblemEnvelope,
             headers(("x-request-id" = Uuid, description = "Request correlation ID"))),
-        (status = SERVICE_UNAVAILABLE, description = "Publication state is unavailable or outcome is uncertain", body = PublicationErrorEnvelope,
+        (status = SERVICE_UNAVAILABLE, description = "Publication state is unavailable or outcome is uncertain", body = AdminProblemEnvelope,
             headers(("x-request-id" = Uuid, description = "Request correlation ID")))
     ),
     tag = "Publications"
 )]
-pub(crate) async fn create_publication(
-    headers: HeaderMap,
-    Extension(request_id): Extension<RequestId>,
-    Extension(coordinator): Extension<PublicationCoordinatorHandle>,
-    body: Result<Json<PublishNowRequest>, JsonRejection>,
+async fn create_publication(
+    PublicationCommand {
+        request_id,
+        coordinator,
+        creation_key,
+        stable_post_id,
+        expected_revision,
+        accepted_preview_digest,
+        scheduled_for,
+    }: PublicationCommand,
 ) -> Response {
-    let Json(request) = match body {
-        Ok(body) => body,
-        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            return problem(
-                ErrorSpec::new(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request_body_too_large",
-                    "the request body must not exceed 4096 bytes",
-                ),
-                request_id,
-            );
-        }
-        Err(_) => {
-            return problem(
-                ErrorSpec::bad_request(
-                    "invalid_request_body",
-                    "the request body must be valid publication JSON",
-                ),
-                request_id,
-            );
-        }
-    };
-    let creation_key = match idempotency_key(&headers) {
-        Ok(key) => key,
-        Err(spec) => return problem(spec, request_id),
-    };
-    let expected_revision = match request
-        .expected_revision
-        .as_deref()
-        .map(PostRevisionDigest::parse)
-        .transpose()
-    {
-        Ok(revision) => revision,
-        Err(_) => {
-            return problem(
-                ErrorSpec::bad_request(
-                    "invalid_expected_revision",
-                    "expected_revision must be a complete Maincopy post revision digest",
-                ),
-                request_id,
-            );
-        }
-    };
-    let accepted_preview_digest = PreviewDigest::parse(request.preview_digest.as_str())
-        .expect("the shared publication contract validates preview digests during JSON parsing");
-    let stable_post_id = PostId::parse(&request.post_id.hyphenated().to_string())
-        .expect("a UUID has one canonical lowercase hyphenated representation");
     let publication_id = Uuid::new_v4();
-    if let Some(scheduled_at) = request.scheduled_for {
+    if let Some(scheduled_at) = scheduled_for {
         let result = coordinator
             .schedule(Schedule {
                 creation_key,
@@ -834,11 +1050,7 @@ fn activation_error(error: &PublicationActivationError) -> ErrorSpec {
             SchedulePublicationLookupError::Query(_)
             | SchedulePublicationLookupError::InvalidStoredState
             | SchedulePublicationLookupError::ActivationInProgress,
-        ) => ErrorSpec::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "publication_unavailable",
-            "publication is temporarily unavailable",
-        ),
+        ) => publication_unavailable(),
         PublicationActivationError::Database(DatabaseMutationError::Command(
             DatabaseCommandError::Rejected,
         )) => ErrorSpec::conflict(
@@ -859,54 +1071,16 @@ fn activation_error(error: &PublicationActivationError) -> ErrorSpec {
 }
 
 const fn publication_unavailable() -> ErrorSpec {
-    ErrorSpec::new(
-        StatusCode::SERVICE_UNAVAILABLE,
+    ErrorSpec::unavailable(
         "publication_unavailable",
         "publication is temporarily unavailable",
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ErrorSpec {
-    status: StatusCode,
-    code: &'static str,
-    message: &'static str,
-}
-
-impl ErrorSpec {
-    const fn new(status: StatusCode, code: &'static str, message: &'static str) -> Self {
-        Self {
-            status,
-            code,
-            message,
-        }
-    }
-
-    const fn bad_request(code: &'static str, message: &'static str) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, code, message)
-    }
-
-    const fn conflict(code: &'static str, message: &'static str) -> Self {
-        Self::new(StatusCode::CONFLICT, code, message)
-    }
-
-    const fn internal(code: &'static str, message: &'static str) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, code, message)
-    }
-}
+type ErrorSpec = AdminProblem;
 
 fn problem(spec: ErrorSpec, request_id: RequestId) -> Response {
-    (
-        spec.status,
-        Json(PublicationErrorEnvelope {
-            error: PublicationErrorBody {
-                code: spec.code,
-                message: spec.message,
-                request_id: request_id.to_string().into_boxed_str(),
-            },
-        }),
-    )
-        .into_response()
+    problem_response(spec, request_id)
 }
 
 fn preview_problem(spec: ErrorSpec, request_id: RequestId) -> Response {
@@ -917,24 +1091,9 @@ fn preview_problem(spec: ErrorSpec, request_id: RequestId) -> Response {
     response
 }
 
-#[derive(Serialize, ToSchema)]
-struct PublicationErrorEnvelope {
-    error: PublicationErrorBody,
-}
-
-#[derive(Serialize, ToSchema)]
-struct PublicationErrorBody {
-    code: &'static str,
-    message: &'static str,
-    request_id: Box<str>,
-}
-
 #[cfg(test)]
 mod tests {
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Request, header::CONTENT_TYPE},
-    };
+    use axum::{body::to_bytes, http::header::CONTENT_TYPE};
     use sqlx::sqlite::SqlitePoolOptions;
     use time::OffsetDateTime;
     use tokio_util::sync::CancellationToken;
@@ -942,21 +1101,104 @@ mod tests {
 
     use super::*;
     use crate::{
-        admin::runtime_admin_router,
-        content::{
-            ContentTreeDigest, DiscoveredContentTree, LogicalAssetPath, PostCollection,
-            PublishedPostRevision, SiteSnapshotDigest, resolve_content_assets,
-            tree::{asset, post, publication},
+        admin::test_support::ProtectedAdminHarness,
+        domain::{
+            profile::ProfileStore,
+            publication::{
+                PublishedPostRevision, activation::PublicationCoordinator, store::PublicationStore,
+            },
         },
-        domain::publication::{activation::PublicationCoordinator, store::PublicationStore},
         frontend_assets::embedded_manifest,
         render::{build_site_snapshot, compile_content_catalog, render_site_shell, snapshot_store},
         web::Readiness,
     };
+    use markdown_compiler::{
+        LogicalAssetPath, PostCollection, SiteSnapshotDigest, resolve_content_assets,
+    };
+
+    use crate::content_fixtures::{asset, content_tree, post, publication};
 
     const KEY: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
     const PREVIEW_ASSET_PATH: &str = "assets/preview.png";
     const CURRENT_PREVIEW_ASSET: &[u8] = b"current preview image";
+
+    fn publication_command_router() -> axum::Router {
+        axum::Router::new()
+            .route("/", axum::routing::post(create_publication))
+            .layer(DefaultBodyLimit::max(MAX_PUBLICATION_REQUEST_BYTES))
+    }
+
+    fn publication_command_request(body: Body) -> Request {
+        let mut request = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/")
+            .header(CONTENT_TYPE, "application/json")
+            .header(IDEMPOTENCY_KEY_HEADER, KEY)
+            .body(body)
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(RequestId(Uuid::parse_str(KEY).unwrap()));
+        request
+    }
+
+    async fn response_problem_code(response: Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        body["error"]["code"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn malformed_publication_json_precedes_missing_coordinator() {
+        let response = publication_command_router()
+            .oneshot(publication_command_request(Body::from("{")))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_problem_code(response).await,
+            "invalid_request_body"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_publication_json_precedes_missing_coordinator() {
+        let response = publication_command_router()
+            .oneshot(publication_command_request(Body::from(vec![
+                b' ';
+                MAX_PUBLICATION_REQUEST_BYTES
+                    + 1
+            ])))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response_problem_code(response).await,
+            "request_body_too_large"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_publication_command_reports_missing_coordinator() {
+        let body = serde_json::json!({
+            "post_id": "11111111-1111-4111-8111-111111111111",
+            "preview_digest": format!("preview-b3-v1-{}", "22".repeat(32)),
+            "expected_revision": null
+        })
+        .to_string();
+        let response = publication_command_router()
+            .oneshot(publication_command_request(Body::from(body)))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_problem_code(response).await,
+            "publication_unavailable"
+        );
+    }
 
     fn posts_catalog() -> ContentCatalog {
         posts_catalog_with_asset("First post", CURRENT_PREVIEW_ASSET)
@@ -967,6 +1209,14 @@ mod tests {
     }
 
     fn posts_catalog_with_asset(first_title: &str, asset_bytes: &[u8]) -> ContentCatalog {
+        posts_catalog_with_named_asset(first_title, PREVIEW_ASSET_PATH, asset_bytes)
+    }
+
+    fn posts_catalog_with_named_asset(
+        first_title: &str,
+        asset_path: &str,
+        asset_bytes: &[u8],
+    ) -> ContentCatalog {
         let publication = publication(
             "publication.toml",
             "[site]\n\
@@ -1009,16 +1259,16 @@ mod tests {
                     "+++\nid = \"{id}\"\ntitle = \"{title}\"\nslug = \"{slug}\"\n\
                      authored_at = 2026-08-30T12:00:00Z\n\
                      description = \"Post summary fixture.\"\n+++\n# {title}\n\n\
-                     ![preview]({PREVIEW_ASSET_PATH})\n"
+                     ![preview]({asset_path})\n"
                 ),
             )
         })
         .collect();
-        let tree = DiscoveredContentTree::new(
+        let tree = content_tree(
             publication,
             posts,
             vec![asset(
-                LogicalAssetPath::parse(PREVIEW_ASSET_PATH).unwrap(),
+                LogicalAssetPath::parse(asset_path).unwrap(),
                 asset_bytes.to_vec(),
             )],
             0,
@@ -1028,48 +1278,54 @@ mod tests {
         compile_content_catalog(&content, &assets).unwrap()
     }
 
-    fn preview_router(ledger: PublicLedgerProjection) -> axum::Router {
+    struct PreviewRuntime {
+        router: axum::Router,
+        auth: ProtectedAdminHarness,
+        cancellation: CancellationToken,
+        actor_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl PreviewRuntime {
+        async fn stop(self) {
+            self.cancellation.cancel();
+            self.actor_task.await.unwrap();
+            self.auth.stop().await;
+        }
+    }
+
+    async fn preview_router(ledger: PublicLedgerProjection) -> PreviewRuntime {
         let catalog = Arc::new(posts_catalog());
-        preview_router_with_catalog(Arc::clone(&catalog), catalog, ledger)
+        preview_router_with_catalog(Arc::clone(&catalog), catalog, ledger).await
     }
 
-    fn preview_router_with_catalog(
+    async fn preview_router_with_catalog(
         candidate: Arc<ContentCatalog>,
         public: Arc<ContentCatalog>,
         ledger: PublicLedgerProjection,
-    ) -> axum::Router {
-        let (router, _coordinator, _actor_task) =
-            preview_runtime_with_catalog(candidate, public, ledger);
-        router
+    ) -> PreviewRuntime {
+        preview_runtime_with_catalog(candidate, public, ledger).await
     }
 
-    fn preview_runtime_with_catalog(
+    async fn preview_runtime_with_catalog(
         candidate: Arc<ContentCatalog>,
         public: Arc<ContentCatalog>,
         ledger: PublicLedgerProjection,
-    ) -> (
-        axum::Router,
-        PublicationCoordinatorHandle,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> PreviewRuntime {
         preview_runtime_with_catalog_and_digest(
             candidate,
             public,
             ledger,
             ContentTreeDigest::from_bytes([0x44; 32]),
         )
+        .await
     }
 
-    fn preview_runtime_with_catalog_and_digest(
+    async fn preview_runtime_with_catalog_and_digest(
         candidate: Arc<ContentCatalog>,
         public: Arc<ContentCatalog>,
         ledger: PublicLedgerProjection,
         content_digest: ContentTreeDigest,
-    ) -> (
-        axum::Router,
-        PublicationCoordinatorHandle,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> PreviewRuntime {
         let shell = render_site_shell(Arc::clone(&public), embedded_manifest(), &ledger).unwrap();
         let snapshot = build_site_snapshot(shell, &ledger).unwrap();
         let site = SiteHead {
@@ -1094,7 +1350,9 @@ mod tests {
             ledger,
             site,
             activator,
-            store: PublicationStore::new(readers, mutations),
+            store: PublicationStore::new(readers.clone(), mutations.clone()),
+            profiles: ProfileStore::new(readers, mutations),
+            tip_recipient: None,
             frontend: embedded_manifest(),
             source_commit: None,
             scheduled: std::collections::BTreeMap::new(),
@@ -1103,35 +1361,47 @@ mod tests {
             cancellation: CancellationToken::new(),
         };
         let (coordinator, actor) = coordinator.into_actor(1);
+        let cancellation = CancellationToken::new();
+        let actor_cancellation = cancellation.clone();
         let actor_task = tokio::spawn(async move {
-            let _ = actor.run(CancellationToken::new()).await;
+            actor.run(actor_cancellation).await.unwrap();
         });
-        (
-            runtime_admin_router(coordinator.clone()),
-            coordinator,
+        let auth = ProtectedAdminHarness::start().await;
+        PreviewRuntime {
+            router: auth.runtime_router(coordinator),
+            auth,
+            cancellation,
             actor_task,
-        )
+        }
     }
 
-    async fn get_preview(router: axum::Router, post_id: &str) -> Response {
-        router
+    async fn get_preview(runtime: &PreviewRuntime, post_id: &str) -> Response {
+        let path = format!("/api/admin/v1/posts/{post_id}/preview");
+        runtime
+            .router
+            .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!("/api/admin/v1/posts/{post_id}/preview"))
-                    .body(Body::empty())
-                    .unwrap(),
+                runtime
+                    .auth
+                    .request(axum::http::Method::GET, &path, Bytes::new(), None),
             )
             .await
             .unwrap()
     }
 
-    async fn get_preview_asset(router: axum::Router, digest: &str, path: &str) -> Response {
-        router
+    async fn get_preview_asset(
+        runtime: &PreviewRuntime,
+        digest: &str,
+        asset_path: &str,
+    ) -> Response {
+        let path = format!("{PREVIEW_ASSETS_PATH}/{digest}?path={asset_path}");
+        runtime
+            .router
+            .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!("{PREVIEW_ASSETS_PATH}/{digest}?path={path}"))
-                    .body(Body::empty())
-                    .unwrap(),
+                runtime
+                    .auth
+                    .request(axum::http::Method::GET, &path, Bytes::new(), None),
             )
             .await
             .unwrap()
@@ -1200,14 +1470,14 @@ mod tests {
             OffsetDateTime::UNIX_EPOCH,
         )])
         .unwrap();
-        let router = preview_router(ledger);
+        let runtime = preview_router(ledger).await;
 
         for (post_id, title, is_published) in [
             ("11111111-1111-4111-8111-111111111111", "First post", true),
             ("22222222-2222-4222-8222-222222222222", "Second post", false),
             ("33333333-3333-4333-8333-333333333333", "Third post", false),
         ] {
-            let response = get_preview(router.clone(), post_id).await;
+            let response = get_preview(&runtime, post_id).await;
             assert_eq!(response.status(), StatusCode::OK, "{post_id}");
             assert_eq!(
                 response.headers().get(CACHE_CONTROL).unwrap(),
@@ -1221,6 +1491,22 @@ mod tests {
                 response.headers().get("x-content-type-options").unwrap(),
                 &NOSNIFF
             );
+            let sandbox = response
+                .headers()
+                .get(CONTENT_SECURITY_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(sandbox.starts_with("sandbox;"));
+            assert!(!sandbox.contains("allow-"));
+            assert!(sandbox.contains("default-src 'none'"));
+            assert!(sandbox.contains("script-src 'none'"));
+            assert!(sandbox.contains("connect-src 'none'"));
+            assert!(sandbox.contains("worker-src 'none'"));
+            assert!(sandbox.contains("frame-src 'none'"));
+            assert!(sandbox.contains("form-action 'none'"));
+            assert!(sandbox.contains("navigate-to 'none'"));
+            assert!(response.headers().get("set-cookie").is_none());
             assert!(response.headers().get("x-request-id").is_some());
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let html = std::str::from_utf8(&body).unwrap();
@@ -1242,7 +1528,7 @@ mod tests {
             );
         }
 
-        let response = get_preview(router, "44444444-4444-4444-8444-444444444444").await;
+        let response = get_preview(&runtime, "44444444-4444-4444-8444-444444444444").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             response.headers().get(CACHE_CONTROL).unwrap(),
@@ -1251,6 +1537,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["code"], "post_not_found");
+        runtime.stop().await;
     }
 
     #[tokio::test]
@@ -1268,15 +1555,16 @@ mod tests {
             public.rendered_posts().next().unwrap().revision,
             candidate.rendered_posts().next().unwrap().revision
         );
-        let router = preview_router_with_catalog(candidate, public, ledger);
+        let runtime = preview_router_with_catalog(candidate, public, ledger).await;
 
-        let response = get_preview(router, "11111111-1111-4111-8111-111111111111").await;
+        let response = get_preview(&runtime, "11111111-1111-4111-8111-111111111111").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains("<h1>First post revised</h1>"));
         assert!(html.contains("class=\"publication-time\""));
         assert!(!html.contains("<h1>First post</h1>"));
+        runtime.stop().await;
     }
 
     #[tokio::test]
@@ -1286,14 +1574,15 @@ mod tests {
             "First post candidate",
             CURRENT_PREVIEW_ASSET,
         ));
-        let (router, _coordinator, _actor_task) = preview_runtime_with_catalog(
+        let runtime = preview_runtime_with_catalog(
             candidate,
             Arc::clone(&public),
             PublicLedgerProjection::empty(),
-        );
+        )
+        .await;
         let old_digest = ContentTreeDigest::from_bytes([0x44; 32]).to_string();
 
-        let response = get_preview_asset(router.clone(), &old_digest, PREVIEW_ASSET_PATH).await;
+        let response = get_preview_asset(&runtime, &old_digest, PREVIEW_ASSET_PATH).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "image/png");
         assert_eq!(
@@ -1311,7 +1600,8 @@ mod tests {
         let new_asset = b"new synchronized preview image";
         let new_digest = ContentTreeDigest::from_bytes([0x55; 32]);
         let new_digest_string = new_digest.to_string();
-        let (router, _coordinator, _actor_task) = preview_runtime_with_catalog_and_digest(
+        runtime.stop().await;
+        let runtime = preview_runtime_with_catalog_and_digest(
             Arc::new(posts_catalog_with_asset(
                 "First post synchronized",
                 new_asset,
@@ -1319,9 +1609,10 @@ mod tests {
             public,
             PublicLedgerProjection::empty(),
             new_digest,
-        );
+        )
+        .await;
 
-        let response = get_preview_asset(router.clone(), &old_digest, PREVIEW_ASSET_PATH).await;
+        let response = get_preview_asset(&runtime, &old_digest, PREVIEW_ASSET_PATH).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CACHE_CONTROL).unwrap(),
@@ -1330,18 +1621,64 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), b"old public image");
 
-        let response =
-            get_preview_asset(router.clone(), &new_digest_string, PREVIEW_ASSET_PATH).await;
+        let response = get_preview_asset(&runtime, &new_digest_string, PREVIEW_ASSET_PATH).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), new_asset);
 
         let missing = ContentTreeDigest::from_bytes([0x66; 32]).to_string();
-        let response = get_preview_asset(router, &missing, PREVIEW_ASSET_PATH).await;
+        let response = get_preview_asset(&runtime, &missing, PREVIEW_ASSET_PATH).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["code"], "preview_candidate_unavailable");
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
+    async fn preview_asset_route_rejects_active_documents_and_downloads_unknown_formats() {
+        let archive_path = "assets/archive.bin";
+        let catalog = Arc::new(posts_catalog_with_named_asset(
+            "Archive preview",
+            archive_path,
+            b"unclassified bytes",
+        ));
+        let runtime = preview_runtime_with_catalog(
+            Arc::clone(&catalog),
+            catalog,
+            PublicLedgerProjection::empty(),
+        )
+        .await;
+        let digest = ContentTreeDigest::from_bytes([0x44; 32]).to_string();
+
+        let rejected = get_preview_asset(&runtime, &digest, "assets/active.svg").await;
+        assert_eq!(rejected.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body = to_bytes(rejected.into_body(), 16 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "active_preview_asset_rejected");
+
+        let downloaded = get_preview_asset(&runtime, &digest, archive_path).await;
+        assert_eq!(downloaded.status(), StatusCode::OK);
+        assert_eq!(
+            downloaded.headers().get(CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            downloaded.headers().get(CONTENT_DISPOSITION).unwrap(),
+            &DOWNLOAD_ASSET
+        );
+        assert_eq!(
+            downloaded.headers().get(CONTENT_SECURITY_POLICY).unwrap(),
+            &ASSET_SANDBOX
+        );
+        assert_eq!(
+            to_bytes(downloaded.into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"unclassified bytes"
+        );
+        runtime.stop().await;
     }
 
     #[test]
@@ -1375,6 +1712,31 @@ mod tests {
         assert_eq!(
             idempotency_key(&headers).unwrap_err().code,
             "invalid_idempotency_key"
+        );
+    }
+
+    #[test]
+    fn preview_assets_reject_active_documents_and_download_unknown_formats() {
+        for path in [
+            "assets/active.svg",
+            "assets/document.pdf",
+            "assets/page.html",
+            "assets/module.js",
+            "assets/theme.css",
+        ] {
+            let path = LogicalAssetPath::parse(path).unwrap();
+            assert_eq!(preview_asset_delivery(&path), Err(()), "{path:?}");
+        }
+
+        let image = LogicalAssetPath::parse("assets/photo.png").unwrap();
+        assert_eq!(
+            preview_asset_delivery(&image),
+            Ok(PreviewAssetDelivery::Inline("image/png"))
+        );
+        let unknown = LogicalAssetPath::parse("assets/archive.bin").unwrap();
+        assert_eq!(
+            preview_asset_delivery(&unknown),
+            Ok(PreviewAssetDelivery::Download)
         );
     }
 

@@ -1,0 +1,11 @@
+[paths]
+content_root = "content"
+state_root = "../../../target/maincopy-dev/state"
+runtime_root = "../../../target/maincopy-dev/run"
+
+[public]
+bind = "127.0.0.1:3000"
+
+[admin]
+bind = "127.0.0.1:3001"
+origin = "https://admin.localhost"

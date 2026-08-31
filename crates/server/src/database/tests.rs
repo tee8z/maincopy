@@ -65,7 +65,16 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
         tables,
         [
             "_sqlx_migrations",
+            "admin_audit_events",
+            "admin_identity_mutation_receipts",
+            "admin_profile_mutation_receipts",
+            "agent_credential_scopes",
+            "agent_credentials",
+            "browser_sessions",
             "canonical_publications",
+            "instance_identity",
+            "login_challenges",
+            "nip98_replay_events",
             "post_revisions",
             "publication_jobs",
             "published_routes",
@@ -73,6 +82,12 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             "reload_post_changes",
             "site_revisions",
             "site_state",
+            "site_tip_recipient",
+            "user_nostr_credentials",
+            "user_password_credentials",
+            "user_profiles",
+            "user_roles",
+            "users",
         ]
     );
     let migrations: i64 =
@@ -459,7 +474,7 @@ async fn a_gap_in_retained_migration_history_is_rejected() {
 }
 
 #[tokio::test]
-async fn application_schema_has_no_triggers_or_explicit_indexes() {
+async fn application_schema_has_no_triggers_and_only_expected_explicit_indexes() {
     let (_root, mut database) = open_database().await;
     let connection = &mut database._writer;
 
@@ -477,7 +492,18 @@ async fn application_schema_has_no_triggers_or_explicit_indexes() {
     .fetch_all(&mut *connection)
     .await
     .unwrap();
-    assert!(indexes.is_empty());
+    assert_eq!(
+        indexes,
+        [
+            "admin_audit_events_idempotency_idx",
+            "admin_audit_events_occurred_idx",
+            "agent_credentials_owner_idx",
+            "browser_sessions_user_idx",
+            "login_challenges_cleanup_idx",
+            "nip98_replay_events_cleanup_idx",
+            "user_roles_role_idx",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -500,6 +526,30 @@ async fn identifiers_and_hashes_use_blob_storage() {
     assert_eq!(
         columns,
         [
+            "admin_audit_events.actor_user_id:BLOB",
+            "admin_audit_events.agent_credential_id:BLOB",
+            "admin_audit_events.audit_event_id:BLOB",
+            "admin_audit_events.idempotency_key:BLOB",
+            "admin_audit_events.request_id:BLOB",
+            "admin_audit_events.session_id:BLOB",
+            "admin_identity_mutation_receipts.audit_event_id:BLOB",
+            "admin_identity_mutation_receipts.command_fingerprint:BLOB",
+            "admin_identity_mutation_receipts.idempotency_key:BLOB",
+            "admin_identity_mutation_receipts.result_id:BLOB",
+            "admin_profile_mutation_receipts.audit_event_id:BLOB",
+            "admin_profile_mutation_receipts.command_fingerprint:BLOB",
+            "admin_profile_mutation_receipts.idempotency_key:BLOB",
+            "admin_profile_mutation_receipts.profile_user_id:BLOB",
+            "admin_profile_mutation_receipts.recipient_user_id:BLOB",
+            "agent_credential_scopes.agent_credential_id:BLOB",
+            "agent_credentials.agent_credential_id:BLOB",
+            "agent_credentials.issuer_user_id:BLOB",
+            "agent_credentials.owner_user_id:BLOB",
+            "agent_credentials.public_key:BLOB",
+            "browser_sessions.csrf_token_digest:BLOB",
+            "browser_sessions.session_id:BLOB",
+            "browser_sessions.session_token_digest:BLOB",
+            "browser_sessions.user_id:BLOB",
             "canonical_publications.accepted_preview_digest:BLOB",
             "canonical_publications.activation_site_digest:BLOB",
             "canonical_publications.content_tree_digest:BLOB",
@@ -510,6 +560,12 @@ async fn identifiers_and_hashes_use_blob_storage() {
             "canonical_publications.requested_revision_digest:BLOB",
             "canonical_publications.source_commit:BLOB",
             "canonical_publications.stable_post_id:BLOB",
+            "instance_identity.instance_id:BLOB",
+            "login_challenges.challenge_digest:BLOB",
+            "login_challenges.challenge_id:BLOB",
+            "nip98_replay_events.agent_credential_id:BLOB",
+            "nip98_replay_events.event_id:BLOB",
+            "nip98_replay_events.user_id:BLOB",
             "post_revisions.revision_digest:BLOB",
             "post_revisions.source_commit:BLOB",
             "post_revisions.stable_post_id:BLOB",
@@ -529,6 +585,14 @@ async fn identifiers_and_hashes_use_blob_storage() {
             "site_revisions.site_revision_digest:BLOB",
             "site_revisions.source_commit:BLOB",
             "site_state.current_site_digest:BLOB",
+            "site_tip_recipient.recipient_user_id:BLOB",
+            "user_nostr_credentials.public_key:BLOB",
+            "user_nostr_credentials.user_id:BLOB",
+            "user_password_credentials.user_id:BLOB",
+            "user_profiles.user_id:BLOB",
+            "user_roles.assigned_by_user_id:BLOB",
+            "user_roles.user_id:BLOB",
+            "users.user_id:BLOB",
         ]
     );
 
@@ -546,7 +610,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 12);
+    assert_eq!(compact_definitions.matches("check(").count(), 92);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",
@@ -560,6 +624,17 @@ async fn identifiers_and_hashes_use_blob_storage() {
         "check(length(reload_operation_id)=16)",
         "check(length(content_tree_digest)=32)",
         "check(length(accepted_preview_digest)=32)",
+        "check(length(instance_id)=16)",
+        "check(length(user_id)=16)",
+        "check(length(session_id)=16)",
+        "check(length(session_token_digest)=32)",
+        "check(length(csrf_token_digest)=32)",
+        "check(length(challenge_id)=16)",
+        "check(length(challenge_digest)=32)",
+        "check(length(agent_credential_id)=16)",
+        "check(length(public_key)=32)",
+        "check(length(event_id)=32)",
+        "check(length(audit_event_id)=16)",
     ] {
         assert!(
             compact_definitions.contains(constraint),

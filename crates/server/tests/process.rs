@@ -1,4 +1,9 @@
-use std::{fs, process::Command};
+use std::{
+    fs,
+    io::Write as _,
+    net::TcpListener,
+    process::{Command, Output, Stdio},
+};
 
 use maincopy_server::{error::ProcessExit, frontend_assets::embedded_manifest};
 
@@ -7,6 +12,56 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+fn write_offline_host_file(
+    root: &tempfile::TempDir,
+    public_listener: &TcpListener,
+    admin_listener: &TcpListener,
+) {
+    fs::write(
+        root.path().join("maincopy.toml"),
+        format!(
+            "[paths]\n\
+             content_root = \"content-that-does-not-exist\"\n\
+             state_root = \"state\"\n\
+             runtime_root = \"run\"\n\
+             [public]\n\
+             bind = \"{}\"\n\
+             [admin]\n\
+             bind = \"{}\"\n\
+             origin = \"https://admin.localhost\"\n",
+            public_listener.local_addr().unwrap(),
+            admin_listener.local_addr().unwrap(),
+        ),
+    )
+    .unwrap();
+}
+
+fn run_password_bootstrap(root: &tempfile::TempDir, password: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
+        .args([
+            "--config",
+            "maincopy.toml",
+            "identity",
+            "bootstrap",
+            "password",
+            "--username",
+            "first-owner",
+        ])
+        .current_dir(root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{password}\n").as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 #[test]
@@ -59,36 +114,133 @@ fn version_exits_successfully_from_the_real_binary() {
 }
 
 #[test]
-fn unexpected_positional_argument_uses_the_usage_exit_code() {
+fn offline_password_bootstrap_needs_no_content_or_listener_and_is_single_use() {
+    const PASSWORD: &str = "correct horse battery staple";
+
+    let root = tempfile::tempdir().unwrap();
+    let public_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_offline_host_file(&root, &public_listener, &admin_listener);
+
+    let first = run_password_bootstrap(&root, PASSWORD);
+    assert_eq!(
+        first.status.code(),
+        Some(ProcessExit::Success.code().into())
+    );
+    assert!(!contains_bytes(&first.stdout, PASSWORD.as_bytes()));
+    assert!(!contains_bytes(&first.stderr, PASSWORD.as_bytes()));
+    assert!(root.path().join("state/maincopy.db").is_file());
+    assert!(!root.path().join("content-that-does-not-exist").exists());
+
+    let second = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
+        .args([
+            "--config",
+            "maincopy.toml",
+            "identity",
+            "bootstrap",
+            "password",
+            "--username",
+            "first-owner",
+        ])
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        second.status.code(),
+        Some(ProcessExit::Conflict.code().into())
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("identity bootstrap is already complete")
+    );
+    assert!(!contains_bytes(&second.stdout, PASSWORD.as_bytes()));
+    assert!(!contains_bytes(&second.stderr, PASSWORD.as_bytes()));
+}
+
+#[test]
+fn offline_password_bootstrap_redacts_invalid_password_input() {
+    const INVALID_PASSWORD: &str = "too-short";
+
+    let root = tempfile::tempdir().unwrap();
+    let public_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_offline_host_file(&root, &public_listener, &admin_listener);
+
+    let output = run_password_bootstrap(&root, INVALID_PASSWORD);
+
+    assert_eq!(
+        output.status.code(),
+        Some(ProcessExit::Validation.code().into())
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("owner credential input is invalid"));
+    assert!(!contains_bytes(&output.stdout, INVALID_PASSWORD.as_bytes()));
+    assert!(!contains_bytes(&output.stderr, INVALID_PASSWORD.as_bytes()));
+}
+
+#[test]
+fn offline_nostr_owner_bootstrap_accepts_the_typed_public_key() {
+    const PUBLIC_KEY: &str = "63fe6318dc58583cfe16810f86dd09e18bfd76aabc24a0081ce2856f330504ed";
+
+    let root = tempfile::tempdir().unwrap();
+    let public_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_offline_host_file(&root, &public_listener, &admin_listener);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
+        .args([
+            "--config",
+            "maincopy.toml",
+            "identity",
+            "bootstrap",
+            "nostr",
+            "--public-key",
+            PUBLIC_KEY,
+        ])
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(ProcessExit::Success.code().into())
+    );
+    assert!(root.path().join("state/maincopy.db").is_file());
+    assert!(!root.path().join("content-that-does-not-exist").exists());
+}
+
+#[test]
+fn unknown_server_subcommand_uses_the_usage_exit_code() {
     let output = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
         .arg("unknown")
         .output()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(ProcessExit::Usage.code().into()));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'unknown'"));
 }
 
 #[test]
-fn invalid_server_configuration_fails_before_the_application_runs() {
+fn missing_explicit_config_uses_the_usage_exit_without_configuration_io() {
     let working_directory = tempfile::tempdir().unwrap();
+    fs::write(
+        working_directory.path().join("maincopy.toml"),
+        "unknown = true\n",
+    )
+    .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
         .current_dir(working_directory.path())
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(ProcessExit::Configuration.code().into())
-    );
+    assert_eq!(output.status.code(), Some(ProcessExit::Usage.code().into()));
     let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostic.contains("host_file_unreadable"));
-    assert!(!diagnostic.contains(working_directory.path().to_string_lossy().as_ref()));
+    assert!(diagnostic.contains("--config <PATH>"));
+    assert!(!diagnostic.contains("host_toml_invalid"));
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn removed_payment_provider_in_the_default_host_file_is_rejected_before_discovery() {
+fn removed_payment_provider_in_the_selected_host_file_is_rejected_before_discovery() {
     let working_directory = tempfile::tempdir().unwrap();
     let selected_content = working_directory.path().join("selected-content");
     let decoy_content = working_directory.path().join("content");
@@ -108,6 +260,7 @@ fn removed_payment_provider_in_the_default_host_file_is_rejected_before_discover
     fs::write(decoy_content.join("publication.toml"), "unknown = true\n").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
+        .args(["--config", "maincopy.toml"])
         .current_dir(working_directory.path())
         .output()
         .unwrap();
@@ -123,7 +276,7 @@ fn removed_payment_provider_in_the_default_host_file_is_rejected_before_discover
 }
 
 #[test]
-fn missing_explicit_host_file_does_not_fall_back_to_the_default() {
+fn missing_selected_host_file_does_not_open_an_unselected_file() {
     let working_directory = tempfile::tempdir().unwrap();
     fs::write(
         working_directory.path().join("maincopy.toml"),
@@ -188,43 +341,20 @@ fn selected_host_file_resolves_file_paths_from_its_parent() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn command_line_paths_resolve_from_the_process_working_directory() {
+fn per_setting_override_is_rejected_before_configuration_io() {
     let working_directory = tempfile::tempdir().unwrap();
-    let host_directory = working_directory.path().join("host");
-    let content_directory = working_directory.path().join("cli-content");
-    let decoy_content_directory = host_directory.join("cli-content");
-    fs::create_dir_all(&host_directory).unwrap();
-    fs::create_dir_all(&content_directory).unwrap();
-    fs::create_dir(&decoy_content_directory).unwrap();
-    fs::write(host_directory.join("selected.toml"), "").unwrap();
-    fs::write(
-        content_directory.join("publication.toml"),
-        "unknown = true\n",
-    )
-    .unwrap();
-    fs::write(
-        decoy_content_directory.join("publication.toml"),
-        "unknown = true\n",
-    )
-    .unwrap();
+    fs::create_dir(working_directory.path().join("selected.toml")).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
-        .args([
-            "--config",
-            "host/selected.toml",
-            "--content-root",
-            "cli-content",
-        ])
+        .args(["--config", "selected.toml", "--content-root", "cli-content"])
         .current_dir(working_directory.path())
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(ProcessExit::Validation.code().into())
-    );
+    assert_eq!(output.status.code(), Some(ProcessExit::Usage.code().into()));
     let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostic.contains("content validation failed"));
+    assert!(diagnostic.contains("unexpected argument '--content-root'"));
+    assert!(!diagnostic.contains("host_file_unreadable"));
 }
 
 #[test]
@@ -245,6 +375,7 @@ fn configured_content_limits_reach_production_discovery() {
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
+        .args(["--config", "maincopy.toml"])
         .current_dir(working_directory.path())
         .output()
         .unwrap();

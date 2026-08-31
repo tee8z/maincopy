@@ -1,3 +1,7 @@
+use markdown_compiler::{
+    ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
+    SiteSnapshotDigest,
+};
 use sqlx::{Executor, FromRow, Sqlite, Transaction, error::ErrorKind};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
@@ -5,10 +9,6 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::{
-    content::{
-        ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
-        SiteSnapshotDigest, SourceCommit,
-    },
     database::store::{
         DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError, Mutation,
     },
@@ -17,9 +17,9 @@ use crate::{
 
 use super::{
     ActivationBlockReason, CanonicalPublication, CanonicalPublicationStatus,
-    CanonicalPublicationView, CanonicalState, RehydrationError, ReleasedTargetJob, TargetJob,
-    TargetJobState, TargetJobStatus, TargetJobView, PublicLedgerProjection,
-    PublishedPostRevision, canonical, target,
+    CanonicalPublicationView, CanonicalState, PublicLedgerProjection, PublishedPostRevision,
+    RehydrationError, ReleasedTargetJob, SourceCommit, TargetJob, TargetJobState, TargetJobStatus,
+    TargetJobView, canonical, target,
 };
 
 const MAX_STARTUP_POST_REVISIONS: usize = 10_000;
@@ -493,6 +493,10 @@ pub(crate) struct LookupSchedulePublication {
 
 /// The durable state returned by an immediate-publication request.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the concrete mutation outcomes are passed directly across a short-lived database writer boundary"
+)]
 pub(crate) enum PublishNowState {
     Activating(BegunPublication),
     Published(CompletedPublication),
@@ -3144,12 +3148,10 @@ mod tests {
         .unwrap();
         for state in ["published", "superseded"] {
             if state == "superseded" {
-                sqlx::query(
-                    "UPDATE canonical_publications SET state = 'superseded', version = 4",
-                )
-                .execute(&pool)
-                .await
-                .unwrap();
+                sqlx::query("UPDATE canonical_publications SET state = 'superseded', version = 4")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             }
             let replay = store
                 .schedule_publication_replay(exact_lookup())
@@ -3159,7 +3161,10 @@ mod tests {
             let SchedulePublicationReplay::Published(completed) = replay else {
                 panic!("a completed scheduled approval must replay as published");
             };
-            assert_eq!(completed.publication_id, Uuid::parse_str(PUBLICATION_ID).unwrap());
+            assert_eq!(
+                completed.publication_id,
+                Uuid::parse_str(PUBLICATION_ID).unwrap()
+            );
             assert_eq!(completed.revision.as_bytes(), &[0x11; 32]);
             assert_eq!(completed.accepted_preview_digest.as_bytes(), &[0x88; 32]);
             assert_eq!(completed.published_at.unix_timestamp_nanos(), 200);
