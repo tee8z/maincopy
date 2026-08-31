@@ -2,7 +2,7 @@
 
 Status: target architecture; implementation is incomplete
 
-Last reviewed: 2026-08-30
+Last reviewed: 2026-08-31
 
 Related documents: [project overview](../README.md),
 [implementation plan](implementation.md), and
@@ -39,16 +39,19 @@ content root. The repository can contain many articles.
 | Operator-managed external checkout | GitHub App, OAuth, and pull-request workflow |
 | Production-faithful draft previews | Multiple publications and tenants |
 | Scheduled initial and update releases | Explicit unpublish and retraction workflow |
-| Canonical website and RSS | Automatic social-network distribution |
-| Manual X and Substack Note share kits | Nostr article signing and relay submission |
+| Canonical website and RSS | Mailing-list capture and email delivery |
+| Syntax highlighting, Mermaid, and sanitized SVG | X and Substack assisted distribution |
+| Maincopy TOML frontmatter | Obsidian-first source and YAML Properties |
 | Users, roles, profiles, and authenticated administration | Per-author publication identities |
 | Static Lightning Address tip handoff | Paid articles and access entitlements |
-| Double-opt-in subscription capture | Bulk newsletter campaigns |
 | Local SQLite and Litestream replication | High-availability database failover |
 | Nix package and NixOS module | Hosted multi-site control plane |
 
-V1 does not automate a third-party website through browser scripting. It does
-not claim that a manual share succeeded.
+The canonical website and RSS are the only V1 article outputs. V1 captures no
+subscriber data and sends no email.
+
+V1 creates no X, Substack, or Nostr article payload. It stores no distribution
+credential, provider job, delivery attempt, or delivery result.
 
 ## Terms
 
@@ -74,8 +77,8 @@ edit Markdown or commit to Git in V1.
 
 ### The author's domain is canonical
 
-The complete article appears on the author's domain. RSS and manual share text
-link to that canonical URL.
+The complete article appears on the author's domain. RSS links to that
+canonical URL.
 
 ### Preview precedes visibility
 
@@ -84,8 +87,8 @@ cannot make an article public or replace its live revision.
 
 ### External services cannot block reading
 
-Website publication does not wait for X, Substack, a Lightning Address service,
-or another distribution network.
+Website publication does not wait for a Lightning Address service or an
+outbound distribution service.
 
 ### Public reading needs no JavaScript
 
@@ -113,7 +116,8 @@ flowchart LR
     Author[Author] -->|push Markdown| Git[Git repository]
     Git --> Sync[Source sync]
     Sync --> Compiler[Content compiler]
-    Compiler --> Artifacts[Retained revision artifacts]
+    Compiler --> Renderer[Technical renderer]
+    Renderer --> Artifacts[Retained revision artifacts]
 
     Browser[Admin browser] --> Gateway[HTTPS admin gateway]
     HumanCli[Human CLI] --> Gateway
@@ -136,10 +140,6 @@ flowchart LR
     Snapshot --> Public[Public Axum service]
     Public --> Reader[Reader]
     Public --> RSS[RSS]
-
-    Admin --> Share[Manual share kit]
-    Snapshot --> Share
-    Share --> Person[Person posts to X or Substack]
 
     DB --> Litestream[Litestream]
     Litestream --> Replica[Database replica]
@@ -168,7 +168,7 @@ recovery transport, recovery API, or continuing authentication bypass.
 | Nostr login and agent identities | SQLite | Store public keys and scoped metadata only. |
 | Browser session and CSRF records | SQLite | Store fixed-length token digests only. |
 | Runtime paths, listeners, limits, and source mode | Host configuration | Reject unknown configuration fields. |
-| SSH, TLS, email, and Litestream secrets | Protected host files | Do not place secret bytes in Git, SQLite, or Nix. |
+| SSH, TLS, and Litestream secrets | Protected host files | Do not place secret bytes in Git, SQLite, or Nix. |
 | Human and agent Nostr private keys | User or agent device | Maincopy never receives an `nsec` in V1. |
 | Current public representation | Immutable memory snapshot | Build it from Git artifacts and SQLite state. |
 | Lightning payment execution and truth | Reader wallet and address service | Maincopy keeps no payment ledger. |
@@ -179,10 +179,10 @@ recovery transport, recovery API, or continuing authentication bypass.
 Maincopy uses three configuration layers.
 
 `publication.toml` travels with the content repository. It contains public site
-metadata, asset policy, subscription policy, and authored feature choices.
+metadata, asset policy, tip defaults, and authored feature choices.
 
 Post frontmatter contains article metadata and the optional tip enablement
-flag. It does not contain a Lightning Address or social credential.
+flag. It does not contain a Lightning Address or V1 distribution settings.
 
 SQLite contains mutable control-plane state. This state includes source
 settings, users, profiles, releases, sessions, and audit records.
@@ -376,6 +376,12 @@ fetches, proxies, or checks that asset.
 Code highlighting and Mermaid rendering happen during compilation. Mermaid
 output crosses a strict SVG sanitization boundary.
 
+Valid Mermaid blocks render through the selected local renderer. An invalid or
+oversized diagram rejects the candidate and preserves the last good snapshot.
+
+Known code languages use syntax highlighting. An unknown language uses safely
+escaped plain-code output.
+
 Public pages work without JavaScript. Application CSS and optional JavaScript
 use deterministic content-hashed bundles.
 
@@ -384,9 +390,8 @@ use deterministic content-hashed bundles.
 `maincopyd` binds the admin router to a dedicated loopback TCP address. The
 listener accepts HTTP only from the same host.
 
-The pre-v1 Unix-socket and Windows named-pipe transport is not a compatibility
-path. The authenticated cutover removes its server and client code, flags,
-defaults, service-unit wiring, and transport tests in one changeset. No build
+The retired Unix-socket and Windows named-pipe transport is not a compatibility
+path. V1 rejects its former configuration and command-line options. No build
 binds both transports or exposes an unauthenticated admin TCP listener.
 
 A separate gateway terminates Transport Layer Security (TLS) for the canonical
@@ -418,6 +423,9 @@ context files.
 Agent records contain one dedicated Nostr public key and typed scopes. Each
 request requires a fresh, replay-protected NIP-98 proof.
 
+NIP-98 authenticates admin requests only. It does not sign or distribute a
+Nostr article in V1.
+
 V1 does not issue a long-lived bearer API token. A scoped `AgentCredential`
 fills the same integration niche as an app or robot credential. It uses
 proof-of-possession for every request instead of a reusable secret.
@@ -429,12 +437,10 @@ V1 has three built-in roles. Each role maps to a fixed set of typed scopes.
 | Content and status, including sync and reload | Allow | Allow | Allow |
 | Preview HTML and assets | Allow | Allow | Allow |
 | Release scheduling and activation | Allow | Allow | Allow |
-| Manual share kits | Allow | Allow | Allow |
 | Profiles and Lightning settings | Allow | Allow | Deny |
 | Users and credentials | Allow | Allow | Deny |
 | Role assignment | Allow | Deny | Deny |
 | Audit records | Allow | Allow | Deny |
-| Subscriber data | Allow | Allow | Deny |
 | Source and instance configuration | Allow | Deny | Deny |
 
 An `AgentCredential` can contain only a subset of its issuer's current scopes.
@@ -448,30 +454,33 @@ preview endpoints return exact HTML and assets so the UI can render them.
 The public origin returns `404 Not Found` for every admin API and UI path.
 Network reachability alone grants no authority.
 
-## Manual share kits
+### Authentication security review
 
-Maincopy creates a share kit only after canonical publication commits. The
-source revision must equal `current_published_digest`.
+V1 requires a release-blocking review of the complete authentication boundary.
+The review includes these areas:
 
-The kit becomes unavailable while an update is `Activating`. This rule avoids
-a mismatch between SQLite and the public snapshot.
+- password hashing, verification, rate limits, and account enumeration;
+- session creation, fixation resistance, expiry, rotation, and revocation;
+- cookie flags, CSRF verification, and exact host and origin checks;
+- Nostr login challenges and NIP-98 freshness, replay, URL, method, and body
+  binding;
+- role and agent-scope enforcement at each admin operation;
+- public and admin route isolation; and
+- gateway header removal, TLS termination, and credential storage.
 
-V1 exposes exactly two named channels:
+Resolve each critical or high-risk finding before release. If a reviewed path
+cannot meet this gate, remove that path from the V1 product surface.
 
-- `x`; and
-- `substack_note`.
+## V1 distribution boundary
 
-Each entry contains the first eligible prose paragraph and canonical URL. A
-required description is the fallback excerpt.
+Maincopy serves the canonical website and RSS in V1. RSS is a pull-based public
+resource, not an outbound delivery operation.
 
-X uses a supported Web Intent. Substack opens its site so the user can choose
-`Create` and then `Note`.
+Maincopy does not collect subscriber details or send email in V1. It does not
+prepare or submit X, Substack, or Nostr article content.
 
-Copy and Open actions are manual. Maincopy stores no schedule, attempt, lease,
-completion, or delivery result for them.
-
-Share-kit generation makes no provider request. A provider outage cannot affect
-the public article.
+No V1 role or agent scope grants distribution authority. The database contains
+no provider credential, delivery job, attempt, lease, or result for an article.
 
 ## Static Lightning Address tips
 
@@ -489,23 +498,6 @@ It stores no payer, amount, invoice, hash, preimage, or settlement.
 
 The reader's wallet and Lightning Address service complete the payment. Paid
 article access requires a separate post-V1 entitlement design.
-
-## Subscription capture
-
-V1 can capture subscriptions through first-party double opt-in. It does not
-send bulk newsletter campaigns.
-
-SQLite stores subscriber consent and lifecycle state. These records contain
-personally identifiable information.
-
-The writer commits subscriber state and transactional email work together. An
-email worker performs network delivery outside the database transaction.
-
-SQLite stores token digests only. Logs, metrics, audit events, and errors must
-not contain raw addresses or tokens.
-
-Confirmation and unsubscribe changes require a POST. A GET can render a form
-without changing state.
 
 ## Operational database
 
@@ -540,7 +532,7 @@ Normal startup follows this order:
 5. Verify required revision artifacts.
 6. Build and install the canonical immutable snapshot.
 7. Bind the public listener and loopback admin listener.
-8. Start source polling, scheduling, email, and backup supervision.
+8. Start managed source polling and release scheduling.
 
 Bootstrap and recovery commands are offline process modes. They bind no network
 listener.
@@ -563,7 +555,7 @@ Production recovery requires these independent inputs:
 Restore is an offline operation. Never restore over a non-empty live database.
 
 The restore verifier checks SQLite integrity, schema compatibility, release
-inputs, artifacts, profile state, subscriber retention, and logical digests.
+inputs, artifacts, profile state, and logical digests.
 
 An accepted restore creates a one-use marker for that restored candidate. The
 first normal startup verifies and consumes the marker before ordinary writes.
@@ -577,9 +569,10 @@ The root `Cargo.toml` defines one workspace:
 
 ```text
 crates/
-|-- server/    # maincopyd and application domains
-|-- cli/       # maincopy operator client
-`-- shared/    # wire contracts and shared defaults
+|-- cli/                 # maincopy operator client
+|-- markdown-compiler/   # content discovery, validation, and identity
+|-- server/              # maincopyd and application domains
+`-- shared/              # wire contracts and shared defaults
 ```
 
 One Maincopy daemon owns one site with many articles. Production also runs an
@@ -590,7 +583,7 @@ and a formatter. The NixOS module is a V1 release requirement.
 
 ## Pre-v1 compatibility transition
 
-The current source still contains superseded provider-backed tip code,
+The current source still contains superseded subscription fields,
 distribution frontmatter, and target-job schema work. These features are not
 part of the V1 contract.
 
@@ -612,7 +605,6 @@ These selections must finish before their owning work starts:
 - revision-artifact backup and retention implementation;
 - production HTTPS admin gateway;
 - Mermaid renderer and SVG sanitizer;
-- confirmation email transport and retention policy;
 - metrics export path; and
 - measured recovery point and recovery time targets.
 
@@ -632,19 +624,193 @@ V1 must prove these properties:
 - Remote users and agents receive only authorized results.
 - A Publisher cannot access profiles, Lightning settings, users, credentials,
   audit records, or instance configuration.
+- The authentication security review has no unresolved critical or high-risk
+  finding.
 - Bootstrap and recovery create no recovery transport, bind no listener, and
   accept no arbitrary SQL.
-- Manual share-kit generation makes no provider request.
+- Syntax highlighting uses bounded local work and a safe plain-code fallback.
+- Mermaid uses a deterministic local renderer with bounded resources.
+- Hostile SVG cannot cross the single reviewed sanitization boundary.
 - Static tip rendering makes no LNURL request.
+- No V1 operation creates a subscriber record, email task, share kit, provider
+  payload, distribution job, or delivery result.
 - Every runtime SQLite write uses the shared writer task.
 - No network call holds a database transaction.
-- Subscriber secrets and personal data follow the privacy boundary.
 - Database and revision artifacts restore to one compatible recovery point.
+- The NixOS virtual-machine test proves gateway isolation, service permissions,
+  Litestream ordering, restart behavior, and restore behavior.
 - A clean checkout passes the documented Nix and Rust checks.
 
 The [implementation plan](implementation.md) contains the complete work-package
 and failure-injection gates. The [engineering style guide](quality.md) defines
 code conventions and the manual CRAP score budget.
+
+## Post-v1 roadmap
+
+Post-v1 work must preserve canonical publication independence. An outbound
+service cannot block, roll back, or change a canonical website release.
+
+### Mailing-list capture and email delivery
+
+The first mailing-list increment can add first-party double opt-in. It must
+also support unsubscribe, scoped export, and deletion.
+
+SQLite will store subscriber consent and lifecycle state. These records contain
+personally identifiable information (PII).
+
+The writer must commit subscriber state and transactional email work together.
+An email worker must perform network delivery outside the database transaction.
+
+SQLite must store confirmation and control token digests only. Logs, metrics,
+audit events, and errors must not contain raw addresses or tokens.
+
+A confirmation or unsubscribe change must use `POST`. A `GET` request can show
+a form without changing state.
+
+Before implementation, select and document these items:
+
+- one email transport for confirmation and control messages;
+- a standards-safe email address comparison rule;
+- retention for pending, unsubscribed, token, audit, and backup records; and
+- secret ownership outside Git, SQLite, logs, and the Nix store.
+
+Bulk newsletter campaigns are a separate increment. Their delivery state and
+privacy review must not reuse transactional-email assumptions without review.
+
+### Assisted X and Substack distribution
+
+A future share kit can exist only after canonical publication commits. Its
+source revision must equal `current_published_digest`.
+
+The kit must be unavailable while an update is `Activating`. This rule prevents
+a mismatch between SQLite and the public snapshot.
+
+The first assisted channels can use these stable names:
+
+- `x`; and
+- `substack_note`.
+
+Each entry can contain the first eligible prose paragraph and canonical URL.
+The required article description is the fallback excerpt.
+
+X can use a supported Web Intent. Substack can open its site for the user to
+select `Create` and then `Note`.
+
+Copy and Open actions are manual. Maincopy must not claim that either action
+published content.
+
+Assisted distribution must store no provider credential, schedule, attempt,
+lease, completion, or delivery result. Share-kit generation must make no
+provider request.
+
+Before X support starts, select and pin a pure Rust weighted-text
+implementation. Test it against official X fixtures. Record its rules version,
+license, features, and Unicode behavior.
+
+### Automatic provider delivery
+
+Automatic X, Substack, or Nostr article delivery requires a separate design.
+That design must define these boundaries:
+
+- provider credential ownership and protected storage;
+- Nostr signer custody that is separate from admin NIP-98 credentials;
+- idempotency, retry, backoff, cancellation, and terminal delivery states;
+- redacted audit and operator-visible failure data; and
+- recovery behavior for a committed canonical release.
+
+No provider network call can hold a SQLite transaction. A provider failure
+cannot change the current public revision.
+
+Maincopy must not automate a third-party website through browser scripting.
+
+### Obsidian-first authoring
+
+A post-v1 release can add `ObsidianSync` as an optional source mode. Git and
+external local-checkout modes remain supported.
+
+The adapter uses the official Obsidian Headless client and Obsidian Sync. It
+does not use Obsidian Publish or an unofficial Sync protocol. Obsidian Headless
+is currently open beta. A dependency spike must approve its stability, license,
+Nix packaging, and pinned runtime before implementation. The current beta
+requires Node.js 22 or later and an active Obsidian Sync subscription.
+
+```mermaid
+flowchart LR
+    Author[Obsidian clients] <-->|End-to-end encrypted Sync| Remote[Obsidian Sync]
+    Remote -->|One-shot mirror| Mirror[Disposable server mirror]
+    Mirror -->|Completed generation| Compiler[Maincopy compiler]
+    Compiler --> Artifact[Immutable revision artifact]
+    Artifact --> Preview[Exact admin preview]
+    Preview -->|Approved release| Public[Website and RSS]
+```
+
+A completed Sync operation creates a candidate. It never publishes or replaces
+a public article.
+
+The first source adapter has these boundaries:
+
+- Use a dedicated publishing vault. Do not sync a personal vault to the server.
+- Require end-to-end encryption for the remote vault.
+- Run one bounded, one-shot mirror operation for each source sync.
+- Use `mirror-remote` only on a disposable, service-owned server mirror.
+- Configure the `conflict` strategy. Reject every reported or materialized
+  conflict before generation completion.
+- Create an immutable Maincopy generation only after Sync succeeds.
+- Copy only `publication.toml`, `posts/`, `drafts/`, and `assets/` from the
+  configured publication root.
+- Keep `.obsidian`, templates, canvases, plugin data, and all other vault notes
+  outside the completed generation.
+- Keep Obsidian account state and encryption secrets outside Git, SQLite, logs,
+  command arguments, and the Nix store.
+- Expose only redacted source status through the admin API.
+
+> [!WARNING]
+> `mirror-remote` can revert local changes. Never point it at an author's
+> working vault. Use only the disposable server mirror.
+
+End-to-end encryption protects the remote vault and network transfer. It does
+not encrypt the local server mirror. The NixOS module must protect the mirror
+with a dedicated `maincopy-obsidian-sync` identity. The `maincopyd` identity can
+read completed generations but cannot read Headless credentials or the mutable
+mirror.
+
+Obsidian documents limits in the cryptographic binding between remote paths and
+content. The security review must include this boundary. Maincopy's manifest
+binds the completed local generation, but it cannot strengthen the remote Sync
+protocol.
+
+Remote Sync is not cross-file transactional. The completed-generation boundary
+prevents Maincopy from compiling a mirror while Headless changes it.
+
+Maincopy creates its own content-tree digest after each completed Sync. This
+digest replaces the Git commit as the source revision for this mode. The
+revision artifact remains the input to preview, release, and restore.
+
+The first Obsidian authoring increment supports both metadata formats:
+
+- existing TOML frontmatter between `+++` delimiters; and
+- strict YAML Properties between `---` delimiters.
+
+Each article uses exactly one format. Both formats normalize into the same
+typed metadata and identity transcript. A supplied Obsidian template contains
+every required Maincopy property. The starter vault configures `assets/` as its
+attachment directory.
+
+The first compatibility contract supports deterministic article wiki links,
+heading links, and image embeds below `assets/`. It can add a bounded callout
+mapping. It does not execute community plugins, CSS snippets, scripts, or note
+transclusions. Maincopy continues to render Mermaid itself.
+
+Obsidian Sync history is editing history, not Maincopy release evidence. It
+does not back up the complete authoring vault. Retained Maincopy artifacts cover
+release inputs, not every draft or vault note. Require a separate one-way vault
+backup and recovery drill.
+
+### Other candidates
+
+Other post-v1 candidates include browser editing, Git write-back, provider Git
+integrations, explicit retraction, paid access, multiple sites, and database
+high availability. Each candidate requires a separate product decision.
 
 ## References
 
@@ -657,3 +823,9 @@ code conventions and the manual CRAP score budget.
 - [Lightning Address, LUD-16](https://github.com/lnurl/luds/blob/luds/16.md)
 - [X Post button and Web Intent](https://docs.x.com/x-for-websites/post-button/overview)
 - [Substack Notes workflow](https://support.substack.com/hc/en-us/articles/14564821756308-Getting-started-on-Substack-Notes)
+- [Obsidian Headless](https://obsidian.md/help/headless)
+- [Obsidian Headless Sync](https://obsidian.md/help/sync/headless)
+- [Obsidian Properties](https://obsidian.md/help/properties)
+- [Obsidian Sync security](https://obsidian.md/help/sync/security)
+- [Obsidian Sync version history](https://obsidian.md/help/sync/version-history)
+- [Back up Obsidian files](https://obsidian.md/help/backup)

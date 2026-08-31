@@ -2,7 +2,7 @@
 
 Status: target delivery plan with open pre-v1 transition gates
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
 
 Related documents: [project overview](../README.md), [system design](design.md),
 and [engineering style guide](quality.md).
@@ -23,8 +23,8 @@ and quality conventions.
 
 ## Current implementation audit
 
-This table describes the reviewed worktree on 2026-08-30. It is not a release
-claim.
+This table describes commit `400b885` as reviewed on 2026-08-31. It is not a
+release claim.
 
 | Area | Reviewed status |
 | --- | --- |
@@ -32,20 +32,24 @@ claim.
 | Content discovery, baseline rendering, and immutable snapshots | Implemented foundation |
 | SQLite bootstrap, single writer, and query pool | Implemented foundation |
 | Admin discovery, OpenAPI, request IDs, and post reads | Implemented foundation |
-| Initial publication and local CLI commands | In progress |
-| Preview-gated initial and update releases | Planned |
-| Remote authentication, authorization, users, and admin UI | Planned |
+| Users, roles, profiles, password and Nostr login, sessions, CSRF, and NIP-98 authentication | Implemented foundation |
+| Initial publication, private previews, and local CLI commands | Implemented foundation |
+| Preview-gated update releases and complete release management | In progress |
 | Managed Git synchronization and restricted bootstrap | Planned |
-| Manual X and Substack Note share kits | Planned |
-| Profile-backed static Lightning Address tips | Planned |
-| Provider-backed tips, distribution frontmatter, and target-job schema | Superseded code pending removal |
+| RSS, discovery documents, public assets, redirects, metadata, and CSP | Planned |
+| HTTPS admin gateway and admin web interface | Planned |
+| Profile-backed static Lightning Address tips | Implemented foundation |
+| NixOS module, Litestream, artifact backup, and restore | Planned |
+| Outbound distribution, subscription, and email delivery | Deferred until after v1 |
+| Distribution frontmatter and target-job schema | Superseded code pending removal |
 
 > [!WARNING]
-> Do not bind the planned admin TCP listener until authentication and
-> authorization pass their gates. Network isolation and JSON are insufficient.
+> Do not expose the loopback admin TCP listener directly. Keep it loopback-only
+> and behind the reviewed HTTPS gateway. Network isolation and JSON are
+> insufficient.
 
-Do not start the remote gateway work before the authentication and
-authorization prerequisites pass their tests.
+Do not expose the remote gateway until its authentication, authorization, route
+isolation, and security-review prerequisites pass their tests.
 
 ## Navigation
 
@@ -60,17 +64,19 @@ authorization prerequisites pass their tests.
 | [Slice 2](#slice-2-canonical-web-service) | Canonical public web service |
 | [Slice 3](#slice-3-single-writer-sqlite-core) | SQLite writer and read core |
 | [Slice 4](#slice-4-user-accounts-admin-control-plane-and-remote-clients) | Accounts and administration |
-| [Slice 5](#slice-5-canonical-publication-required-previews-and-manual-share-kits) | Preview, release, and sharing |
+| [Slice 5](#slice-5-canonical-publication-and-required-previews) | Preview and release |
 | [Slice 6](#slice-6-release-quality-rendering) | Release-quality rendering |
 | [Slice 7](#slice-7-profile-backed-lightning-address-tips) | Static profile-backed tips |
-| [Slice 8](#slice-8-first-party-newsletter-subscription-capture) | Double-opt-in subscription capture |
-| [Slice 9](#slice-9-litestream-nixos-and-restore) | Packaging, deployment, and restore |
-| [Slice 10](#slice-10-release-hardening) | End-to-end and release evidence |
+| [Post-v1 assisted distribution](#post-v1-assisted-distribution-specification) | X and Substack handoff contracts |
+| [Post-v1 subscriptions and email](#post-v1-subscription-and-email-specification) | Mailing-list state, privacy, and delivery contracts |
+| [Post-v1 Obsidian authoring](#post-v1-obsidian-first-authoring-specification) | Headless Sync source and authoring compatibility |
+| [Slice 8](#slice-8-litestream-nixos-and-restore) | Packaging, deployment, and restore |
+| [Slice 9](#slice-9-release-hardening) | End-to-end and release evidence |
 | [V1 release definition](#v1-release-definition) | Owner approval boundary |
 
 ## V1 outcome
 
-Maincopy v1 is complete when Slice 10 passes its release gate.
+Maincopy v1 is complete when Slice 9 passes its release gate.
 Crate and flake publication require a separate owner approval.
 
 V1 runs one server instance on one host. Operators, agents, and browser users
@@ -90,9 +96,8 @@ Before any article revision can become public, its release must bind the exact
 production-rendered preview digest. The browser workflow shows that preview
 before it permits confirmation. A Git sync or reload indexes a change to a
 published article as an unpublished revision; it does not silently replace the
-live revision. The canonical site and RSS are the only automatic outputs for
-articles in v1. After the canonical URL is live, Maincopy provides
-local X and Substack Note copy-and-link kits for a person to use.
+live revision. The canonical site and RSS are the only article outputs in v1.
+V1 contains no outbound distribution or subscription-delivery feature.
 
 The managed source uses a provider-neutral read-only SSH deploy key and local
 mirror. External local-checkout mode remains available for operator-managed
@@ -100,7 +105,7 @@ deployments.
 
 ## Delivery rules
 
-- Keep v1 in one Cargo workspace with three Rust crates and one Maincopy daemon.
+- Keep v1 in one Cargo workspace with four Rust crates and one Maincopy daemon.
   The HTTPS gateway and Litestream run as separate processes.
 - Keep each pull request small enough for one focused review.
 - Merge infrastructure only when a product slice needs it.
@@ -117,15 +122,11 @@ deployments.
 - Do not host multiple sites, repositories, or tenant control planes in v1.
 - Do not add OAuth, a GitHub App, repository write-back, pull-request creation,
   merge-conflict UI, or webhook ingestion in v1.
-- Treat canonical web publication and RSS as the only automatic outputs for
-  articles in v1.
-- For X and Substack Note, prepare copy-and-link handoffs that a person
-  completes. A generic Copy action can reuse the same text elsewhere without
-  naming another supported channel. Do not connect an account, store a channel
-  credential, automate a browser, or claim that a share occurred.
-- Defer automatic Nostr article signing and relay submission with every other
-  automatic external distribution adapter.
-- Do not add bulk newsletter sending in v1.
+- Treat canonical web publication and RSS as the only article outputs in v1.
+- Defer X, Substack, Nostr article distribution, newsletter capture, and email
+  delivery until after v1.
+- Do not add provider credentials, outbound jobs, delivery state, subscriber
+  data, or email-control tokens in v1.
 
 A pull request can split one work package when review risk is high.
 It must not combine unrelated work packages for convenience.
@@ -133,7 +134,8 @@ It must not combine unrelated work packages for convenience.
 ## Non-negotiable code boundaries
 
 The root `Cargo.toml` must define a workspace only. The workspace contains
-`maincopy-server`, `maincopy-cli`, and `maincopy-shared` under `crates/`.
+`maincopy-server`, `maincopy-cli`, `markdown-compiler`, and `maincopy-shared`
+under `crates/`.
 
 `crates/server/src/main.rs` must stay tiny. Its asynchronous Tokio `main` uses
 `maincopy_server::startup::run_until_stop` and calls `run_until_stop().await`.
@@ -175,6 +177,9 @@ guards.
 `AdminClient`, sends an HTTPS request, and exits. It never constructs server
 state or opens SQLite.
 
+`crates/markdown-compiler` discovers and validates authored content. It produces
+deterministic compiled representations and has no server runtime wiring.
+
 `crates/shared` contains wire contracts. It does not contain runtime wiring,
 listener defaults, or application-domain behavior.
 
@@ -214,6 +219,9 @@ Use this compile-time dependency direction:
 
 ```text
 maincopy CLI ---- uses ----> maincopy-shared <---- uses ---- server crate
+                                                    |
+                                                    v
+                                          markdown compiler crate
 ```
 
 Use this runtime request direction:
@@ -260,71 +268,66 @@ Every slice must preserve these invariants:
 8. Every runtime database write uses one bounded command channel.
 9. Read connections use a bounded, query-only SQLx pool.
 10. No network call can hold a database transaction.
-11. A canonical article never waits for an external share.
+11. A canonical article never waits for an external service.
 12. Every activation, including an update to a published article, binds an
     accepted preview digest for the exact post revision, renderer identity,
     page-shell identity, profile projection, and reviewed canonical URL.
 13. The live SQLite database always uses local storage.
 14. Public reading and navigation do not require JavaScript.
 15. Maincopy never fetches or proxies an external content asset.
-16. Subscription acceptance and email work commit in one transaction.
-17. Logs, metrics, and audit events contain no raw email or control token.
-18. A share kit is unavailable until canonical publication commits a
-    `current_published_digest`, its URL is public, and no release is
-    `Activating` for that publication. It derives only from that digest.
-19. Canonical `published_at` comes only from a committed SQLite activation.
-20. Finite domains use enums, and non-interchangeable primitives use distinct
+16. V1 stores no outbound provider credential, distribution job, delivery
+    state, subscriber data, email address, or email-control token.
+17. V1 starts no distribution worker, email worker, or subscriber route.
+18. Canonical `published_at` comes only from a committed SQLite activation.
+19. Finite domains use enums, and non-interchangeable primitives use distinct
     wrappers.
-21. Git owns only the authored post `tips` policy. Git does not own a Lightning
+20. Git owns only the authored post `tips` policy. Git does not own a Lightning
     Address or a payment recipient.
-22. SQLite owns users, login identities, roles, profiles, sessions, agent
+21. SQLite owns users, login identities, roles, profiles, sessions, agent
     credentials, and the active tip recipient.
-23. A v1 tip CTA appears only when the authored policy is enabled and the
+22. A v1 tip CTA appears only when the authored policy is enabled and the
     active recipient has an enabled profile with a valid Lightning Address.
-24. Maincopy performs no LNURL network request, invoice creation, payment
+23. Maincopy performs no LNURL network request, invoice creation, payment
     tracking, or settlement confirmation for v1 tips.
-25. Admin clients use an HTTPS gateway on a separate admin origin. The gateway
+24. Admin clients use an HTTPS gateway on a separate admin origin. The gateway
     connects to the loopback-only HTTP admin listener.
-26. Maincopy authorizes every remote admin operation from a verified actor and
+25. Maincopy authorizes every remote admin operation from a verified actor and
     typed scopes. Network reachability alone grants no authority.
-27. The public virtual host has no route, fallback, or upstream connection to
+26. The public virtual host has no route, fallback, or upstream connection to
     the admin listener.
-28. A publishing agent cannot read, export, suppress, or delete subscriber
-    data without an explicit subscriber scope.
-29. `UserId` is the stable user identity. A Nostr public key is an optional,
+27. `UserId` is the stable user identity. A Nostr public key is an optional,
     unique login identity and never replaces `UserId`.
-30. V1 never receives or stores a user's Nostr private key or an outbound
-    social-network credential. Nostr login remains public-key verification.
-31. At least one human login provider is enabled. Every enabled user retains
+28. V1 never receives or stores a user's Nostr private key. Nostr login remains
+    public-key verification and does not authorize article distribution.
+29. At least one human login provider is enabled. Every enabled user retains
     at least one credential that an enabled provider can verify.
-32. A password credential stores only a uniquely salted, policy-versioned
+30. A password credential stores only a uniquely salted, policy-versioned
     Argon2id v19 PHC string. Nostr credentials use signature verification.
-33. Browser session and Cross-Site Request Forgery (CSRF) tokens are independent
+31. Browser session and Cross-Site Request Forgery (CSRF) tokens are independent
     256-bit random values. SQLite stores only fixed-length lookup digests for
     them and never applies Argon2.
-34. An agent credential contains a unique Nostr public key. Maincopy verifies a
+32. An agent credential contains a unique Nostr public key. Maincopy verifies a
     fresh NIP-98 proof for each agent request and never receives or stores the
     agent private key.
-35. A profile or recipient change uses a resource version and installs a new
+33. A profile or recipient change uses a resource version and installs a new
     public presentation snapshot without changing a Git post revision.
-36. Sync and reload can index a changed live article only as
+34. Sync and reload can index a changed live article only as
     `UnpublishedChange`. Only a preview-gated initial or update release can
     change public article visibility.
-37. V1 share-kit generation is a pure local projection. It performs no
-    provider request and stores no delivery result.
-38. Browser sessions are opaque server-side records in host-only `Secure`,
+35. Browser sessions are opaque server-side records in host-only `Secure`,
     `HttpOnly`, and `SameSite` cookies. V1 does not use JWT browser sessions.
-39. Human CLI sessions are revocable and remain in operating-system credential
+36. Human CLI sessions are revocable and remain in operating-system credential
     storage. Context files, arguments, and environment variables contain none.
-40. V1 issues no long-lived bearer API token. Each `AgentCredential` uses a
+37. V1 issues no long-lived bearer API token. Each `AgentCredential` uses a
     fresh, replay-protected NIP-98 proof for every request.
-41. `Owner`, `Administrator`, and `Publisher` are built-in roles backed by
+38. `Owner`, `Administrator`, and `Publisher` are built-in roles backed by
     fixed typed scopes.
-42. A `Publisher` has content, status, sync, reload, preview, release, and
-    share scopes only.
+39. A `Publisher` has content, status, sync, reload, preview, and release scopes.
     It has no profile, Lightning, user, credential, audit, or instance scope.
-43. Maincopy roles and agent scopes grant no Git write permission.
-44. Bootstrap and recovery are offline typed commands. They bind no listener,
+40. Maincopy roles and agent scopes grant no Git write permission.
+41. Mermaid rendering runs during compilation. Only sanitized SVG can enter a
+    candidate, and a rendering or sanitization failure rejects that candidate.
+42. Bootstrap and recovery are offline typed commands. They bind no listener,
     accept no arbitrary SQL, and require exclusive process ownership.
 
 ### Strong-type policy
@@ -336,8 +339,7 @@ code when the set of valid values is known.
 Use separate enums or newtype wrappers for values that serialize to the same
 primitive but have different meanings. Examples include API versions, feature
 contract versions, post IDs, publication IDs, preview digests, revision
-digests, idempotency keys, and email-control tokens. Use a closed
-`ManualShareChannel` enum with only `X` and `SubstackNote` in v1.
+digests, and idempotency keys.
 Use `UnpublishedChange` for the typed admin projection and `Unpublished
 changes` for its human-facing UI label.
 
@@ -385,22 +387,16 @@ flowchart LR
     AR --> S5C
     S4 --> S5C
     S5C --> S5A[WP5.3-5.4: Publication API and UI]
-    S5A --> S5W[WP5.5: Manual share-kit boundary]
-    S5W --> S5[Slice 5 complete]
-    S2 --> S6[Slice 6: Rendering]
+    S5A --> S5[Slice 5 complete]
+    S2 --> S6[Slice 6: Required rendering]
     S2 --> S7[Slice 7: Profile-backed Lightning tips]
     S4 --> S7
-    S2 --> S8[Slice 8: Newsletter capture]
-    S3 --> S8
-    S4 --> S8
-    S3 --> S9[Slice 9: Backup and NixOS]
-    S5 --> S9
+    S3 --> S8[Slice 8: Backup and NixOS]
+    S5 --> S8
+    S5 --> S9[Slice 9: Release hardening]
+    S6 --> S9
+    S7 --> S9
     S8 --> S9
-    S5 --> S10[Slice 10: Release hardening]
-    S6 --> S10
-    S7 --> S10
-    S8 --> S10
-    S9 --> S10
 ```
 
 The pre-v1 transition must finish before another persistent contract lands.
@@ -453,12 +449,10 @@ Slices 1 and 3 use separate stacks after Slice 0 merges.
 | Admin source and client surfaces | 4.3 -> 4.4 | Managed Git source, revision artifacts, and Admin foundation |
 | Canonical publication core | 5.1 -> 5.2 | Reload coordination, revision artifacts, and Slice 4 |
 | Publication admin surfaces | 5.3 -> 5.4 | Publication core and Admin control plane |
-| Manual share-kit boundary | 5.5 | Publication core and Publication admin surfaces |
 | Rendering | 6.1 -> 6.2 -> 6.3 -> 6.4 | Slice 2 |
 | Profile-backed Lightning tips | 7.1 -> 7.2 | Slices 2 and 4 |
-| Newsletter capture | 8.1 -> 8.2 -> 8.3 -> 8.4 -> 8.5 | Slices 2, 3, and 4 |
-| NixOS and restore | 9.1 -> 9.2 -> 9.3 -> 9.4 -> 9.5 | Slices 3, 5, and 8 |
-| Release hardening | 10.1 -> 10.2 -> 10.3 -> 10.4 | All prior slices |
+| NixOS and restore | 8.1 -> 8.2 -> 8.3 -> 8.4 -> 8.5 | Slices 3 and 5 |
+| Release hardening | 9.1 -> 9.2 -> 9.3 -> 9.4 | All v1 slices |
 
 Run focused tests on each layer. Run the full slice gate on the top layer.
 
@@ -503,17 +497,14 @@ Rust toolchain and the project license.
 | Password credentials | Pin the direct RustCrypto `argon2` crate; use explicit Argon2id v19 PHC strings and no convenience authentication wrapper | 4 |
 | Browser session and CSRF secrets | Generate independent 256-bit random values and store only fixed-length digests | 4 |
 | Agent authentication | Verify NIP-98 per request against a scoped Nostr public-key record; keep the signer and private key outside Maincopy | 4 |
-| X share length | Select a pure Rust implementation of the pinned official X weighted-text rules; use no provider SDK, browser script, or runtime network request | 5 |
 | Syntax highlighting | Select through the rendering corpus | 6 |
-| Mermaid | Select through the required implementation spike | 6 |
+| Mermaid | Select a local renderer through the required implementation spike | 6 |
 | SVG sanitization | Use an explicit SVG allowlist boundary | 6 |
 | Lightning Address | A typed SQLite profile value and deterministic LUD-16/LUD-01 projection | 4 |
 | LNURL encoding | Select a small local Bech32 encoder with no network behavior | 7 |
 | QR generation | Select a deterministic local component with a compatible license | 7 |
-| Email transport | Select one concrete consent-message-only transport; inject a narrow send function for controlled tests | 8 |
-| Subscription tokens | Use a cryptographic generator and stored token digests | 8 |
-| Database replication | Litestream executable from the Nix closure | 9 |
-| Reproducible build | Nix, Crane, and the project flake | 0 and 9 |
+| Database replication | Litestream executable from the Nix closure | 8 |
+| Reproducible build | Nix, Crane, and the project flake | 0 and 8 |
 
 Do not add a library only because a later slice might need it.
 Record the license and feature flags for each direct dependency.
@@ -561,14 +552,11 @@ A fixed row is binding. Resolve each selection row before its due work starts.
 | Managed-source bootstrap | Use offline typed commands that bind no listener. Create the first owner and source settings before the first accepted fetch, compile, public listener, or admin listener. | Fixed | 1.7 and 4.1 |
 | Instance identity | Generate a stable random `InstanceId` during bootstrap. Store it in SQLite and advertise it with the expected public origin through unauthenticated bounded discovery. A restore preserves it. | Fixed | 4.2 |
 | Pinned revision retention | Store a content-addressed immutable artifact package for each current or non-terminal release revision. Treat unexpected loss as `revision_unavailable`. | Fixed | 1.8 and 5.1 |
-| Revision-artifact backup | Select a backup and retention implementation that restores artifact packages at a recovery point compatible with SQLite. Litestream alone is insufficient. | Select | 9.4 |
+| Revision-artifact backup | Select a backup and retention implementation that restores artifact packages at a recovery point compatible with SQLite. Litestream alone is insufficient. | Select | 8.4 |
 | Preview precondition | Require an accepted preview digest plus the expected post and site revision for every first-publication or update schedule and publish-now action. | Fixed | 5.1 and 5.3 |
 | Preview evidence | Treat `PreviewDigest` as an exact content and presentation binding, not proof that a person viewed it. The browser UI must show the preview before confirmation; API clients can submit a reproducible correct digest without a prior preview operation. | Fixed | 4.3 and 5.1 |
 | V1 unpublish boundary | A Git deletion or draft change cannot silently retract a live article. Keep its current revision public and show the ineligible source change. Defer an explicit unpublish/retraction workflow. | Fixed | 1.5 |
-| V1 external distribution | Support assisted, credential-free X and Substack Note handoffs. Defer every automatic external adapter, including Nostr article distribution. | Fixed | 5.5 |
-| Share copy | Derive a first-paragraph excerpt with the required description as fallback. Provide excerpt-and-link and link-only values. An unsaved browser edit can change the copied text without changing Git or SQLite. | Fixed | 4.3 and 5.5 |
-| Share timing | Generate a share kit only after canonical publication. V1 has no external-platform schedule or delivery state. | Fixed | 5.2 and 5.5 |
-| X weighted-text implementation | Select and pin a pure Rust implementation against official X fixtures. Record its rules version, license, features, and Unicode behavior. | Select | 5.5 |
+| V1 outbound boundary | Defer assisted and automatic article distribution, subscription capture, and email delivery. Store no provider credential, job, delivery state, subscriber data, or email-control token. | Fixed | 0.5 and 3.1 |
 | OpenAPI generator | Use `utoipa` schemas plus one `utoipa-axum` registry that creates routes and operations together. | Fixed | 0.1 |
 | Managed source | Use one read-only SSH remote, one branch, one local mirror, polling, and admin `Sync now`. | Fixed | 1.7 |
 | Source authority | Host config owns mode, filesystem bounds, and the credential registry. SQLite owns the active remote, branch, content root, credential name, and poll setting. | Fixed | 1.7 |
@@ -576,11 +564,12 @@ A fixed row is binding. Resolve each selection row before its due work starts.
 | External checkout | Retain an operator-managed local content-root mode without remote Git synchronization. | Fixed | 1.7 |
 | Git write features | Defer OAuth, GitHub App, write-back, pull requests, conflict UI, and multi-repository operation. No Maincopy role or scope grants repository write access. | Fixed | Post-v1 |
 | Git webhook | Defer it. A future webhook can trigger fetch only and cannot supply trusted content or revision state. | Fixed | Post-v1 |
+| Obsidian authoring | Add the official Obsidian Headless client as an optional source only after its dependency and security spike passes. Preserve immutable revision artifacts, exact previews, and explicit release approval. | Fixed | Post-v1 |
 | Admin access topology | Bind one loopback-only HTTP admin listener. Use a separate authenticated HTTPS gateway and admin origin for all normal clients. Never mount admin routes on the public router. | Fixed | 4.2 and 4.5 |
 | Admin actor contract | Resolve `AdminPrincipal` in Maincopy from a verified human session or a fresh NIP-98 proof for an active scoped `AgentCredential`. Offline recovery is not a network principal. | Fixed | 4.2 and 4.6 |
-| Built-in roles | Map `Owner`, `Administrator`, and `Publisher` to fixed typed scopes. A Publisher has content, status, sync, reload, preview, release, and share authority only. | Fixed | 4.2 and 4.6 |
+| Built-in roles | Map `Owner`, `Administrator`, and `Publisher` to fixed typed scopes. A Publisher has content, status, sync, reload, preview, and release authority only. | Fixed | 4.2 and 4.6 |
 | CLI context contract | Store a signer reference, pinned instance identity, and transport policy. Load the signer only after unauthenticated discovery matches the pin. | Fixed | 4.4 |
-| Gateway implementation | Select the supported gateway and its NixOS integration. Preserve the Slice 4 actor contract. | Select | 9.2 |
+| Gateway implementation | Select the supported gateway and its NixOS integration. Preserve the Slice 4 actor contract. | Select | 8.2 |
 | User identity | Use stable `UserId`. Keep the canonical Nostr public key optional and unique. Store no Nostr private key in v1. | Fixed | 4.6 |
 | Human login providers | Permit Nostr, username/password, or both. Reject an empty provider set and any change that strands an enabled user. | Fixed | 4.6 |
 | Password hashing | Apply the direct RustCrypto `argon2` 0.6.0 crate only to human password credentials. Use explicit Argon2id v19 parameters, unique random salts, PHC strings, and rehash after a successful login when policy increases. | Fixed | 4.6 |
@@ -593,13 +582,10 @@ A fixed row is binding. Resolve each selection row before its due work starts.
 | Tip recipient | Store one active recipient `UserId` in SQLite. Render a CTA only for an enabled user, profile, and Lightning Address. | Fixed | 7.1 |
 | V1 payment boundary | Use a static wallet handoff. Do not create invoices, query LNURL services, or store payment state. | Fixed | 7.1 |
 | Paid article access | Defer access control until the post-v1 settlement and entitlement contract is implemented. | Fixed | Post-v1 |
-| Mermaid engine | Select only after the fixture and limit spike passes. | Select | 6.2 |
+| Mermaid engine | Select only after the fixture and limit spike passes. V1 cannot release without the selected renderer and SVG sanitizer. | Select | 6.2 and 6.3 |
 | Metrics export | Select the export path without adding it to the public router. | Select | 3.5 |
-| Email transport | Select one transport for confirmation and subscription-control messages only. | Select | Slice 8 |
-| Email normalization | Define the minimal, standards-safe comparison rule. | Select | 8.1 |
-| Subscriber retention | Set pending, unsubscribed, token, audit, and backup retention. | Select | 8.1 |
-| Recovery targets | Set measurable recovery point and recovery time targets. | Select | 9.4 |
-| Restore marker | Use a one-use marker bound to one offline-verified restored candidate. Consume it on the first accepted startup. Ordinary restarts do not require it. | Fixed | 9.4 |
+| Recovery targets | Set measurable recovery point and recovery time targets. | Select | 8.4 |
+| Restore marker | Use a one-use marker bound to one offline-verified restored candidate. Consume it on the first accepted startup. Ordinary restarts do not require it. | Fixed | 8.4 |
 
 The canonical publication scheduler controls first public visibility and each
 later public revision change. It uses the SQLite schedule and a post revision
@@ -607,9 +593,7 @@ pinned at release creation. Git sync and reload never approve an article
 revision for public visibility.
 
 The admin API and UI can preview, schedule, cancel, inspect, or publish now.
-After the related canonical publication has a committed
-`current_published_digest`, they can obtain a credential-free X and Substack
-Note share kit. Maincopy records no external delivery outcome.
+They expose no outbound distribution or subscription operation in v1.
 
 ### Operator workflow language
 
@@ -621,7 +605,6 @@ The CLI and admin UI must use these terms consistently:
 | Sync | Fetch the managed branch, prepare its immutable candidate, and reload it when changed. |
 | Reload | Validate and index the current local candidate. Rebuild the site snapshot only from already approved public article revisions. |
 | Publish | Make one previewed post revision canonically visible now or at a scheduled time, either initially or as an update. |
-| Share | Copy or open prepared text after canonical publication. This action does not prove that an external post exists. |
 
 Do not report a committed schedule as published. Do not report a reload as a
 new canonical publication. Human views can group these resources into one
@@ -699,7 +682,7 @@ Deliverables:
 - A short-lived `maincopy` binary with its own concrete admin client.
 - A contract-only shared crate for versioned wire types and shared defaults.
 - Empty module boundaries for configuration, errors, content, web, admin,
-  database, publication scheduling, rendering, and manual share kits.
+  database, publication scheduling, and rendering.
 - A startup result that maps typed failures to a process exit code.
 - Typed status and version enums for the first public and admin contracts.
 - `utoipa` schemas and one `utoipa-axum` registry that generates the admin
@@ -825,7 +808,7 @@ Deliverables:
 - A transport-only `TestServer` with an injected listener.
 - Explicit `TestServer` shutdown that awaits all owned tasks.
 - Explicit instants, paused Tokio time, controlled DNS answers, HTTP servers,
-  private rendered previews, and manual share-kit fixtures.
+  and private rendered previews.
 - Short decision records for each resolved blocking decision.
 
 Tests:
@@ -851,6 +834,8 @@ Deliverables:
   validation, rendering, and digest transcripts.
 - Removal or explicit migration of `publication_jobs` and other external-target
   tables.
+- Rejection of subscription configuration until the post-v1 contract starts.
+- No subscriber table, email outbox, email worker, or subscription route.
 - A stable rejection diagnostic for unsupported pre-v1 state.
 - No compatibility claim before the selected transition tests pass.
 
@@ -908,14 +893,15 @@ Deliverables:
 - Route-safe ASCII slugs, aliases, and normalized tags, each with an inclusive
   1,024-byte limit.
 - An inclusive 8 KiB limit for each derived canonical article URL used by
-  preview, metadata, and share-kit contracts.
+  preview and metadata contracts.
 - Authored UTC-offset preservation for authored metadata.
 - A fixed renderer policy that is not authored configuration in v1.
 - Publication-default tip policy with an explicit per-post `tips` override.
 - A rule that authored tip policy never selects a recipient or proves payment.
 - A rule that the existing `[distribution.*]` shape is not a v1 content
-  contract. External share copy is derived from the selected revision after
-  compilation and is not an automatic publishing instruction.
+  contract. A future distribution feature must derive its input after
+  compilation and cannot treat frontmatter as an automatic publishing command.
+- A rule that `[subscriptions]` is not a v1 publication contract.
 
 Tests:
 
@@ -932,6 +918,7 @@ Tests:
   `publication.toml` and post frontmatter.
 - Reject provider-specific distribution configuration in
   `publication.toml` and post frontmatter.
+- Reject subscription configuration in `publication.toml`.
 - Reject `updated_at` values earlier than `authored_at`.
 - Prove that `authored_at` does not control public visibility.
 - Prove stable error ordering across repeated runs.
@@ -1989,13 +1976,12 @@ Deliverables:
 - Stable `UserId`, `AdminSessionId`, and `AgentCredentialId` types in API and
   audit contracts.
 - Typed scopes for content and preview reads, source syncs, reloads,
-  publication mutations, share-kit reads, profile changes, user
-  administration, credential management, audit reads, instance management,
-  and subscriber operations.
+  publication mutations, profile changes, user administration, credential
+  management, audit reads, and instance management.
 - Built-in `Owner`, `Administrator`, and `Publisher` roles with fixed
   role-to-scope mappings.
-- Publisher authority limited to content, status, sync, reload, preview,
-  release, and share operations.
+- Publisher authority limited to content, status, sync, reload, preview, and
+  release operations.
 - Authorization at each admin operation boundary.
 - A closed authentication result that accepts only a verified Maincopy session
   or a fresh NIP-98 proof for an active `AgentCredential`.
@@ -2026,9 +2012,9 @@ Tests:
 - Prove that offline bootstrap and recovery authority cannot enter through an
   HTTP request.
 - Prove that a `Publisher` can read content and status, trigger sync and reload,
-  render previews, manage releases, and read share kits.
+  render previews, and manage releases.
 - Reject a `Publisher` at profile, Lightning, user, credential, audit,
-  subscriber, source-configuration, and instance operations.
+  source-configuration, and instance operations.
 - Commit an accepted mutation and its audit event in the same writer
   transaction.
 - Record a redacted audit event for each rejected authenticated mutation.
@@ -2074,10 +2060,6 @@ Deliverables:
   renderer identity, page-shell identity, profile projection version, and the
   exact reviewed canonical URL. The schedule time is a separate operational
   value and does not change this digest.
-- The deterministic first eligible prose paragraph, required-description
-  fallback, and future canonical URL as share-copy candidates. Previewing them
-  creates no share or delivery state. Copy and Open handoff actions remain
-  unavailable until the related revision is public.
 - `Cache-Control: private, no-store` on every preview response.
 - An explicit `Not public` status, source commit, post revision, and proposed
   publication time outside the production-rendered document.
@@ -2221,7 +2203,7 @@ Full content discovery remains Linux-only.
 ### Work package 4.5: HTTPS admin gateway contract
 
 Define and test the gateway contract before the admin UI or publication API
-uses it. Work package 9.2 packages this contract for NixOS.
+uses it. Work package 8.2 packages this contract for NixOS.
 
 Deliverables:
 
@@ -2256,7 +2238,6 @@ Tests:
 - Authenticate a browser session and an agent NIP-98 request independently in
   Maincopy.
 - Reject a spoofed actor, scope, forwarding, `Host`, or `Origin` header.
-- Reject a `Publisher` principal at every subscriber endpoint.
 - Preserve one idempotent mutation when the client loses the first response.
 - Verify that gateway logs contain no cookie, token, or authorization header.
 
@@ -2277,11 +2258,11 @@ Use this fixed v1 role-to-scope mapping:
 | --- | --- | --- | --- |
 | Content, status, sync, and reload | Allow | Allow | Allow |
 | Preview HTML and assets | Allow | Allow | Allow |
-| Releases and manual share kits | Allow | Allow | Allow |
+| Releases | Allow | Allow | Allow |
 | Profiles and Lightning settings | Allow | Allow | Deny |
 | Users and credentials | Allow | Allow | Deny |
 | Role assignment | Allow | Deny | Deny |
-| Audit and subscriber data | Allow | Allow | Deny |
+| Audit records | Allow | Allow | Deny |
 | Source and instance configuration | Allow | Deny | Deny |
 
 Deliverables:
@@ -2291,9 +2272,9 @@ Deliverables:
 - A closed `UserStatus` with `Enabled` and `Disabled`.
 - A closed `UserRole` with `Owner`, `Administrator`, and `Publisher`.
 - One fixed role-to-scope mapping. `Publisher` includes only content, status,
-  sync, reload, preview, release, and share scopes.
+  sync, reload, preview, and release scopes.
 - No Publisher scope for profiles, Lightning settings, users, credentials,
-  audit records, subscribers, source configuration, or instance management.
+  audit records, source configuration, or instance management.
 - An agent public-key credential can receive only an explicit subset of the
   issuing user's current scopes.
 - A closed `HumanLoginProvider` with `Nostr` and `Password`. Host configuration
@@ -2425,8 +2406,8 @@ Deliverables:
   scopes. Only Owner can assign roles or change instance configuration.
 - Redacted audit events for login, logout, failed authentication, user changes,
   profile changes, and agent credential lifecycle operations.
-- Owner or typed offline-recovery password rotation. V1 has no public email
-  recovery or self-service password-reset flow.
+- Owner or typed offline-recovery password rotation. V1 has no public or
+  self-service password-reset flow.
 - No raw password, browser session token, CSRF token, Nostr private key, or
   encrypted `nsec` field in v1 SQLite, logs, metrics, errors, traces, or audit
   events. PHC strings stay in the password credential table and never enter
@@ -2488,10 +2469,10 @@ Tests:
 - Disable a user and reject its sessions and agent credentials immediately.
 - Reduce a user's roles and remove the lost authority on the next request.
 - Prove the exact scope mapping for Owner, Administrator, and Publisher.
-- Permit a Publisher to use content, status, sync, reload, preview, release,
-  and share operations.
+- Permit a Publisher to use content, status, sync, reload, preview, and release
+  operations.
 - Reject a Publisher at profile, Lightning, user, credential, audit,
-  subscriber, source-configuration, and instance operations.
+  source-configuration, and instance operations.
 - Reject an agent scope outside the issuer's current scopes.
 - Register an agent credential with only its unique canonical Nostr public key
   and metadata. Reject a duplicate agent public key.
@@ -2538,8 +2519,8 @@ Tests:
   agent request requires a fresh, exact, replay-protected NIP-98 proof.
 - V1 issues no long-lived bearer API token.
 - Maincopy never receives, stores, or transmits an agent private key.
-- Publisher authority is limited to content, status, sync, reload, preview,
-  release, and share operations.
+- Publisher authority is limited to content, status, sync, reload, preview, and
+  release operations.
 - Maincopy roles and agent scopes grant no Git write permission.
 - A user can update a versioned Lightning Address profile without editing Git.
 - OpenAPI describes all implemented admin routes.
@@ -2547,16 +2528,15 @@ Tests:
 - The CLI never opens SQLite for writes.
 - No admin endpoint exists on the public router.
 
-## Slice 5: Canonical publication, required previews, and manual share kits
+## Slice 5: Canonical publication and required previews
 
 ### Goal
 
 Let operators render and review the exact selected revision, then control when
 that revision first becomes visible or replaces an older public revision on
 the canonical site. Require the accepted preview digest for every activation.
-After publication, provide local X and Substack Note share kits without making
-a social-provider request. Index immutable Git revisions for one site. Store
-schedule and publication state in SQLite without editing Markdown or
+Index immutable Git revisions for one site. Store schedule and publication
+state in SQLite without editing Markdown or
 committing Git.
 
 ```mermaid
@@ -2565,13 +2545,10 @@ flowchart LR
     P --> A[Accept preview digest and schedule release]
     A --> C[Canonical snapshot activation]
     C --> U[Public canonical URL]
-    U --> K[Local X and Substack Note share kit]
-    K --> H[Person copies or opens]
 ```
 
 The transition of a revision into the public canonical URL is the only
-scheduled canonical release event in v1. The final handoff is neither
-scheduled nor observed by Maincopy.
+scheduled canonical release event in v1.
 
 ### Work package 5.1: Preview-gated canonical publication commands
 
@@ -2612,7 +2589,7 @@ Deliverables:
 - Canonical `published_at` assigned by the first successful `Initial`
   activation and preserved by every `Update` release.
 - A stateless preview operation. It returns a digest but creates no publication
-  or external-delivery state.
+  or release state.
 - Atomic creation of an initial or update schedule with the accepted preview
   binding.
 - Atomic cancellation of an eligible scheduled release. Cancelling an update
@@ -2713,8 +2690,8 @@ Deliverables:
   snapshot-transition primitive.
 - Bounded activation concurrency and ordered shutdown.
 
-The snapshot swap must happen before the `Published` commit. No social-provider
-worker or external-delivery release exists in v1.
+The snapshot swap must happen before the `Published` commit. V1 releases no
+outbound work.
 
 Failure tests:
 
@@ -2722,22 +2699,19 @@ Failure tests:
   exact UTC boundaries.
 - Reject activation before the snapshot swap when the stored preview binding
   cannot be reproduced.
-- Fail the snapshot swap without creating a share or outbound side effect.
-- Block an unavailable initial activation without exposing the post or a share
-  kit. A blocked update keeps the prior public article and its prior-revision
-  kit available.
+- Fail the snapshot swap without creating an outbound side effect.
+- Block an unavailable initial activation without exposing the post. A blocked
+  update keeps the prior public article available.
 - Keep the prior public revision live until an update's snapshot swap succeeds.
 - Crash after `Activating` and before the swap.
 - Crash after the swap and before the `Published` commit.
 - Restart and reconcile both crash positions before listener binding.
-- Prove that no initial share kit is available before canonical visibility and
-  that an activating update does not expose its new kit before the swap.
 - Apply the documented missed-schedule policy after downtime.
 - Display and preserve the delay between requested and actual times.
 - Reject cancellation after release activation starts.
 - Stop the scheduler without losing an accepted writer command.
 
-### Work package 5.3: Canonical publication and share-kit API
+### Work package 5.3: Canonical publication API
 
 Expose complete operations to the CLI, agents, and admin UI.
 
@@ -2752,30 +2726,6 @@ Deliverables:
   change or same-revision preview-binding refresh while eligible.
 - `POST /api/admin/v1/releases/{id}/cancel`.
 - `POST /api/admin/v1/releases/{id}/publish-now`.
-- `GET /api/admin/v1/publications/{id}/share-kit` after the publication is
-  canonically published with a non-null `current_published_digest` and no
-  `Activating` release for that publication.
-- Exactly two typed share entries: `x` and `substack_note`. The second name
-  means a short Substack Note that links to the canonical article; it does not
-  mean Substack article or newsletter publication.
-- A versioned, deterministic channel-neutral package containing the post ID,
-  exact `canonical_publications.current_published_digest`, first eligible
-  plain-text prose paragraph, description fallback, exact live canonical HTTPS
-  URL, and package digest. Never select an indexed, previewed, scheduled,
-  activating, blocked, or cancelled update revision.
-- `excerpt_and_url` and `url_only` values for both entries.
-- A closed X length result with `Full`, `Truncated`, and `LinkOnly`; do not
-  attach an invented platform-length status to Substack Note.
-- A supported X Web Intent that uses the user's browser. For Substack, open
-  Substack so the user can choose `Create` and then `Note`; do not claim a
-  direct Notes composer or prefilled state.
-- `requires_human = true` and `completion_observable = false` in each share
-  entry.
-- No mutation, delivery status, remote attempt, completion operation, or
-  external account resource for a share kit.
-- Matching CLI commands that print the exact copy and handoff URLs. Machine
-  JSON never opens a browser or changes a clipboard. An explicit interactive
-  Open action runs only on the client machine.
 - Create-time schedule or immediate-release selection.
 - Expected post, site, canonical-publication, release, and preview-digest
   preconditions.
@@ -2802,29 +2752,8 @@ Tests:
 - Publish now through the same coordinator as a due schedule.
 - Use publish-now to approve retry of an eligible blocked release.
 - Cancel and replace a blocked release to select a new pinned revision.
-- Cancel a scheduled update without changing the current public revision or
-  creating external work.
-- Return a typed not-ready result before the canonical publication has a
-  committed `current_published_digest` or while a release is `Activating`.
-- Generate identical share-kit bytes for repeated reads of the same published
-  revision and canonical URL.
-- Keep those bytes identical while another revision is only indexed,
-  preview-bound, scheduled, blocked, or cancelled. Make the kit temporarily
-  unavailable while an update is `Activating`, then switch it only after the
-  update's canonical commit.
-- Produce only plain text: exclude Markdown syntax, raw HTML, link
-  destinations, headings, code blocks, images, and empty blocks from excerpt
-  extraction. Preserve inline text, link labels, and inline-code text.
-- Fall back to the required description when no eligible prose paragraph
-  exists. Always provide `url_only` independently of the excerpt.
-- Include the canonical URL in the package digest and add no tracking
-  parameter.
-- Report X text as full, visibly truncated, or link-only under the pinned v1 X
-  weighted-length policy. Do not invent a Substack character limit.
-- Make no X, Substack, or Nostr network request while generating a share kit.
-- Reject a share-kit read without its typed read scope.
+- Cancel a scheduled update without changing the current public revision.
 - Reject each mutation when the principal lacks its required scope.
-- Reject a `Publisher` principal at every subscriber operation.
 - Return `503` with retry guidance when the writer queue is full.
 - Validate every response and error against OpenAPI.
 
@@ -2836,8 +2765,7 @@ access uses the HTTPS gateway and separate admin origin.
 Deliverables:
 
 - An overview page for the live site revision, latest reload, upcoming
-  releases, blocked releases, unpublished changes to live posts, and recently
-  published posts that are ready to share manually.
+  releases, blocked releases, and unpublished changes to live posts.
 - A Source page with the configured branch, content root, last installed
   commit, current sync status, last failure, next poll, and `Sync now`.
 - Owner-only copy controls for the selected SSH public key and fingerprint
@@ -2880,27 +2808,8 @@ Deliverables:
 - Release kind, state, activation error, original `published_at`, and current
   public revision display.
 - Blocked retry and cancel-and-replace controls.
-- A post-publication share panel with X and Substack Note sections, the exact
-  excerpt-and-link and link-only values, and visible selectable text.
-- Progressive-enhancement Copy buttons. Without JavaScript, the user can
-  select the same text and use ordinary external links.
-- `Open in X` only through the supported X Web Intent. After the user copies
-  the prepared text, `Open Substack` opens Substack so the user can choose
-  `Create` and then `Note`. The UI does not claim a direct composer or
-  prefilled content.
-- Ordinary anchors only for Open actions. Do not load a provider SDK, widget,
-  script, iframe, embed, tracking pixel, or provider asset. Do not preflight,
-  probe, resolve, or follow a provider URL. The first provider request is the
-  user's navigation after an explicit click.
-- External Open links use `rel="noopener noreferrer"` and a no-referrer policy
-  so a social site does not receive the admin URL or control the admin tab.
-- An editable browser-only text area for one-off changes before copying. Its
-  contents are not saved as article content or operational state.
-- No shared, delivered, failed, retrying, or remotely scheduled claim for a
-  manual handoff.
 - An activity summary with actor, action, time, outcome, and request ID. Hide
   it when the principal lacks audit scope.
-- No Copy or Open activity is recorded as shared, delivered, or completed.
 - Creator and last-mutator identity on release detail pages.
 - Explicit operator timezone and UTC confirmation.
 - CSRF tokens and Origin checks for browser mutations.
@@ -2924,8 +2833,7 @@ Tests:
 - Reject source reconfiguration without owner scope or fresh re-authentication.
 - Edit an eligible schedule and preserve its creator identity.
 - Reject a stale schedule edit without overwriting the newer schedule.
-- Publish now and observe canonical visibility before the share panel becomes
-  available.
+- Publish now and observe canonical visibility.
 - Keep an edited live post unchanged until its preview-gated update release
   activates, then preserve its original canonical `published_at`.
 - Cancel a schedule and keep its post publicly hidden.
@@ -2936,24 +2844,123 @@ Tests:
 - Reject an unauthenticated session and an insufficiently scoped session.
 - Update the current user's profile without a Git change.
 - Reject profile or user administration without the required scope.
-- Permit a Publisher to use content, status, sync, reload, preview, release,
-  and share UI.
-- Hide and reject profile, Lightning, user, credential, audit, subscriber,
+- Permit a Publisher to use content, status, sync, reload, preview, and release
+  UI.
+- Hide and reject profile, Lightning, user, credential, audit,
   source-configuration, and instance controls for a Publisher.
 - Reject a session cookie on the public origin.
 - Display a resource conflict without overwriting newer state.
-- Keep preview, copy, and Open actions free of publication and delivery-state
-  mutations.
-- Edit the browser-only share text, refresh, and recover the deterministic
-  derived text. Prove that the edit entered no SQLite row, API resource, audit
-  event, log, or metric.
-- Exercise preview, selectable copy, and external links without JavaScript.
-- Verify the external-link rel and referrer-policy boundary.
+- Keep preview actions free of publication-state mutations.
 - Verify that the public listener returns not found for every UI route.
 
-### Work package 5.5: Preview and manual share-kit boundary
+### Slice 5 exit gate
 
-Prove that external sharing is a local, credential-free handoff in v1.
+- Operators and agents control first visibility and every later public article
+  revision change.
+- A scheduled or activating initial revision remains hidden until its snapshot
+  swap. For an update, the prior approved revision remains public until that
+  swap.
+- Every release pins a required post digest. Managed mode also pins the exact
+  source commit; external checkout mode can omit it.
+- Every activation carries a valid accepted preview digest for its exact
+  pinned revision and presentation identities.
+- Drafts and unpublished revisions can be previewed only through the admin
+  origin. Their preview documents and assets remain absent from public routes.
+- The schedule form shows the production-faithful preview before final
+  confirmation.
+- A sync or reload of an edited live post produces `Unpublished changes` and
+  cannot replace the public revision without a preview-gated update release.
+- Blocked releases support retry or cancel-and-replace behavior.
+- Restart reconciles every `Activating` release before listener binding.
+- The UI uses only the same application commands as the API.
+- Every mutation is durable, idempotent, and version checked.
+- V1 stores no outbound provider credential, distribution job, or delivery
+  state. It starts no outbound article-distribution worker.
+
+## Post-v1 assisted-distribution specification
+
+This specification is not a v1 dependency or release gate. It preserves the
+selected X and Substack Note contracts for a later version.
+
+### Post-v1 dependency and decision gates
+
+| Concern | Required selection |
+| --- | --- |
+| X share length | Select a pure Rust implementation of the pinned official X weighted-text rules. Use no provider SDK, browser script, or runtime network request. |
+
+| Decision | Required resolution | Status |
+| --- | --- | --- |
+| Assisted distribution | Support credential-free X and Substack Note handoffs. Defer every automatic adapter, including Nostr article distribution. | Fixed |
+| Share copy | Derive the first prose paragraph with the description as fallback. Provide excerpt-and-link and link-only values. | Fixed |
+| Share timing | Generate a share kit only after canonical publication. Store no external-platform schedule or delivery state. | Fixed |
+| X weighted text | Select and pin a pure Rust implementation against official X fixtures. Record its rules version, license, features, and Unicode behavior. | Select |
+
+### Post-v1 share-kit API and client contract
+
+Deliverables:
+
+- `GET /api/admin/v1/publications/{id}/share-kit` only after canonical
+  publication commits `current_published_digest` and no release is
+  `Activating` for that publication.
+- Exactly two typed entries: `x` and `substack_note`.
+- A versioned channel-neutral package with the post ID, current published
+  digest, selected excerpt, description fallback, canonical HTTPS URL, and
+  package digest.
+- `excerpt_and_url` and `url_only` values for both entries.
+- A closed X result with `Full`, `Truncated`, and `LinkOnly`.
+- A supported X Web Intent. Open Substack without claiming a direct Notes
+  composer or prefilled state.
+- `requires_human = true` and `completion_observable = false` in each entry.
+- No mutation, delivery status, remote attempt, completion operation, or
+  external account resource.
+- Matching CLI commands that print exact copy and handoff URLs. Machine JSON
+  never opens a browser or changes a clipboard.
+
+Tests:
+
+- Return a typed not-ready result before canonical publication or during an
+  `Activating` release.
+- Generate identical bytes for repeated reads of one published revision and
+  canonical URL.
+- Keep the bytes stable while another revision is indexed, scheduled, blocked,
+  or cancelled. Switch only after the update commits.
+- Exclude Markdown syntax, raw HTML, destinations, headings, code blocks,
+  images, and empty blocks from excerpts.
+- Preserve inline text, link labels, and inline-code text.
+- Fall back to the description and always provide `url_only`.
+- Include the canonical URL in the package digest without a tracking parameter.
+- Exercise each X weighted-length result without inventing a Substack limit.
+- Make no X, Substack, or Nostr network request during generation.
+- Reject a read without its typed scope.
+
+### Post-v1 share-kit admin UI contract
+
+Deliverables:
+
+- A panel with X and Substack Note sections, exact copy values, and selectable
+  text.
+- Progressive-enhancement Copy controls with a no-JavaScript fallback.
+- `Open in X` through the supported X Web Intent and `Open Substack` through an
+  ordinary Substack link.
+- No provider SDK, widget, script, iframe, embed, tracking pixel, provider
+  asset, preflight, probe, or availability request.
+- `rel="noopener noreferrer"` and a no-referrer policy on external links.
+- An unsaved browser-only text area for one-off edits.
+- No shared, delivered, failed, retrying, or remotely scheduled claim.
+- No Copy or Open completion event.
+
+Tests:
+
+- Show the panel only after canonical visibility.
+- Keep Copy and Open actions free of publication and delivery-state mutations.
+- Discard a browser-only edit on refresh without writing SQLite, audit, log, or
+  metric state.
+- Exercise selectable copy and external links without JavaScript.
+- Verify the external-link relationship and referrer-policy boundary.
+
+### Post-v1 assisted-distribution boundary
+
+Prove that assisted distribution is a local, credential-free handoff.
 
 Deliverables:
 
@@ -2980,7 +2987,8 @@ Deliverables:
   [weighted-length policy](https://docs.x.com/fundamentals/counting-characters)
   and supported
   [Post button](https://docs.x.com/x-for-websites/post-button/overview).
-  Pin the v1 fixtures to the documented 280 weighted-unit maximum, 23-unit URL
+  Pin the first-contract fixtures to the documented 280 weighted-unit maximum,
+  23-unit URL
   weight, and NFC normalization rule. A future policy change requires a
   projection-version change.
   The local `excerpt_and_url` value has the exact bytes `excerpt`, one blank
@@ -2997,7 +3005,7 @@ Deliverables:
   with the copy value and fixed X origin instead of an oversized URL.
 - Fixed handoff origins: `https://x.com/intent/tweet` for X and
   `https://substack.com/` for Substack. Git, SQLite, and requests cannot
-  override these destinations in v1.
+  override these destinations in this contract.
 - A generic Copy action for reuse on another service without calling that
   service a supported channel.
 - A requirement that the linked public page already exposes its canonical URL
@@ -3008,8 +3016,8 @@ Deliverables:
   automation, target schedule, delivery worker, lease, retry, remote attempt,
   or completion state.
 - No Nostr article signature, managed signing credential, or relay submission
-  in v1. Nostr login and agent NIP-98 authentication remain separate inbound
-  authentication mechanisms.
+  exists in this contract. Nostr login and agent NIP-98 authentication remain
+  separate inbound authentication mechanisms.
 
 Tests:
 
@@ -3049,33 +3057,17 @@ Tests:
 - Prove that startup registers no article-distribution background task or
   social-provider client.
 
-### Slice 5 exit gate
+### Post-v1 assisted-distribution acceptance gate
 
-- Operators and agents control first visibility and every later public article
-  revision change.
-- A scheduled or activating initial revision remains hidden until its snapshot
-  swap. For an update, the prior approved revision remains public until that
-  swap.
-- Every release pins a required post digest. Managed mode also pins the exact
-  source commit; external checkout mode can omit it.
-- Every activation carries a valid accepted preview digest for its exact
-  pinned revision and presentation identities.
-- Drafts and unpublished revisions can be previewed only through the admin
-  origin. Their preview documents and assets remain absent from public routes.
-- The schedule form shows the production-faithful preview before final
-  confirmation.
 - Share kits are unavailable when the canonical publication has no committed
   `current_published_digest` or while its release is `Activating`.
-- A sync or reload of an edited live post produces `Unpublished changes` and
-  cannot replace the public revision without a preview-gated update release.
-- V1 exposes only X and Substack Note as named manual share channels.
-- Blocked releases support retry or cancel-and-replace behavior.
-- Restart reconciles every `Activating` release before listener binding.
-- The UI uses only the same application commands as the API.
-- Every mutation is durable, idempotent, and version checked.
-- V1 has no article-distribution network execution or provider credential.
-- V1 ships no automatic external adapter. Nostr article signing and relay
-  distribution remain post-v1.
+- The first assisted-distribution contract exposes only X and Substack Note as
+  named channels.
+- Repeated generation for one published revision produces identical output.
+- Copy and Open actions create no delivery or completion state.
+- Maincopy stores no provider credential and runs no automatic adapter.
+- Nostr article signing and relay distribution require a separate later
+  contract.
 
 ## Slice 6: Release-quality rendering
 
@@ -3083,6 +3075,7 @@ Tests:
 
 Render technical content during compilation within strict security limits.
 Keep one reviewed HTML trust boundary.
+Full Mermaid rendering and SVG sanitization are required for v1.
 
 ### Work package 6.1: Code and syntax rendering
 
@@ -3113,7 +3106,7 @@ Deliverables:
 - Measured startup, render, memory, and output costs.
 - Input, output, time, and concurrency limit support.
 - A deterministic failure contract.
-- A recorded selection or a documented release blocker.
+- A recorded renderer selection. Failure to select one is a v1 release blocker.
 
 Tests:
 
@@ -3179,6 +3172,7 @@ Tests:
 - The complete representative corpus passes.
 - Rendering uses no external network service.
 - Hostile SVG cannot cross the reviewed boundary.
+- The selected Mermaid renderer produces sanitized SVG for the complete corpus.
 - Every rendering limit has a deterministic failure test.
 - Preview and public article regions use the same release renderer for the same
   bound inputs.
@@ -3374,17 +3368,17 @@ A future paid-article slice must implement all of these requirements:
 LUD-21 is optional in LNURL. Therefore, a Lightning Address that works for tips
 does not automatically support external-wallet paid articles.
 
-## Slice 8: First-party newsletter subscription capture
+## Post-v1 subscription and email specification
 
 ### Goal
 
-Capture first-party newsletter consent with double opt-in.
-Do not send bulk newsletters in v1.
+Capture first-party newsletter consent with double opt-in in a later version.
+This specification is not a v1 dependency or release gate.
 
 The selected email transport sends confirmation and subscription-control
 messages only. A future release can add bulk sending through a separate plan.
 
-### Work package 8.1: Subscription contract and transport decision
+### Post-v1 work package S.1: Subscription contract and transport decision
 
 Record the accepted transport and define privacy behavior before storage.
 
@@ -3428,7 +3422,7 @@ Tests:
 - Return the same status and body for new and existing addresses.
 - Prove that default tests cannot reach a real email transport.
 
-### Work package 8.2: Subscriber schema and writer commands
+### Post-v1 work package S.2: Subscriber schema and writer commands
 
 Store subscriptions through the sole database writer.
 
@@ -3465,7 +3459,7 @@ Failure tests:
 - Roll back each failed transition without partial consent state.
 - Prove that each mutation passed through the shared writer channel.
 
-### Work package 8.3: Public routes and confirmation delivery
+### Post-v1 work package S.3: Public routes and confirmation delivery
 
 Add subscription, confirmation, and unsubscribe routes to `public_router`.
 
@@ -3516,7 +3510,7 @@ Tests:
 - Disable the form and reject capture when no transport is configured.
 - Capture all logs and find no raw email or token.
 
-### Work package 8.4: Admin export and deletion
+### Post-v1 work package S.4: Admin export and deletion
 
 Add personally identifiable information (PII) operations only to
 `admin_router` and authenticated admin clients.
@@ -3548,7 +3542,7 @@ Tests:
 - Audit the actor, request, action, and count without raw addresses.
 - Verify that public routes cannot reach export or delete operations.
 
-### Work package 8.5: Abuse, retention, backup, and privacy tests
+### Post-v1 work package S.5: Abuse, retention, backup, and privacy tests
 
 Prove the complete subscriber-data lifecycle.
 
@@ -3576,7 +3570,7 @@ Failure tests:
 - Verify replica and export file permissions in the NixOS test.
 - Search application logs, traces, metrics, and audit rows for seeded PII.
 
-### Slice 8 exit gate
+### Post-v1 subscription acceptance gate
 
 - Subscription capture uses a tested double-opt-in state machine.
 - All public subscription outcomes use the generic response contract.
@@ -3586,9 +3580,264 @@ Failure tests:
   authenticated admin API.
 - Raw addresses and tokens stay out of logs, metrics, and audit records.
 - Backup retention and restore behavior for PII have direct test evidence.
-- V1 contains no bulk newsletter sending feature.
+- This contract contains no bulk newsletter sending feature.
 
-## Slice 9: Litestream, NixOS, and restore
+## Post-v1 Obsidian-first authoring specification
+
+### Goal
+
+Offer Obsidian Sync as an optional source for writers who do not want a Git
+workflow. Keep managed Git and external local-checkout modes supported.
+
+Use the official Obsidian Headless client. Do not use Obsidian Publish, an
+unofficial Sync protocol, or a community plugin as the server integration.
+
+```mermaid
+flowchart LR
+    Author[Obsidian clients] <-->|End-to-end encrypted Sync| Remote[Obsidian Sync]
+    Remote -->|One-shot mirror| Mirror[Disposable server mirror]
+    Mirror -->|Completed generation| Compiler[Maincopy compiler]
+    Compiler --> Artifact[Immutable revision artifact]
+    Artifact --> Preview[Exact admin preview]
+    Preview -->|Approved release| Public[Website and RSS]
+```
+
+A completed Sync operation creates a source candidate. It never publishes or
+replaces a public article.
+
+### Post-v1 work package O.1: Headless dependency and source contract
+
+Select and package the supported Obsidian integration before persistent state
+or network behavior lands.
+
+Deliverables:
+
+- A closed source-mode enum with `ManagedGit`, `ExternalCheckout`, and
+  `ObsidianSync` variants. Exactly one mode is active for a site.
+- The official `obsidian-headless` package and its `ob` executable in the Nix
+  closure. Runtime installation from npm is forbidden.
+- A pinned Obsidian Headless version, supported Node.js runtime, package digest,
+  license record, and upgrade policy.
+- An explicit acceptance decision for the client's open-beta stability,
+  platform support, output contract, and credential storage.
+- The current beta requirement for Node.js 22 or later recorded as a lower
+  bound. Recheck and pin the supported runtime during the dependency spike.
+- A requirement for an active Obsidian Sync subscription and a dedicated
+  publishing vault.
+- End-to-end encryption required for the remote publishing vault.
+- A provisioning verifier that establishes the configured remote vault uses
+  end-to-end encryption. Block implementation if the pinned client cannot expose
+  reliable evidence for this check.
+- One configured publication root inside the dedicated vault.
+- Offline, interactive `ob login` and `ob sync-setup` provisioning under the
+  dedicated `maincopy-obsidian-sync` identity. Do not pass a password or
+  multi-factor code through a command argument.
+- Protected Headless credential state owned only by
+  `maincopy-obsidian-sync`. Keep it outside Git, SQLite, diagnostics, and the Nix
+  store.
+- A separate `maincopyd` identity that cannot read Headless credentials or the
+  mutable mirror. It can read completed generations only.
+- No Obsidian account password, encryption password, session value, or remote
+  vault credential in the Maincopy admin API.
+- No secret in child-process arguments, environment variables, process
+  metadata, crash output, or command diagnostics.
+- No Obsidian Publish command, unofficial provider request, browser automation,
+  desktop Obsidian process, or community-plugin runtime.
+- Deterministic in-process substitutes for default tests. Default tests make no
+  Obsidian network request.
+
+Tests:
+
+- Build the pinned client and runtime from the locked Nix inputs.
+- Run the packaged `ob` executable without a source-tree or global npm path.
+- Reject multiple active source modes.
+- Reject Obsidian mode without the pinned package and provisioned credential
+  state.
+- Reject a standard-encryption remote vault.
+- Verify that configuration and API output contain no raw account or vault
+  secret.
+- Verify that the `maincopyd` identity cannot read credential state or the
+  mutable mirror.
+- Prove that default tests cannot reach Obsidian Sync.
+
+### Post-v1 work package O.2: Secure mirror and completed generation
+
+Create an atomic handoff between remote synchronization and content discovery.
+
+Deliverables:
+
+- A replaceable server mirror under a fixed path owned by
+  `maincopy-obsidian-sync`.
+- One source-sync lock for every Headless process and generation handoff.
+- A bounded one-shot `ob sync` operation for each poll or `Sync now` request.
+  The first adapter does not use `ob sync --continuous`.
+- A bounded NixOS-managed request handoff from `maincopyd` to the one-shot Sync
+  service. The handoff grants no access to Headless credentials.
+- `ob sync-config --mode mirror-remote --conflict-strategy conflict` on the
+  replaceable mirror.
+- A pinned success and status contract for the selected Headless version. A zero
+  process exit alone is insufficient evidence of a conflict-free Sync.
+- Direct child-process invocation with fixed arguments. Do not invoke a shell.
+- Bounded execution time, output bytes, diagnostics, and termination behavior.
+- Redaction of command output before logs, audit events, or admin resources.
+- A new staging generation only after the process succeeds and status checks
+  report no conflict.
+- Rejection of each reported or materialized conflict artifact before the
+  completed marker.
+- Descriptor-relative copying of the configured publication root into that
+  staging generation.
+- The Slice 1 traversal, symlink, file-count, and byte limits applied during the
+  copy.
+- Copying of only `publication.toml`, `posts/`, `drafts/`, and `assets/` from the
+  configured publication root.
+- Exclusion of `.obsidian`, templates, canvases, plugin data, and every other
+  vault note from the manifest and digest.
+- A canonical path-and-content manifest, generation digest, final filesystem
+  synchronization, and atomic completed marker.
+- Read-only group access for `maincopyd` to completed generations. The mutable
+  mirror is never a compiler input.
+- A source change for a legitimate remote deletion. `mirror-remote` removes the
+  stale mirror file before the next generation.
+- The existing ineligible-source behavior for a deleted live article. Its
+  current public revision remains live.
+- Retention of the last good generation after authentication, network,
+  conflict, timeout, process, copy, manifest, or storage failure.
+
+> [!WARNING]
+> `mirror-remote` can revert local changes. Never point it at an author's
+> working vault. Use only the replaceable server mirror.
+
+Tests:
+
+- Kill the Headless process during download and expose no partial generation.
+- Time out the process and terminate its complete process group.
+- Exceed the output limit without exposing output or changing the candidate.
+- Simulate authentication, network, reported-conflict, and materialized-conflict
+  failures.
+- Return a zero process exit with a reported conflict and reject completion.
+- Delete a remote draft and remove the stale mirror and generation copies.
+- Delete a live article remotely and retain its current public revision under
+  the existing ineligible-source rule.
+- Change files while the staging copy runs and reject an unstable generation.
+- Reject a symlink, traversal, device, socket, or out-of-root path.
+- Verify that `.obsidian`, templates, canvases, and unrelated vault notes never
+  enter a manifest.
+- Repeat one remote state and produce the same generation digest.
+- Preserve the installed source generation and public snapshot after every
+  failure.
+
+### Post-v1 work package O.3: Obsidian metadata and Markdown compatibility
+
+Make the Obsidian workflow pleasant without accepting ambiguous syntax.
+
+Deliverables:
+
+- Existing TOML frontmatter between `+++` delimiters remains supported.
+- Strict YAML Properties between `---` delimiters become an alternate metadata
+  syntax. One article cannot contain both formats.
+- One selected YAML parser with pinned features, version, and license.
+- A closed YAML schema with a root string-key mapping and the existing Maincopy
+  metadata fields.
+- Rejection of duplicate keys, aliases, anchors, merge keys, custom tags,
+  nested mappings, unknown fields, and implicit values outside the selected
+  schema.
+- Required offset-aware `authored_at` metadata in both formats. The Obsidian
+  template stores this value as an explicit quoted string.
+- One typed normalization path after either parser. Equivalent TOML and YAML
+  metadata produce the same canonical identity transcript.
+- A supplied Obsidian article template with every required property, documented
+  optional properties, an article heading, and a Mermaid example.
+- Deterministic `[[article]]`, `[[article|label]]`, and
+  `[[article#heading|label]]` links.
+- Exact normalized relative-path resolution first. A unique article stem is the
+  fallback. An ambiguous stem fails compilation.
+- A versioned heading-anchor policy for Obsidian heading links.
+- Local attachment embeds through `![[relative/path.ext]]` and the existing
+  `AssetRef` validation and limits.
+- No Markdown note transclusion, block reference, canvas, base, script, CSS
+  snippet, or community-plugin syntax in the first compatibility contract.
+- A typed diagnostic for each unsupported Obsidian construct.
+- Maincopy Mermaid rendering for every `mermaid` fence. Do not reuse Obsidian
+  preview HTML or generated SVG.
+
+Tests:
+
+- Parse the complete article template through Obsidian and Maincopy fixtures.
+- Normalize equivalent TOML and YAML metadata to the same typed values and
+  identity transcript.
+- Reject each forbidden YAML construct and each unknown property.
+- Preserve offset-aware authored timestamps exactly.
+- Resolve path, label, heading, Unicode, case, and ambiguous-stem link fixtures.
+- Reject links and embeds that escape the publication root.
+- Resolve attachment embeds through the same local-asset digest contract as
+  ordinary Markdown images.
+- Return actionable diagnostics for note transclusion and other unsupported
+  constructs.
+- Render the Mermaid corpus identically for Git and Obsidian source modes.
+
+### Post-v1 work package O.4: Publication, NixOS, security, and recovery
+
+Connect completed Obsidian generations to the existing publication ledger.
+
+Deliverables:
+
+- Polling and `Sync now` use the same durable source-sync operation as managed
+  Git.
+- A typed Obsidian source provenance value with the completed generation digest,
+  redacted remote identity, and pinned Headless client version.
+- An immutable revision package created before a candidate becomes available to
+  preview or release.
+- The same `PreviewDigest`, update-release, and activation contracts used by Git
+  revisions.
+- A sync edit to a live article becomes `Unpublished changes`. It cannot replace
+  the public revision.
+- Admin status for last attempt, last success, installed generation, client
+  version, and redacted failure category.
+- NixOS options for the pinned package, protected credential-state directory,
+  disposable mirror, publication root, polling, limits, and service ownership.
+- Restrictive permissions for the plaintext local mirror and completed
+  generations.
+- An authentication and supply-chain review for the Headless child process,
+  credential state, environment, update policy, and redacted output.
+- Offline credential rotation and source disable procedures.
+- Recovery from SQLite and revision artifacts without Obsidian availability.
+  Re-provision Sync separately after the restored site becomes healthy.
+- Documentation that Obsidian Sync and its version history do not replace the
+  Maincopy database and revision-artifact backups.
+
+Tests:
+
+- Use one completed generation for the exact preview and public release.
+- Sync a changed live article and retain the current public revision until a new
+  preview-gated release activates.
+- Restart during generation installation and reconcile before listener binding.
+- Restore the database and revision artifacts while Obsidian Sync is unavailable.
+- Re-provision the Headless client without changing restored publication state.
+- Verify mirror, generation, and credential permissions in a NixOS virtual
+  machine.
+- Verify that Maincopy cannot publish `.obsidian` data or an unselected note.
+- Search configuration, SQLite, OpenAPI, logs, metrics, and audit events for
+  seeded Obsidian credentials.
+- Simulate a Headless upgrade with changed output and require compatibility
+  evidence before activation.
+
+### Post-v1 Obsidian acceptance gate
+
+- Git, external checkout, and Obsidian Sync remain exclusive source modes.
+- Only the official pinned Headless client communicates with Obsidian Sync.
+- A failed or partial Sync operation cannot create a completed generation.
+- Every candidate has a deterministic content digest and immutable revision
+  package before preview.
+- A completed Sync never publishes without the exact preview and release gate.
+- YAML Properties and supported Obsidian links normalize deterministically.
+- Unsupported Obsidian syntax fails with an actionable diagnostic.
+- Remote Sync uses end-to-end encryption. The local mirror has restrictive
+  service permissions.
+- No Obsidian credential enters Git, SQLite, the Nix store, logs, metrics,
+  OpenAPI, or audit events.
+- Litestream and revision-artifact restore work without Obsidian availability.
+
+## Slice 8: Litestream, NixOS, and restore
 
 ### Goal
 
@@ -3596,7 +3845,7 @@ Run Maincopy reproducibly on one NixOS server host.
 Permit authenticated operators and agents to manage that host remotely.
 Restore the complete operational ledger from Litestream.
 
-### Work package 9.1: Runtime flake closure
+### Work package 8.1: Runtime flake closure
 
 Complete the production package and application outputs.
 
@@ -3615,7 +3864,7 @@ Tests:
 - Verify that the closure contains all required render tools.
 - Verify that managed sync uses only Git and SSH from the closure.
 
-### Work package 9.2: NixOS module and admin gateway
+### Work package 8.2: NixOS module and admin gateway
 
 Implement `nixosModules.default` before v1.
 
@@ -3665,7 +3914,7 @@ Tests:
 - Verify that forged identity headers cannot create an admin principal.
 - Verify CSRF and Origin rejection through the gateway.
 
-### Work package 9.3: Litestream profiles and health
+### Work package 8.3: Litestream profiles and health
 
 Configure replication without creating another database writer.
 
@@ -3674,7 +3923,7 @@ Deliverables:
 - A development local-folder replica profile.
 - Production S3 and network-folder replica options.
 - Secret-file based production credentials.
-- Replica access controls suitable for subscriber PII.
+- Replica access controls suitable for protected operational state.
 - Documented encryption controls for each production replica type.
 - Replication lag and last-success observability.
 - Explicit app and Litestream startup and shutdown ordering.
@@ -3687,10 +3936,10 @@ Tests:
 - Simulate a replica outage and report degraded backup health.
 - Recover replication without changing the live database location.
 - Verify that secrets never enter the Nix store or logs.
-- Verify replica permissions against the subscriber privacy policy.
+- Verify replica permissions against the documented state-protection policy.
 - Verify the selected production encryption configuration without secrets.
 
-### Work package 9.4: Offline restore procedure
+### Work package 8.4: Offline restore procedure
 
 Implement and document a fail-closed restore workflow.
 
@@ -3707,8 +3956,7 @@ Deliverables:
   artifact root. Every current or non-terminal release must resolve to one
   verified package.
 - Recorded recovery point and recovery duration.
-- Subscriber consent, deletion, and retention verification.
-- A redacted subscriber-state report produced without listener binding.
+- A redacted operational-state report produced without listener binding.
 - Offline application of every migration supported by the candidate binary,
   followed by a final WAL checkpoint and close.
 - A canonical logical digest, final post-migration database digest, and
@@ -3734,7 +3982,7 @@ Tests:
 
 1. Create users, profiles, roles, an active tip recipient, canonical
    publications, initial and update releases with accepted preview bindings,
-   subscriber consent, and audits.
+   and audits.
 2. Wait for a confirmed Litestream replica position.
 3. Stop Maincopy and Litestream.
 4. Move the database and sidecar files to a preserved path.
@@ -3742,17 +3990,17 @@ Tests:
    recovery point.
 6. Run the candidate binary's offline migration preparation, final checkpoint,
    and close.
-7. Run the integrity, payload, and subscriber-privacy verifier against the
-   final post-migration database.
+7. Run the integrity, payload, and state-protection verifier against the final
+   post-migration database.
 8. Review its redacted report and bind operator acceptance to the canonical
    logical digest, final database digest, artifact-set digest, schema version,
    and candidate binary.
 9. Start Maincopy. Before any database mutation, verify the accepted schema and
    digests through a read-only connection and refuse any pending migration.
 10. Verify user, profile, role, tip-recipient, canonical, release,
-    preview-binding, audit, and retained consent records through the admin
-    service. Recompute the same preview and share kit from the restored
-    revision package.
+    preview-binding, and audit records through the admin service. Recompute the
+    same preview, public article, and RSS item from the restored revision
+    package.
 11. Verify that the marker was consumed. Restart without a marker and confirm
     that ordinary startup succeeds.
 12. Restart Litestream and compare recovery results with accepted targets.
@@ -3760,17 +4008,16 @@ Tests:
 Failure tests:
 
 - Refuse a restored candidate whose verifier did not create an acceptance
-  marker. Do not require a marker only because an ordinary database contains
-  subscriber data.
+  marker. Do not require a marker for an ordinary restart.
 - Refuse a marker created for a different logical digest, database digest, or
   artifact-set digest, schema version, or candidate binary.
 - Refuse a marker whose referenced artifact package is missing or corrupt.
 - Refuse reuse of a consumed marker.
 - Refuse startup when the candidate binary would migrate after acceptance.
-- Report retained pre-deletion subscriber state before listener binding.
-- Refuse listener binding when any repeated integrity or privacy gate fails.
+- Refuse listener binding when any repeated integrity or state-protection gate
+  fails.
 
-### Work package 9.5: NixOS lifecycle and restore test
+### Work package 8.5: NixOS lifecycle and restore test
 
 Automate the production service contract in a NixOS virtual machine.
 
@@ -3780,43 +4027,41 @@ Deliverables:
 - Loopback listener, HTTPS CLI, and gateway checks on NixOS.
 - Restart reconciliation for an activating initial or update release.
 - Restart validation of retained accepted preview bindings and deterministic
-  share-kit regeneration for a published revision.
+  public article and RSS regeneration for a published revision.
 - Development replica and restore drill.
 - Post-restore user, role, profile, and active-tip-recipient verification.
 - Post-restore invalidation of browser sessions and revocation of all restored
   agent public-key credentials before remote administration resumes. Re-register
   current agent public keys through a typed offline recovery command.
-- Subscriber PII and deletion-retention assertions.
 - Local database and network replica path assertions.
 
 Failure tests:
 
 - Kill Maincopy during an accepted write.
-- Kill the email outbox test worker after its controlled transport side effect.
 - Interrupt Litestream and recover replication.
 - Restore after moving all local SQLite sidecar files.
 - Restore a profile-backed tip recipient and reproduce the static CTA without
   an outbound network dependency.
 - Refuse startup with unsafe file ownership or paths.
 
-### Slice 9 exit gate
+### Slice 8 exit gate
 
 - `nixosModules.default` runs Maincopy and Litestream in a virtual machine.
 - The live database remains on local storage.
 - The development replica uses a separate local folder.
 - Production supports a secret-backed S3 or network-folder replica.
 - The restore drill preserves the complete operational ledger.
-- The restore drill applies the documented subscriber privacy checks.
+- The restore drill applies the documented state-protection checks.
 - Measured recovery results satisfy the accepted targets.
 
-## Slice 10: Release hardening
+## Slice 9: Release hardening
 
 ### Goal
 
 Prove the complete v1 system under failures and representative load.
 Prepare publishing workflows without publishing artifacts.
 
-### Work package 10.1: End-to-end system matrix
+### Work package 9.1: End-to-end system matrix
 
 Run the whole product from a representative content checkout.
 
@@ -3824,8 +4069,8 @@ Deliverables:
 
 - Startup, configured human login, managed source sync, profile update, reload,
   private rendered preview, canonical schedule, schedule edit, publish now,
-  X and Substack Note share kits, assets, public read, static tip handoff,
-  subscription, backup, and shutdown flow.
+  assets, public article and RSS reads, static tip handoff, backup, and shutdown
+  flow.
 - Nostr-only, password-only, and combined-provider login fixtures.
 - A remote laptop CLI flow through the HTTPS admin gateway.
 - A noninteractive agent flow that pins unauthenticated discovery before signer
@@ -3844,30 +4089,33 @@ Failure tests:
 - Reload invalid content while readers continue on the old snapshot.
 - Saturate the writer queue while public reads continue.
 - Stop the writer and verify readiness failure and controlled shutdown.
-- Restart with scheduled, activating, and published records plus pending email
-  outbox work.
+- Restart with scheduled, activating, and published records.
 - Prove that reload cannot expose a scheduled canonical publication.
 - Reject an initial or update activation without the accepted preview digest
   for the exact selected revision.
 - Preview a draft through the admin origin while the public origin returns
   `404 Not Found` for its document and assets.
-- Generate X and Substack Note share kits without an outbound provider request
-  and keep them unavailable until the canonical URL is public.
 - Sync an edit to a published article and keep it in `Unpublished changes`
   until a preview-gated update activates; preserve canonical `published_at`.
-- Disable the active tip recipient while email and backup targets fail
-  independently. Articles remain readable and omit the tip CTA.
+- Disable the active tip recipient while the backup target fails. Articles
+  remain readable and omit the tip CTA.
 
-### Work package 10.2: Security, resilience, and performance review
+### Work package 9.2: Security, resilience, and performance review
 
 Measure the system and close the accepted threat model.
 
 Deliverables:
 
-- Public, admin, content, CDN, renderer, manual-social-handoff, email,
-  subscriber, outbound-network, and secret boundaries.
+- Public, admin, content, CDN, renderer, outbound-distribution exclusion, and
+  secret boundaries.
 - Gateway, admin-origin, principal, credential, authorization, and audit
   boundaries.
+- A release-blocking authentication review that covers password hashing and
+  enumeration resistance; session fixation, expiry, rotation, and revocation;
+  cookie and CSRF controls; exact host and origin checks; Nostr login and NIP-98
+  freshness, replay, URL, method, and body binding; role and scope enforcement;
+  route isolation; gateway header removal; TLS termination; and credential
+  storage.
 - Dependency license and advisory review.
 - Fuzz or property targets for parsers and state transitions.
 - Measured queue, pool, renderer, retry, and retention defaults.
@@ -3883,7 +4131,7 @@ Tests:
   idempotency-binding corpora.
 - Run password-bound, PHC-parser, dummy-verification, rate-limit, and worker
   saturation corpora.
-- Run asset-origin, email, token, and anti-enumeration corpora.
+- Run asset-origin and anti-enumeration corpora.
 - Run sustained readers with serialized writes.
 - Hold long readers and verify WAL diagnostics.
 - Verify that no log or response exposes a secret.
@@ -3892,7 +4140,7 @@ Tests:
   article-signing operation.
 - Confirm graceful termination within the documented timeout.
 
-### Work package 10.3: Operator and contributor documentation
+### Work package 9.3: Operator and contributor documentation
 
 Make each supported workflow reproducible from a clean host.
 
@@ -3902,14 +4150,13 @@ Deliverables:
 - Content repository example and validation guide.
 - Managed read-only SSH source, external checkout, polling, and `Sync now`
   guide.
-- Rendered-preview, canonical schedule, publish-now, activation recovery, and
-  manual X and Substack Note share-kit guide.
+- Rendered-preview, canonical schedule, publish-now, and activation-recovery
+  guide.
 - Local asset, CDN allowlist, favicon, CSP, and revision guide.
 - Admin CLI and agent API guide.
 - Remote context, login-provider selection, password policy and recovery,
   agent signer and public-key rotation, and offline recovery guide.
 - Admin gateway, private-network, and separate-origin deployment guide.
-- Subscription consent, privacy, export, deletion, and retention guide.
 - Deployment, backup, restore, and upgrade runbooks.
 - Configuration reference with secret handling.
 - Architecture updates for any accepted implementation change.
@@ -3922,7 +4169,7 @@ Tests:
 - Execute the restore runbook without undocumented steps.
 - Validate links and generated OpenAPI output.
 
-### Work package 10.4: Release candidate and publication dry run
+### Work package 9.4: Release candidate and publication dry run
 
 Prepare a reproducible candidate without publishing it.
 
@@ -3958,14 +4205,15 @@ Tests:
 - Verify that only the FlakeHub job receives `id-token: write`.
 - Simulate a rerun after each individual publication step.
 
-### Slice 10 exit gate
+### Slice 9 exit gate
 
 - Every prior slice exit gate still passes.
 - All required release evidence in [the design](design.md) has direct evidence.
 - The release review confirms compliance with the
   [engineering style guide](quality.md).
 - The manual CRAP report has no measured score of 20 or higher.
-- No unresolved release-blocking security finding remains.
+- No unresolved release-blocking security finding remains, including any
+  critical or high-risk authentication finding.
 - The restore drill meets the accepted recovery targets.
 - The packaged crate and flake build from clean release inputs.
 - The owner has reviewed the v1 release report.
@@ -3996,7 +4244,7 @@ Tests:
 | Admin gateway | Public origin requests an admin path | The public origin returns `404 Not Found`. |
 | Admin gateway | A protected route has no valid Maincopy principal | Maincopy returns `401 Unauthorized` without reaching a mutation. |
 | Admin authorization | Principal lacks the required scope | Maincopy returns `403 Forbidden` and records a redacted audit event. |
-| Publisher authorization | A Publisher requests profile, Lightning, user, credential, audit, subscriber, source-configuration, or instance access | Maincopy returns `403 Forbidden` before the operation. |
+| Publisher authorization | A Publisher requests profile, Lightning, user, credential, audit, source-configuration, or instance access | Maincopy returns `403 Forbidden` before the operation. |
 | Admin identity | A client supplies actor, role, or scope headers | The gateway removes them and Maincopy resolves no authority from them. |
 | Nostr login | A challenge or signed event is replayed | Maincopy returns `401 Unauthorized` and creates no second session. |
 | Password login | The username is unknown or the password is wrong | Maincopy performs one real or dummy bounded Argon2 verification and returns the same generic authentication error. |
@@ -4013,21 +4261,15 @@ Tests:
 | Read pool | Long read transaction | Reads remain consistent and WAL growth is visible. |
 | Admin caller | Disconnect after enqueue | The command completes and retry is idempotent. |
 | Canonical activation | Crash before snapshot swap | Restart reconciles before listener binding. |
-| Canonical activation | Crash after snapshot swap | Startup reconciles the canonical record before a share kit becomes available. |
+| Canonical activation | Crash after snapshot swap | Startup reconciles the canonical record before listeners or readiness. |
 | Release edit | The resource version is stale or activation started | Maincopy preserves the current release and returns a conflict. |
 | Rendered preview | The digest is missing or belongs to another revision or presentation identity | Scheduling or activation stops before the snapshot swap. |
 | Preview route | A draft preview or preview asset is requested on the public origin | The public origin returns `404 Not Found`. |
-| Share kit | The publication has no committed current digest, its canonical URL is not public, or its release is `Activating` | Admin returns a typed not-ready result and performs no external request. |
-| Share destination | X or Substack is unavailable | The public article remains available and the exact copy remains selectable. |
 | Mermaid | Timeout or oversized SVG | Candidate compilation fails without activation. |
 | Tip profile | A profile update uses a stale version | Maincopy returns a conflict and preserves the current recipient projection. |
 | Tip recipient | The selected user, profile, or address becomes ineligible | The new snapshot omits the CTA and keeps every article readable. |
 | Tip projection | The process stops after the profile commit and before snapshot installation | Startup reconstructs the SQLite-owned projection before listener binding. |
 | Lightning handoff | Outbound network access is unavailable | Maincopy still renders the visible address, LNURL link, and local QR. |
-| Subscription | Existing or unknown address | The public response remains generic. |
-| Email outbox | Crash after commit or claim | Work recovers and token bounds hold. |
-| Email transport | Timeout or rejection | Consent stays durable and retry stays bounded. |
-| Subscriber deletion | Restore a retained recovery point | Privacy checks report PII state before readiness. |
 | Litestream | Replica unavailable | The live local database continues with degraded backup health. |
 | Restore | Destination is not empty | The restore stops without overwriting data. |
 | Restore | The accepted database still requires a migration | Startup refuses mutation and requires a new offline preparation and acceptance. |
@@ -4052,7 +4294,6 @@ A work package is done only when all applicable statements are true:
 - Fallible domain and application operations return typed errors.
 - Logs, metrics, and health behavior cover new background tasks.
 - No public response exposes secrets or host paths.
-- No log, metric, or audit event exposes raw subscriber email or tokens.
 - No handler creates a concrete database or network dependency.
 - `crates/server/src/main.rs` remains tiny.
 - `crates/server/src/startup.rs` remains the server composition root.
@@ -4091,7 +4332,6 @@ V1 is ready for owner approval when all of these statements are true:
 - The gateway forwards only to a loopback-only admin listener.
 - Offline bootstrap and recovery create no recovery transport, bind no
   listener, and accept no arbitrary SQL.
-- Publishing agents cannot access subscriber data without an explicit scope.
 - Browser, human CLI, and agent clients receive the same typed resources and
   errors after authentication.
 - Durable operations remain inspectable after a client disconnect or timeout.
@@ -4116,8 +4356,8 @@ V1 is ready for owner approval when all of these statements are true:
 - Maincopy never receives or stores an agent `nsec`. Operator guidance
   recommends a dedicated key separate from human login and authorship keys.
 - Owner, Administrator, and Publisher use fixed role-to-scope mappings.
-- Publisher authority is limited to content, status, sync, reload, preview,
-  release, and share operations.
+- Publisher authority is limited to content, status, sync, reload, preview, and
+  release operations.
 - Maincopy roles and agent scopes grant no Git write permission.
 - Users can update versioned profiles and Lightning Addresses without a Git
   change.
@@ -4131,30 +4371,29 @@ V1 is ready for owner approval when all of these statements are true:
 - V1 has no unpublish or retraction workflow. Making a live article a draft or
   removing it from Git leaves the current public revision live and reports an
   ineligible source change.
-- Canonical publication survives activation crashes without early visibility
-  or an outbound social action.
-- After publication, Maincopy generates deterministic X and Substack Note
-  share kits with excerpt-and-link and link-only copy.
-- X uses a supported Web Intent. For Substack Note, the user copies the text,
-  opens Substack, and chooses `Create` and then `Note`. Maincopy does not claim
-  that Copy or Open published anything.
-- V1 stores no outbound social credential and has no article-distribution
-  adapter, provider schedule, delivery worker, browser automation, completion
-  tracking, Nostr article signing, or relay publication.
+- Canonical publication survives activation crashes without early visibility or
+  partial public state.
+- V1 stores no subscriber or outbound-provider credential and has no email
+  transport, article-distribution adapter, provider schedule, delivery worker,
+  browser automation, completion tracking, Nostr article signing, or relay
+  publication.
+- Technical Markdown renders with deterministic syntax highlighting and bounded
+  resource use. Unsupported languages use the documented safe fallback.
+- Mermaid diagrams use the selected local renderer, pass through the SVG
+  sanitizer, and render identically in the exact preview and public article.
+  A rendering or sanitization failure preserves the current live snapshot.
 - An enabled post and eligible SQLite profile produce a static Lightning
   Address CTA, LNURL wallet link, and locally generated QR.
 - V1 has no payment provider, Lightning node, invoice, settlement tracker, or
   paid-content entitlement.
-- First-party newsletter capture uses double opt-in and supports unsubscribe.
-- Scoped admin users can export and delete subscriber data through the
-  authenticated admin API.
-- V1 does not send bulk newsletters.
 - Litestream restores the SQLite operational ledger. The selected artifact
   backup restores a compatible revision package set. The combined restore
   reproduces current and scheduled previews and public output.
 - The selected pre-v1 reset or migration path has passed its compatibility
   fixtures. The release notes state which pre-v1 state is retained.
 - The dedicated flake builds the package and NixOS module.
+- The authentication security review has no unresolved critical or high-risk
+  finding.
 - A clean release candidate passes all quality gates.
 
 The owner can then approve one Semantic Versioning tag.
