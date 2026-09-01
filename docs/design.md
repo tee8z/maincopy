@@ -45,6 +45,7 @@ content root. The repository can contain many articles.
 | Users, roles, profiles, and authenticated administration | Per-author publication identities |
 | Static Lightning Address tip handoff | Paid articles and access entitlements |
 | Local SQLite and Litestream replication | High-availability database failover |
+| Prometheus metrics on a loopback-only `/metrics` endpoint | Public or multi-host metrics exposure |
 | Nix package and NixOS module | Hosted multi-site control plane |
 
 The canonical website and RSS are the only V1 article outputs. V1 captures no
@@ -143,14 +144,30 @@ flowchart LR
 
     DB --> Litestream[Litestream]
     Litestream --> Replica[Database replica]
+
+    Runtime[Tokio runtime and supervised tasks] --> MetricsRegistry[Prometheus registry]
+    Process[Linux process collector] --> MetricsRegistry
+    Writer --> MetricsRegistry
+    MetricsRegistry --> MetricsListener[Metrics listener]
+    Prometheus[Prometheus scraper] -->|GET /metrics over loopback| MetricsListener
 ```
 
-`maincopyd` serves public traffic and a loopback-only HTTP admin listener. A
-separate gateway provides the HTTPS admin origin.
+`maincopyd` serves public traffic, a loopback-only HTTP admin listener, and a
+loopback-only metrics listener. A separate gateway provides the HTTPS admin
+origin.
 
 The public virtual host has no admin route or admin upstream. The loopback
-listener is not a public recovery interface. The gateway has no direct database
-or content-file access.
+admin listener is not a public recovery interface. The gateway has no direct
+database or content-file access.
+
+The metrics listener serves Prometheus scrapes at `/metrics`. `GET` returns the
+body, and `HEAD` returns the same headers without a body. Other paths return
+`404 Not Found`, and other methods return `405 Method Not Allowed`.
+
+The public and admin routers do not mount `/metrics`.
+
+The metrics listener does not use admin authentication. V1 relies on the
+loopback bind and host access controls and provides no remote metrics gateway.
 
 Offline bootstrap and repair are finite process invocations. They create no
 recovery transport, recovery API, or continuing authentication bypass.
@@ -218,7 +235,7 @@ required.
 ### First-run bootstrap
 
 An empty managed installation starts in a restricted bootstrap state. It binds
-no public or admin listener.
+no network listener.
 
 An operator runs typed, offline `maincopyd` bootstrap commands on the host.
 Each command acquires exclusive process ownership and uses domain transactions.
@@ -518,6 +535,45 @@ cross-table invariants. The schema enforces stable widths and basic integrity.
 
 The CLI and admin UI never open SQLite directly.
 
+## Prometheus metrics
+
+`maincopyd` owns one explicit Prometheus registry. A dedicated loopback-only
+HTTP listener exposes that registry at `/metrics`.
+
+The host configuration owns the metrics bind address. It defaults to
+`127.0.0.1:3002` and rejects every non-loopback address.
+
+The metrics endpoint uses the Prometheus text exposition format. A successful
+response uses `text/plain; version=0.0.4` as its content type.
+
+The endpoint is not part of the public router, admin router, or OpenAPI
+document.
+
+V1 includes these Tokio runtime metrics from a five-second sampling interval:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `tokio_workers_count` | Gauge | Runtime worker thread count |
+| `tokio_worker_busy_ratio` | Gauge | Worker busy time divided by available worker time |
+| `tokio_total_busy_duration_ms` | Gauge | Total worker busy time during the latest sample |
+| `tokio_worker_parks_total` | Counter | Cumulative worker park count |
+| `tokio_live_tasks_count` | Gauge | Tasks that are alive at the sample time |
+| `tokio_global_queue_depth` | Gauge | Tasks waiting in the runtime global queue |
+
+Each runtime series uses only `service="maincopyd"` and `runtime="main"` as
+labels. V1 does not require unstable Tokio metrics.
+
+V1 also exports Linux process usage, database queue and pool pressure,
+transaction latency, writer health, write-ahead log size, and checkpoint
+outcomes.
+
+Every label uses a closed, bounded value. Metrics never contain a user or post
+identifier, slug, raw URL, request identifier, host path, secret, or error
+message.
+
+The Tokio collector and metrics listener are supervised application tasks.
+They use the application cancellation token and stop during ordered shutdown.
+
 ## Startup and shutdown
 
 `crates/server/src/main.rs` remains a small process entry point.
@@ -526,19 +582,20 @@ The CLI and admin UI never open SQLite directly.
 Normal startup follows this order:
 
 1. Validate host configuration and acquire process ownership.
-2. Open and verify SQLite through its single-writer bootstrap.
-3. Verify instance identity and authentication compatibility.
-4. Reconcile incomplete reloads and releases.
-5. Verify required revision artifacts.
-6. Build and install the canonical immutable snapshot.
-7. Bind the public listener and loopback admin listener.
-8. Start managed source polling and release scheduling.
+2. Construct the Prometheus registry and registered metric instruments.
+3. Open and verify SQLite through its instrumented single-writer bootstrap.
+4. Verify instance identity and authentication compatibility.
+5. Reconcile incomplete reloads and releases.
+6. Verify required revision artifacts.
+7. Build and install the canonical immutable snapshot.
+8. Bind the public, loopback admin, and loopback metrics listeners.
+9. Start the supervised Tokio collector, source polling, and release scheduler.
 
 Bootstrap and recovery commands are offline process modes. They bind no network
 listener.
 
 Shutdown stops intake before workers. It drains accepted database work before
-it closes SQLite and releases both listener addresses.
+it closes SQLite and releases all listener addresses.
 
 ## Backup and restore
 
@@ -602,7 +659,6 @@ These selections must finish before their owning work starts:
 - revision-artifact backup and retention implementation;
 - production HTTPS admin gateway;
 - Mermaid renderer and SVG sanitizer;
-- metrics export path; and
 - measured recovery point and recovery time targets.
 
 ## Required release evidence
@@ -615,7 +671,13 @@ V1 must prove these properties:
 - Draft and preview assets are absent from the public origin.
 - Historical releases cannot grant current visibility.
 - Public routing exposes no admin endpoint.
+- The public router and an authenticated admin request return `404 Not Found`
+  for `/metrics`.
 - The loopback admin listener never serves an unprotected operation.
+- The loopback metrics listener serves only Prometheus `GET /metrics` and
+  standard `HEAD /metrics` requests.
+- Tokio runtime, process, and database metric families appear with only the
+  documented bounded labels.
 - The authenticated cutover leaves no Unix-socket or named-pipe compatibility
   transport, configuration, service unit, or test.
 - Remote users and agents receive only authorized results.

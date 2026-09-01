@@ -39,6 +39,7 @@ release claim.
 | RSS, discovery documents, public assets, redirects, metadata, and CSP | Planned |
 | HTTPS admin gateway and admin web interface | Planned |
 | Profile-backed static Lightning Address tips | Implemented foundation |
+| Prometheus registry, loopback `/metrics`, and runtime dashboard | Planned |
 | NixOS module, Litestream, artifact backup, and restore | Planned |
 | Outbound distribution, subscription, and email delivery | Deferred until after v1 |
 | Distribution frontmatter and target-job schema | Removed from v1 |
@@ -47,6 +48,10 @@ release claim.
 > Do not expose the loopback admin TCP listener directly. Keep it loopback-only
 > and behind the reviewed HTTPS gateway. Network isolation and JSON are
 > insufficient.
+
+> [!CAUTION]
+> Keep the metrics listener loopback-only. Prometheus metrics can reveal
+> workload, resource use, and failure timing.
 
 Do not expose the remote gateway until its authentication, authorization, route
 isolation, and security-review prerequisites pass their tests.
@@ -99,6 +104,9 @@ published article as an unpublished revision; it does not silently replace the
 live revision. The canonical site and RSS are the only article outputs in v1.
 V1 contains no outbound distribution or subscription-delivery feature.
 
+`maincopyd` exports Prometheus process, Tokio runtime, and database metrics from
+a dedicated loopback-only `/metrics` endpoint.
+
 The managed source uses a provider-neutral read-only SSH deploy key and local
 mirror. External local-checkout mode remains available for operator-managed
 deployments.
@@ -116,6 +124,7 @@ deployments.
 - Keep the repository private until the owner approves public release.
 - Treat remote administration as the normal production workflow.
 - Keep bootstrap and recovery as offline, no-listener process modes.
+- Keep `/metrics` on its dedicated loopback-only listener.
 - Keep Git write permission outside every Maincopy role and credential.
 - Do not add a browser content editor in v1.
 - Do not store an editable article body in SQLite.
@@ -157,9 +166,11 @@ must:
 - load and validate host configuration;
 - construct concrete dependencies;
 - acquire the process lock;
+- construct the owned Prometheus registry and metric instruments;
 - start the database components;
 - compile the initial site snapshot;
-- bind both listeners;
+- bind the public, admin, and metrics listeners;
+- start the Tokio runtime collector with the other supervised tasks;
 - supervise background tasks;
 - coordinate readiness;
 - handle termination signals; and
@@ -196,6 +207,8 @@ The top-level infrastructure modules have narrow responsibilities:
 - `web` owns public listener state, health endpoints, and router composition.
 - `admin` owns the loopback listener, authentication, authorization, actor
   context, OpenAPI assembly, and admin router composition.
+- `observability` owns structured logging, the Prometheus registry, metrics
+  instruments, the Tokio collector, and metrics listener composition.
 - A domain `store.rs`, `web.rs`, or `admin.rs` owns domain-specific SQL and
   endpoint behavior.
 
@@ -242,11 +255,16 @@ browser, human CLI, or agent ---> HTTPS admin gateway
                                    server domain modules
 
 offline bootstrap or recovery ---> typed domain operations ---> SQLite writer
+
+Prometheus scraper ---> loopback TCP metrics listener ---> GET /metrics
 ```
 
 The public virtual host has no admin route or upstream. The HTTPS gateway uses
 a separate admin origin and forwards to a loopback-only HTTP listener.
 Maincopy authenticates each request after forwarding.
+
+The public and admin routers do not mount `/metrics`. A separate loopback-only
+router serves that operation without adding it to OpenAPI.
 
 `maincopy-cli` must not depend on `maincopy-server`.
 
@@ -329,6 +347,8 @@ Every slice must preserve these invariants:
     candidate, and a rendering or sanitization failure rejects that candidate.
 42. Bootstrap and recovery are offline typed commands. They bind no listener,
     accept no arbitrary SQL, and require exclusive process ownership.
+43. `maincopyd` serves `/metrics` only from a dedicated loopback listener. The
+    public and admin routers do not mount this route.
 
 ### Strong-type policy
 
@@ -478,7 +498,7 @@ Rust toolchain and the project license.
 | Errors and diagnostics | Typed library errors and startup context | 0 |
 | Secret memory | Pin `zeroize` 1.9.0; wipe Maincopy-owned fixed secret buffers on drop | 0 |
 | Tracing | `tracing` 0.1.44 with `tracing-subscriber` 0.3.23 and only its `fmt` feature | 0 |
-| Metrics | Select a maintained metrics facade with the first metric export | Later |
+| Prometheus metrics | Pin `prometheus` 0.14.0 with its `process` feature and `tokio-metrics` 0.4.9 with `rt` | 3 |
 | UUIDs | `uuid` with only the features used by typed identifiers | 0 and 1 |
 | Operational time | `time::OffsetDateTime` with `serde-well-known`; no custom timestamp type | 0 and 1 |
 | Revision digests | BLAKE3 | 1 |
@@ -524,7 +544,9 @@ Maincopy package license.
 | `thiserror` build edge | 2.0.20 | Default features | `MIT OR Apache-2.0` | 1.71 |
 | `zeroize` | 1.9.0 | Default features disabled; `alloc` | `Apache-2.0 OR MIT` | 1.85 |
 | `argon2` | 0.6.0 | Default features disabled; `alloc`, `getrandom`, `password-hash`, `zeroize`; do not enable `kdf` or `parallel` | `MIT OR Apache-2.0` | 1.85 |
+| `prometheus` | 0.14.0 | Default features disabled; `process` | `Apache-2.0` | 1.81 |
 | `sqlx` | 0.9.0 | Default features disabled; `macros`, `migrate`, `runtime-tokio`, `sqlite-bundled` | `MIT OR Apache-2.0` | 1.94 |
+| `tokio-metrics` | 0.4.9 | Default features disabled; `rt`; do not enable unstable Tokio metrics | `MIT` | 1.70 |
 | `libsqlite3-sys` | 0.37.0 | Default features disabled; `bundled` | `MIT` | Not declared |
 
 `libsqlite3-sys` 0.37.0 bundles SQLite 3.51.3. SQLite places its bundled source
@@ -583,7 +605,7 @@ A fixed row is binding. Resolve each selection row before its due work starts.
 | V1 payment boundary | Use a static wallet handoff. Do not create invoices, query LNURL services, or store payment state. | Fixed | 7.1 |
 | Paid article access | Defer access control until the post-v1 settlement and entitlement contract is implemented. | Fixed | Post-v1 |
 | Mermaid engine | Select only after the fixture and limit spike passes. V1 cannot release without the selected renderer and SVG sanitizer. | Select | 6.2 and 6.3 |
-| Metrics export | Select the export path without adding it to the public router. | Select | 3.5 |
+| Metrics export | Serve Prometheus text for `GET /metrics` and standard empty-body `HEAD /metrics` on a dedicated loopback-only listener. Keep both off the public and admin routers and out of OpenAPI. | Fixed | 3.5 |
 | Recovery targets | Set measurable recovery point and recovery time targets. | Select | 8.4 |
 | Restore marker | Use a one-use marker bound to one offline-verified restored candidate. Consume it on the first accepted startup. Ordinary restarts do not require it. | Fixed | 8.4 |
 
@@ -633,9 +655,9 @@ Tests must not use a developer's home directory or real credentials.
 
 ### Router and transport harness
 
-`crates/server/src/lib.rs` must export pure `public_router` and `admin_router`
-constructors. Each constructor must accept explicit state and return an Axum
-router.
+`crates/server/src/lib.rs` must export pure `public_router`, `admin_router`, and
+`metrics_router` constructors. Each constructor must accept explicit state and
+return an Axum router.
 
 Router tests must call `tower::ServiceExt::oneshot` without binding a listener.
 Use these tests for routes, middleware, bodies, headers, and error contracts.
@@ -652,6 +674,9 @@ Use a loopback TCP process harness for listener lifecycle tests. Do not use
 Use an HTTPS gateway harness for remote CLI and browser tests. Use separate
 public and admin origins. The public origin must return `404 Not Found` for
 each admin API and UI path.
+
+Use the router harness to prove that `/metrics` exists only in
+`metrics_router`. Use an authenticated request when checking the admin router.
 
 The gateway harness must allow only the login allowlist without a principal.
 It must remove untrusted actor, role, scope, and forwarding headers.
@@ -713,8 +738,12 @@ Deliverables:
   candidate. Do not add an independent publication-file read.
 - Typed content-tree limits for all seven discovery resources. The documented
   defaults are also the v1 hard maxima.
-- Command-line overrides for the documented host paths, listener, database,
+- Command-line overrides for the documented host paths, listeners, database,
   and all seven content-tree limits.
+- A typed `[metrics].bind` setting and `--metrics-bind` override. Use
+  `127.0.0.1:3002` by default and accept only loopback addresses.
+- A distinct `MetricsBind` type and `MetricsBindInvalid` diagnostic. Do not
+  reuse the admin bind type across this boundary.
 - A closed host source mode: provider-neutral managed SSH mirror or external
   local checkout.
 - Host-owned filesystem paths, mirror size and process bounds, and a named SSH
@@ -748,6 +777,8 @@ Tests:
 - Reject an invalid effective configuration before startup advances.
 - Verify default, file, and command-line precedence for every override.
 - Verify every host table rejects unknown fields.
+- Reject a wildcard, public, multicast, or otherwise non-loopback metrics bind.
+- Snapshot the stable `MetricsBindInvalid` configuration diagnostic.
 - Reject a managed source without a safe local mirror root, process bounds, and
   at least one valid named SSH credential.
 - Reject an empty or unknown human login provider set.
@@ -1331,7 +1362,7 @@ Deliverables:
 - A bootstrap-only source-settings command after the identity bootstrap has
   created the first owner. This offline `maincopyd` mode binds no listener and
   uses the same typed writer operations. The CLI never writes SQLite directly.
-- No public listener, admin listener, source fetch, or normal content compile
+- No public, admin, or metrics listener, source fetch, or normal content compile
   before the first owner and source settings commit.
 - A first successful fetch and compile that closes bootstrap state before
   normal listener binding.
@@ -1649,6 +1680,7 @@ Deliverables:
 - Readiness based on snapshot and required core-subsystem health. An absent tip
   recipient is a valid presentation state and cannot fail this route.
 - Structured access logs without secret data.
+- No `/metrics` route. Metrics remain on their dedicated loopback listener.
 
 Failure tests:
 
@@ -1656,6 +1688,7 @@ Failure tests:
 - Release earlier resources after a later startup failure.
 - Drain an active request during termination.
 - Fail readiness after a supervised required task exits.
+- Verify that `GET /metrics` returns `404 Not Found` from the public router.
 
 ### Work package 2.5: Favicon, asset output, and CSP
 
@@ -1753,7 +1786,7 @@ Deliverables:
 - Startup configuration for WAL and `synchronous=NORMAL`.
 - Per-connection foreign keys and busy timeout.
 - Migration and integrity stages before listener binding. An incompatible
-  database must leave both listener endpoints absent.
+  database must leave all network listener endpoints absent.
 
 Tests:
 
@@ -1850,21 +1883,81 @@ Failure tests:
 - Start with a valid database and expose its read and write capabilities only
   after every database startup check succeeds.
 
-### Work package 3.5: Database health and fault reporting
+### Work package 3.5: Prometheus metrics, database health, and fault reporting
 
 Add bounded observability and fail-closed storage behavior.
 
 Deliverables:
 
+- An explicit `prometheus::Registry` owned by `Application` and constructed
+  before database startup. Pass registered instruments into database owners.
+- Metric constructors or `*_with_registry` macros that use the owned registry.
+  Do not use the default registry or its `register_*` macros.
+- A dedicated loopback-only metrics listener with `GET /metrics` and
+  `HEAD /metrics`. Keep both operations out of OpenAPI.
+- No Maincopy admin authentication on the metrics listener. The handler reads
+  only the owned registry and performs no database query or outbound request.
+- Prometheus text encoding with the encoder content type, `200 OK` on success,
+  and a generic `500 Internal Server Error` after an encoding failure.
+- A five-second collector built with `tokio_metrics::RuntimeMonitor`. Run it on
+  the supplied runtime handle as a supervised application task.
+- Add `MetricsServer` and `RuntimeMetricsCollector` to `CriticalTaskName`.
+  Supervise, cancel, and await both tasks with the other runtime tasks.
+- Add `StartupStage::Observability` for registry or metric registration
+  failures. Preserve the stable startup-stage display contract.
+- Initialize the fixed Tokio label set before readiness. The first scrape must
+  contain all six Tokio metric families.
+- `tokio_workers_count`, `tokio_worker_busy_ratio`,
+  `tokio_total_busy_duration_ms`, `tokio_live_tasks_count`, and
+  `tokio_global_queue_depth` gauges.
+- Compute `tokio_worker_busy_ratio` as total busy time divided by elapsed time
+  and worker count. Emit zero when that denominator is zero.
+- A cumulative `tokio_worker_parks_total` counter. Add each sampled interval
+  delta instead of exporting the reference interval value as a gauge.
+- Static `service="maincopyd"` and `runtime="main"` labels for Tokio metrics.
+  Do not enable unstable Tokio metrics.
+- On Linux, register `ProcessCollector::for_self()` explicitly with the owned
+  registry. Do not rely on default-registry process registration.
+- `process_cpu_seconds_total`, `process_resident_memory_bytes`,
+  `process_virtual_memory_bytes`, `process_open_fds`, `process_max_fds`,
+  `process_start_time_seconds`, and `process_threads` on Linux.
 - Queue depth and enqueue latency.
 - Transaction and pool wait latency.
 - Writer task health.
 - WAL size and checkpoint outcomes.
+- A checked-in `crates/server/dashboards/tokio-runtime.json` dashboard for
+  worker busy ratio, live tasks, global queue depth, interval busy time,
+  worker count, and worker park rate.
+- Dashboard legends that use only `service` and `runtime`. Do not retain the
+  reference dashboard's Kubernetes-only `pod` legend.
+- A park-rate query that uses
+  `rate(tokio_worker_parks_total[$__rate_interval])` with the dashboard's
+  `service` and `runtime` filters. All PromQL must match emitted types and names.
+- Metrics labels that never contain identifiers, URLs, paths, secrets, user
+  input, or error messages.
 - Typed disk-full and corruption failures.
-- The accepted non-public metrics export path.
 
 Failure tests:
 
+- Build isolated application registries in one process without duplicate
+  registration or cross-test series.
+- Scrape `GET /metrics` and verify its status, content type, help text, types,
+  and required Tokio families. Exercise database instrumentation before
+  checking its families. Verify process families on Linux.
+- Send `HEAD /metrics` and verify matching headers with an empty body. Return
+  `404 Not Found` for other paths and `405 Method Not Allowed` for other
+  methods on `/metrics`.
+- Unit-test the pure busy-ratio and counter-update helpers with constructed
+  values. Do not use wall-clock timing for these assertions.
+- Prove on a separate supplied runtime that the collector advances, cancels,
+  and terminates within a short real-time bound.
+- Fail the metrics bind and verify cleanup before readiness.
+- Exit the metrics server or collector unexpectedly and verify controlled
+  shutdown.
+- Check every label key and seeded value for bounded cardinality and sensitive
+  data.
+- Parse the Grafana dashboard and verify that each query uses an emitted
+  metric with compatible counter or gauge semantics. Reject a `pod` legend.
 - Inject disk exhaustion and stop new mutations.
 - Open a corrupt fixture and preserve diagnostic context.
 - Fail a checkpoint without failing ordinary committed reads.
@@ -1878,6 +1971,9 @@ Failure tests:
 - Direct readers remain available during sustained writes.
 - No live database file uses a network filesystem in tests or examples.
 - The writer failure path causes controlled shutdown.
+- Prometheus can scrape the loopback metrics listener during representative
+  database reader and writer load.
+- The metrics router contains no route other than `/metrics`.
 
 ## Slice 4: User accounts, admin control plane, and remote clients
 
@@ -1917,7 +2013,7 @@ Deliverables:
   security state.
 - Graceful listener shutdown and address release.
 - No gateway access to the database, content, state, or secret directories.
-- A `BootstrapRequired` process state that binds no public or admin listener.
+- A `BootstrapRequired` process state that binds no network listener.
 - Typed offline bootstrap and recovery modes that acquire the process lock,
   use invariant-preserving domain operations, and accept no arbitrary SQL.
 - Offline modes create no recovery transport, recovery API, or continuing
@@ -1944,6 +2040,8 @@ Failure tests:
   These fixtures do not provide an admin transport.
 - Prove that no build supports both the retired transport and admin TCP.
 - Deny the gateway service access to daemon state and secret files.
+- Send an authenticated `GET /metrics` request to the admin router and receive
+  `404 Not Found`.
 - Prove that `BootstrapRequired` and recovery modes create no recovery
   transport and bind no listener.
 - Refuse an offline command while the daemon owns the process lock.
@@ -3886,9 +3984,11 @@ Deliverables:
 - A local managed-mirror directory with ownership separate from public assets.
 - Local state directory for SQLite.
 - A loopback-only `maincopyd` admin bind option.
+- A loopback-only `maincopyd` metrics bind option and optional local Prometheus
+  scrape configuration.
 - A gateway upstream that targets only the loopback admin address.
 - Firewall rules that prevent direct non-loopback access to the daemon's admin
-  listener.
+  and metrics listeners.
 - Separation between the gateway identity and the `maincopyd` identity.
 - Public listener options.
 - A separate admin origin and private-network exposure mode.
@@ -3910,9 +4010,12 @@ Tests:
 - Reject a remote admin configuration without TLS and authentication.
 - Reject a live database path on a configured network mount.
 - Verify the loopback bind and gateway upstream in a NixOS virtual machine.
+- Scrape `/metrics` from the configured local Prometheus job in the NixOS
+  virtual machine.
 - Verify that module evaluation emits no Unix-socket or named-pipe unit or
   option.
 - Reject direct access to the daemon's admin listener from another namespace.
+- Reject direct access to the metrics listener from another namespace.
 - Verify mirror ownership and read-only remote access in a NixOS virtual
   machine.
 - Verify that the gateway cannot read database, content, state, or daemon
@@ -3921,6 +4024,7 @@ Tests:
   session or fresh agent NIP-98 proof on a protected route.
 - Verify `403 Forbidden` when the principal lacks a required scope.
 - Verify that the public virtual host has no admin upstream or fallback.
+- Verify that neither virtual host forwards `/metrics`.
 - Verify remote CLI access through the admin origin.
 - Verify that forged identity headers cannot create an admin principal.
 - Verify CSRF and Origin rejection through the gateway.
@@ -4058,6 +4162,7 @@ Failure tests:
 ### Slice 8 exit gate
 
 - `nixosModules.default` runs Maincopy and Litestream in a virtual machine.
+- Local Prometheus can scrape the loopback metrics listener.
 - The live database remains on local storage.
 - The development replica uses a separate local folder.
 - Production supports a secret-backed S3 or network-folder replica.
@@ -4087,6 +4192,8 @@ Deliverables:
 - A noninteractive agent flow that pins unauthenticated discovery before signer
   access and signs each request with a dedicated operational Nostr key.
 - A browser admin flow through the same API and application commands.
+- A local Prometheus scrape during representative public, admin, source-sync,
+  scheduler, and database activity.
 - A compatibility matrix for retained configuration and database versions.
 - A release fixture with representative technical content.
 - Repeatable process and NixOS test commands.
@@ -4110,6 +4217,10 @@ Failure tests:
   until a preview-gated update activates; preserve canonical `published_at`.
 - Disable the active tip recipient while the backup target fails. Articles
   remain readable and omit the tip CTA.
+- Attempt to scrape `/metrics` through the public origin and receive
+  `404 Not Found`.
+- Send an authenticated request through the admin origin and receive
+  `404 Not Found` for `/metrics`.
 
 ### Work package 9.2: Security, resilience, and performance review
 
@@ -4131,6 +4242,8 @@ Deliverables:
 - Fuzz or property targets for parsers and state transitions.
 - Measured queue, pool, renderer, retry, and retention defaults.
 - Public latency and compilation baselines with representative content.
+- Tokio worker utilization, live-task, global-queue, and process-usage
+  baselines with representative content.
 - WAL growth and Litestream lag thresholds.
 
 Tests:
@@ -4145,6 +4258,10 @@ Tests:
 - Run asset-origin and anti-enumeration corpora.
 - Run sustained readers with serialized writes.
 - Hold long readers and verify WAL diagnostics.
+- Scrape metrics during representative load and verify that the dashboard
+  panels receive compatible series.
+- Verify that metric names and labels expose no secret, path, raw URL, request
+  identifier, user identifier, post identifier, or slug.
 - Verify that no log or response exposes a secret.
 - Verify that the API and process contain no article-distribution credential,
   provider client, browser-automation session, or outbound Nostr
@@ -4168,6 +4285,7 @@ Deliverables:
 - Remote context, login-provider selection, password policy and recovery,
   agent signer and public-key rotation, and offline recovery guide.
 - Admin gateway, private-network, and separate-origin deployment guide.
+- Prometheus scrape, metric interpretation, and Grafana dashboard guide.
 - Deployment, backup, restore, and upgrade runbooks.
 - Configuration reference with secret handling.
 - Architecture updates for any accepted implementation change.
@@ -4178,6 +4296,7 @@ Tests:
 - Run every documented command in a clean environment.
 - Validate every configuration example.
 - Execute the restore runbook without undocumented steps.
+- Run the documented Prometheus scrape and dashboard validation commands.
 - Validate links and generated OpenAPI output.
 
 ### Work package 9.4: Release candidate and publication dry run
@@ -4251,6 +4370,9 @@ Tests:
 | Public bind | Address unavailable | Startup releases earlier resources. |
 | Admin bind | Address is occupied or is not loopback | Startup refuses to bind the admin listener. |
 | Admin bind | Authentication state is absent or incompatible | Startup leaves the admin listener unbound. |
+| Metrics bind | Address is occupied or is not loopback | Startup refuses to bind the metrics listener and releases earlier resources. |
+| Metrics route | The public origin or an authenticated admin requests `/metrics` | That origin returns `404 Not Found`. |
+| Metrics task | The listener or collector exits unexpectedly | Readiness fails and controlled shutdown begins. |
 | Offline administration | The daemon owns the process lock or the command requests arbitrary SQL | The command refuses the operation and creates no recovery transport or listener. |
 | Admin gateway | Public origin requests an admin path | The public origin returns `404 Not Found`. |
 | Admin gateway | A protected route has no valid Maincopy principal | Maincopy returns `401 Unauthorized` without reaching a mutation. |
@@ -4304,6 +4426,8 @@ A work package is done only when all applicable statements are true:
   fields and validated operations.
 - Fallible domain and application operations return typed errors.
 - Logs, metrics, and health behavior cover new background tasks.
+- Metric labels use bounded enums or fixed values and contain no sensitive
+  data.
 - No public response exposes secrets or host paths.
 - No handler creates a concrete database or network dependency.
 - `crates/server/src/main.rs` remains tiny.
@@ -4337,6 +4461,11 @@ V1 is ready for owner approval when all of these statements are true:
   origin returns `404 Not Found` for its preview document and assets.
 - SQLite writes are serialized through one task.
 - Concurrent query-only readers work in WAL mode.
+- A local Prometheus scraper can read process, Tokio runtime, and database
+  metrics from the loopback-only `/metrics` endpoint.
+- The public router and an authenticated admin request return `404 Not Found`
+  for `/metrics`. Metric labels remain bounded and contain no sensitive or
+  content-derived values.
 - CLI, agents, and the admin UI use one versioned admin service.
 - Remote clients use an HTTPS gateway on a separate admin origin.
 - The public origin has no route or upstream to the admin service.

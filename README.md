@@ -27,6 +27,8 @@ V1 has these product boundaries:
 - Maincopy stores no tip invoice, payment, or settlement state in v1.
 - The remote admin site uses authenticated access on a separate origin.
 - The admin gateway forwards to a loopback-only HTTP listener in `maincopyd`.
+- `maincopyd` exports Prometheus process, Tokio runtime, and database metrics
+  from a dedicated loopback-only `/metrics` endpoint.
 - Owner, Administrator, and Publisher roles map to fixed scopes.
 - Publisher access covers content, status, sync, reload, preview, and release
   only.
@@ -57,13 +59,14 @@ connects through the configured HTTPS admin origin.
 
 Managed Git synchronization, RSS and discovery documents, the admin web
 interface, release-quality technical rendering, the NixOS module, Litestream
-wiring, and complete restore evidence remain incomplete. Superseded
-subscription and outbound-distribution code remains during the pre-v1
-transition. That code is not part of the V1 product contract.
+wiring, Prometheus metrics and dashboard, and complete restore evidence remain
+incomplete. V1 rejects authored subscription and outbound-distribution
+configuration and stores no target-job state.
 
 > [!CAUTION]
 > Do not expose the loopback admin listener directly. Use the reviewed HTTPS
-> gateway and keep the public origin isolated from every admin route.
+> gateway and keep the public origin isolated from every admin route. Keep the
+> metrics listener loopback-only.
 
 ## Post-v1 roadmap
 
