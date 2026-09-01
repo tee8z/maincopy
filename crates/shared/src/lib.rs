@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// Stable path for discovering the private admin contracts supported by a server.
 pub const ADMIN_CAPABILITIES_PATH: &str = "/api/admin/capabilities";
 
-/// Versioned compatibility path for discovering the v1 private admin contract.
+/// Versioned path for discovering the V1 private admin contract.
 pub const CAPABILITIES_PATH: &str = "/api/admin/v1/capabilities";
 
 /// Admin API versions understood by this contract crate.

@@ -1071,6 +1071,10 @@ async fn list_audit_events(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the Axum adapter returns a ready response to preserve the stable error envelope"
+)]
 async fn prepare_credentials(
     credentials: Vec<HumanCredentialInput>,
     security: &AdminSecurityState,
@@ -1092,6 +1096,10 @@ async fn prepare_credentials(
     Ok(prepared)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the Axum adapter returns a ready response to preserve the stable error envelope"
+)]
 async fn prepare_credential(
     credential: HumanCredentialInput,
     security: &AdminSecurityState,
@@ -1159,6 +1167,10 @@ async fn load_agent_response(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the Axum adapter returns a ready response to preserve the stable error envelope"
+)]
 async fn require_target_authority(
     security: &AdminSecurityState,
     principal: &AdminPrincipal,
@@ -1186,6 +1198,10 @@ async fn require_target_authority(
     ))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the Axum adapter returns a ready response to preserve the stable error envelope"
+)]
 async fn require_agent_owner_authority(
     security: &AdminSecurityState,
     principal: &AdminPrincipal,

@@ -431,6 +431,19 @@ mod tests {
     fn assert_openapi_contract(document: &Value) {
         assert_eq!(document["openapi"], "3.1.0");
         assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
+        let encoded = serde_json::to_string(document).unwrap();
+        for removed_contract in [
+            "publication_jobs",
+            "target_job",
+            "TargetJob",
+            "subscriptions",
+            "distribution",
+        ] {
+            assert!(
+                !encoded.contains(removed_contract),
+                "OpenAPI retained removed contract {removed_contract}"
+            );
+        }
         assert!(document["paths"][ADMIN_CAPABILITIES_PATH]["get"].is_object());
         assert!(document["paths"][CAPABILITIES_PATH]["get"].is_object());
         assert!(document["paths"][POSTS_PATH]["get"].is_object());

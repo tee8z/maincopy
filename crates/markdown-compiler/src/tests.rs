@@ -1,8 +1,7 @@
 use time::UtcOffset;
 
 use crate::{
-    DefaultPostTipPolicy, PostAlias, PostSlug, PostTag, PrivacyPolicyRevision, PublicationBaseUrl,
-    PublicationBaseUrlError,
+    DefaultPostTipPolicy, PostAlias, PostSlug, PostTag, PublicationBaseUrl, PublicationBaseUrlError,
 };
 
 use super::*;
@@ -161,7 +160,6 @@ fn checked_in_full_minimal_and_crlf_fixtures_form_one_valid_catalog() {
         ["rust", "sqlite"]
     );
     assert_eq!(full.metadata.tips, PostTipPolicy::Enabled);
-    assert_eq!(full.metadata.distribution.x.mode, DistributionMode::Enabled);
     assert_eq!(
         content.publication.site.favicon.as_ref().unwrap().as_str(),
         "https://cdn.example.com/site/favicon-v1.png"
@@ -189,6 +187,12 @@ fn checked_in_full_minimal_and_crlf_fixtures_form_one_valid_catalog() {
         serialized["posts"][1]["metadata"]["image"],
         "https://cdn.example.com/posts/sqlite/cover-v1.webp"
     );
+    assert!(serialized["publication"].get("subscriptions").is_none());
+    assert!(
+        serialized["posts"][1]["metadata"]
+            .get("distribution")
+            .is_none()
+    );
 }
 
 #[test]
@@ -199,7 +203,6 @@ fn minimal_documents_apply_every_documented_default() {
         publication.site.base_url.as_str(),
         "https://minimal.example.test/"
     );
-    assert_eq!(publication.subscriptions, SubscriptionSettings::Disabled);
     assert_eq!(publication.tips, DefaultPostTipPolicy::Disabled);
 
     let post = &content.posts[0].metadata;
@@ -208,8 +211,6 @@ fn minimal_documents_apply_every_documented_default() {
     assert!(post.aliases.is_empty());
     assert_eq!(post.draft, DraftStatus::Publishable);
     assert_eq!(post.tips, PostTipPolicy::InheritPublication);
-    assert_eq!(post.distribution.x.mode, DistributionMode::Disabled);
-    assert!(post.distribution.x.copy.is_none());
 }
 
 #[test]
@@ -456,25 +457,20 @@ fn publication_requires_site_and_author_contracts_and_aggregates_fields() {
 }
 
 #[test]
-fn subscriptions_are_typed_and_enabled_requires_a_revision() {
-    let missing = format!("{MINIMAL_PUBLICATION}\n[subscriptions]\nenabled = true\n");
-    assert_eq!(
-        error_contract(validate(&missing, &[("posts/post.md", MINIMAL_POST)])),
-        [(
-            "publication.toml".to_owned(),
-            "subscriptions.privacy_policy_revision".to_owned(),
-            ContentValidationCode::SubscriptionPrivacyRevisionRequired,
-        )]
-    );
-
-    let disabled_with_revision = format!(
-        "{MINIMAL_PUBLICATION}\n[subscriptions]\nenabled = false\nprivacy_policy_revision = \"old\"\n"
-    );
-    let content = validate(&disabled_with_revision, &[("posts/post.md", MINIMAL_POST)]).unwrap();
-    assert_eq!(
-        content.publication.subscriptions,
-        SubscriptionSettings::Disabled
-    );
+fn subscription_configuration_is_not_part_of_the_v1_content_contract() {
+    for unsupported in [
+        format!("{MINIMAL_PUBLICATION}\n[subscriptions]\nenabled = true\n"),
+        format!("subscriptions = false\n{MINIMAL_PUBLICATION}"),
+    ] {
+        assert_eq!(
+            error_contract(validate(&unsupported, &[("posts/post.md", MINIMAL_POST)])),
+            [(
+                "publication.toml".to_owned(),
+                "subscriptions".to_owned(),
+                ContentValidationCode::UnknownField,
+            )]
+        );
+    }
 }
 
 #[test]
@@ -813,32 +809,24 @@ fn aliases_share_one_global_route_namespace() {
 }
 
 #[test]
-fn distribution_is_closed_to_x_and_requires_an_explicit_mode() {
-    let missing_enabled = MINIMAL_POST.replace(
-        "+++\n\n# A Minimal Post",
-        "\n[distribution.x]\ntext = \"copy\"\n+++\n\n# A Minimal Post",
-    );
-    assert_eq!(
-        error_contract(validate(
-            MINIMAL_PUBLICATION,
-            &[("posts/x.md", &missing_enabled)]
-        ))[0]
-            .2,
-        ContentValidationCode::DistributionEnabledRequired
-    );
-
-    let unknown = MINIMAL_POST.replace(
-        "+++\n\n# A Minimal Post",
-        "\n[distribution.nostr]\nenabled = true\n+++\n\n# A Minimal Post",
-    );
-    assert_eq!(
-        error_contract(validate(
-            MINIMAL_PUBLICATION,
-            &[("posts/target.md", &unknown)]
-        ))[0]
-            .2,
-        ContentValidationCode::UnknownField
-    );
+fn distribution_configuration_is_not_part_of_the_v1_content_contract() {
+    for table in ["x", "nostr"] {
+        let unsupported = MINIMAL_POST.replace(
+            "+++\n\n# A Minimal Post",
+            &format!("\n[distribution.{table}]\nenabled = true\n+++\n\n# A Minimal Post"),
+        );
+        assert_eq!(
+            error_contract(validate(
+                MINIMAL_PUBLICATION,
+                &[("posts/target.md", &unsupported)]
+            )),
+            [(
+                "posts/target.md".to_owned(),
+                "distribution".to_owned(),
+                ContentValidationCode::UnknownField,
+            )]
+        );
+    }
 }
 
 #[test]
@@ -885,14 +873,6 @@ fn enum_and_validation_code_wire_names_are_stable() {
         (
             serde_json::to_value(PostTipPolicy::Disabled).unwrap(),
             "disabled",
-        ),
-        (
-            serde_json::to_value(DistributionMode::Disabled).unwrap(),
-            "disabled",
-        ),
-        (
-            serde_json::to_value(DistributionMode::Enabled).unwrap(),
-            "enabled",
         ),
         (
             serde_json::to_value(DefaultPostTipPolicy::Enabled).unwrap(),
@@ -947,20 +927,6 @@ fn enum_and_validation_code_wire_names_are_stable() {
         })
     );
 
-    assert_eq!(
-        serde_json::to_value(SubscriptionSettings::Disabled).unwrap(),
-        serde_json::json!({ "state": "disabled" })
-    );
-    assert_eq!(
-        serde_json::to_value(SubscriptionSettings::Enabled {
-            privacy_policy_revision: PrivacyPolicyRevision::new("2026-08-29").unwrap(),
-        })
-        .unwrap(),
-        serde_json::json!({
-            "state": "enabled",
-            "privacy_policy_revision": "2026-08-29",
-        })
-    );
     let codes = [
         (
             ContentValidationCode::ContentPlatformUnsupported,
@@ -1118,14 +1084,6 @@ fn enum_and_validation_code_wire_names_are_stable() {
         (
             ContentValidationCode::DuplicatePostRoute,
             "duplicate_post_route",
-        ),
-        (
-            ContentValidationCode::SubscriptionPrivacyRevisionRequired,
-            "subscription_privacy_revision_required",
-        ),
-        (
-            ContentValidationCode::DistributionEnabledRequired,
-            "distribution_enabled_required",
         ),
         (
             ContentValidationCode::DraftDirectoryConflict,

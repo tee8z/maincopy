@@ -21,16 +21,14 @@ pub use candidate_store::{
 };
 pub use content::{
     AssetDigest, AssetRevisionReference, AuthorName, AuthorSettings, DefaultPostTipPolicy,
-    DigestKind, DigestParseError, DigestedAsset, DistributionCopy, DistributionMode,
-    DistributionSettings, DraftStatus, ExternalAssetOrigin, ExternalAssetOriginError,
-    ExternalAssetUrl, ExternalAssetUrlError, LogicalAssetPath, LogicalContentPath,
-    LogicalTreePathError, MarkdownSource, PlainTextError, PostAlias, PostCollection,
-    PostDescription, PostDocument, PostId, PostIdParseError, PostMetadata, PostRevisionDigest,
-    PostSlug, PostTag, PostTipPolicy, PostTitle, PreviewDigest, PrivacyPolicyRevision,
+    DigestKind, DigestParseError, DigestedAsset, DraftStatus, ExternalAssetOrigin,
+    ExternalAssetOriginError, ExternalAssetUrl, ExternalAssetUrlError, LogicalAssetPath,
+    LogicalContentPath, LogicalTreePathError, MarkdownSource, PlainTextError, PostAlias,
+    PostCollection, PostDescription, PostDocument, PostId, PostIdParseError, PostMetadata,
+    PostRevisionDigest, PostSlug, PostTag, PostTipPolicy, PostTitle, PreviewDigest,
     PublicationAssetSettings, PublicationBaseUrl, PublicationBaseUrlError, PublicationSettings,
     RouteValueError, SiteDescription, SiteSettings, SiteSnapshotDigest, SiteTitle,
-    SubscriptionSettings, UnresolvedAssetReference, UnresolvedHttpsOrigin, ValidatedContent,
-    XDistributionSettings,
+    UnresolvedAssetReference, UnresolvedHttpsOrigin, ValidatedContent,
 };
 pub use identity::{
     AssetBindingTarget, PostRendererIdentity, RevisionIdentityError, SiteShellRendererIdentity,

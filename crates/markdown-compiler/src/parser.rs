@@ -4,14 +4,12 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use toml::{Table, Value};
 
 use crate::content::{
-    AuthorName, AuthorSettings, DefaultPostTipPolicy, DistributionCopy, DistributionMode,
-    DistributionSettings, DraftStatus, MarkdownSource, PlainTextError, PostAlias, PostDescription,
-    PostDocument, PostId, PostMetadata, PostSlug, PostTag, PostTipPolicy, PostTitle,
-    PrivacyPolicyRevision, PublicationAssetSettings, PublicationBaseUrl, PublicationSettings,
+    AuthorName, AuthorSettings, DefaultPostTipPolicy, DraftStatus, MarkdownSource, PlainTextError,
+    PostAlias, PostDescription, PostDocument, PostId, PostMetadata, PostSlug, PostTag,
+    PostTipPolicy, PostTitle, PublicationAssetSettings, PublicationBaseUrl, PublicationSettings,
     RouteConflict, RouteKind, SiteDescription, SiteSettings, SiteTitle, UnresolvedAssetReference,
-    UnresolvedHttpsOrigin, ValidatedContent, XDistributionSettings, classify_route_conflict,
-    resolve_draft_status as resolve_authored_draft_status, subscription_settings,
-    timestamps_are_ordered,
+    UnresolvedHttpsOrigin, ValidatedContent, classify_route_conflict,
+    resolve_draft_status as resolve_authored_draft_status, timestamps_are_ordered,
 };
 
 use super::{
@@ -277,15 +275,14 @@ fn parse_publication(
         }
     };
 
-    let subscriptions = parse_subscriptions(&mut table, &path, diagnostics);
     let tips = parse_publication_tips(&mut table, &path, diagnostics);
     reject_unknown_fields(table, "", &path, diagnostics);
 
     let settings = if diagnostics.len() == start_error_count {
-        match (site, author, assets, subscriptions, tips) {
-            (Some(site), Some(author), Some(assets), Some(subscriptions), Some(tips)) => Some(
-                PublicationSettings::new(site, author, assets, subscriptions, tips),
-            ),
+        match (site, author, assets, tips) {
+            (Some(site), Some(author), Some(assets), Some(tips)) => {
+                Some(PublicationSettings::new(site, author, assets, tips))
+            }
             _ => {
                 diagnostics.push(invariant_error(
                     path.clone(),
@@ -299,62 +296,6 @@ fn parse_publication(
     };
 
     PublicationCandidate { path, settings }
-}
-
-fn parse_subscriptions(
-    table: &mut Table,
-    path: &LogicalContentPath,
-    diagnostics: &mut DiagnosticCollector,
-) -> Option<super::SubscriptionSettings> {
-    let mut subscriptions =
-        match take_optional_table(table, "subscriptions", "subscriptions", path, diagnostics) {
-            OptionalField::Missing => return Some(super::SubscriptionSettings::Disabled),
-            OptionalField::Invalid => return None,
-            OptionalField::Valid(value) => value,
-        };
-
-    let enabled = take_optional_bool(
-        &mut subscriptions,
-        "enabled",
-        "subscriptions.enabled",
-        path,
-        diagnostics,
-    );
-    let revision = take_optional_string(
-        &mut subscriptions,
-        "privacy_policy_revision",
-        "subscriptions.privacy_policy_revision",
-        path,
-        diagnostics,
-    )
-    .and_then(|value| {
-        parse_plain_text(
-            value,
-            PrivacyPolicyRevision::new,
-            "subscriptions.privacy_policy_revision",
-            path,
-            diagnostics,
-        )
-    });
-    reject_unknown_fields(subscriptions, "subscriptions", path, diagnostics);
-
-    let enabled = match enabled {
-        OptionalField::Missing => false,
-        OptionalField::Valid(enabled) => enabled,
-        OptionalField::Invalid => return None,
-    };
-    match subscription_settings(enabled, revision) {
-        Ok(settings) => Some(settings),
-        Err(()) => {
-            diagnostics.push(ContentValidationError::new(
-                path.clone(),
-                "subscriptions.privacy_policy_revision",
-                ContentValidationCode::SubscriptionPrivacyRevisionRequired,
-                "an enabled subscription policy requires a privacy-policy revision",
-            ));
-            None
-        }
-    }
 }
 
 fn parse_publication_tips(
@@ -523,7 +464,6 @@ fn parse_post_with_placement(
         OptionalField::Valid(false) => Some(PostTipPolicy::Disabled),
         OptionalField::Invalid => None,
     };
-    let distribution = parse_distribution(&mut table, &path, diagnostics);
     reject_unknown_fields(table, "", &path, diagnostics);
 
     let document = if diagnostics.len() == start_error_count {
@@ -534,7 +474,6 @@ fn parse_post_with_placement(
             authored_at,
             description,
             tips,
-            distribution,
         ) {
             (
                 Some(id),
@@ -543,7 +482,6 @@ fn parse_post_with_placement(
                 Some(authored_at),
                 Some(description),
                 Some(tips),
-                Some(distribution),
             ) => Some(PostDocument::new(
                 path.clone(),
                 PostMetadata {
@@ -558,7 +496,6 @@ fn parse_post_with_placement(
                     aliases: aliases.iter().map(|(_, alias)| alias.clone()).collect(),
                     draft,
                     tips,
-                    distribution,
                 },
                 MarkdownSource::new(markdown),
             )),
@@ -705,55 +642,6 @@ fn resolve_draft_status(
         ));
     }
     resolution.status
-}
-
-fn parse_distribution(
-    table: &mut Table,
-    path: &LogicalContentPath,
-    diagnostics: &mut DiagnosticCollector,
-) -> Option<DistributionSettings> {
-    let mut distribution =
-        match take_optional_table(table, "distribution", "distribution", path, diagnostics) {
-            OptionalField::Missing => return Some(DistributionSettings::default()),
-            OptionalField::Invalid => return None,
-            OptionalField::Valid(value) => value,
-        };
-    let x = match take_optional_table(&mut distribution, "x", "distribution.x", path, diagnostics) {
-        OptionalField::Missing => Some(XDistributionSettings::default()),
-        OptionalField::Invalid => None,
-        OptionalField::Valid(mut x) => {
-            let enabled = take_required_bool(
-                &mut x,
-                "enabled",
-                "distribution.x.enabled",
-                path,
-                diagnostics,
-                ContentValidationCode::DistributionEnabledRequired,
-            );
-            let copy =
-                take_optional_string(&mut x, "text", "distribution.x.text", path, diagnostics)
-                    .and_then(|value| {
-                        parse_plain_text(
-                            value,
-                            DistributionCopy::new,
-                            "distribution.x.text",
-                            path,
-                            diagnostics,
-                        )
-                    });
-            reject_unknown_fields(x, "distribution.x", path, diagnostics);
-            Some(XDistributionSettings::new(
-                if enabled? {
-                    DistributionMode::Enabled
-                } else {
-                    DistributionMode::Disabled
-                },
-                copy,
-            ))
-        }
-    };
-    reject_unknown_fields(distribution, "distribution", path, diagnostics);
-    x.map(DistributionSettings::new)
 }
 
 fn split_frontmatter<'source>(
@@ -1090,27 +978,6 @@ fn take_optional_bool(
             OptionalField::Invalid
         }
         None => OptionalField::Missing,
-    }
-}
-
-fn take_required_bool(
-    table: &mut Table,
-    key: &str,
-    field: &str,
-    path: &LogicalContentPath,
-    diagnostics: &mut DiagnosticCollector,
-    missing_code: ContentValidationCode,
-) -> Option<bool> {
-    match table.remove(key) {
-        Some(Value::Boolean(value)) => Some(value),
-        Some(value) => {
-            invalid_type(path, field, "boolean", &value, diagnostics);
-            None
-        }
-        None => {
-            required_field(path, field, diagnostics, missing_code);
-            None
-        }
     }
 }
 

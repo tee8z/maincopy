@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use sqlx::{ConnectOptions as _, Connection as _, Executor as _, SqliteConnection};
+use sqlx::{Executor as _, SqliteConnection};
 
 use super::*;
 use crate::config::{DatabaseBusyTimeout, DatabaseReadPoolSize, DatabaseWriterQueueCapacity};
@@ -76,7 +76,6 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             "login_challenges",
             "nip98_replay_events",
             "post_revisions",
-            "publication_jobs",
             "published_routes",
             "reload_operations",
             "reload_post_changes",
@@ -401,14 +400,16 @@ async fn newer_modified_missing_and_dirty_migration_history_are_distinct() {
         .await
         .unwrap();
     connection
-        .execute("UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 1")
+        .execute("UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 3")
         .await
         .unwrap();
     connection.close().await.unwrap();
+    let before = fs::read(&path).unwrap();
     assert!(matches!(
         bootstrap_error(&path).await,
-        DatabaseStartupError::MigrationModified { version: 1 }
+        DatabaseStartupError::MigrationModified { version: 3 }
     ));
+    assert_eq!(fs::read(&path).unwrap(), before);
 
     let (_root, path) = prepared().await;
     let mut connection = SqliteConnectOptions::new()
@@ -569,10 +570,6 @@ async fn identifiers_and_hashes_use_blob_storage() {
             "post_revisions.revision_digest:BLOB",
             "post_revisions.source_commit:BLOB",
             "post_revisions.stable_post_id:BLOB",
-            "publication_jobs.idempotency_key:BLOB",
-            "publication_jobs.payload_digest:BLOB",
-            "publication_jobs.publication_id:BLOB",
-            "publication_jobs.publication_job_id:BLOB",
             "published_routes.revision_digest:BLOB",
             "published_routes.stable_post_id:BLOB",
             "reload_operations.candidate_site_digest:BLOB",
@@ -610,17 +607,15 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 92);
+    assert_eq!(compact_definitions.matches("check(").count(), 89);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",
         "check(length(revision_digest)=32)",
         "check(length(candidate_site_digest)=32)",
-        "check(length(payload_digest)=32)",
         "check(length(publication_id)=16)",
         "check(length(stable_post_id)=16)",
         "check(length(idempotency_key)=16)",
-        "check(length(publication_job_id)=16)",
         "check(length(reload_operation_id)=16)",
         "check(length(content_tree_digest)=32)",
         "check(length(accepted_preview_digest)=32)",

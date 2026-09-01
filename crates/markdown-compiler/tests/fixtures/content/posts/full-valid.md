@@ -10,10 +10,6 @@ tags = ["Rust", "SQLite"]
 aliases = ["sqlite-deployments", "deploying-sqlite"]
 draft = false
 tips = true
-
-[distribution.x]
-enabled = true
-text = "SQLite is a file, but deployment still has coordination rules."
 +++
 
 # SQLite Does Not Need a Network

@@ -6,10 +6,9 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::DefaultPostTipPolicy;
 
 use super::{
-    AssetDigest, AssetRevisionReference, DigestedAsset, DistributionMode, DistributionSettings,
-    DraftStatus, ExternalAssetOrigin, PostDocument, PostId, PostRevisionDigest, PostTipPolicy,
-    PreviewDigest, PublicationSettings, ResolvedPostAssets, ResolvedSiteAssets, SiteSnapshotDigest,
-    SubscriptionSettings,
+    AssetDigest, AssetRevisionReference, DigestedAsset, DraftStatus, ExternalAssetOrigin,
+    PostDocument, PostId, PostRevisionDigest, PostTipPolicy, PreviewDigest, PublicationSettings,
+    ResolvedPostAssets, ResolvedSiteAssets, SiteSnapshotDigest,
 };
 
 const ASSET_CONTEXT: &str = "maincopy asset digest v1";
@@ -120,7 +119,6 @@ struct PostRevisionInput<'input> {
     renderer: &'input PostRendererIdentity,
     pre_injection_article: PreInjectionRenderedArticle<'input>,
     generated_assets: &'input [DigestedAsset],
-    effective_distribution: &'input DistributionSettings,
 }
 
 impl<'input> PostRevisionInput<'input> {
@@ -131,7 +129,6 @@ impl<'input> PostRevisionInput<'input> {
         renderer: &'input PostRendererIdentity,
         pre_injection_article: PreInjectionRenderedArticle<'input>,
         generated_assets: &'input [DigestedAsset],
-        effective_distribution: &'input DistributionSettings,
     ) -> Self {
         Self {
             document,
@@ -140,7 +137,6 @@ impl<'input> PostRevisionInput<'input> {
             renderer,
             pre_injection_article,
             generated_assets,
-            effective_distribution,
         }
     }
 
@@ -151,7 +147,6 @@ impl<'input> PostRevisionInput<'input> {
         renderer: &'input PostRendererIdentity,
         pre_injection_article: PreInjectionRenderedArticle<'input>,
         generated_assets: &'input [DigestedAsset],
-        effective_distribution: &'input DistributionSettings,
     ) -> Self {
         Self {
             document,
@@ -160,7 +155,6 @@ impl<'input> PostRevisionInput<'input> {
             renderer,
             pre_injection_article,
             generated_assets,
-            effective_distribution,
         }
     }
 }
@@ -336,7 +330,6 @@ fn digest_post_revision(
     encode_post_renderer(&mut transcript, input.renderer);
     transcript.bytes(input.pre_injection_article.as_bytes());
     encode_generated_assets(&mut transcript, &generated_assets);
-    encode_distribution(&mut transcript, input.effective_distribution);
     Ok(PostRevisionDigest::from_hash(transcript.finish()))
 }
 
@@ -352,7 +345,6 @@ pub fn finalize_post_revision(
     renderer: &PostRendererIdentity,
     pre_injection_article: &[u8],
     generated_assets: &[DigestedAsset],
-    effective_distribution: &DistributionSettings,
 ) -> Result<PostRevisionDigest, RevisionIdentityError> {
     digest_post_revision(&PostRevisionInput::new(
         document,
@@ -361,7 +353,6 @@ pub fn finalize_post_revision(
         renderer,
         PreInjectionRenderedArticle::new(pre_injection_article),
         generated_assets,
-        effective_distribution,
     ))
 }
 
@@ -569,19 +560,7 @@ fn encode_post_document(transcript: &mut Transcript, document: &PostDocument) {
         PostTipPolicy::Enabled => 1,
         PostTipPolicy::Disabled => 2,
     });
-    encode_distribution(transcript, &metadata.distribution);
     transcript.bytes(document.markdown.as_str().as_bytes());
-}
-
-fn encode_distribution(transcript: &mut Transcript, distribution: &DistributionSettings) {
-    let x = &distribution.x;
-    transcript.tag(match x.mode {
-        DistributionMode::Disabled => 0,
-        DistributionMode::Enabled => 1,
-    });
-    transcript.optional(x.copy.as_ref(), |transcript, copy| {
-        transcript.string(copy.as_str());
-    });
 }
 
 fn encode_baseline_renderer_policy(transcript: &mut Transcript) {
@@ -610,17 +589,6 @@ fn encode_publication(transcript: &mut Transcript, publication: &PublicationSett
     // Asset-valued fields are excluded here. The final site transcript
     // requires resolver-owned favicon, allowlist, and reference inputs.
     transcript.string(publication.author.name.as_str());
-
-    match &publication.subscriptions {
-        SubscriptionSettings::Disabled => transcript.tag(0),
-        SubscriptionSettings::Enabled {
-            privacy_policy_revision,
-        } => {
-            transcript.tag(1);
-            transcript.string(privacy_policy_revision.as_str());
-        }
-    }
-
     transcript.tag(match publication.tips {
         DefaultPostTipPolicy::Disabled => 0,
         DefaultPostTipPolicy::Enabled => 1,
@@ -849,7 +817,7 @@ name = "Example Author"
                 "tags = [\"Rust\", \"sqlite\"]",
                 "tags = [\"rust\", \"sqlite\"]",
             )
-            + "draft = false\n[distribution.x]\nenabled = false\n";
+            + "draft = false\n";
         let (_, first) = validate_post(&first_frontmatter, "# Body\n");
         let (_, equivalent) = validate_post(&reordered, "# Body\n");
         let (_, offset_changed) = validate_post(&frontmatter("2026-08-29T16:00:00Z"), "# Body\n");
@@ -1026,12 +994,6 @@ name = "Example Author"
             ),
             ("draft", format!("{baseline_frontmatter}draft = true\n")),
             ("tips", format!("{baseline_frontmatter}tips = false\n")),
-            (
-                "distribution",
-                format!(
-                    "{baseline_frontmatter}[distribution.x]\nenabled = true\ntext = \"Share this\"\n"
-                ),
-            ),
         ];
         for (field, frontmatter) in variants {
             let (_, changed) = validate_post(&frontmatter, "# Body\n");
@@ -1077,7 +1039,6 @@ name = "Example Author"
             &renderer,
             PreInjectionRenderedArticle::new(b"<h1>Body</h1>"),
             &generated,
-            &post.metadata.distribution,
         ))
         .unwrap();
         let changed = digest_post_revision(&PostRevisionInput::new_unchecked(
@@ -1086,13 +1047,12 @@ name = "Example Author"
             &renderer,
             PreInjectionRenderedArticle::new(b"<h1>Changed</h1>"),
             &generated,
-            &post.metadata.distribution,
         ))
         .unwrap();
         assert_ne!(baseline, changed);
         assert_eq!(
             baseline.as_str(),
-            "post-b3-v1-bd78c5db53768b8da38359df826a6c928a1a21b764fcfb44cef99d43a9da8a7b"
+            "post-b3-v1-5bae9fad34c2c42250d46db8704d38f7f57a804086afa47111b7ffb52c6ade4a"
         );
 
         let duplicate_refs = [
@@ -1106,7 +1066,6 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                &post.metadata.distribution,
             )),
             Err(RevisionIdentityError::DuplicateAssetReference { .. })
         ));
@@ -1134,7 +1093,6 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                &post.metadata.distribution,
             ))
             .unwrap()
         };
@@ -1142,13 +1100,8 @@ name = "Example Author"
     }
 
     #[test]
-    fn generated_assets_and_effective_distribution_are_complete_components() {
-        let baseline_frontmatter = frontmatter("2026-08-29T12:00:00Z");
-        let (_, post) = validate_post(&baseline_frontmatter, "# Body\n");
-        let distributed_frontmatter = format!(
-            "{baseline_frontmatter}[distribution.x]\nenabled = true\ntext = \"Share this\"\n"
-        );
-        let (_, distributed) = validate_post(&distributed_frontmatter, "# Body\n");
+    fn generated_assets_are_complete_revision_components() {
+        let (_, post) = validate_post(&frontmatter("2026-08-29T12:00:00Z"), "# Body\n");
         let renderer = renderer();
         let first = DigestedAsset::new(
             LogicalAssetPath::parse("assets/generated/a.bin").unwrap(),
@@ -1158,74 +1111,43 @@ name = "Example Author"
             LogicalAssetPath::parse("assets/generated/b.bin").unwrap(),
             digest_asset(b"second"),
         );
-        let digest = |generated: &[DigestedAsset], distribution: &DistributionSettings| {
+        let digest = |generated: &[DigestedAsset]| {
             digest_post_revision(&PostRevisionInput::new_unchecked(
                 &post,
                 &ResolvedPostAssets::new(&post, None, Vec::new()),
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 generated,
-                distribution,
             ))
         };
-        let baseline = digest(
-            &[first.clone(), second.clone()],
-            &post.metadata.distribution,
-        )
-        .unwrap();
-        assert_eq!(
+        let baseline = digest(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(baseline, digest(&[second.clone(), first.clone()]).unwrap());
+        assert_ne!(
             baseline,
-            digest(
-                &[second.clone(), first.clone()],
-                &post.metadata.distribution
-            )
+            digest(&[
+                DigestedAsset::new(first.path.clone(), digest_asset(b"changed")),
+                second.clone()
+            ])
             .unwrap()
         );
         assert_ne!(
             baseline,
-            digest(
-                &[
-                    DigestedAsset::new(first.path.clone(), digest_asset(b"changed")),
-                    second.clone()
-                ],
-                &post.metadata.distribution
-            )
-            .unwrap()
-        );
-        assert_ne!(
-            baseline,
-            digest(
-                &[
-                    DigestedAsset::new(
-                        LogicalAssetPath::parse("assets/generated/renamed.bin").unwrap(),
-                        first.digest.clone(),
-                    ),
-                    second.clone(),
-                ],
-                &post.metadata.distribution
-            )
-            .unwrap()
-        );
-        assert_ne!(
-            baseline,
-            digest(
-                &[first.clone(), second.clone()],
-                &distributed.metadata.distribution
-            )
+            digest(&[
+                DigestedAsset::new(
+                    LogicalAssetPath::parse("assets/generated/renamed.bin").unwrap(),
+                    first.digest.clone(),
+                ),
+                second.clone(),
+            ])
             .unwrap()
         );
         assert!(matches!(
-            digest(&[first.clone(), first.clone()], &post.metadata.distribution),
+            digest(&[first.clone(), first.clone()]),
             Err(RevisionIdentityError::DuplicateGeneratedAsset { .. })
         ));
 
-        let digest_with_unreferenced_catalog_asset = |_asset: &AssetDigest| {
-            digest(
-                &[first.clone(), second.clone()],
-                &post.metadata.distribution,
-            )
-            .unwrap()
-        };
+        let digest_with_unreferenced_catalog_asset =
+            |_asset: &AssetDigest| digest(&[first.clone(), second.clone()]).unwrap();
         assert_eq!(
             digest_with_unreferenced_catalog_asset(&digest_asset(b"not referenced")),
             digest_with_unreferenced_catalog_asset(&digest_asset(b"other bytes"))
@@ -1243,7 +1165,6 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                &post.metadata.distribution,
             ))
             .unwrap()
         };
@@ -1294,7 +1215,6 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                &post.metadata.distribution,
             ))
             .unwrap()
         };
@@ -1336,7 +1256,6 @@ name = "Example Author"
             &renderer,
             PreInjectionRenderedArticle::new(b"rendered"),
             &[],
-            &post.metadata.distribution,
         ))
         .unwrap();
         let first = PublishedPostRevision::new(
@@ -1368,7 +1287,7 @@ name = "Example Author"
         assert_eq!(digest(&forward), digest(&reverse));
         assert_eq!(
             digest(&forward).as_str(),
-            "site-b3-v1-22b9b4e6c0dc366a5caee1db553be66da15a9998467a594d6c8354122bbf0815"
+            "site-b3-v1-c63177775acdf7615986bf87ec7a101045fd6ef9a0d2f744163fd6e468c22b83"
         );
 
         let duplicate = [first.clone(), first];
@@ -1395,7 +1314,6 @@ name = "Example Author"
             &post_renderer,
             PreInjectionRenderedArticle::new(b"rendered"),
             &[],
-            &post.metadata.distribution,
         ))
         .unwrap();
         let post_id = PostId::parse("11111111-1111-4111-8111-111111111111").unwrap();
@@ -1484,8 +1402,8 @@ name = "Example Author"
         assert_eq!(
             [disabled.as_str(), enabled.as_str()],
             [
-                "c4dba360b690034c709710aafaee3fc14b80bf4e8bd60096abb967eb146b3e21",
-                "19a3a8b052cf662428758eb328a798871f67e28c1d26b6255dbc3bc5b6c4e0cf",
+                "16fe4131db1b25cbf489838b10bb2c9d6383687a910e393ffc78f44b0c93e9b6",
+                "682305887e35b918ab9f685a3c05b50388d339d67c9109e2bd5a7ec50a4ce056",
             ]
         );
     }
@@ -1516,9 +1434,6 @@ name = "Example Author"
             ),
             PUBLICATION.replace("An example publication.", "A changed publication."),
             PUBLICATION.replace("Example Author", "Changed Author"),
-            format!(
-                "{PUBLICATION}\n[subscriptions]\nenabled = true\nprivacy_policy_revision = \"v2\"\n"
-            ),
         ];
         for source in variants {
             let publication = validate_publication(&source);
@@ -1594,7 +1509,6 @@ name = "Example Author"
                 &post_renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                &changed_post.metadata.distribution,
             )),
             Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
                 target: AssetBindingTarget::Post
@@ -1621,7 +1535,6 @@ name = "Example Author"
                 &post_renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                &changed_image_post.metadata.distribution,
             )),
             Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
                 target: AssetBindingTarget::Post
@@ -1744,7 +1657,6 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                &post.metadata.distribution,
             ))
         };
 
@@ -1831,7 +1743,6 @@ name = "Example Author"
                 &renderer,
                 PreInjectionRenderedArticle::new(b"rendered"),
                 &[],
-                &post.metadata.distribution,
             ))
             .unwrap()
         };

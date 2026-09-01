@@ -150,8 +150,6 @@ plain_text_type!(SiteDescription);
 plain_text_type!(AuthorName);
 plain_text_type!(PostTitle);
 plain_text_type!(PostDescription);
-plain_text_type!(PrivacyPolicyRevision);
-plain_text_type!(DistributionCopy);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error("value must use at most 1024 bytes of lowercase ASCII words separated by single hyphens")]
@@ -330,54 +328,9 @@ pub enum PostTipPolicy {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DistributionMode {
-    Disabled,
-    Enabled,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct XDistributionSettings {
-    pub mode: DistributionMode,
-    pub copy: Option<DistributionCopy>,
-}
-
-impl XDistributionSettings {
-    pub(crate) const fn new(mode: DistributionMode, copy: Option<DistributionCopy>) -> Self {
-        Self { mode, copy }
-    }
-}
-
-impl Default for XDistributionSettings {
-    fn default() -> Self {
-        Self::new(DistributionMode::Disabled, None)
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct DistributionSettings {
-    pub x: XDistributionSettings,
-}
-
-impl DistributionSettings {
-    pub(crate) const fn new(x: XDistributionSettings) -> Self {
-        Self { x }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum DefaultPostTipPolicy {
     Enabled,
     Disabled,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum SubscriptionSettings {
-    Disabled,
-    Enabled {
-        privacy_policy_revision: PrivacyPolicyRevision,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -425,7 +378,6 @@ pub struct PublicationSettings {
     pub site: SiteSettings,
     pub author: AuthorSettings,
     pub assets: PublicationAssetSettings,
-    pub subscriptions: SubscriptionSettings,
     pub tips: DefaultPostTipPolicy,
 }
 
@@ -434,14 +386,12 @@ impl PublicationSettings {
         site: SiteSettings,
         author: AuthorSettings,
         assets: PublicationAssetSettings,
-        subscriptions: SubscriptionSettings,
         tips: DefaultPostTipPolicy,
     ) -> Self {
         Self {
             site,
             author,
             assets,
-            subscriptions,
             tips,
         }
     }
@@ -462,7 +412,6 @@ pub struct PostMetadata {
     pub aliases: Vec<PostAlias>,
     pub draft: DraftStatus,
     pub tips: PostTipPolicy,
-    pub distribution: DistributionSettings,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

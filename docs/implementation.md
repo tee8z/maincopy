@@ -1,8 +1,8 @@
 # Maincopy v1 implementation plan
 
-Status: target delivery plan with open pre-v1 transition gates
+Status: target delivery plan with open design gates
 
-Last updated: 2026-08-31
+Last updated: 2026-09-01
 
 Related documents: [project overview](../README.md), [system design](design.md),
 and [engineering style guide](quality.md).
@@ -23,7 +23,7 @@ and quality conventions.
 
 ## Current implementation audit
 
-This table describes commit `400b885` as reviewed on 2026-08-31. It is not a
+This table describes the implementation reviewed on 2026-09-01. It is not a
 release claim.
 
 | Area | Reviewed status |
@@ -41,7 +41,7 @@ release claim.
 | Profile-backed static Lightning Address tips | Implemented foundation |
 | NixOS module, Litestream, artifact backup, and restore | Planned |
 | Outbound distribution, subscription, and email delivery | Deferred until after v1 |
-| Distribution frontmatter and target-job schema | Superseded code pending removal |
+| Distribution frontmatter and target-job schema | Removed from v1 |
 
 > [!WARNING]
 > Do not expose the loopback admin TCP listener directly. Keep it loopback-only
@@ -547,7 +547,7 @@ A fixed row is binding. Resolve each selection row before its due work starts.
 
 | Decision | Required resolution | Status | Due before |
 | --- | --- | --- | --- |
-| Pre-v1 compatibility | Select reset or migration for pre-v1 databases. Select whether the existing API and digest encodings retain `v1` or receive new versions. Do not claim upgrade compatibility first. | Select | 0.5 |
+| Pre-v1 state | Discard all pre-release databases and bootstrap fresh state. Rewrite baseline migrations in place. Keep `/api/admin/v1` and `*-b3-v1-*` as the first intended product contracts. Add no migration, converter, fallback, or legacy reader. | Fixed | 0.5 |
 | Git metadata | Require the full commit in managed mode. Keep it optional in external checkout mode. Always require the content digest. | Fixed | 1.7 |
 | Managed-source bootstrap | Use offline typed commands that bind no listener. Create the first owner and source settings before the first accepted fetch, compile, public listener, or admin listener. | Fixed | 1.7 and 4.1 |
 | Instance identity | Generate a stable random `InstanceId` during bootstrap. Store it in SQLite and advertise it with the expected public origin through unauthenticated bounded discovery. A restore preserves it. | Fixed | 4.2 |
@@ -824,28 +824,39 @@ Remove superseded experiments before another persistent V1 contract lands.
 
 Deliverables:
 
-- A written decision to reset or migrate every pre-v1 database generation.
-- A written decision for the existing pre-release admin `v1` paths.
-- A written decision for digest encodings that currently bind removed
-  distribution fields.
+- A fixed clean break: every pre-release database is unsupported and must be
+  archived or removed before a fresh bootstrap.
+- Baseline migrations rewritten directly to the V1 schema. The existing
+  checksum preflight rejects an older database before mutation. Maincopy adds
+  no reset, migration, conversion, fallback, or old-schema reader.
+- `/api/admin/v1` and the `*-b3-v1-*` digest encodings retained as the first
+  intended product contracts. Current code recomputes identities without the
+  removed fields; it does not parse or resolve identities from earlier
+  development state.
 - Removal of provider-backed tip configuration, dependencies, runtime tasks,
   and payment modules from the V1 composition root.
 - Removal of provider-specific distribution frontmatter from parsing,
   validation, rendering, and digest transcripts.
-- Removal or explicit migration of `publication_jobs` and other external-target
-  tables.
-- Rejection of subscription configuration until the post-v1 contract starts.
+- Removal of `publication_jobs` and every other external-target table from the
+  rewritten baseline schema.
+- Closed-schema rejection of subscription configuration until the post-v1
+  contract starts.
 - No subscriber table, email outbox, email worker, or subscription route.
-- A stable rejection diagnostic for unsupported pre-v1 state.
-- No compatibility claim before the selected transition tests pass.
+- The existing typed migration-checksum error for an older database and the
+  ordinary stable `unknown_field` content diagnostic for removed authored
+  tables. Do not add legacy-specific inspection or parsing.
 
 Tests:
 
 - Scan the dependency graph, host schema, source tree, migrations, API, and
   OpenAPI document for removed provider and target-job contracts.
-- Prove that the selected database transition is deterministic and fail closed.
-- Prove that old and new digest encodings cannot be confused.
-- Prove that a stale client receives a typed version or compatibility error.
+- Prove that a fresh bootstrap contains no removed table and that an older
+  migration checksum fails before mutation.
+- Prove that `[subscriptions]` and `[distribution.*]` fail with the exact
+  closed-schema field path and `unknown_field` code.
+- Freeze current V1 digest goldens after removing the superseded transcript
+  fields.
+- Prove that the OpenAPI document contains no removed resource or operation.
 - Run the current publication slice after the cleanup without resurrecting a
   removed target or payment contract.
 
@@ -4389,8 +4400,9 @@ V1 is ready for owner approval when all of these statements are true:
 - Litestream restores the SQLite operational ledger. The selected artifact
   backup restores a compatible revision package set. The combined restore
   reproduces current and scheduled previews and public output.
-- The selected pre-v1 reset or migration path has passed its compatibility
-  fixtures. The release notes state which pre-v1 state is retained.
+- Fresh bootstrap is the only supported V1 state transition. Rewritten
+  migration checksums reject older development databases before mutation, and
+  release notes state that no pre-v1 state is retained.
 - The dedicated flake builds the package and NixOS module.
 - The authentication security review has no unresolved critical or high-risk
   finding.

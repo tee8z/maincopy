@@ -1,5 +1,5 @@
--- Canonical publication and target-job state. The application's single writer
--- owns state transitions, optimistic concurrency, and idempotent retries.
+-- Canonical publication state. The application's single writer owns state
+-- transitions, optimistic concurrency, and idempotent retries.
 
 CREATE TABLE canonical_publications (
     publication_id BLOB PRIMARY KEY CHECK (length(publication_id) = 16),
@@ -25,21 +25,4 @@ CREATE TABLE canonical_publications (
         REFERENCES post_revisions (stable_post_id, revision_digest),
     FOREIGN KEY (stable_post_id, current_published_digest)
         REFERENCES post_revisions (stable_post_id, revision_digest)
-) STRICT;
-
-CREATE TABLE publication_jobs (
-    publication_job_id BLOB PRIMARY KEY
-        CHECK (length(publication_job_id) = 16),
-    publication_id BLOB NOT NULL
-        REFERENCES canonical_publications (publication_id),
-    idempotency_key BLOB NOT NULL UNIQUE
-        CHECK (length(idempotency_key) = 16),
-    state TEXT NOT NULL,
-    target TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    scheduled_at_ns INTEGER NOT NULL,
-    payload_version INTEGER NOT NULL,
-    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
-    payload_body TEXT NOT NULL,
-    UNIQUE (publication_id, target)
 ) STRICT;

@@ -427,6 +427,10 @@ where
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the Axum adapter returns a ready response to preserve the stable error envelope"
+)]
 async fn publication_request_id<S>(parts: &mut Parts, state: &S) -> Result<RequestId, Response>
 where
     S: Send + Sync,

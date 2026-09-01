@@ -126,7 +126,7 @@ fn decode_lower_hex<const LENGTH: usize>(encoded: &str) -> Option<[u8; LENGTH]> 
         return None;
     }
     let mut decoded = [0_u8; LENGTH];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = lower_hex_nibble(pair[0])?
             .checked_mul(16)?
             .checked_add(lower_hex_nibble(pair[1])?)?;
@@ -144,7 +144,6 @@ const fn lower_hex_nibble(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use base64::{Engine as _, engine::general_purpose};
     use k256::schnorr::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier as _};
     use serde_json::Value;
 

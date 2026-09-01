@@ -123,8 +123,8 @@ pub struct PublishNowRequest {
     pub preview_digest: PreviewDigest,
     /// Exact revision precondition for the approval.
     ///
-    /// This remains optional on the wire for compatibility with the initial
-    /// immediate-publication contract. Approval of an update requires it.
+    /// A first publication can omit this precondition. Approval of an update
+    /// requires it.
     pub expected_revision: Option<Box<str>>,
     /// Requested publication time. Omission requests immediate publication.
     #[serde(
@@ -137,12 +137,11 @@ pub struct PublishNowRequest {
 }
 
 /// Durable state reached by a publication approval command.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationApprovalState {
     Scheduled,
-    #[default]
     Published,
 }
 
@@ -159,7 +158,6 @@ pub struct PublishNowResponse {
     #[cfg_attr(feature = "schema", schema(pattern = r"^post-b3-v1-[0-9a-f]{64}$"))]
     pub revision: Box<str>,
     /// Whether the pinned revision is waiting for its time or is already public.
-    #[serde(default)]
     pub state: PublicationApprovalState,
     /// Requested publication time when the approval was scheduled.
     #[serde(
@@ -479,17 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_immediate_response_defaults_to_published() {
-        let mut value = published_response_value();
-        value.as_object_mut().unwrap().remove("state");
-
-        let response = serde_json::from_value::<PublishNowResponse>(value).unwrap();
-        assert_eq!(response.state, PublicationApprovalState::Published);
-        assert_eq!(response.scheduled_for, None);
-        assert_eq!(response.published_at, Some(OffsetDateTime::UNIX_EPOCH));
-    }
-
-    #[test]
     fn approval_states_have_stable_wire_names() {
         for (state, name) in [
             (PublicationApprovalState::Scheduled, "scheduled"),
@@ -527,5 +514,10 @@ mod tests {
             let error = serde_json::from_value::<PublishNowResponse>(value).unwrap_err();
             assert!(error.to_string().contains(field), "{field}: {error}");
         }
+
+        let mut missing_state = published_response_value();
+        missing_state.as_object_mut().unwrap().remove("state");
+        let error = serde_json::from_value::<PublishNowResponse>(missing_state).unwrap_err();
+        assert!(error.to_string().contains("state"), "{error}");
     }
 }

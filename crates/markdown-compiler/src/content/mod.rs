@@ -18,16 +18,14 @@ pub use identity::{
 };
 
 pub use model::{
-    AuthorName, AuthorSettings, DefaultPostTipPolicy, DistributionCopy, DistributionMode,
-    DistributionSettings, DraftStatus, LogicalContentPath, MarkdownSource, PlainTextError,
-    PostAlias, PostCollection, PostDescription, PostDocument, PostId, PostIdParseError,
-    PostMetadata, PostSlug, PostTag, PostTipPolicy, PostTitle, PrivacyPolicyRevision,
+    AuthorName, AuthorSettings, DefaultPostTipPolicy, DraftStatus, LogicalContentPath,
+    MarkdownSource, PlainTextError, PostAlias, PostCollection, PostDescription, PostDocument,
+    PostId, PostIdParseError, PostMetadata, PostSlug, PostTag, PostTipPolicy, PostTitle,
     PublicationAssetSettings, PublicationBaseUrl, PublicationBaseUrlError, PublicationSettings,
-    RouteValueError, SiteDescription, SiteSettings, SiteTitle, SubscriptionSettings,
-    UnresolvedAssetReference, UnresolvedHttpsOrigin, ValidatedContent, XDistributionSettings,
+    RouteValueError, SiteDescription, SiteSettings, SiteTitle, UnresolvedAssetReference,
+    UnresolvedHttpsOrigin, ValidatedContent,
 };
 pub use path::{LogicalAssetPath, LogicalTreePathError};
 pub(crate) use rules::{
-    RouteConflict, RouteKind, classify_route_conflict, resolve_draft_status, subscription_settings,
-    timestamps_are_ordered,
+    RouteConflict, RouteKind, classify_route_conflict, resolve_draft_status, timestamps_are_ordered,
 };

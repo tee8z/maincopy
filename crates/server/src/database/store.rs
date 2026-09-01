@@ -14,10 +14,9 @@ use crate::domain::profile::store::{
 };
 use crate::domain::publication::store::{
     BeginPublishNow, BeginPublishNowResult, BeginScheduledActivation,
-    BeginScheduledActivationResult, CreateTargetJob, CreateTargetJobResult, FinishPublication,
-    FinishPublicationResult, IndexContentCatalog, IndexContentCatalogResult,
-    InstallStartupSnapshot, InstallStartupSnapshotResult, PublicationStore, SchedulePublication,
-    SchedulePublicationResult,
+    BeginScheduledActivationResult, FinishPublication, FinishPublicationResult,
+    IndexContentCatalog, IndexContentCatalogResult, InstallStartupSnapshot,
+    InstallStartupSnapshotResult, PublicationStore, SchedulePublication, SchedulePublicationResult,
 };
 
 /// The server-facing database capability.
@@ -117,10 +116,6 @@ pub(crate) enum Mutation {
     IndexContentCatalog {
         command: IndexContentCatalog,
         respond_to: oneshot::Sender<IndexContentCatalogResult>,
-    },
-    CreateTargetJob {
-        command: CreateTargetJob,
-        respond_to: oneshot::Sender<CreateTargetJobResult>,
     },
     BeginPublishNow {
         command: BeginPublishNow,

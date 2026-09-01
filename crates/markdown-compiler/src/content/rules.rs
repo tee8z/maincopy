@@ -1,6 +1,6 @@
 use time::OffsetDateTime;
 
-use super::{DraftStatus, PostCollection, PrivacyPolicyRevision, SubscriptionSettings};
+use super::{DraftStatus, PostCollection};
 
 pub(crate) fn timestamps_are_ordered(
     authored_at: OffsetDateTime,
@@ -37,20 +37,6 @@ pub(crate) const fn resolve_draft_status(
             conflicts_with_collection: false,
         },
     }
-}
-
-pub(crate) fn subscription_settings(
-    enabled: bool,
-    privacy_policy_revision: Option<PrivacyPolicyRevision>,
-) -> Result<SubscriptionSettings, ()> {
-    if !enabled {
-        return Ok(SubscriptionSettings::Disabled);
-    }
-    privacy_policy_revision
-        .map(|privacy_policy_revision| SubscriptionSettings::Enabled {
-            privacy_policy_revision,
-        })
-        .ok_or(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

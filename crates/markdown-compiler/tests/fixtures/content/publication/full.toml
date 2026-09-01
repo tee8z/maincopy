@@ -10,9 +10,5 @@ name = "Example Author"
 [assets]
 allowed_https_origins = ["https://cdn.example.com"]
 
-[subscriptions]
-enabled = true
-privacy_policy_revision = "2026-08-29"
-
 [tips]
 enabled = true

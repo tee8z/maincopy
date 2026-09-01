@@ -48,7 +48,6 @@ fn render_markdown_with_limits(
         &identity,
         rendered.article.identity_html.as_bytes(),
         &generated_identities,
-        &document.metadata.distribution,
     )
     .map_err(|error| identity_error(document, error))?;
 

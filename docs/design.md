@@ -2,7 +2,7 @@
 
 Status: target architecture; implementation is incomplete
 
-Last reviewed: 2026-08-31
+Last reviewed: 2026-09-01
 
 Related documents: [project overview](../README.md),
 [implementation plan](implementation.md), and
@@ -581,27 +581,24 @@ HTTPS gateway and Litestream as separate, least-privilege processes.
 The Nix flake provides packages, applications, checks, a development shell,
 and a formatter. The NixOS module is a V1 release requirement.
 
-## Pre-v1 compatibility transition
+## Pre-v1 state boundary
 
-The current source still contains superseded subscription fields,
-distribution frontmatter, and target-job schema work. These features are not
-part of the V1 contract.
+Maincopy has no deployed or supported database state. Every database created
+before V1 is disposable development state. An operator must archive or remove
+it and bootstrap a fresh database. Maincopy does not reset, migrate, convert,
+or read that state. Rewritten embedded migrations cause the existing checksum
+preflight to reject an older database before mutation.
 
-Before the next persistent contract lands, the project must select these
-transition rules:
-
-- reset or migrate pre-v1 databases;
-- retain or replace the pre-release admin `v1` paths; and
-- retain or version existing post-digest encodings.
-
-Until those choices are fixed, pre-v1 databases and API responses have no
-upgrade guarantee.
+The `/api/admin/v1` paths and `*-b3-v1-*` digest encodings are the first
+intended product contracts. Earlier development builds do not create a
+compatibility obligation. Current code recomputes all identities into fresh
+V1 state; it has no old-schema reader, old-transcript parser, fallback, or
+compatibility transport.
 
 ## Open design selections
 
 These selections must finish before their owning work starts:
 
-- pre-v1 database, API, and digest transition policy;
 - revision-artifact backup and retention implementation;
 - production HTTPS admin gateway;
 - Mermaid renderer and SVG sanitizer;

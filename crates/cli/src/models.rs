@@ -146,8 +146,6 @@ fn parse_utc_rfc3339(value: &str) -> Result<OffsetDateTime, String> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser as _;
-
     use super::*;
 
     const PREVIEW_DIGEST: &str =

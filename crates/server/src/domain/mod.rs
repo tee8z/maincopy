@@ -5,6 +5,5 @@
 //! modules provide shared mechanisms and compose the domain adapters.
 
 pub(crate) mod auth;
-pub mod distribution;
 pub(crate) mod profile;
 pub mod publication;

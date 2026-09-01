@@ -37,7 +37,7 @@ impl ContentTreeDigest {
             return Err(ContentTreeDigestParseError::InvalidLength);
         }
         let mut bytes = [0_u8; 32];
-        for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let high =
                 decode_nibble(pair[0]).ok_or(ContentTreeDigestParseError::InvalidEncoding)?;
             let low = decode_nibble(pair[1]).ok_or(ContentTreeDigestParseError::InvalidEncoding)?;
