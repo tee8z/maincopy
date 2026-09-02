@@ -15,13 +15,16 @@ use axum::{
 use markdown_compiler::{PostSlug, PostTag};
 use serde::de::DeserializeOwned;
 
+use super::RSS_FEED_PATH;
 use crate::{
     frontend_assets::{FrontendAssetName, FrontendBundleDigest, IMMUTABLE_CACHE_CONTROL},
     render::{SiteSnapshot, SiteSnapshotReader},
 };
 
 const HTML_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("text/html; charset=utf-8");
-const HTML_CACHE_POLICY: HeaderValue = HeaderValue::from_static("no-cache");
+const REVALIDATE_CACHE_POLICY: HeaderValue = HeaderValue::from_static("no-cache");
+const RSS_CONTENT_TYPE: HeaderValue =
+    HeaderValue::from_static("application/rss+xml; charset=utf-8");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 
 /// Builds the publication-specific portion of the public HTTP API.
@@ -31,6 +34,7 @@ pub(crate) fn router(snapshots: SiteSnapshotReader) -> Router {
         .route("/posts/{slug}", get(post))
         .route("/tags/{tag}", get(tag))
         .route("/archive", get(archive))
+        .route(RSS_FEED_PATH, get(feed))
         .route("/app-assets/{digest}/{name}", get(application_asset))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -130,6 +134,31 @@ async fn archive(PublicRequest { snapshot, headers }: PublicRequest) -> Response
     html_response(StatusCode::OK, snapshot.archive_page(), &snapshot, &headers)
 }
 
+async fn feed(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
+    let Ok(etag) = HeaderValue::from_str(&format!("\"{}\"", snapshot.feed.digest)) else {
+        return internal_error_response();
+    };
+    if if_none_match(&headers, &etag) {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        let headers = response.headers_mut();
+        headers.insert(CACHE_CONTROL, REVALIDATE_CACHE_POLICY);
+        headers.insert(ETAG, etag);
+        headers.insert("x-content-type-options", NOSNIFF);
+        return response;
+    }
+
+    let body = Arc::clone(&snapshot.feed.body);
+    let mut response = Response::new(Body::from(Bytes::from_owner(ArcStrBodyOwner(body))));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, RSS_CONTENT_TYPE);
+    headers.insert(CACHE_CONTROL, REVALIDATE_CACHE_POLICY);
+    headers.insert(ETAG, etag);
+    headers.insert("x-content-type-options", NOSNIFF);
+    response
+}
+
 async fn application_asset(
     PublicPath {
         snapshot,
@@ -186,9 +215,9 @@ fn not_found_response(snapshot: &SiteSnapshot, headers: &HeaderMap) -> Response 
     )
 }
 
-struct HtmlBodyOwner(Arc<str>);
+struct ArcStrBodyOwner(Arc<str>);
 
-impl AsRef<[u8]> for HtmlBodyOwner {
+impl AsRef<[u8]> for ArcStrBodyOwner {
     fn as_ref(&self) -> &[u8] {
         self.0.as_bytes()
     }
@@ -209,18 +238,18 @@ fn html_response(
         response.headers_mut().insert(ETAG, etag);
         response
             .headers_mut()
-            .insert(CACHE_CONTROL, HTML_CACHE_POLICY);
+            .insert(CACHE_CONTROL, REVALIDATE_CACHE_POLICY);
         return response;
     }
 
-    let mut response = Response::new(Body::from(Bytes::from_owner(HtmlBodyOwner(html))));
+    let mut response = Response::new(Body::from(Bytes::from_owner(ArcStrBodyOwner(html))));
     *response.status_mut() = status;
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HTML_CONTENT_TYPE);
     response
         .headers_mut()
-        .insert(CACHE_CONTROL, HTML_CACHE_POLICY);
+        .insert(CACHE_CONTROL, REVALIDATE_CACHE_POLICY);
     response.headers_mut().insert(ETAG, etag);
     response
 }
@@ -360,7 +389,7 @@ mod tests {
         response
             .headers()
             .get(ETAG)
-            .expect("rendered HTML must carry an ETag")
+            .expect("snapshot response must carry an ETag")
             .clone()
     }
 
@@ -384,6 +413,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rss_feed_is_snapshot_backed_and_discoverable() {
+        let response = get("/feed.xml").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&RSS_CONTENT_TYPE)
+        );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&REVALIDATE_CACHE_POLICY)
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&NOSNIFF)
+        );
+        let current = etag(&response);
+        assert!(current.to_str().unwrap().starts_with("\"feed-b3-v1-"));
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(body.contains("<title>Maincopy Example</title>"));
+        assert!(body.contains("<link>https://example.test/</link>"));
+        assert!(body.contains("href=\"https://example.test/feed.xml\""));
+        assert!(body.contains("<link>https://example.test/posts/hello-maincopy</link>"));
+        assert!(
+            body.contains(
+                "<guid isPermaLink=\"false\">1dd7559b-90a9-4c5b-a13c-70bf6ec01e92</guid>"
+            )
+        );
+        assert!(body.contains("<pubDate>Thu, 01 Jan 1970 00:33:20 +0000</pubDate>"));
+        assert!(!body.contains("not-published"));
+        assert!(!body.contains("This repository is the canonical source"));
+
+        let index = String::from_utf8(
+            to_bytes(get("/").await.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(index.contains(
+            "<link rel=\"alternate\" type=\"application/rss+xml\" title=\"Maincopy Example RSS feed\" href=\"https://example.test/feed.xml\">"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rss_head_and_conditional_reads_preserve_feed_headers() {
+        let current = etag(&get("/feed.xml").await);
+
+        let head = request(Method::HEAD, "/feed.xml", &[]).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers().get(CONTENT_TYPE), Some(&RSS_CONTENT_TYPE));
+        assert_eq!(
+            head.headers().get(CACHE_CONTROL),
+            Some(&REVALIDATE_CACHE_POLICY)
+        );
+        assert_eq!(head.headers().get(ETAG), Some(&current));
+        assert_eq!(head.headers().get("x-content-type-options"), Some(&NOSNIFF));
+        assert!(
+            to_bytes(head.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let conditional = request(Method::GET, "/feed.xml", std::slice::from_ref(&current)).await;
+        assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            conditional.headers().get(CACHE_CONTROL),
+            Some(&REVALIDATE_CACHE_POLICY)
+        );
+        assert_eq!(conditional.headers().get(ETAG), Some(&current));
+        assert_eq!(
+            conditional.headers().get("x-content-type-options"),
+            Some(&NOSNIFF)
+        );
+        assert!(conditional.headers().get(CONTENT_TYPE).is_none());
+        assert!(
+            to_bytes(conditional.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_path_parameters_use_the_snapshot_backed_not_found_page() {
         let expected = get("/not-found").await;
         let expected_etag = etag(&expected);
@@ -403,7 +523,7 @@ mod tests {
             );
             assert_eq!(
                 response.headers().get(CACHE_CONTROL),
-                Some(&HTML_CACHE_POLICY)
+                Some(&REVALIDATE_CACHE_POLICY)
             );
             assert_eq!(response.headers().get(ETAG), Some(&expected_etag));
             assert_eq!(
@@ -422,7 +542,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{path}");
             assert_eq!(
                 response.headers().get(CACHE_CONTROL),
-                Some(&HTML_CACHE_POLICY)
+                Some(&REVALIDATE_CACHE_POLICY)
             );
             assert_eq!(
                 response.headers().get(CONTENT_TYPE),
@@ -460,7 +580,7 @@ mod tests {
                 assert_eq!(response.headers().get(ETAG), Some(&current));
                 assert_eq!(
                     response.headers().get(CACHE_CONTROL),
-                    Some(&HTML_CACHE_POLICY)
+                    Some(&REVALIDATE_CACHE_POLICY)
                 );
                 assert!(response.headers().get(CONTENT_TYPE).is_none());
                 assert!(
@@ -503,7 +623,7 @@ mod tests {
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             not_found.headers().get(CACHE_CONTROL),
-            Some(&HTML_CACHE_POLICY)
+            Some(&REVALIDATE_CACHE_POLICY)
         );
         assert_eq!(
             not_found.headers().get(CONTENT_TYPE),
@@ -526,7 +646,7 @@ mod tests {
         assert_eq!(etag(&method_not_allowed), current);
         assert_eq!(
             method_not_allowed.headers().get(CACHE_CONTROL),
-            Some(&HTML_CACHE_POLICY)
+            Some(&REVALIDATE_CACHE_POLICY)
         );
         assert_eq!(
             method_not_allowed.headers().get(CONTENT_TYPE),

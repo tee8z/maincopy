@@ -27,6 +27,7 @@ use crate::domain::publication::{
 };
 use crate::frontend_assets::FrontendAssetManifest;
 
+use super::rss::{RenderedRssFeed, RssItem, RssRenderError, render_rss};
 use super::{ContentCatalog, GeneratedPostAsset, RenderedPost, SnapshotAssetPath};
 
 const MAX_PAGE_BYTES: usize = 40 * 1024 * 1024;
@@ -107,6 +108,7 @@ pub struct RenderedSiteShell {
     posts: Arc<[PublicPostView]>,
     chronology: Arc<[usize]>,
     tags: BTreeMap<PostTag, Arc<[usize]>>,
+    feed: RenderedRssFeed,
     pre_injection_output: SiteShellOutputDigest,
     tip_recipient: Option<TipRecipientProjection>,
 }
@@ -118,6 +120,7 @@ impl fmt::Debug for RenderedSiteShell {
             .field("ledger_entries", &self.ledger.len())
             .field("posts", &self.posts.len())
             .field("tags", &self.tags.len())
+            .field("feed_digest", &self.feed.digest)
             .finish_non_exhaustive()
     }
 }
@@ -134,10 +137,17 @@ pub fn render_site_shell(
     let chronology = chronology(&posts);
     let tags = tag_index(&posts, &chronology);
     validate_route_count(posts.len(), tags.len())?;
+    let feed = render_public_feed(&catalog.publication, &posts, &chronology)?;
 
     let renderer = SiteShellRendererIdentity::new(*frontend.bundle_digest.as_bytes());
-    let pre_injection_output =
-        render_pre_injection_shell(&catalog.publication, frontend, &posts, &chronology, &tags)?;
+    let pre_injection_output = render_pre_injection_shell(
+        &catalog.publication,
+        frontend,
+        &posts,
+        &chronology,
+        &tags,
+        &feed,
+    )?;
 
     Ok(RenderedSiteShell {
         catalog,
@@ -147,6 +157,7 @@ pub fn render_site_shell(
         posts: posts.into(),
         chronology: chronology.into(),
         tags,
+        feed,
         pre_injection_output,
         tip_recipient: None,
     })
@@ -349,10 +360,33 @@ fn tag_index(posts: &[PublicPostView], chronology: &[usize]) -> BTreeMap<PostTag
         .collect()
 }
 
+fn render_public_feed(
+    publication: &PublicationSettings,
+    posts: &[PublicPostView],
+    chronology: &[usize],
+) -> Result<RenderedRssFeed, SiteSnapshotBuildError> {
+    let feed_url = CanonicalSiteUrl::for_path(&publication.site.base_url, &PublicPagePath::feed());
+    render_rss(
+        publication,
+        &feed_url,
+        chronology.iter().map(|index| {
+            let post = &posts[*index];
+            RssItem {
+                post_id: &post.post_id,
+                title: &post.title,
+                description: &post.description,
+                canonical_url: &post.canonical_url,
+                published_at: post.published_at,
+            }
+        }),
+    )
+    .map_err(SiteSnapshotBuildError::rss)
+}
+
 fn validate_route_count(posts: usize, tags: usize) -> Result<(), SiteSnapshotBuildError> {
     let routes = posts
         .checked_add(tags)
-        .and_then(|count| count.checked_add(4))
+        .and_then(|count| count.checked_add(5))
         .ok_or_else(SiteSnapshotBuildError::route_limit)?;
     if routes > MAX_PUBLIC_ROUTES {
         return Err(SiteSnapshotBuildError::route_limit());
@@ -366,10 +400,12 @@ fn render_pre_injection_shell(
     posts: &[PublicPostView],
     chronology: &[usize],
     tags: &BTreeMap<PostTag, Arc<[usize]>>,
+    feed: &RenderedRssFeed,
 ) -> Result<SiteShellOutputDigest, SiteSnapshotBuildError> {
     let mut pages = BTreeMap::new();
     pages.insert(PublicPagePath::index(), PreInjectionPage::Index);
     pages.insert(PublicPagePath::archive(), PreInjectionPage::Archive);
+    pages.insert(PublicPagePath::feed(), PreInjectionPage::Feed);
     for (index, post) in posts.iter().enumerate() {
         pages.insert(post.public_path(), PreInjectionPage::Post(index));
     }
@@ -388,44 +424,77 @@ fn render_pre_injection_shell(
     let mut retained = RetainedHtmlBudget::new();
     let mut hasher = SiteShellOutputHasher::new(pages.len());
     for (path, page) in pages {
-        let page = match page {
-            PreInjectionPage::Index => {
-                render_index(publication, frontend, posts, chronology).into_string()
+        match page {
+            PreInjectionPage::Index => hash_pre_injection_html(
+                &mut hasher,
+                &mut retained,
+                &path,
+                render_index(publication, frontend, posts, chronology).into_string(),
+            ),
+            PreInjectionPage::Archive => hash_pre_injection_html(
+                &mut hasher,
+                &mut retained,
+                &path,
+                render_archive(publication, frontend, posts, chronology).into_string(),
+            ),
+            PreInjectionPage::Feed => {
+                hasher.page(path.as_str(), feed.body.as_bytes());
+                Ok(())
             }
-            PreInjectionPage::Archive => {
-                render_archive(publication, frontend, posts, chronology).into_string()
-            }
-            PreInjectionPage::Post(index) => render_post(
-                publication,
-                frontend,
-                PostPageView::from_public(&posts[index]),
-                ArticleBody::Omitted,
-                None,
-            )
-            .into_string(),
-            PreInjectionPage::Tag(tag) => render_tag(
-                publication,
-                frontend,
-                tag,
-                posts,
-                tags.get(tag).map_or(&[], Arc::as_ref),
-            )
-            .into_string(),
-            PreInjectionPage::Error(error) => {
-                render_error(publication, frontend, error).into_string()
-            }
-        };
-        validate_page_size(page.len())?;
-        retained.add(page.len())?;
-        hasher.page(path.as_str(), page.as_bytes());
+            PreInjectionPage::Post(index) => hash_pre_injection_html(
+                &mut hasher,
+                &mut retained,
+                &path,
+                render_post(
+                    publication,
+                    frontend,
+                    PostPageView::from_public(&posts[index]),
+                    ArticleBody::Omitted,
+                    None,
+                )
+                .into_string(),
+            ),
+            PreInjectionPage::Tag(tag) => hash_pre_injection_html(
+                &mut hasher,
+                &mut retained,
+                &path,
+                render_tag(
+                    publication,
+                    frontend,
+                    tag,
+                    posts,
+                    tags.get(tag).map_or(&[], Arc::as_ref),
+                )
+                .into_string(),
+            ),
+            PreInjectionPage::Error(error) => hash_pre_injection_html(
+                &mut hasher,
+                &mut retained,
+                &path,
+                render_error(publication, frontend, error).into_string(),
+            ),
+        }?;
     }
     Ok(hasher.finish())
+}
+
+fn hash_pre_injection_html(
+    hasher: &mut SiteShellOutputHasher,
+    retained: &mut RetainedHtmlBudget,
+    path: &PublicPagePath,
+    html: String,
+) -> Result<(), SiteSnapshotBuildError> {
+    validate_page_size(html.len())?;
+    retained.add(html.len())?;
+    hasher.page(path.as_str(), html.as_bytes());
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
 enum PreInjectionPage<'view> {
     Index,
     Archive,
+    Feed,
     Post(usize),
     Tag(&'view PostTag),
     Error(PublicErrorPage),
@@ -475,12 +544,14 @@ pub fn build_site_snapshot(
         PublicErrorPage::MethodNotAllowed,
         &mut retained,
     )?;
+    let feed = shell.feed.clone();
     let assets = collect_public_assets(&shell, &digest)?;
-    let presentation_digest = presentation_digest(&pages, &not_found, &method_not_allowed);
+    let presentation_digest = presentation_digest(&pages, &not_found, &method_not_allowed, &feed);
 
     Ok(SiteSnapshot {
         digest,
         presentation_digest,
+        feed,
         pages,
         not_found,
         method_not_allowed,
@@ -853,6 +924,7 @@ fn presentation_digest(
     pages: &BTreeMap<PageRoute, RenderedPage>,
     not_found: &RenderedPage,
     method_not_allowed: &RenderedPage,
+    feed: &RenderedRssFeed,
 ) -> PresentationDigest {
     let mut hasher = blake3::Hasher::new_derive_key("maincopy presentation snapshot v1");
     hash_presentation_part(&mut hasher, &(pages.len() as u64).to_be_bytes());
@@ -864,6 +936,8 @@ fn presentation_digest(
     hash_presentation_part(&mut hasher, not_found.html.as_bytes());
     hash_presentation_part(&mut hasher, b"method-not-allowed");
     hash_presentation_part(&mut hasher, method_not_allowed.html.as_bytes());
+    hash_presentation_part(&mut hasher, PublicPagePath::feed().as_str().as_bytes());
+    hash_presentation_part(&mut hasher, feed.body.as_bytes());
     PresentationDigest(*hasher.finalize().as_bytes())
 }
 
@@ -883,6 +957,7 @@ pub struct SnapshotPublicAsset {
 pub struct SiteSnapshot {
     pub(crate) digest: SiteSnapshotDigest,
     pub(crate) presentation_digest: PresentationDigest,
+    pub(crate) feed: RenderedRssFeed,
     pages: BTreeMap<PageRoute, RenderedPage>,
     not_found: RenderedPage,
     method_not_allowed: RenderedPage,
@@ -897,6 +972,7 @@ impl fmt::Debug for SiteSnapshot {
             .debug_struct("SiteSnapshot")
             .field("digest", &self.digest)
             .field("presentation_digest", &self.presentation_digest)
+            .field("feed_digest", &self.feed.digest)
             .field("pages", &self.pages.len())
             .field("assets", &self.assets.len())
             .field("retained_html_bytes", &self.retained_html_bytes)
@@ -1040,6 +1116,7 @@ pub enum SiteSnapshotBuildErrorCode {
     AssetUnavailable,
     AssetCollision,
     ArticleProjectionFailed,
+    RssRenderFailed,
     QrCodeGenerationFailed,
     IdentityRejected,
 }
@@ -1094,6 +1171,19 @@ impl SiteSnapshotBuildError {
             SiteSnapshotBuildErrorCode::QrCodeGenerationFailed,
             None,
             message,
+        )
+    }
+
+    fn rss(error: RssRenderError) -> Self {
+        let post_id = match &error {
+            RssRenderError::IllegalXmlCharacter { post_id, .. } => post_id.clone(),
+            RssRenderError::PublishedAtNotRepresentable { post_id, .. } => Some(post_id.clone()),
+            RssRenderError::OutputTooLarge { .. } | RssRenderError::InvalidUtf8(_) => None,
+        };
+        Self::new(
+            SiteSnapshotBuildErrorCode::RssRenderFailed,
+            post_id,
+            error.to_string(),
         )
     }
 
@@ -1415,6 +1505,8 @@ fn render_layout(
     content: Markup,
 ) -> Markup {
     let site = &publication.site;
+    let feed_url = CanonicalSiteUrl::for_path(&site.base_url, &PublicPagePath::feed());
+    let feed_title = format!("{} RSS feed", site.title.as_str());
     let full_title = if page_title == site.title.as_str() {
         page_title.to_owned()
     } else {
@@ -1428,6 +1520,8 @@ fn render_layout(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="description" content=(site.description.as_str());
                 title { (full_title) }
+                link rel="alternate" type="application/rss+xml"
+                    title=(feed_title) href=(feed_url.as_str());
                 link rel="stylesheet" href=(frontend.css.public_path);
                 @if let Some(javascript) = &frontend.javascript {
                     script src=(javascript.public_path) defer {}
@@ -1977,6 +2071,33 @@ mod tests {
         );
         assert!(!snapshot.index_page().contains("Second post"));
         assert!(!snapshot.index_page().contains("Draft post"));
+        assert!(snapshot.feed.body.contains(FIRST_ID));
+        assert!(
+            snapshot
+                .feed
+                .body
+                .contains("https://blog.example.com/posts/first-post")
+        );
+        assert!(!snapshot.feed.body.contains(SECOND_ID));
+        assert!(!snapshot.feed.body.contains(DRAFT_ID));
+    }
+
+    #[test]
+    fn rss_failure_rejects_the_candidate_without_changing_the_active_snapshot() {
+        let valid = fixture();
+        let ledger = projection([entry(&valid, FIRST_ID, 2_000)]);
+        let active = build_snapshot(&valid, &ledger).unwrap();
+        let (reader, _activator) = snapshot_store(active);
+        let before = reader.load_full();
+
+        let mut invalid = fixture();
+        Arc::make_mut(&mut invalid.catalog).publication.site.title =
+            markdown_compiler::SiteTitle::new("Invalid RSS \u{fffe}").unwrap();
+        let error = build_snapshot(&invalid, &ledger).unwrap_err();
+
+        assert_eq!(error.code, SiteSnapshotBuildErrorCode::RssRenderFailed);
+        assert_eq!(error.post_id, None);
+        assert!(Arc::ptr_eq(&before, &reader.load_full()));
     }
 
     #[test]
@@ -2121,6 +2242,10 @@ mod tests {
         let snapshot = build_snapshot(&fixture, &ledger).unwrap();
         let index = snapshot.index_page();
         assert!(index.find("Second post").unwrap() < index.find("First &lt;script&gt;").unwrap());
+        assert!(
+            snapshot.feed.body.find(SECOND_ID).unwrap()
+                < snapshot.feed.body.find(FIRST_ID).unwrap()
+        );
 
         let reversed = projection([
             entry(&fixture, SECOND_ID, 2_000),
@@ -2129,6 +2254,51 @@ mod tests {
         let rebuilt = build_snapshot(&fixture, &reversed).unwrap();
         assert_eq!(snapshot.digest, rebuilt.digest);
         assert_eq!(snapshot.index_page(), rebuilt.index_page());
+        assert_eq!(snapshot.feed.body, rebuilt.feed.body);
+        assert_eq!(snapshot.feed.digest, rebuilt.feed.digest);
+
+        let tied = projection([
+            entry(&fixture, SECOND_ID, 3_000),
+            entry(&fixture, FIRST_ID, 3_000),
+        ]);
+        let tied = build_snapshot(&fixture, &tied).unwrap();
+        assert!(
+            tied.index_page().find("First &lt;script&gt;").unwrap()
+                < tied.index_page().find("Second post").unwrap()
+        );
+        assert!(tied.feed.body.find(FIRST_ID).unwrap() < tied.feed.body.find(SECOND_ID).unwrap());
+    }
+
+    #[test]
+    fn site_shell_identity_binds_the_exact_feed_representation() {
+        let fixture = fixture();
+        let ledger = projection([entry(&fixture, FIRST_ID, 2_000)]);
+        let posts = select_public_posts(&fixture.catalog, &ledger).unwrap();
+        let chronology = chronology(&posts);
+        let tags = tag_index(&posts, &chronology);
+        let feed = render_public_feed(&fixture.catalog.publication, &posts, &chronology).unwrap();
+        let original = render_pre_injection_shell(
+            &fixture.catalog.publication,
+            embedded_manifest(),
+            &posts,
+            &chronology,
+            &tags,
+            &feed,
+        )
+        .unwrap();
+        let mut changed = feed.clone();
+        changed.body = format!("{}\n", feed.body).into();
+        let changed = render_pre_injection_shell(
+            &fixture.catalog.publication,
+            embedded_manifest(),
+            &posts,
+            &chronology,
+            &tags,
+            &changed,
+        )
+        .unwrap();
+
+        assert_ne!(original, changed);
     }
 
     #[test]
@@ -2139,6 +2309,8 @@ mod tests {
         let old = build_snapshot(&fixture, &ledger).unwrap();
         let content_digest = old.digest.clone();
         let old_presentation = old.presentation_digest;
+        let old_feed_body = Arc::clone(&old.feed.body);
+        let old_feed_digest = old.feed.digest;
         let revision = fixture.revisions[&post_id].clone();
         let mut next = build_snapshot(&fixture, &ledger).unwrap();
         let projection = tip_projection(Some("Alice"), "alice@example.com");
@@ -2150,12 +2322,18 @@ mod tests {
         let mut html = page.html.to_string();
         html.push_str(&render_tip_cta(&handoff).into_string());
         page.html = html.into();
-        next.presentation_digest =
-            presentation_digest(&next.pages, &next.not_found, &next.method_not_allowed);
+        next.presentation_digest = presentation_digest(
+            &next.pages,
+            &next.not_found,
+            &next.method_not_allowed,
+            &next.feed,
+        );
 
         assert_eq!(next.digest, content_digest);
         assert_eq!(fixture.revisions[&post_id], revision);
         assert_ne!(next.presentation_digest, old_presentation);
+        assert_eq!(next.feed.body, old_feed_body);
+        assert_eq!(next.feed.digest, old_feed_digest);
 
         let (reader, mut activator) = snapshot_store(old);
         assert_eq!(
@@ -2209,9 +2387,9 @@ mod tests {
             validate_page_size(MAX_PAGE_BYTES + 1).unwrap_err().code,
             SiteSnapshotBuildErrorCode::PageLimitExceeded
         );
-        assert!(validate_route_count(MAX_PUBLIC_ROUTES - 4, 0).is_ok());
+        assert!(validate_route_count(MAX_PUBLIC_ROUTES - 5, 0).is_ok());
         assert_eq!(
-            validate_route_count(MAX_PUBLIC_ROUTES - 3, 0)
+            validate_route_count(MAX_PUBLIC_ROUTES - 4, 0)
                 .unwrap_err()
                 .code,
             SiteSnapshotBuildErrorCode::RouteLimitExceeded
@@ -2259,12 +2437,14 @@ mod tests {
                                 .post_page(&PostSlug::parse("first-post").unwrap())
                                 .is_none()
                         );
+                        assert!(!observed.feed.body.contains(FIRST_ID));
                     } else if observed.digest == new_digest {
                         assert!(
                             observed
                                 .post_page(&PostSlug::parse("first-post").unwrap())
                                 .is_some()
                         );
+                        assert!(observed.feed.body.contains(FIRST_ID));
                     } else {
                         panic!("reader observed an unknown snapshot");
                     }
@@ -2324,6 +2504,8 @@ mod tests {
             SiteSnapshotBuildErrorCode::AssetUnavailable,
             SiteSnapshotBuildErrorCode::AssetCollision,
             SiteSnapshotBuildErrorCode::ArticleProjectionFailed,
+            SiteSnapshotBuildErrorCode::RssRenderFailed,
+            SiteSnapshotBuildErrorCode::QrCodeGenerationFailed,
             SiteSnapshotBuildErrorCode::IdentityRejected,
         ];
         let names = [
@@ -2340,6 +2522,8 @@ mod tests {
             "asset_unavailable",
             "asset_collision",
             "article_projection_failed",
+            "rss_render_failed",
+            "qr_code_generation_failed",
             "identity_rejected",
         ];
         for (code, name) in build_codes.into_iter().zip(names) {

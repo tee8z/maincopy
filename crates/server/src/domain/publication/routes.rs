@@ -3,6 +3,8 @@ use std::fmt;
 use markdown_compiler::{PostSlug, PostTag, PublicationBaseUrl};
 use serde::Serialize;
 
+pub(crate) const RSS_FEED_PATH: &str = "/feed.xml";
+
 /// A canonical absolute URL derived only from validated publication settings.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -28,7 +30,7 @@ impl fmt::Display for CanonicalSiteUrl {
     }
 }
 
-/// The closed canonical route vocabulary for public site pages.
+/// The closed path and identity vocabulary for public site output.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PublicPagePath(Box<str>);
 
@@ -39,6 +41,10 @@ impl PublicPagePath {
 
     pub(crate) fn archive() -> Self {
         Self("/archive".into())
+    }
+
+    pub(crate) fn feed() -> Self {
+        Self(RSS_FEED_PATH.into())
     }
 
     pub(crate) fn post(slug: &PostSlug) -> Self {

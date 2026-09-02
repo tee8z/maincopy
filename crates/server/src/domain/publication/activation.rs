@@ -659,7 +659,7 @@ impl PublicationCoordinator {
         };
         match replay {
             Some(PublishNowState::Published(completed)) => {
-                return Ok(completed_result(completed));
+                return canonical_publication_result(&self.ledger, completed_result(completed));
             }
             Some(PublishNowState::Activating(begun)) => {
                 let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
@@ -737,7 +737,10 @@ impl PublicationCoordinator {
                 if !prebuilt.already_published {
                     return Err(PublicationActivationError::DurableStateMismatch);
                 }
-                let result = validate_completed(completed, &selected)?;
+                let result = canonical_publication_result(
+                    &self.ledger,
+                    validate_completed(completed, &selected)?,
+                )?;
                 safety.disarm();
                 return Ok(result);
             }
@@ -809,9 +812,10 @@ impl PublicationCoordinator {
                 SchedulePublicationReplay::Scheduled(scheduled) => self
                     .accept_scheduled_replay(&command, scheduled)
                     .map(ScheduledApprovalOutcome::Scheduled),
-                SchedulePublicationReplay::Published(completed) => Ok(
-                    ScheduledApprovalOutcome::Published(completed_result(completed)),
-                ),
+                SchedulePublicationReplay::Published(completed) => {
+                    canonical_publication_result(&self.ledger, completed_result(completed))
+                        .map(ScheduledApprovalOutcome::Published)
+                }
             };
         }
 
@@ -1117,7 +1121,10 @@ impl PublicationCoordinator {
                 slug: selected.slug.clone(),
             })
             .await?;
-        let result = validate_finished(finished, &selected)?;
+        let result = canonical_publication_result(
+            &candidate.ledger,
+            validate_finished(finished, &selected)?,
+        )?;
         if result.site.digest != candidate.digest
             || result.accepted_preview_digest != accepted_preview_digest
         {
@@ -1384,6 +1391,17 @@ fn completed_result(completed: CompletedPublication) -> PublishedPublication {
     }
 }
 
+fn canonical_publication_result(
+    ledger: &PublicLedgerProjection,
+    mut result: PublishedPublication,
+) -> Result<PublishedPublication, PublicationActivationError> {
+    result.published_at = ledger
+        .published_post(&result.stable_post_id)
+        .ok_or(PublicationActivationError::DurableStateMismatch)?
+        .published_at;
+    Ok(result)
+}
+
 fn definitely_unclaimed(error: &DatabaseMutationError) -> bool {
     matches!(
         error,
@@ -1496,6 +1514,7 @@ mod tests {
         profile::{LightningAddress, ProfileDisplayName, ProfileVersion},
     };
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use time::format_description::well_known::Rfc2822;
     use tokio::task::JoinHandle;
 
     use super::*;
@@ -1563,8 +1582,14 @@ mod tests {
             post(
                 "posts/publishable.md",
                 PostCollection::Posts,
-                post_source(PUBLISHABLE_ID, "publishable", false)
-                    .replace("Publication body.", "Revised publication body."),
+                post_source_with_metadata(
+                    PUBLISHABLE_ID,
+                    "Revised publishable",
+                    "revised-publishable",
+                    "Revised activation summary.",
+                    false,
+                )
+                .replace("Publication body.", "Revised publication body."),
             ),
             post(
                 "drafts/draft.md",
@@ -1660,13 +1685,23 @@ mod tests {
     }
 
     fn post_source(id: &str, slug: &str, draft: bool) -> String {
+        post_source_with_metadata(id, slug, slug, "Activation fixture.", draft)
+    }
+
+    fn post_source_with_metadata(
+        id: &str,
+        title: &str,
+        slug: &str,
+        description: &str,
+        draft: bool,
+    ) -> String {
         format!(
             "+++\n\
              id = {id:?}\n\
-             title = {slug:?}\n\
+             title = {title:?}\n\
              slug = {slug:?}\n\
              authored_at = 2026-08-29T15:00:00-04:00\n\
-             description = \"Activation fixture.\"\n\
+             description = {description:?}\n\
              draft = {draft}\n\
              +++\n\
              Publication body.\n"
@@ -2778,7 +2813,7 @@ mod tests {
         let initial_digest = initial.digest.clone();
         let (_root, store, profiles, _auth, head, shutdown, task) =
             start_store(&catalog, initial_digest).await;
-        let (_reader, activator) = snapshot_store(initial);
+        let (reader, activator) = snapshot_store(initial);
         let readiness = Readiness::new(true);
         let cancellation = CancellationToken::new();
         let content_digest = ContentTreeDigest::from_bytes([0x11; 32]);
@@ -2815,6 +2850,7 @@ mod tests {
             coordinator.schedule(request.clone()).await.unwrap(),
             ScheduledApprovalOutcome::Scheduled(approval.clone())
         );
+        assert!(!reader.load_full().feed.body.contains(PUBLISHABLE_ID));
 
         let durable = store.next_scheduled_publication().await.unwrap().unwrap();
         assert_eq!(durable.publication_id, approval.publication_id);
@@ -2855,6 +2891,17 @@ mod tests {
             .unwrap();
         assert_eq!(published.revision, pinned);
         assert_eq!(published.published_at, scheduled_at);
+        let active = reader.load_full();
+        assert!(active.feed.body.contains(PUBLISHABLE_ID));
+        assert!(
+            active.feed.body.contains(
+                &published
+                    .published_at
+                    .to_offset(time::UtcOffset::UTC)
+                    .format(&Rfc2822)
+                    .unwrap()
+            )
+        );
         assert!(coordinator.scheduled.is_empty());
         assert!(store.next_scheduled_publication().await.unwrap().is_none());
         assert_eq!(
@@ -3003,7 +3050,7 @@ mod tests {
         let initial_digest = initial.digest.clone();
         let (root, store, profiles, _auth, head, shutdown, task) =
             start_store(&catalog, initial_digest).await;
-        let (_reader, activator) = snapshot_store(initial);
+        let (reader, activator) = snapshot_store(initial);
         let content_digest = ContentTreeDigest::from_bytes([0x11; 32]);
         let mut coordinator = PublicationCoordinator {
             catalog: Arc::clone(&catalog),
@@ -3024,6 +3071,9 @@ mod tests {
         };
 
         let first = coordinator.publish_now(command()).await.unwrap();
+        let first_snapshot = reader.load_full();
+        let first_feed_body = Arc::clone(&first_snapshot.feed.body);
+        let first_feed_digest = first_snapshot.feed.digest;
         let revised = revised_catalog();
         let revised_pin = select_post(&revised, &PostId::parse(PUBLISHABLE_ID).unwrap(), None)
             .unwrap()
@@ -3033,18 +3083,71 @@ mod tests {
             .await
             .unwrap();
         let update_id = Uuid::parse_str("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee").unwrap();
+        let update_command = PublishNow {
+            creation_key: Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffffff").unwrap(),
+            publication_id: update_id,
+            stable_post_id: PostId::parse(PUBLISHABLE_ID).unwrap(),
+            expected_revision: Some(revised_pin.clone()),
+            accepted_preview_digest: preview_digest(&coordinator.catalog, &coordinator.ledger),
+        };
         let updated = coordinator
-            .publish_now(PublishNow {
-                creation_key: Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffffff").unwrap(),
-                publication_id: update_id,
-                stable_post_id: PostId::parse(PUBLISHABLE_ID).unwrap(),
-                expected_revision: Some(revised_pin.clone()),
-                accepted_preview_digest: preview_digest(&coordinator.catalog, &coordinator.ledger),
-            })
+            .publish_now(update_command.clone())
             .await
             .unwrap();
         assert_eq!(updated.revision, revised_pin);
         assert_ne!(updated.revision, first.revision);
+        assert_eq!(updated.published_at, first.published_at);
+        let replayed = coordinator
+            .publish_now(update_command.clone())
+            .await
+            .unwrap();
+        assert_eq!(replayed, updated);
+        assert_eq!(
+            coordinator
+                .ledger
+                .published_post(&updated.stable_post_id)
+                .unwrap()
+                .published_at,
+            first.published_at
+        );
+        let updated_snapshot = reader.load_full();
+        assert_ne!(updated_snapshot.feed.body, first_feed_body);
+        assert_ne!(updated_snapshot.feed.digest, first_feed_digest);
+        assert!(updated_snapshot.feed.body.contains(PUBLISHABLE_ID));
+        assert!(first_feed_body.contains(PUBLISHABLE_ID));
+        assert!(
+            updated_snapshot
+                .feed
+                .body
+                .contains("<title>Revised publishable</title>")
+        );
+        assert!(
+            updated_snapshot
+                .feed
+                .body
+                .contains("<description>Revised activation summary.</description>")
+        );
+        assert!(
+            updated_snapshot
+                .feed
+                .body
+                .contains("<link>https://example.com/posts/revised-publishable</link>")
+        );
+        assert!(
+            !updated_snapshot
+                .feed
+                .body
+                .contains("Revised publication body.")
+        );
+        assert!(
+            updated_snapshot.feed.body.contains(
+                &first
+                    .published_at
+                    .to_offset(time::UtcOffset::UTC)
+                    .format(&Rfc2822)
+                    .unwrap()
+            )
+        );
 
         let inspection = SqlitePoolOptions::new()
             .max_connections(1)
@@ -3095,14 +3198,33 @@ mod tests {
 
         let durable = store.startup_snapshot_state().await.unwrap();
         assert_eq!(durable.ledger.len(), 1);
-        assert_eq!(
-            durable
-                .ledger
-                .published_post(&updated.stable_post_id)
-                .unwrap()
-                .revision,
-            updated.revision
-        );
+        let durable_post = durable
+            .ledger
+            .published_post(&updated.stable_post_id)
+            .unwrap();
+        assert_eq!(durable_post.revision, updated.revision);
+        assert_eq!(durable_post.published_at, first.published_at);
+        let restarted_snapshot = snapshot(&coordinator.catalog, &durable.ledger);
+        let (_restart_reader, restart_activator) = snapshot_store(restarted_snapshot);
+        let mut restarted = PublicationCoordinator {
+            catalog: Arc::clone(&coordinator.catalog),
+            content_digest: coordinator.content_digest.clone(),
+            candidates: Arc::clone(&coordinator.candidates),
+            ledger: durable.ledger,
+            site: durable.site.unwrap(),
+            activator: restart_activator,
+            store: store.clone(),
+            profiles: coordinator.profiles.clone(),
+            tip_recipient: coordinator.tip_recipient.clone(),
+            frontend: coordinator.frontend,
+            source_commit: coordinator.source_commit.clone(),
+            scheduled: BTreeMap::new(),
+            scheduler_wakeup: Arc::new(Notify::new()),
+            readiness: Readiness::new(true),
+            cancellation: CancellationToken::new(),
+        };
+        let restarted_replay = restarted.publish_now(update_command).await.unwrap();
+        assert_eq!(restarted_replay, updated);
         inspection.close().await;
         drop(coordinator);
         shutdown.cancel();

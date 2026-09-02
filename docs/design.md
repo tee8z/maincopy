@@ -371,6 +371,9 @@ an ineligible source change for administrator review.
 The public router serves the publication index, canonical articles, tags,
 archive, RSS, sitemap, robots policy, immutable assets, and health resources.
 
+V1 serves one RSS 2.0 feed at `GET /feed.xml` and `HEAD /feed.xml`. The feed
+contains summaries and absolute links to complete canonical articles.
+
 Public pages include canonical links and structured metadata. Feeds use stable
 post identifiers and absolute canonical URLs.
 

@@ -2,7 +2,7 @@
 
 Status: target delivery plan with open design gates
 
-Last updated: 2026-09-01
+Last updated: 2026-09-02
 
 Related documents: [project overview](../README.md), [system design](design.md),
 and [engineering style guide](quality.md).
@@ -23,7 +23,7 @@ and quality conventions.
 
 ## Current implementation audit
 
-This table describes the implementation reviewed on 2026-09-01. It is not a
+This table describes the implementation reviewed on 2026-09-02. It is not a
 release claim.
 
 | Area | Reviewed status |
@@ -36,7 +36,8 @@ release claim.
 | Initial publication, private previews, and local CLI commands | Implemented foundation |
 | Preview-gated update releases and complete release management | In progress |
 | Managed Git synchronization and restricted bootstrap | Planned |
-| RSS, discovery documents, public assets, redirects, metadata, and CSP | Planned |
+| Snapshot-backed RSS feed and HTML autodiscovery | Implemented foundation |
+| Sitemap, robots, redirects, remaining metadata, and CSP | Planned |
 | HTTPS admin gateway and admin web interface | Planned |
 | Profile-backed static Lightning Address tips | Implemented foundation |
 | Prometheus registry, loopback `/metrics`, and runtime dashboard | Planned |
@@ -509,6 +510,7 @@ Rust toolchain and the project license.
 | Snapshot activation | Pin `arc-swap` 1.9.2 without optional features | 2 |
 | HTTP service | Axum and Tower | 0 and 2 |
 | HTML templates | Maud | 2 |
+| XML feeds and discovery documents | Pin `quick-xml` 0.42.0 without optional features; use its event writer instead of string interpolation | 2 |
 | Frontend asset build | Deterministic `crates/server/build.rs`; Lightning CSS 1.0.0-alpha.72 for V1 CSS; add a reviewed JavaScript minifier only with the first JavaScript input | 2 |
 | SQLite | Pin SQLx 0.9.0 with embedded migrations and bundled SQLite 3.51.3 | 3 |
 | Process lock | Use standard-library file locks for runtime and database ownership | 3 |
@@ -538,6 +540,7 @@ Maincopy package license.
 | `arc-swap` | 1.9.2 | Default features disabled; no optional features | `MIT OR Apache-2.0` | Not declared |
 | `bech32` | 0.11.1 | Default features disabled; `alloc` | `MIT` | 1.48 |
 | `maud` | 0.27.0 | Default features disabled; no optional features | `MIT OR Apache-2.0` | Not declared |
+| `quick-xml` | 0.42.0 | Default features disabled; no optional features | `MIT` | 1.86 |
 | `blake3` build edge | 1.8.7 | Default features disabled; `std` | `CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception` | Not declared |
 | `lightningcss` | 1.0.0-alpha.72 | Default features disabled | `MPL-2.0` | Not declared |
 | `rustix` build and test edge | 1.1.4 | Default features disabled; `fs`, `std`; Linux and macOS only | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 1.63 |
@@ -1619,11 +1622,59 @@ Tests:
 
 Implement RSS, sitemap, robots, Open Graph, and JSON-LD output.
 
+The first vertical slice serves one RSS 2.0 resource at `GET /feed.xml` and
+`HEAD /feed.xml`. Do not add feed aliases or redirects in this slice.
+
+Generate the feed once during immutable site snapshot construction. Store its
+exact UTF-8 bytes and content digest in that snapshot. The request handler must
+not query SQLite, inspect Git, parse Markdown, or serialize XML.
+
+The RSS channel contains the publication title, canonical site root,
+publication description, and an Atom self-link to the absolute feed URL. Each
+item contains these fields in deterministic chronology order:
+
+- the authored title;
+- the absolute current canonical post URL;
+- the authored description as escaped plain text, not full article HTML;
+- the stable lowercase post UUID as `guid` with `isPermaLink="false"`; and
+- the canonical SQLite `published_at` in RFC 2822 UTC form with `+0000`.
+
+Order items by descending `published_at`, then ascending post UUID. Preserve
+the GUID and publication date across revisions and allowed slug changes. A
+slug change updates only the canonical item link.
+
+Carry the first successful publication time through update candidates and all
+publication responses, including idempotent replay. During startup, recover it
+from the successful release linked to the earliest monotonic site-revision
+version, never by comparing wall-clock timestamps. Reject missing links,
+timestamp disagreement, duplicate activation versions, multiple current
+releases, or a current release that is not the latest successful activation.
+
+RSS readers treat item description values as HTML. Encode each authored post
+description as an HTML text node before the XML writer escapes the document.
+This preserves literal text without permitting authored markup. Encode the
+channel description as ordinary XML character data.
+
+Emit an XML 1.0 UTF-8 declaration and reject XML-forbidden scalar values. Omit
+`lastBuildDate`, full article content, author email, images, and wall-clock
+values. Follow the [RSS 2.0 specification](https://www.rssboard.org/rss-specification),
+the [RSS Best Practices Profile](https://www.rssboard.org/rss-profile), and the
+[RSS Autodiscovery specification](https://www.rssboard.org/rss-autodiscovery).
+
+Add one absolute RSS autodiscovery link to every public HTML page. Serve the
+feed with `application/rss+xml; charset=utf-8`, `Cache-Control: no-cache`,
+`X-Content-Type-Options: nosniff`, and a strong digest of the exact XML bytes.
+Honor matching `If-None-Match` values with an empty `304 Not Modified`.
+
+Apply the inclusive 40 MiB per-document output limit to the feed. A feed build
+failure must reject the candidate snapshot and preserve the active snapshot.
+
 Deliverables:
 
-- Absolute canonical URLs.
+- The snapshot-backed `/feed.xml` contract defined above.
+- Absolute canonical URLs in RSS, sitemap, Open Graph, and JSON-LD output.
 - Stable post UUIDs as feed GUIDs.
-- XML-safe feed and sitemap serialization.
+- XML-safe RSS and sitemap serialization through the selected XML writer.
 - `BlogPosting` JSON-LD.
 - Open Graph and canonical-link metadata.
 
@@ -1631,11 +1682,16 @@ Tests:
 
 - Validate XML fixtures with a strict parser.
 - Snapshot metadata containing hostile punctuation and Unicode.
+- Require byte-identical RSS and feed digests for identical snapshot inputs.
+- Verify empty feeds and the inclusive 40 MiB feed bound.
+- Verify `GET`, `HEAD`, MIME type, cache policy, `nosniff`, strong ETags, and
+  conditional `304` responses.
 - Exclude draft, scheduled, cancelled, and pre-swap activating posts.
 - Include the claimed activating revision in feeds and discovery immediately
   after the same atomic snapshot swap that makes its page visible.
 - Use canonical SQLite `published_at` for feeds and structured data.
-- Preserve feed identity after an allowed slug change.
+- Preserve the feed GUID after an allowed slug change while changing its
+  canonical item link.
 
 ### Work package 2.3: Redirects, assets, and HTTP caching
 

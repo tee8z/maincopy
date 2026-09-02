@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use markdown_compiler::{
     ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
     SiteSnapshotDigest,
@@ -51,20 +53,27 @@ impl PublicationStore {
             return Err(StartupSnapshotLoadError::MissingSiteHead);
         }
 
+        let stored: Vec<_> = rows
+            .into_iter()
+            .map(decode_canonical_publication)
+            .collect::<Result<_, _>>()?;
+        let canonical_times = canonical_publication_times(&stored)?;
         let mut published = Vec::new();
         let mut activating = Vec::new();
         let mut scheduled = Vec::new();
-        for row in rows {
-            let stored = decode_canonical_publication(row)?;
+        for stored in stored {
             match stored.status {
                 CanonicalPublicationStatus::Published(publication) => {
                     let view = publication.into_view();
+                    let published_at = canonical_times
+                        .get(&view.stable_post_id)
+                        .copied()
+                        .expect("published history has a canonical publication time");
                     published.push(PublishedPostRevision::new(
                         view.stable_post_id,
                         view.current_published_digest
                             .expect("published publications have a current revision"),
-                        view.published_at
-                            .expect("published publications have a publication timestamp"),
+                        published_at,
                     ));
                 }
                 CanonicalPublicationStatus::Activating(publication) => {
@@ -522,6 +531,8 @@ const LOAD_CANONICAL_PUBLICATIONS: &str = "SELECT \
     canonical.creation_key AS creation_key, \
     canonical.command_kind AS command_kind, \
     canonical.activation_site_digest AS activation_site_digest, \
+    activation.version AS activation_site_version, \
+    activation.activated_at_ns AS activation_site_activated_at_ns, \
     canonical.requested_revision_digest AS requested_revision_digest, \
     canonical.content_tree_digest AS content_tree_digest, \
     canonical.accepted_preview_digest AS accepted_preview_digest, \
@@ -535,6 +546,8 @@ const LOAD_CANONICAL_PUBLICATIONS: &str = "SELECT \
     LEFT JOIN post_revisions AS current \
       ON current.stable_post_id = canonical.stable_post_id \
      AND current.revision_digest = canonical.current_published_digest \
+    LEFT JOIN site_revisions AS activation \
+      ON activation.site_revision_digest = canonical.activation_site_digest \
     ORDER BY canonical.stable_post_id, canonical.publication_id";
 
 const LOAD_CANONICAL_BY_CREATION_KEY: &str = "SELECT \
@@ -552,6 +565,8 @@ const LOAD_CANONICAL_BY_CREATION_KEY: &str = "SELECT \
     canonical.creation_key AS creation_key, \
     canonical.command_kind AS command_kind, \
     canonical.activation_site_digest AS activation_site_digest, \
+    activation.version AS activation_site_version, \
+    activation.activated_at_ns AS activation_site_activated_at_ns, \
     canonical.requested_revision_digest AS requested_revision_digest, \
     canonical.content_tree_digest AS content_tree_digest, \
     canonical.accepted_preview_digest AS accepted_preview_digest, \
@@ -565,6 +580,8 @@ const LOAD_CANONICAL_BY_CREATION_KEY: &str = "SELECT \
     LEFT JOIN post_revisions AS current \
       ON current.stable_post_id = canonical.stable_post_id \
      AND current.revision_digest = canonical.current_published_digest \
+    LEFT JOIN site_revisions AS activation \
+      ON activation.site_revision_digest = canonical.activation_site_digest \
     WHERE canonical.creation_key = ?";
 
 const LOAD_CANONICAL_BY_PUBLICATION_ID: &str = "SELECT \
@@ -582,6 +599,8 @@ const LOAD_CANONICAL_BY_PUBLICATION_ID: &str = "SELECT \
     canonical.creation_key AS creation_key, \
     canonical.command_kind AS command_kind, \
     canonical.activation_site_digest AS activation_site_digest, \
+    activation.version AS activation_site_version, \
+    activation.activated_at_ns AS activation_site_activated_at_ns, \
     canonical.requested_revision_digest AS requested_revision_digest, \
     canonical.content_tree_digest AS content_tree_digest, \
     canonical.accepted_preview_digest AS accepted_preview_digest, \
@@ -595,6 +614,8 @@ const LOAD_CANONICAL_BY_PUBLICATION_ID: &str = "SELECT \
     LEFT JOIN post_revisions AS current \
       ON current.stable_post_id = canonical.stable_post_id \
      AND current.revision_digest = canonical.current_published_digest \
+    LEFT JOIN site_revisions AS activation \
+      ON activation.site_revision_digest = canonical.activation_site_digest \
     WHERE canonical.publication_id = ?";
 
 #[derive(FromRow)]
@@ -624,6 +645,8 @@ struct CanonicalPublicationRow {
     creation_key: Option<Vec<u8>>,
     command_kind: String,
     activation_site_digest: Option<Vec<u8>>,
+    activation_site_version: Option<i64>,
+    activation_site_activated_at_ns: Option<i64>,
     requested_revision_digest: Option<Vec<u8>>,
     content_tree_digest: Vec<u8>,
     accepted_preview_digest: Vec<u8>,
@@ -710,11 +733,98 @@ struct StoredCanonicalPublication {
     creation_key: Option<CommandIdempotencyKey>,
     command_kind: PublicationCommandKind,
     activation_site_digest: Option<SiteSnapshotDigest>,
+    activation_site_version: Option<u64>,
+    activation_site_activated_at: Option<OffsetDateTime>,
     requested_revision_digest: Option<PostRevisionDigest>,
     content_digest: ContentTreeDigest,
     accepted_preview_digest: PreviewDigest,
     pinned_slug: PostSlug,
     status: CanonicalPublicationStatus,
+}
+
+fn canonical_publication_times(
+    publications: &[StoredCanonicalPublication],
+) -> Result<BTreeMap<PostId, OffsetDateTime>, StartupSnapshotLoadError> {
+    struct SuccessfulPublication {
+        publication_id: Uuid,
+        site_version: u64,
+        published_at: OffsetDateTime,
+        is_current: bool,
+    }
+
+    let mut histories: BTreeMap<PostId, Vec<SuccessfulPublication>> = BTreeMap::new();
+    for stored in publications {
+        let (view, is_current) = match &stored.status {
+            CanonicalPublicationStatus::Published(publication) => (publication.view(), true),
+            CanonicalPublicationStatus::Superseded(publication) => (publication.view(), false),
+            CanonicalPublicationStatus::Scheduled(_)
+            | CanonicalPublicationStatus::Activating(_)
+            | CanonicalPublicationStatus::Blocked(_)
+            | CanonicalPublicationStatus::Cancelled(_) => continue,
+        };
+        let published_at = view
+            .published_at
+            .expect("validated publication history has a publication timestamp");
+        let site_version = stored.activation_site_version.ok_or_else(|| {
+            StartupSnapshotLoadError::MissingPublishedSiteRevision {
+                publication_id: stored.publication_id,
+            }
+        })?;
+        let site_activated_at = stored.activation_site_activated_at.ok_or_else(|| {
+            StartupSnapshotLoadError::MissingPublishedSiteRevision {
+                publication_id: stored.publication_id,
+            }
+        })?;
+        if site_activated_at != published_at {
+            return Err(StartupSnapshotLoadError::MismatchedPublishedSiteTimestamp {
+                publication_id: stored.publication_id,
+            });
+        }
+        histories
+            .entry(view.stable_post_id.clone())
+            .or_default()
+            .push(SuccessfulPublication {
+                publication_id: stored.publication_id,
+                site_version,
+                published_at,
+                is_current,
+            });
+    }
+
+    let mut first_publications = BTreeMap::new();
+    for (post_id, mut history) in histories {
+        history.sort_unstable_by_key(|publication| publication.site_version);
+        if let Some(duplicate) = history
+            .windows(2)
+            .find(|pair| pair[0].site_version == pair[1].site_version)
+        {
+            return Err(StartupSnapshotLoadError::DuplicatePublishedSiteRevision {
+                post_id,
+                site_version: duplicate[0].site_version,
+            });
+        }
+        let current: Vec<_> = history
+            .iter()
+            .filter(|publication| publication.is_current)
+            .collect();
+        let [current] = current.as_slice() else {
+            return Err(StartupSnapshotLoadError::InvalidCurrentPublicationCount {
+                post_id,
+                count: current.len(),
+            });
+        };
+        let first = history
+            .first()
+            .expect("successful publication history is non-empty");
+        let latest = history
+            .last()
+            .expect("successful publication history is non-empty");
+        if current.publication_id != latest.publication_id {
+            return Err(StartupSnapshotLoadError::PublishedRevisionIsNotLatest { post_id });
+        }
+        first_publications.insert(post_id, first.published_at);
+    }
+    Ok(first_publications)
 }
 
 fn decode_canonical_publication(
@@ -724,6 +834,14 @@ fn decode_canonical_publication(
         .map_err(|_| StartupSnapshotLoadError::InvalidPublicationId)?;
     let command_kind = PublicationCommandKind::parse(&row.command_kind)?;
     let activation_site_digest = row.activation_site_digest.map(site_digest).transpose()?;
+    let activation_site_version = row
+        .activation_site_version
+        .map(|version| positive_version(Some(version)))
+        .transpose()?;
+    let activation_site_activated_at = row
+        .activation_site_activated_at_ns
+        .map(publication_timestamp)
+        .transpose()?;
     let (stable_post_id, pinned_post_digest, pinned_slug) = decode_pinned_revision(
         row.stable_post_id,
         row.pinned_post_digest,
@@ -781,6 +899,8 @@ fn decode_canonical_publication(
         creation_key,
         command_kind,
         activation_site_digest,
+        activation_site_version,
+        activation_site_activated_at,
         requested_revision_digest,
         content_digest,
         accepted_preview_digest,
@@ -966,6 +1086,20 @@ pub(crate) enum StartupSnapshotLoadError {
     MultipleActivations,
     #[error("an activating publication has no candidate site digest")]
     MissingActivationSiteDigest,
+    #[error("published publication {publication_id} has no retained site revision")]
+    MissingPublishedSiteRevision { publication_id: Uuid },
+    #[error(
+        "published publication {publication_id} and its retained site revision have different activation timestamps"
+    )]
+    MismatchedPublishedSiteTimestamp { publication_id: Uuid },
+    #[error(
+        "published history for post {post_id} reuses retained site revision version {site_version}"
+    )]
+    DuplicatePublishedSiteRevision { post_id: PostId, site_version: u64 },
+    #[error("published history for post {post_id} has {count} current publications instead of one")]
+    InvalidCurrentPublicationCount { post_id: PostId, count: usize },
+    #[error("the current publication for post {post_id} is not its latest successful activation")]
+    PublishedRevisionIsNotLatest { post_id: PostId },
     #[error("a stored publication ID is invalid")]
     InvalidPublicationId,
     #[error("a stored publication creation key is invalid")]
@@ -2434,7 +2568,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO site_revisions (\
                 site_revision_digest, version, activated_at_ns\
-             ) VALUES (?, ?, 100)",
+             ) VALUES (?, ?, 200)",
         )
         .bind(digest)
         .bind(version)
@@ -2510,6 +2644,68 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_clock_rollback_history(pool: &SqlitePool) -> ([u8; 32], [u8; 32]) {
+        let initial_site = [0x66_u8; 32];
+        let updated_site = [0x67_u8; 32];
+        insert_site_head(pool, &initial_site, 1).await;
+        insert_published_publication(pool, "published").await;
+        sqlx::query("UPDATE canonical_publications SET state = 'superseded', version = 4")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO site_revisions (\
+                site_revision_digest, version, activated_at_ns\
+             ) VALUES (?, 2, 100)",
+        )
+        .bind(updated_site.as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE site_state SET current_site_digest = ?, version = 2 WHERE singleton = 1",
+        )
+        .bind(updated_site.as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let post_id = uuid_bytes(POST_ID);
+        let updated_revision = [0x12_u8; 32];
+        sqlx::query(
+            "INSERT INTO post_revisions (\
+                stable_post_id, revision_digest, publication_status, first_observed_at_ns, slug\
+             ) VALUES (?, ?, 'publishable', 2, 'published-post')",
+        )
+        .bind(&post_id)
+        .bind(updated_revision.as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO canonical_publications (\
+                publication_id, creation_key, command_kind, stable_post_id, \
+                requested_revision_digest, pinned_post_digest, state, version, \
+                scheduled_at_ns, activation_at_ns, activation_site_digest, published_at_ns, \
+                current_published_digest, content_tree_digest, accepted_preview_digest\
+             ) VALUES (?, ?, 'immediate', ?, ?, ?, 'published', 3, \
+                100, 100, ?, 100, ?, ?, ?)",
+        )
+        .bind(uuid_bytes("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"))
+        .bind(uuid_bytes("88888888-8888-4888-8888-888888888888"))
+        .bind(&post_id)
+        .bind(updated_revision.as_slice())
+        .bind(updated_revision.as_slice())
+        .bind(updated_site.as_slice())
+        .bind(updated_revision.as_slice())
+        .bind([0x78_u8; 32].as_slice())
+        .bind([0x89_u8; 32].as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+        (initial_site, updated_revision)
+    }
+
     #[tokio::test]
     async fn startup_snapshot_state_accepts_a_pristine_database() {
         let (store, pool) = startup_store().await;
@@ -2525,14 +2721,128 @@ mod tests {
     #[tokio::test]
     async fn startup_snapshot_state_accepts_a_published_row_with_required_bindings() {
         let (store, pool) = startup_store().await;
-        let site = [0x22_u8; 32];
+        let site = [0x66_u8; 32];
         insert_site_head(&pool, &site, 1).await;
         insert_published_publication(&pool, "published").await;
+        sqlx::query(
+            "UPDATE canonical_publications \
+             SET requested_revision_digest = pinned_post_digest",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let state = store.startup_snapshot_state().await.unwrap();
 
         assert_eq!(state.site.unwrap().digest.as_bytes(), &site);
         assert_eq!(state.ledger.len(), 1);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn startup_snapshot_state_rejects_published_history_without_its_site_revision() {
+        let (store, pool) = startup_store().await;
+        insert_site_head(&pool, &[0x22_u8; 32], 1).await;
+        insert_published_publication(&pool, "published").await;
+
+        let error = store.startup_snapshot_state().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            StartupSnapshotLoadError::MissingPublishedSiteRevision { publication_id }
+                if publication_id == Uuid::parse_str(PUBLICATION_ID).unwrap()
+        ));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn startup_uses_activation_order_when_the_publication_clock_moves_backward() {
+        let (store, pool) = startup_store().await;
+        let (_, updated_revision) = insert_clock_rollback_history(&pool).await;
+
+        let state = store.startup_snapshot_state().await.unwrap();
+        let published = state
+            .ledger
+            .published_post(&PostId::parse(POST_ID).unwrap())
+            .unwrap();
+
+        assert_eq!(published.revision.as_bytes(), &updated_revision);
+        assert_eq!(
+            published.published_at,
+            OffsetDateTime::from_unix_timestamp_nanos(200).unwrap()
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_a_publication_timestamp_that_disagrees_with_its_site_revision() {
+        let (store, pool) = startup_store().await;
+        insert_clock_rollback_history(&pool).await;
+        sqlx::query("UPDATE site_revisions SET activated_at_ns = 101 WHERE version = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = store.startup_snapshot_state().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            StartupSnapshotLoadError::MismatchedPublishedSiteTimestamp { publication_id }
+                if publication_id
+                    == Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap()
+        ));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_two_releases_bound_to_one_site_revision() {
+        let (store, pool) = startup_store().await;
+        let (initial_site, _) = insert_clock_rollback_history(&pool).await;
+        sqlx::query(
+            "UPDATE canonical_publications \
+             SET activation_at_ns = 200, activation_site_digest = ?, published_at_ns = 200 \
+             WHERE publication_id = ?",
+        )
+        .bind(initial_site.as_slice())
+        .bind(uuid_bytes("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = store.startup_snapshot_state().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            StartupSnapshotLoadError::DuplicatePublishedSiteRevision {
+                post_id,
+                site_version: 1,
+            } if post_id == PostId::parse(POST_ID).unwrap()
+        ));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_a_current_publication_older_than_a_superseded_release() {
+        let (store, pool) = startup_store().await;
+        insert_clock_rollback_history(&pool).await;
+        sqlx::query(
+            "UPDATE canonical_publications \
+             SET state = CASE publication_id \
+                 WHEN ? THEN 'published' ELSE 'superseded' END, \
+                 version = 4",
+        )
+        .bind(uuid_bytes(PUBLICATION_ID))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = store.startup_snapshot_state().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            StartupSnapshotLoadError::PublishedRevisionIsNotLatest { post_id }
+                if post_id == PostId::parse(POST_ID).unwrap()
+        ));
         pool.close().await;
     }
 

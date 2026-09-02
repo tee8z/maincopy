@@ -116,11 +116,14 @@ impl PublicLedgerProjection {
         })
     }
 
-    /// Inserts a first publication or replaces the currently approved revision.
-    pub(crate) fn with_approved(&self, approved: PublishedPostRevision) -> Self {
+    /// Inserts a first publication or replaces its revision at the original publication time.
+    pub(crate) fn with_approved(&self, mut approved: PublishedPostRevision) -> Self {
         let mut entries = self.entries.to_vec();
         match entries.binary_search_by(|entry| entry.post_id.cmp(&approved.post_id)) {
-            Ok(index) => entries[index] = approved,
+            Ok(index) => {
+                approved.published_at = entries[index].published_at;
+                entries[index] = approved;
+            }
             Err(index) => entries.insert(index, approved),
         }
         Self {
@@ -139,5 +142,39 @@ impl PublicLedgerProjectionError {
     #[cfg(test)]
     pub(crate) fn post_id(&self) -> &PostId {
         &self.post_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn post_id() -> PostId {
+        PostId::parse("11111111-1111-4111-8111-111111111111").unwrap()
+    }
+
+    fn revision(byte: u8) -> PostRevisionDigest {
+        let encoded = format!("{byte:02x}").repeat(32);
+        PostRevisionDigest::parse(&format!("post-b3-v1-{encoded}")).unwrap()
+    }
+
+    #[test]
+    fn approving_an_update_preserves_the_original_publication_time() {
+        let initial_time = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let update_time = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        let initial = PublicLedgerProjection::empty().with_approved(PublishedPostRevision::new(
+            post_id(),
+            revision(0x11),
+            initial_time,
+        ));
+        let updated = initial.with_approved(PublishedPostRevision::new(
+            post_id(),
+            revision(0x22),
+            update_time,
+        ));
+        let published = updated.published_post(&post_id()).unwrap();
+
+        assert_eq!(published.revision, revision(0x22));
+        assert_eq!(published.published_at, initial_time);
     }
 }

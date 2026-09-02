@@ -29,6 +29,39 @@ async fn empty_public_snapshot_serves_semantic_index_and_archive_pages() {
 }
 
 #[tokio::test]
+async fn empty_public_snapshot_serves_a_valid_rss_channel() {
+    let app = public_router(public_state(Readiness::new(true)));
+    let response = get(app, "/feed.xml").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/rss+xml; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-cache"
+    );
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert!(
+        response
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("\"feed-b3-v1-")
+    );
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+    assert!(body.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+    assert!(body.contains("<channel>"));
+    assert!(!body.contains("<item>"));
+}
+
+#[tokio::test]
 async fn public_router_uses_snapshot_backed_error_pages() {
     let app = public_router(public_state(Readiness::new(true)));
 
@@ -40,13 +73,24 @@ async fn public_router_uses_snapshot_backed_error_pages() {
             .contains("Page not found")
     );
 
-    let method = request(app, Method::POST, "/").await;
-    assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
-    assert!(
-        String::from_utf8(body_bytes(method).await.to_vec())
-            .unwrap()
-            .contains("Method not allowed")
-    );
+    for path in ["/", "/feed.xml"] {
+        let method = request(app.clone(), Method::POST, path).await;
+        assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            String::from_utf8(body_bytes(method).await.to_vec())
+                .unwrap()
+                .contains("Method not allowed")
+        );
+    }
+}
+
+#[tokio::test]
+async fn rss_feed_has_no_implicit_aliases() {
+    let app = public_router(public_state(Readiness::new(true)));
+
+    for path in ["/feed", "/rss", "/rss.xml"] {
+        assert_eq!(get(app.clone(), path).await.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]

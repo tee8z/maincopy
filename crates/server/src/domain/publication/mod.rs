@@ -11,7 +11,7 @@ pub(crate) mod web;
 
 pub use provenance::{SourceCommit, SourceCommitAlgorithm, SourceCommitParseError};
 pub use routes::CanonicalSiteUrl;
-pub(crate) use routes::PublicPagePath;
+pub(crate) use routes::{PublicPagePath, RSS_FEED_PATH};
 pub use visibility::{PublicLedgerProjection, PublishedPostRevision};
 
 use std::marker::PhantomData;

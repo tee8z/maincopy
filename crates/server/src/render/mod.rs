@@ -3,6 +3,7 @@
 mod asset_path;
 mod catalog;
 mod markdown;
+mod rss;
 mod site;
 
 pub use asset_path::{SnapshotAssetPath, SnapshotAssetPathError};
