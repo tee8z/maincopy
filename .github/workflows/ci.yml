@@ -27,6 +27,12 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
 
+      - name: Cache Nix build outputs
+        uses: DeterminateSystems/flakehub-cache-action@83293488abfd33fbfb2ab084097467491c029962 # v3.22.2
+        with:
+          use-gha-cache: enabled
+          diagnostic-endpoint: ""
+
       - name: Run flake checks
         run: nix flake check --print-build-logs
 
@@ -34,7 +40,7 @@ jobs:
         run: nix build --print-build-logs
 
   windows:
-    name: Windows workspace checks
+    name: Windows client checks
     runs-on: windows-latest
     timeout-minutes: 20
 
@@ -49,6 +55,3 @@ jobs:
 
       - name: Test shared contracts and CLI
         run: cargo test --locked --package maincopy-shared --package maincopy-cli --all-targets
-
-      - name: Check the server
-        run: cargo check --locked --package maincopy-server --all-targets --all-features
