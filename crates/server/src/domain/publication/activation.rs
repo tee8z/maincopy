@@ -2835,9 +2835,10 @@ mod tests {
             cancellation: cancellation.clone(),
         };
 
-        let pinned = select_post(&catalog, &PostId::parse(PUBLISHABLE_ID).unwrap(), None)
-            .unwrap()
-            .revision;
+        let selected =
+            select_post(&catalog, &PostId::parse(PUBLISHABLE_ID).unwrap(), None).unwrap();
+        let pinned = selected.revision.clone();
+        let canonical_url = format!("https://example.com/posts/{}", selected.slug.as_str());
         let scheduled_at = OffsetDateTime::now_utc() + time::Duration::hours(1);
         let request = schedule_command(scheduled_at);
         let ScheduledApprovalOutcome::Scheduled(approval) =
@@ -2851,6 +2852,7 @@ mod tests {
             ScheduledApprovalOutcome::Scheduled(approval.clone())
         );
         assert!(!reader.load_full().feed.body.contains(PUBLISHABLE_ID));
+        assert!(!reader.load_full().sitemap.body.contains(&canonical_url));
 
         let durable = store.next_scheduled_publication().await.unwrap().unwrap();
         assert_eq!(durable.publication_id, approval.publication_id);
@@ -2893,6 +2895,7 @@ mod tests {
         assert_eq!(published.published_at, scheduled_at);
         let active = reader.load_full();
         assert!(active.feed.body.contains(PUBLISHABLE_ID));
+        assert!(active.sitemap.body.contains(&canonical_url));
         assert!(
             active.feed.body.contains(
                 &published
@@ -3070,14 +3073,26 @@ mod tests {
             cancellation: CancellationToken::new(),
         };
 
+        let original_selected =
+            select_post(&catalog, &PostId::parse(PUBLISHABLE_ID).unwrap(), None).unwrap();
+        let original_url = format!(
+            "https://example.com/posts/{}",
+            original_selected.slug.as_str()
+        );
         let first = coordinator.publish_now(command()).await.unwrap();
         let first_snapshot = reader.load_full();
         let first_feed_body = Arc::clone(&first_snapshot.feed.body);
         let first_feed_digest = first_snapshot.feed.digest;
+        let first_sitemap_body = Arc::clone(&first_snapshot.sitemap.body);
+        let first_sitemap_digest = first_snapshot.sitemap.digest;
         let revised = revised_catalog();
-        let revised_pin = select_post(&revised, &PostId::parse(PUBLISHABLE_ID).unwrap(), None)
-            .unwrap()
-            .revision;
+        let revised_selected =
+            select_post(&revised, &PostId::parse(PUBLISHABLE_ID).unwrap(), None).unwrap();
+        let revised_pin = revised_selected.revision.clone();
+        let revised_url = format!(
+            "https://example.com/posts/{}",
+            revised_selected.slug.as_str()
+        );
         coordinator
             .apply_content_catalog(revised, ContentTreeDigest::from_bytes([0x22; 32]), None)
             .await
@@ -3113,6 +3128,10 @@ mod tests {
         let updated_snapshot = reader.load_full();
         assert_ne!(updated_snapshot.feed.body, first_feed_body);
         assert_ne!(updated_snapshot.feed.digest, first_feed_digest);
+        assert_ne!(updated_snapshot.sitemap.body, first_sitemap_body);
+        assert_ne!(updated_snapshot.sitemap.digest, first_sitemap_digest);
+        assert!(!updated_snapshot.sitemap.body.contains(&original_url));
+        assert!(updated_snapshot.sitemap.body.contains(&revised_url));
         assert!(updated_snapshot.feed.body.contains(PUBLISHABLE_ID));
         assert!(first_feed_body.contains(PUBLISHABLE_ID));
         assert!(
@@ -3205,6 +3224,14 @@ mod tests {
         assert_eq!(durable_post.revision, updated.revision);
         assert_eq!(durable_post.published_at, first.published_at);
         let restarted_snapshot = snapshot(&coordinator.catalog, &durable.ledger);
+        assert_eq!(
+            restarted_snapshot.sitemap.body,
+            updated_snapshot.sitemap.body
+        );
+        assert_eq!(
+            restarted_snapshot.sitemap.digest,
+            updated_snapshot.sitemap.digest
+        );
         let (_restart_reader, restart_activator) = snapshot_store(restarted_snapshot);
         let mut restarted = PublicationCoordinator {
             catalog: Arc::clone(&coordinator.catalog),

@@ -36,8 +36,8 @@ release claim.
 | Initial publication, private previews, and local CLI commands | Implemented foundation |
 | Preview-gated update releases and complete release management | In progress |
 | Managed Git synchronization and restricted bootstrap | Planned |
-| Snapshot-backed RSS feed and HTML autodiscovery | Implemented foundation |
-| Sitemap, robots, redirects, remaining metadata, and CSP | Planned |
+| Snapshot-backed RSS feed, sitemap, and HTML autodiscovery | Implemented foundation |
+| Robots, redirects, Open Graph, JSON-LD, and CSP | Planned |
 | HTTPS admin gateway and admin web interface | Planned |
 | Profile-backed static Lightning Address tips | Implemented foundation |
 | Prometheus registry, loopback `/metrics`, and runtime dashboard | Planned |
@@ -1669,9 +1669,52 @@ Honor matching `If-None-Match` values with an empty `304 Not Modified`.
 Apply the inclusive 40 MiB per-document output limit to the feed. A feed build
 failure must reject the candidate snapshot and preserve the active snapshot.
 
+The second vertical slice serves one sitemap only at `GET /sitemap.xml` and
+`HEAD /sitemap.xml`. Do not add sitemap aliases or redirects in this slice.
+
+Generate the sitemap once during immutable site snapshot construction. Store
+its exact UTF-8 bytes and typed content digest in that snapshot. The request
+handler must not query SQLite, inspect Git, parse Markdown, or serialize XML.
+
+Include only these canonical HTML locations:
+
+- the site root;
+- the archive page;
+- each current public post page; and
+- each tag page that contains at least one current public post.
+
+Exclude RSS, assets, health resources, errors, drafts, previews, scheduled
+posts, and pre-swap activating posts. Sort the final absolute URLs in ascending
+order before serialization.
+
+Emit an XML 1.0 UTF-8 declaration and one `urlset` in the standard sitemap
+namespace. Emit one `url` per location and only one `loc` inside each `url`.
+Do not emit `lastmod`, `changefreq`, or `priority`. The current public
+projection does not contain the truthful activation time for the selected post
+revision.
+
+Require each `loc` value to contain fewer than 2,048 characters. Reject
+duplicate locations and XML 1.0-illegal scalar values. Accept at most 50,000
+locations and 40 MiB of serialized output, with both project limits inclusive.
+
+Compute a versioned, sitemap-domain-separated digest from the exact emitted
+bytes. Include those bytes in the site snapshot identity and presentation
+identity. A sitemap build failure must reject the candidate snapshot and
+preserve the active snapshot.
+
+Serve `application/xml; charset=utf-8`, `Cache-Control: no-cache`, and
+`X-Content-Type-Options: nosniff`. Use the exact-byte digest as a strong ETag.
+Return an empty `304 Not Modified` for a matching `If-None-Match` value.
+
+Follow the official [Sitemaps protocol](https://www.sitemaps.org/protocol.html)
+for the document shape and location limits. Follow
+[RFC 7303](https://www.rfc-editor.org/rfc/rfc7303) for the XML media type and
+UTF-8 declaration.
+
 Deliverables:
 
 - The snapshot-backed `/feed.xml` contract defined above.
+- The snapshot-backed `/sitemap.xml` contract defined above.
 - Absolute canonical URLs in RSS, sitemap, Open Graph, and JSON-LD output.
 - Stable post UUIDs as feed GUIDs.
 - XML-safe RSS and sitemap serialization through the selected XML writer.
@@ -1692,6 +1735,24 @@ Tests:
 - Use canonical SQLite `published_at` for feeds and structured data.
 - Preserve the feed GUID after an allowed slug change while changing its
   canonical item link.
+- Require byte-identical sitemap bytes and digests for identical snapshot
+  inputs.
+- Verify root, archive, current post, and nonempty-tag inclusion in ascending
+  absolute URL order.
+- Exclude empty tags and every noncanonical or non-HTML public resource.
+- Verify the XML declaration, sitemap namespace, `loc`-only entries, and the
+  absence of optional metadata.
+- Reject duplicate locations, XML-illegal characters, and a `loc` value with
+  2,048 characters.
+- Accept 50,000 locations and reject 50,001 locations.
+- Prove the inclusive 40 MiB output limit through bounded-writer and exact
+  renderer-boundary tests.
+- Verify sitemap `GET`, `HEAD`, MIME type, cache policy, `nosniff`, strong
+  ETags, and conditional `304` responses.
+- Return `404 Not Found` for sitemap aliases and `405 Method Not Allowed` for
+  unsupported methods at the canonical path.
+- Fail a candidate sitemap build without changing any active page, feed, or
+  sitemap bytes.
 
 ### Work package 2.3: Redirects, assets, and HTTP caching
 

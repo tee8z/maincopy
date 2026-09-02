@@ -3,6 +3,7 @@ use maincopy_server::{
     frontend_assets::{FrontendAssetName, IMMUTABLE_CACHE_CONTROL, embedded_manifest},
     web::{Readiness, public_router},
 };
+use quick_xml::{Reader, escape::unescape, events::Event};
 
 use crate::helpers::{body_bytes, get, public_state, request};
 
@@ -62,6 +63,93 @@ async fn empty_public_snapshot_serves_a_valid_rss_channel() {
 }
 
 #[tokio::test]
+async fn empty_public_snapshot_serves_a_valid_sitemap() {
+    let app = public_router(public_state(Readiness::new(true)));
+    let response = get(app, "/sitemap.xml").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/xml; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-cache"
+    );
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let etag = response
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let digest = etag
+        .strip_prefix("\"sitemap-b3-v1-")
+        .and_then(|value| value.strip_suffix('"'))
+        .expect("sitemap ETag must be strong, quoted, and domain-separated");
+    assert_eq!(digest.len(), 64);
+    assert!(
+        digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+    let mut reader = Reader::from_str(&body);
+    let mut saw_urlset = false;
+    let mut url_count = 0;
+    let mut locations = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => match start.name().as_ref() {
+                "urlset" => {
+                    assert!(!saw_urlset, "sitemap must have one urlset root");
+                    saw_urlset = true;
+                    let namespace = start
+                        .try_get_attribute("xmlns")
+                        .unwrap()
+                        .expect("urlset must declare the sitemap namespace");
+                    assert_eq!(
+                        namespace.value.as_ref(),
+                        "http://www.sitemaps.org/schemas/sitemap/0.9"
+                    );
+                }
+                "url" => url_count += 1,
+                "loc" => {
+                    let raw = reader.read_text(start.name()).unwrap();
+                    locations.push(unescape(raw.as_ref()).unwrap().into_owned());
+                }
+                "lastmod" | "changefreq" | "priority" => {
+                    panic!("empty sitemap must omit optional URL metadata")
+                }
+                _ => {}
+            },
+            Ok(Event::Empty(empty))
+                if matches!(empty.name().as_ref(), "lastmod" | "changefreq" | "priority") =>
+            {
+                panic!("empty sitemap must omit optional URL metadata")
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => panic!(
+                "sitemap must be well-formed XML at byte {}: {error}",
+                reader.error_position()
+            ),
+        }
+    }
+
+    assert!(saw_urlset);
+    assert_eq!(url_count, 2);
+    assert_eq!(
+        locations,
+        ["https://example.test/", "https://example.test/archive"]
+    );
+}
+
+#[tokio::test]
 async fn public_router_uses_snapshot_backed_error_pages() {
     let app = public_router(public_state(Readiness::new(true)));
 
@@ -73,7 +161,7 @@ async fn public_router_uses_snapshot_backed_error_pages() {
             .contains("Page not found")
     );
 
-    for path in ["/", "/feed.xml"] {
+    for path in ["/", "/feed.xml", "/sitemap.xml"] {
         let method = request(app.clone(), Method::POST, path).await;
         assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert!(
@@ -89,6 +177,20 @@ async fn rss_feed_has_no_implicit_aliases() {
     let app = public_router(public_state(Readiness::new(true)));
 
     for path in ["/feed", "/rss", "/rss.xml"] {
+        assert_eq!(get(app.clone(), path).await.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn sitemap_has_no_implicit_aliases() {
+    let app = public_router(public_state(Readiness::new(true)));
+
+    for path in [
+        "/sitemap",
+        "/sitemap.xml/",
+        "/sitemap_index.xml",
+        "/SITEMAP.XML",
+    ] {
         assert_eq!(get(app.clone(), path).await.status(), StatusCode::NOT_FOUND);
     }
 }

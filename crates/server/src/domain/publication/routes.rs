@@ -4,6 +4,7 @@ use markdown_compiler::{PostSlug, PostTag, PublicationBaseUrl};
 use serde::Serialize;
 
 pub(crate) const RSS_FEED_PATH: &str = "/feed.xml";
+pub(crate) const SITEMAP_PATH: &str = "/sitemap.xml";
 
 /// A canonical absolute URL derived only from validated publication settings.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -45,6 +46,10 @@ impl PublicPagePath {
 
     pub(crate) fn feed() -> Self {
         Self(RSS_FEED_PATH.into())
+    }
+
+    pub(crate) fn sitemap() -> Self {
+        Self(SITEMAP_PATH.into())
     }
 
     pub(crate) fn post(slug: &PostSlug) -> Self {

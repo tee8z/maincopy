@@ -39,7 +39,7 @@ content root. The repository can contain many articles.
 | Operator-managed external checkout | GitHub App, OAuth, and pull-request workflow |
 | Production-faithful draft previews | Multiple publications and tenants |
 | Scheduled initial and update releases | Explicit unpublish and retraction workflow |
-| Canonical website and RSS | Mailing-list capture and email delivery |
+| Canonical website, RSS, and sitemap | Mailing-list capture and email delivery |
 | Syntax highlighting, Mermaid, and sanitized SVG | X and Substack assisted distribution |
 | Maincopy TOML frontmatter | Obsidian-first source and YAML Properties |
 | Users, roles, profiles, and authenticated administration | Per-author publication identities |
@@ -373,6 +373,35 @@ archive, RSS, sitemap, robots policy, immutable assets, and health resources.
 
 V1 serves one RSS 2.0 feed at `GET /feed.xml` and `HEAD /feed.xml`. The feed
 contains summaries and absolute links to complete canonical articles.
+
+V1 serves one sitemap only at `GET /sitemap.xml` and `HEAD /sitemap.xml`. The
+public router has no sitemap alias or redirect.
+
+The sitemap contains only canonical HTML locations. These locations are the
+site root, archive, current public posts, and tags with at least one public
+post. Maincopy sorts the absolute locations in ascending order.
+
+The UTF-8 document contains an XML declaration and one `urlset` in the sitemap
+namespace. Each `url` contains only one `loc`. Maincopy omits `lastmod`,
+`changefreq`, and `priority`. The public projection does not contain the
+truthful activation time for the current post revision.
+
+Each `loc` contains fewer than 2,048 characters. Maincopy rejects duplicate
+locations and XML 1.0-illegal characters. One sitemap accepts at most 50,000
+locations and 40 MiB of output, with both project limits inclusive.
+
+Maincopy generates the sitemap once during immutable snapshot construction.
+The snapshot stores the exact bytes and a typed, sitemap-domain-separated
+digest of those bytes. A sitemap build failure rejects the candidate snapshot
+and preserves the active snapshot.
+
+The handler serves `application/xml; charset=utf-8`, `Cache-Control: no-cache`,
+and `X-Content-Type-Options: nosniff`. It uses the exact-byte digest as a strong
+ETag. A matching `If-None-Match` returns an empty `304 Not Modified` response.
+
+The sitemap follows the official
+[Sitemaps protocol](https://www.sitemaps.org/protocol.html). Its media type and
+UTF-8 declaration follow [RFC 7303](https://www.rfc-editor.org/rfc/rfc7303).
 
 Public pages include canonical links and structured metadata. Feeds use stable
 post identifiers and absolute canonical URLs.

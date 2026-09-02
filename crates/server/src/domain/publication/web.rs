@@ -1,4 +1,4 @@
-use std::{convert::Infallible, str::FromStr, sync::Arc};
+use std::{convert::Infallible, fmt, str::FromStr, sync::Arc};
 
 use axum::{
     Router,
@@ -15,7 +15,7 @@ use axum::{
 use markdown_compiler::{PostSlug, PostTag};
 use serde::de::DeserializeOwned;
 
-use super::RSS_FEED_PATH;
+use super::{RSS_FEED_PATH, SITEMAP_PATH};
 use crate::{
     frontend_assets::{FrontendAssetName, FrontendBundleDigest, IMMUTABLE_CACHE_CONTROL},
     render::{SiteSnapshot, SiteSnapshotReader},
@@ -25,6 +25,8 @@ const HTML_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("text/html; char
 const REVALIDATE_CACHE_POLICY: HeaderValue = HeaderValue::from_static("no-cache");
 const RSS_CONTENT_TYPE: HeaderValue =
     HeaderValue::from_static("application/rss+xml; charset=utf-8");
+const SITEMAP_CONTENT_TYPE: HeaderValue =
+    HeaderValue::from_static("application/xml; charset=utf-8");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 
 /// Builds the publication-specific portion of the public HTTP API.
@@ -35,6 +37,7 @@ pub(crate) fn router(snapshots: SiteSnapshotReader) -> Router {
         .route("/tags/{tag}", get(tag))
         .route("/archive", get(archive))
         .route(RSS_FEED_PATH, get(feed))
+        .route(SITEMAP_PATH, get(sitemap))
         .route("/app-assets/{digest}/{name}", get(application_asset))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -135,10 +138,33 @@ async fn archive(PublicRequest { snapshot, headers }: PublicRequest) -> Response
 }
 
 async fn feed(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
-    let Ok(etag) = HeaderValue::from_str(&format!("\"{}\"", snapshot.feed.digest)) else {
+    snapshot_document_response(
+        Arc::clone(&snapshot.feed.body),
+        &snapshot.feed.digest,
+        RSS_CONTENT_TYPE,
+        &headers,
+    )
+}
+
+async fn sitemap(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
+    snapshot_document_response(
+        Arc::clone(&snapshot.sitemap.body),
+        &snapshot.sitemap.digest,
+        SITEMAP_CONTENT_TYPE,
+        &headers,
+    )
+}
+
+fn snapshot_document_response(
+    body: Arc<str>,
+    digest: &impl fmt::Display,
+    content_type: HeaderValue,
+    request_headers: &HeaderMap,
+) -> Response {
+    let Ok(etag) = HeaderValue::from_str(&format!("\"{digest}\"")) else {
         return internal_error_response();
     };
-    if if_none_match(&headers, &etag) {
+    if if_none_match(request_headers, &etag) {
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::NOT_MODIFIED;
         let headers = response.headers_mut();
@@ -148,11 +174,10 @@ async fn feed(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
         return response;
     }
 
-    let body = Arc::clone(&snapshot.feed.body);
     let mut response = Response::new(Body::from(Bytes::from_owner(ArcStrBodyOwner(body))));
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, RSS_CONTENT_TYPE);
+    headers.insert(CONTENT_TYPE, content_type);
     headers.insert(CACHE_CONTROL, REVALIDATE_CACHE_POLICY);
     headers.insert(ETAG, etag);
     headers.insert("x-content-type-options", NOSNIFF);
@@ -484,6 +509,92 @@ mod tests {
         );
 
         let conditional = request(Method::GET, "/feed.xml", std::slice::from_ref(&current)).await;
+        assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            conditional.headers().get(CACHE_CONTROL),
+            Some(&REVALIDATE_CACHE_POLICY)
+        );
+        assert_eq!(conditional.headers().get(ETAG), Some(&current));
+        assert_eq!(
+            conditional.headers().get("x-content-type-options"),
+            Some(&NOSNIFF)
+        );
+        assert!(conditional.headers().get(CONTENT_TYPE).is_none());
+        assert!(
+            to_bytes(conditional.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sitemap_is_snapshot_backed_and_contains_only_canonical_html_routes() {
+        let response = get("/sitemap.xml").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&SITEMAP_CONTENT_TYPE)
+        );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&REVALIDATE_CACHE_POLICY)
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&NOSNIFF)
+        );
+        let current = etag(&response);
+        assert!(current.to_str().unwrap().starts_with("\"sitemap-b3-v1-"));
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let expected = [
+            "https://example.test/",
+            "https://example.test/archive",
+            "https://example.test/posts/hello-maincopy",
+            "https://example.test/tags/rust",
+        ];
+        let mut prior = 0;
+        for location in expected {
+            let position = body.find(&format!("<loc>{location}</loc>")).unwrap();
+            assert!(position > prior, "sitemap locations must be sorted");
+            prior = position;
+        }
+        assert!(!body.contains("feed.xml"));
+        assert!(!body.contains("not-published"));
+        assert!(!body.contains("<lastmod>"));
+    }
+
+    #[tokio::test]
+    async fn sitemap_head_and_conditional_reads_preserve_document_headers() {
+        let current = etag(&get("/sitemap.xml").await);
+
+        let head = request(Method::HEAD, "/sitemap.xml", &[]).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers().get(CONTENT_TYPE),
+            Some(&SITEMAP_CONTENT_TYPE)
+        );
+        assert_eq!(
+            head.headers().get(CACHE_CONTROL),
+            Some(&REVALIDATE_CACHE_POLICY)
+        );
+        assert_eq!(head.headers().get(ETAG), Some(&current));
+        assert_eq!(head.headers().get("x-content-type-options"), Some(&NOSNIFF));
+        assert!(
+            to_bytes(head.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let conditional =
+            request(Method::GET, "/sitemap.xml", std::slice::from_ref(&current)).await;
         assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(
             conditional.headers().get(CACHE_CONTROL),

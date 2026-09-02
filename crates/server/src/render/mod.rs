@@ -5,6 +5,7 @@ mod catalog;
 mod markdown;
 mod rss;
 mod site;
+mod sitemap;
 
 pub use asset_path::{SnapshotAssetPath, SnapshotAssetPathError};
 pub(crate) use catalog::CatalogRetentionError;
