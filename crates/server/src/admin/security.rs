@@ -1399,9 +1399,9 @@ mod tests {
         }
 
         async fn stop(self) {
+            self.shutdown.cancel();
             drop(self.state);
             drop(self.store);
-            self.shutdown.cancel();
             self.writer.await.unwrap();
         }
     }
