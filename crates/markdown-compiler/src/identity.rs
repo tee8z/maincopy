@@ -32,6 +32,9 @@ const MERMAID_PLACEHOLDER_TAG: u8 = 0;
 const POST_RENDERER_VERSION_TAG: u8 = 0;
 const SANITIZER_VERSION_TAG: u8 = 0;
 const SITE_SHELL_RENDERER_VERSION_TAG: u8 = 0;
+// This tag freezes public content-asset MIME, disposition, and security-header
+// behavior into the snapshot URL. Bump it whenever that delivery policy changes.
+const PUBLIC_ASSET_DELIVERY_POLICY_TAG: u8 = 0;
 const LOCAL_PROFILE_KIND_TAG: u8 = 0;
 const LOCAL_PROFILE_SCHEMA_VERSION: u16 = 1;
 
@@ -578,6 +581,7 @@ fn encode_post_renderer(transcript: &mut Transcript, _renderer: &PostRendererIde
 
 fn encode_site_renderer(transcript: &mut Transcript, renderer: &SiteShellRendererIdentity) {
     transcript.tag(SITE_SHELL_RENDERER_VERSION_TAG);
+    transcript.tag(PUBLIC_ASSET_DELIVERY_POLICY_TAG);
     transcript.fixed_bytes(&renderer.frontend_bundle);
 }
 
@@ -1287,7 +1291,7 @@ name = "Example Author"
         assert_eq!(digest(&forward), digest(&reverse));
         assert_eq!(
             digest(&forward).as_str(),
-            "site-b3-v1-c63177775acdf7615986bf87ec7a101045fd6ef9a0d2f744163fd6e468c22b83"
+            "site-b3-v1-8951f1f9fd36abf4e365417ca7e7df972d8db2d847985544dd4779be2e991000"
         );
 
         let duplicate = [first.clone(), first];

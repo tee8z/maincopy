@@ -1,7 +1,7 @@
 use axum::{
     Router,
     body::{Body, to_bytes},
-    http::{Method, Request},
+    http::{HeaderMap, Method, Request},
     response::Response,
 };
 use serde_json::Value;
@@ -39,11 +39,21 @@ pub async fn get(app: Router, path: &str) -> Response {
 }
 
 pub async fn request(app: Router, method: Method, path: &str) -> Response {
-    let request = Request::builder()
+    request_with_headers(app, method, path, HeaderMap::new()).await
+}
+
+pub async fn request_with_headers(
+    app: Router,
+    method: Method,
+    path: &str,
+    headers: HeaderMap,
+) -> Response {
+    let mut request = Request::builder()
         .method(method)
         .uri(path)
         .body(Body::empty())
         .expect("test request must be valid");
+    *request.headers_mut() = headers;
 
     app.oneshot(request)
         .await

@@ -10,10 +10,10 @@ use markdown_compiler::identity::{
     finalize_preview_digest, finalize_site_snapshot,
 };
 use markdown_compiler::{
-    AssetRevisionReference, DefaultPostTipPolicy, DigestedAsset, DraftStatus, LogicalAssetPath,
-    PostDescription, PostId, PostRevisionDigest, PostSlug, PostTag, PostTipPolicy, PostTitle,
-    PreviewDigest, PublicationSettings, ResolvedLocalAssetStore, ResolvedPostAssets,
-    RevisionIdentityError, SiteShellRendererIdentity, SiteSnapshotDigest,
+    AssetDigest, AssetRevisionReference, DefaultPostTipPolicy, DigestedAsset, DraftStatus,
+    LogicalAssetPath, PostDescription, PostId, PostRevisionDigest, PostSlug, PostTag,
+    PostTipPolicy, PostTitle, PreviewDigest, PublicationSettings, ResolvedLocalAssetStore,
+    ResolvedPostAssets, RevisionIdentityError, SiteShellRendererIdentity, SiteSnapshotDigest,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use qrcode::{QrCode, types::Color};
@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 use crate::domain::profile::TipRecipientProjection;
 use crate::domain::publication::{
     CanonicalSiteUrl, PublicLedgerProjection, PublicPagePath, PublishedPostRevision,
+    assets::AssetDelivery,
 };
 use crate::frontend_assets::FrontendAssetManifest;
 
@@ -38,6 +39,8 @@ use super::{ContentCatalog, GeneratedPostAsset, RenderedPost, SnapshotAssetPath}
 const MAX_PAGE_BYTES: usize = 40 * 1024 * 1024;
 const MAX_PUBLIC_ROUTES: usize = 50_000;
 const MAX_RETAINED_HTML_BYTES: usize = 512 * 1024 * 1024;
+const MAX_PUBLIC_ASSETS: usize = 50_000;
+const MAX_RETAINED_ASSET_BYTES: usize = 512 * 1024 * 1024;
 // Index, archive, feed, robots, sitemap, and the two rendered fallback pages.
 const FIXED_PUBLIC_ROUTES: usize = 7;
 
@@ -820,7 +823,7 @@ fn collect_public_assets(
     shell: &RenderedSiteShell,
     digest: &SiteSnapshotDigest,
 ) -> Result<BTreeMap<SnapshotAssetPath, SnapshotPublicAsset>, SiteSnapshotBuildError> {
-    let mut selected: BTreeMap<LogicalAssetPath, SelectedAsset> = BTreeMap::new();
+    let mut selected = SelectedAssets::new();
     collect_site_global_assets(
         &mut selected,
         &shell.catalog.site_assets,
@@ -850,7 +853,7 @@ fn collect_public_assets(
 }
 
 fn collect_site_global_assets(
-    selected: &mut BTreeMap<LogicalAssetPath, SelectedAsset>,
+    selected: &mut SelectedAssets,
     site_assets: &markdown_compiler::ResolvedSiteAssets,
     local_assets: &ResolvedLocalAssetStore,
 ) -> Result<(), SiteSnapshotBuildError> {
@@ -866,7 +869,7 @@ fn collect_site_global_assets(
 }
 
 fn collect_selected_post_assets(
-    selected: &mut BTreeMap<LogicalAssetPath, SelectedAsset>,
+    selected: &mut SelectedAssets,
     assets: &ResolvedPostAssets,
     generated_assets: &[GeneratedPostAsset],
     store: &ResolvedLocalAssetStore,
@@ -880,51 +883,131 @@ fn collect_selected_post_assets(
         }
     }
     for generated in generated_assets {
-        insert_selected_asset(
-            selected,
+        selected.insert(
             generated.asset.clone(),
             Arc::clone(&generated.bytes),
+            SelectedAssetProvenance::UntrustedRendererOutput,
         )?;
     }
     Ok(())
 }
 
 fn materialize_public_assets(
-    selected: BTreeMap<LogicalAssetPath, SelectedAsset>,
+    selected: SelectedAssets,
     digest: &SiteSnapshotDigest,
 ) -> Result<BTreeMap<SnapshotAssetPath, SnapshotPublicAsset>, SiteSnapshotBuildError> {
-    let mut assets = BTreeMap::new();
-    for selected in selected.into_values() {
-        let path = SnapshotAssetPath::new(digest, &selected.asset.path).map_err(|error| {
-            SiteSnapshotBuildError::new(
-                SiteSnapshotBuildErrorCode::AssetUnavailable,
-                None,
-                error.to_string(),
-            )
-        })?;
-        let public = SnapshotPublicAsset {
-            path: path.clone(),
-            asset: selected.asset,
-            bytes: selected.bytes,
-        };
-        if assets.insert(path, public).is_some() {
-            return Err(SiteSnapshotBuildError::new(
-                SiteSnapshotBuildErrorCode::AssetCollision,
-                None,
-                "two selected assets resolved to the same immutable public path",
-            ));
-        }
-    }
-    Ok(assets)
+    // One fixed snapshot digest and the map's unique logical paths make this
+    // transformation injective, so collection cannot replace an earlier asset.
+    selected
+        .by_path
+        .into_values()
+        .map(|selected| {
+            let delivery = selected.provenance.delivery(&selected.asset.path);
+            let path = SnapshotAssetPath::new(digest, &selected.asset.path).map_err(|error| {
+                SiteSnapshotBuildError::new(
+                    SiteSnapshotBuildErrorCode::AssetUnavailable,
+                    None,
+                    error.to_string(),
+                )
+            })?;
+            let public = SnapshotPublicAsset {
+                digest: selected.asset.digest,
+                bytes: selected.bytes,
+                delivery,
+            };
+            Ok((path, public))
+        })
+        .collect()
 }
 
 struct SelectedAsset {
     asset: DigestedAsset,
     bytes: Arc<[u8]>,
+    provenance: SelectedAssetProvenance,
+}
+
+struct SelectedAssets {
+    by_path: BTreeMap<LogicalAssetPath, SelectedAsset>,
+    retained_bytes: usize,
+}
+
+impl SelectedAssets {
+    const fn new() -> Self {
+        Self {
+            by_path: BTreeMap::new(),
+            retained_bytes: 0,
+        }
+    }
+
+    fn insert(
+        &mut self,
+        asset: DigestedAsset,
+        bytes: Arc<[u8]>,
+        provenance: SelectedAssetProvenance,
+    ) -> Result<(), SiteSnapshotBuildError> {
+        if let Some(existing) = self.by_path.get(&asset.path) {
+            if existing.asset == asset && existing.provenance == provenance {
+                return Ok(());
+            }
+            return Err(SiteSnapshotBuildError::new(
+                SiteSnapshotBuildErrorCode::AssetCollision,
+                None,
+                "selected assets disagree at one logical path",
+            ));
+        }
+
+        let retained_bytes =
+            next_public_asset_bytes(self.by_path.len(), self.retained_bytes, bytes.len())?;
+        self.by_path.insert(
+            asset.path.clone(),
+            SelectedAsset {
+                asset,
+                bytes,
+                provenance,
+            },
+        );
+        self.retained_bytes = retained_bytes;
+        Ok(())
+    }
+}
+
+fn next_public_asset_bytes(
+    current_count: usize,
+    current_bytes: usize,
+    asset_bytes: usize,
+) -> Result<usize, SiteSnapshotBuildError> {
+    if current_count
+        .checked_add(1)
+        .is_none_or(|count| count > MAX_PUBLIC_ASSETS)
+    {
+        return Err(SiteSnapshotBuildError::public_asset_count_limit());
+    }
+    let Some(next_bytes) = current_bytes.checked_add(asset_bytes) else {
+        return Err(SiteSnapshotBuildError::retained_asset_limit());
+    };
+    if next_bytes > MAX_RETAINED_ASSET_BYTES {
+        return Err(SiteSnapshotBuildError::retained_asset_limit());
+    }
+    Ok(next_bytes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedAssetProvenance {
+    Authored,
+    UntrustedRendererOutput,
+}
+
+impl SelectedAssetProvenance {
+    fn delivery(self, path: &LogicalAssetPath) -> AssetDelivery {
+        match self {
+            Self::Authored => AssetDelivery::for_authored(path),
+            Self::UntrustedRendererOutput => AssetDelivery::for_untrusted_generated(),
+        }
+    }
 }
 
 fn insert_authored_asset(
-    selected: &mut BTreeMap<LogicalAssetPath, SelectedAsset>,
+    selected: &mut SelectedAssets,
     asset: &DigestedAsset,
     store: &ResolvedLocalAssetStore,
 ) -> Result<(), SiteSnapshotBuildError> {
@@ -935,26 +1018,11 @@ fn insert_authored_asset(
             error.to_string(),
         )
     })?;
-    insert_selected_asset(selected, asset.clone(), Arc::clone(&resolved.bytes))
-}
-
-fn insert_selected_asset(
-    selected: &mut BTreeMap<LogicalAssetPath, SelectedAsset>,
-    asset: DigestedAsset,
-    bytes: Arc<[u8]>,
-) -> Result<(), SiteSnapshotBuildError> {
-    if let Some(existing) = selected.get(&asset.path) {
-        if existing.asset.digest == asset.digest && existing.bytes == bytes {
-            return Ok(());
-        }
-        return Err(SiteSnapshotBuildError::new(
-            SiteSnapshotBuildErrorCode::AssetCollision,
-            None,
-            "selected assets disagree about the bytes at one logical path",
-        ));
-    }
-    selected.insert(asset.path.clone(), SelectedAsset { asset, bytes });
-    Ok(())
+    selected.insert(
+        asset.clone(),
+        Arc::clone(&resolved.bytes),
+        SelectedAssetProvenance::Authored,
+    )
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1028,10 +1096,10 @@ fn hash_presentation_part(hasher: &mut blake3::Hasher, value: &[u8]) {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SnapshotPublicAsset {
-    pub path: SnapshotAssetPath,
-    pub asset: DigestedAsset,
-    pub bytes: Arc<[u8]>,
+pub(crate) struct SnapshotPublicAsset {
+    pub(crate) digest: AssetDigest,
+    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) delivery: AssetDelivery,
 }
 
 /// Complete immutable request-facing state for one canonical publication.
@@ -1072,8 +1140,8 @@ impl SiteSnapshot {
             .map(|page| &page.canonical_url)
     }
 
-    pub fn public_assets(&self) -> impl ExactSizeIterator<Item = &SnapshotPublicAsset> {
-        self.assets.values()
+    pub(crate) fn public_asset(&self, path: &SnapshotAssetPath) -> Option<&SnapshotPublicAsset> {
+        self.assets.get(path)
     }
 
     pub(crate) fn index_page(&self) -> Arc<str> {
@@ -1200,6 +1268,8 @@ pub enum SiteSnapshotBuildErrorCode {
     RetainedHtmlLimitExceeded,
     AssetUnavailable,
     AssetCollision,
+    PublicAssetCountLimitExceeded,
+    RetainedAssetLimitExceeded,
     ArticleProjectionFailed,
     RssRenderFailed,
     RobotsRenderFailed,
@@ -1313,6 +1383,24 @@ impl SiteSnapshotBuildError {
             None,
             format!(
                 "site exceeds the inclusive {MAX_RETAINED_HTML_BYTES}-byte retained HTML limit"
+            ),
+        )
+    }
+
+    fn public_asset_count_limit() -> Self {
+        Self::new(
+            SiteSnapshotBuildErrorCode::PublicAssetCountLimitExceeded,
+            None,
+            format!("site exceeds the inclusive {MAX_PUBLIC_ASSETS}-asset limit"),
+        )
+    }
+
+    fn retained_asset_limit() -> Self {
+        Self::new(
+            SiteSnapshotBuildErrorCode::RetainedAssetLimitExceeded,
+            None,
+            format!(
+                "site exceeds the inclusive {MAX_RETAINED_ASSET_BYTES}-byte retained asset limit"
             ),
         )
     }
@@ -2006,14 +2094,24 @@ mod tests {
     }
 
     fn catalog_asset(fixture: &Fixture, path: &str) -> DigestedAsset {
+        let path = LogicalAssetPath::parse(path).unwrap();
         fixture
             .catalog
-            .local_assets
-            .assets
-            .get(&LogicalAssetPath::parse(path).unwrap())
-            .unwrap()
-            .asset
-            .clone()
+            .site_assets
+            .favicon
+            .iter()
+            .chain(fixture.catalog.site_assets.references.iter())
+            .chain(fixture.catalog.rendered_posts().flat_map(|post| {
+                post.assets
+                    .image
+                    .iter()
+                    .chain(post.assets.references.iter())
+            }))
+            .find_map(|reference| match reference {
+                AssetRevisionReference::Local(asset) if asset.path == path => Some(asset.clone()),
+                AssetRevisionReference::Local(_) | AssetRevisionReference::External(_) => None,
+            })
+            .expect("fixture asset reference must be present")
     }
 
     fn assert_core_page_metadata(
@@ -2390,18 +2488,17 @@ mod tests {
             "https://blog.example.com/posts/first-post"
         );
 
-        let paths: Vec<_> = snapshot
-            .public_assets()
-            .map(|asset| asset.asset.path.as_str())
-            .collect();
-        assert_eq!(
-            paths,
-            [
-                "assets/favicon.png",
-                "assets/first-cover.png",
-                "assets/public.png"
-            ]
-        );
+        let paths: Vec<_> = [
+            "assets/favicon.png",
+            "assets/first-cover.png",
+            "assets/public.png",
+        ]
+        .map(|path| {
+            SnapshotAssetPath::new(&snapshot.digest, &LogicalAssetPath::parse(path).unwrap())
+                .unwrap()
+        })
+        .into();
+        assert_eq!(snapshot.assets.keys().cloned().collect::<Vec<_>>(), paths);
         assert!(!snapshot.index_page().contains("Second post"));
         assert!(!snapshot.index_page().contains("Draft post"));
         assert!(snapshot.feed.body.contains(FIRST_ID));
@@ -2624,8 +2721,13 @@ mod tests {
             .unwrap();
         assert!(second.contains("Second"));
         let retained_asset = snapshot
-            .public_assets()
-            .find(|asset| asset.asset.path.as_str() == "assets/public.png")
+            .public_asset(
+                &SnapshotAssetPath::new(
+                    &snapshot.digest,
+                    &LogicalAssetPath::parse("assets/public.png").unwrap(),
+                )
+                .unwrap(),
+            )
             .unwrap();
         assert_eq!(retained_asset.bytes.as_ref(), b"retained public bytes");
     }
@@ -2641,7 +2743,7 @@ mod tests {
             Vec::new(),
             vec![AssetRevisionReference::local(shared_reference.clone())],
         );
-        let mut selected = BTreeMap::new();
+        let mut selected = SelectedAssets::new();
         collect_site_global_assets(&mut selected, &site_assets, &fixture.catalog.local_assets)
             .unwrap();
 
@@ -2657,7 +2759,7 @@ mod tests {
             vec![AssetRevisionReference::local(shared_reference)],
         );
         let generated = GeneratedPostAsset::from_owned_bytes(
-            LogicalAssetPath::parse("assets/generated.svg").unwrap(),
+            LogicalAssetPath::parse("assets/generated.png").unwrap(),
             Arc::from(&b"generated"[..]),
         );
         collect_selected_post_assets(
@@ -2668,34 +2770,52 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selected.len(), 4, "the repeated post reference must dedupe");
+        assert_eq!(
+            selected.by_path.len(),
+            4,
+            "the repeated post reference must dedupe"
+        );
         let digest = SiteSnapshotDigest::parse(&format!("site-b3-v1-{}", "44".repeat(32))).unwrap();
         let public = materialize_public_assets(selected, &digest).unwrap();
-        let paths: Vec<_> = public
-            .values()
-            .map(|asset| asset.asset.path.as_str())
-            .collect();
+        let paths: Vec<_> = [
+            "assets/favicon.png",
+            "assets/first-cover.png",
+            "assets/generated.png",
+            "assets/public.png",
+        ]
+        .map(|path| {
+            SnapshotAssetPath::new(&digest, &LogicalAssetPath::parse(path).unwrap()).unwrap()
+        })
+        .into();
+        assert_eq!(public.keys().cloned().collect::<Vec<_>>(), paths);
+        let authored_path = SnapshotAssetPath::new(
+            &digest,
+            &LogicalAssetPath::parse("assets/public.png").unwrap(),
+        )
+        .unwrap();
+        let authored_png = public.get(&authored_path).unwrap();
         assert_eq!(
-            paths,
-            [
-                "assets/favicon.png",
-                "assets/first-cover.png",
-                "assets/generated.svg",
-                "assets/public.png",
-            ]
+            authored_png.digest,
+            catalog_asset(&fixture, "assets/public.png").digest
         );
-        assert!(
-            public
-                .values()
-                .any(|asset| asset.asset == generated.asset && asset.bytes == generated.bytes)
+        assert_eq!(authored_png.delivery.content_type(), "image/png");
+        assert!(matches!(authored_png.delivery, AssetDelivery::Inline(_)));
+        let generated_path = SnapshotAssetPath::new(&digest, &generated.asset.path).unwrap();
+        let generated_png = public.get(&generated_path).unwrap();
+        assert_eq!(generated_png.digest, generated.asset.digest);
+        assert_eq!(generated_png.bytes, generated.bytes);
+        assert_eq!(
+            generated_png.delivery.content_type(),
+            "application/octet-stream"
         );
+        assert_eq!(generated_png.delivery, AssetDelivery::Attachment);
 
         let missing = DigestedAsset::new(
             LogicalAssetPath::parse("assets/missing.png").unwrap(),
             digest_asset(b"missing"),
         );
         let error = insert_authored_asset(
-            &mut BTreeMap::new(),
+            &mut SelectedAssets::new(),
             &missing,
             &fixture.catalog.local_assets,
         )
@@ -2705,7 +2825,7 @@ mod tests {
 
         let mismatched = DigestedAsset::new(favicon.path.clone(), digest_asset(b"changed"));
         let error = insert_authored_asset(
-            &mut BTreeMap::new(),
+            &mut SelectedAssets::new(),
             &mismatched,
             &fixture.catalog.local_assets,
         )
@@ -2713,18 +2833,31 @@ mod tests {
         assert_eq!(error.code, SiteSnapshotBuildErrorCode::AssetUnavailable);
         assert!(error.message.contains("does not match"));
 
-        let mut collision = BTreeMap::new();
-        insert_selected_asset(
-            &mut collision,
-            generated.asset.clone(),
-            Arc::clone(&generated.bytes),
-        )
-        .unwrap();
+        let mut collision = SelectedAssets::new();
+        collision
+            .insert(
+                generated.asset.clone(),
+                Arc::clone(&generated.bytes),
+                SelectedAssetProvenance::UntrustedRendererOutput,
+            )
+            .unwrap();
+        let error = collision
+            .insert(
+                generated.asset.clone(),
+                Arc::clone(&generated.bytes),
+                SelectedAssetProvenance::Authored,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, SiteSnapshotBuildErrorCode::AssetCollision);
         let conflicting =
             DigestedAsset::new(generated.asset.path.clone(), digest_asset(b"conflicting"));
-        let error =
-            insert_selected_asset(&mut collision, conflicting, Arc::from(&b"conflicting"[..]))
-                .unwrap_err();
+        let error = collision
+            .insert(
+                conflicting,
+                Arc::from(&b"conflicting"[..]),
+                SelectedAssetProvenance::UntrustedRendererOutput,
+            )
+            .unwrap_err();
         assert_eq!(error.code, SiteSnapshotBuildErrorCode::AssetCollision);
     }
 
@@ -2983,6 +3116,28 @@ mod tests {
             retained.add(1).unwrap_err().code,
             SiteSnapshotBuildErrorCode::RetainedHtmlLimitExceeded
         );
+
+        assert_eq!(
+            next_public_asset_bytes(MAX_PUBLIC_ASSETS - 1, 0, 0).unwrap(),
+            0
+        );
+        assert_eq!(
+            next_public_asset_bytes(MAX_PUBLIC_ASSETS, 0, 0)
+                .unwrap_err()
+                .code,
+            SiteSnapshotBuildErrorCode::PublicAssetCountLimitExceeded
+        );
+
+        assert_eq!(
+            next_public_asset_bytes(0, 0, MAX_RETAINED_ASSET_BYTES).unwrap(),
+            MAX_RETAINED_ASSET_BYTES
+        );
+        assert_eq!(
+            next_public_asset_bytes(1, MAX_RETAINED_ASSET_BYTES, 1)
+                .unwrap_err()
+                .code,
+            SiteSnapshotBuildErrorCode::RetainedAssetLimitExceeded
+        );
     }
 
     #[test]
@@ -3088,6 +3243,8 @@ mod tests {
             SiteSnapshotBuildErrorCode::RetainedHtmlLimitExceeded,
             SiteSnapshotBuildErrorCode::AssetUnavailable,
             SiteSnapshotBuildErrorCode::AssetCollision,
+            SiteSnapshotBuildErrorCode::PublicAssetCountLimitExceeded,
+            SiteSnapshotBuildErrorCode::RetainedAssetLimitExceeded,
             SiteSnapshotBuildErrorCode::ArticleProjectionFailed,
             SiteSnapshotBuildErrorCode::RssRenderFailed,
             SiteSnapshotBuildErrorCode::RobotsRenderFailed,
@@ -3109,6 +3266,8 @@ mod tests {
             "retained_html_limit_exceeded",
             "asset_unavailable",
             "asset_collision",
+            "public_asset_count_limit_exceeded",
+            "retained_asset_limit_exceeded",
             "article_projection_failed",
             "rss_render_failed",
             "robots_render_failed",

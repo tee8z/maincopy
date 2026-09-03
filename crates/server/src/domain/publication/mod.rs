@@ -2,6 +2,7 @@
 
 pub(crate) mod activation;
 pub(crate) mod admin;
+pub(crate) mod assets;
 mod provenance;
 mod routes;
 pub(crate) mod scheduler;

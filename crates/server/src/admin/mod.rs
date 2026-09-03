@@ -487,6 +487,21 @@ mod tests {
             assert!(preview["responses"][status]["headers"]["cache-control"].is_object());
             assert!(preview["responses"][status]["headers"]["x-request-id"].is_object());
         }
+        let preview_asset =
+            &document["paths"]["/api/admin/v1/preview-assets/{content_digest}"]["get"];
+        assert!(preview_asset["responses"]["200"]["content"]["*/*"].is_object());
+        for header in [
+            "cache-control",
+            "content-disposition",
+            "content-security-policy",
+            "x-content-type-options",
+            "x-request-id",
+        ] {
+            assert!(
+                preview_asset["responses"]["200"]["headers"][header].is_object(),
+                "preview asset response is missing {header}"
+            );
+        }
         let publication = &document["paths"][PUBLICATIONS_PATH]["post"];
         let idempotency_key = publication["parameters"]
             .as_array()

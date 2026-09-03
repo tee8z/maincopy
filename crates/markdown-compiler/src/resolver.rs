@@ -120,7 +120,7 @@ pub struct ResolvedLocalAsset {
 /// Immutable local bytes keyed by their portable logical path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedLocalAssetStore {
-    pub assets: BTreeMap<LogicalAssetPath, ResolvedLocalAsset>,
+    assets: BTreeMap<LogicalAssetPath, ResolvedLocalAsset>,
 }
 
 impl ResolvedLocalAssetStore {
@@ -131,10 +131,21 @@ impl ResolvedLocalAssetStore {
         let Some(asset) = self.assets.get(&reference.path) else {
             return Err(ResolvedLocalAssetLookupError::Missing);
         };
-        if asset.asset.digest != reference.digest {
+        if asset.asset.path != reference.path || asset.asset.digest != reference.digest {
             return Err(ResolvedLocalAssetLookupError::DigestMismatch);
         }
         Ok(asset)
+    }
+}
+
+/// Iterates resolved logical paths without bypassing reference-checked byte access.
+impl<'assets> IntoIterator for &'assets ResolvedLocalAssetStore {
+    type Item = &'assets LogicalAssetPath;
+    type IntoIter =
+        std::collections::btree_map::Keys<'assets, LogicalAssetPath, ResolvedLocalAsset>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.assets.keys()
     }
 }
 
@@ -143,7 +154,7 @@ impl ResolvedLocalAssetStore {
 pub enum ResolvedLocalAssetLookupError {
     #[error("the local asset is not present in this resolution")]
     Missing,
-    #[error("the local asset digest does not match the resolved bytes")]
+    #[error("the local asset identity does not match the resolved reference")]
     DigestMismatch,
 }
 

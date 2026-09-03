@@ -1539,7 +1539,10 @@ mod tests {
             publication::store::{InstallStartupSnapshot, ObservedPostRevision},
         },
         frontend_assets::embedded_manifest,
-        render::{SiteSnapshotReader, compile_content_catalog, snapshot_store},
+        render::{
+            SiteSnapshotReader, SnapshotAssetPath, SnapshotPublicAsset, compile_content_catalog,
+            snapshot_store,
+        },
     };
     use markdown_compiler::{
         DiscoveredPost, LogicalAssetPath, PostCollection, resolve_content_assets,
@@ -1711,6 +1714,15 @@ mod tests {
     fn snapshot(catalog: &Arc<ContentCatalog>, ledger: &PublicLedgerProjection) -> SiteSnapshot {
         let shell = render_site_shell(Arc::clone(catalog), embedded_manifest(), ledger).unwrap();
         build_site_snapshot(shell, ledger).unwrap()
+    }
+
+    fn snapshot_asset<'snapshot>(
+        snapshot: &'snapshot SiteSnapshot,
+        logical_path: &str,
+    ) -> &'snapshot SnapshotPublicAsset {
+        let logical_path = LogicalAssetPath::parse(logical_path).unwrap();
+        let public_path = SnapshotAssetPath::new(&snapshot.digest, &logical_path).unwrap();
+        snapshot.public_asset(&public_path).unwrap()
     }
 
     fn candidate_catalogs(
@@ -3022,20 +3034,9 @@ mod tests {
         assert!(active.index_page().contains("Candidate A shell"));
         assert!(!active.index_page().contains("Candidate B shell"));
 
-        let active_favicon = active
-            .public_assets()
-            .find(|asset| asset.asset.path.as_str() == "assets/favicon.png")
-            .unwrap();
-        let expected_a_favicon = expected_a
-            .snapshot
-            .public_assets()
-            .find(|asset| asset.asset.path.as_str() == "assets/favicon.png")
-            .unwrap();
-        let expected_b_favicon = expected_b
-            .snapshot
-            .public_assets()
-            .find(|asset| asset.asset.path.as_str() == "assets/favicon.png")
-            .unwrap();
+        let active_favicon = snapshot_asset(&active, "assets/favicon.png");
+        let expected_a_favicon = snapshot_asset(&expected_a.snapshot, "assets/favicon.png");
+        let expected_b_favicon = snapshot_asset(&expected_b.snapshot, "assets/favicon.png");
         assert_eq!(active_favicon, expected_a_favicon);
         assert_ne!(active_favicon, expected_b_favicon);
         assert_eq!(active_favicon.bytes.as_ref(), b"favicon-a");

@@ -1,11 +1,20 @@
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use maincopy_server::{
     frontend_assets::{FrontendAssetName, IMMUTABLE_CACHE_CONTROL, embedded_manifest},
     web::{Readiness, public_router},
 };
 use quick_xml::{Reader, escape::unescape, events::Event};
 
-use crate::helpers::{body_bytes, get, public_state, request};
+use crate::helpers::{body_bytes, get, public_state, request, request_with_headers};
+
+fn if_none_match(value: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::IF_NONE_MATCH,
+        HeaderValue::from_bytes(value.as_bytes()).expect("fixture ETag header must be valid"),
+    );
+    headers
+}
 
 #[tokio::test]
 async fn empty_public_snapshot_serves_semantic_index_and_archive_pages() {
@@ -260,6 +269,10 @@ async fn application_assets_require_an_exact_typed_manifest_lookup() {
         IMMUTABLE_CACHE_CONTROL
     );
     assert_eq!(
+        response.headers().get(header::CONTENT_LENGTH).unwrap(),
+        stylesheet.bytes.len().to_string().as_str()
+    );
+    assert_eq!(
         response
             .headers()
             .get(header::ETAG)
@@ -272,6 +285,73 @@ async fn application_assets_require_an_exact_typed_manifest_lookup() {
         response.headers().get("x-content-type-options").unwrap(),
         "nosniff"
     );
+    assert_eq!(body_bytes(response).await.as_ref(), stylesheet.bytes);
+
+    let response = request(app.clone(), Method::HEAD, stylesheet.public_path).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        stylesheet.mime()
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        IMMUTABLE_CACHE_CONTROL
+    );
+    assert_eq!(
+        response.headers().get(header::CONTENT_LENGTH).unwrap(),
+        stylesheet.bytes.len().to_string().as_str()
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        stylesheet.etag()
+    );
+    assert!(body_bytes(response).await.is_empty());
+
+    for method in [Method::GET, Method::HEAD] {
+        let response = request_with_headers(
+            app.clone(),
+            method,
+            stylesheet.public_path,
+            if_none_match(&stylesheet.etag()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            IMMUTABLE_CACHE_CONTROL
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            stylesheet.etag()
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert!(body_bytes(response).await.is_empty());
+    }
+
+    let response = request_with_headers(
+        app.clone(),
+        Method::GET,
+        stylesheet.public_path,
+        if_none_match("\"frontend-asset-b3-v1-not-the-current-digest\""),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response).await.as_ref(), stylesheet.bytes);
 
     let javascript = manifest.javascript.as_ref().unwrap();

@@ -58,13 +58,13 @@ present. The admin backend now uses a loopback-only HTTP listener. The CLI
 connects through the configured HTTPS admin origin.
 
 The snapshot-backed RSS feed, sitemap, robots policy, HTML autodiscovery,
-canonical links, core non-image Open Graph fields, and `BlogPosting` JSON-LD
-are present. Managed Git synchronization, redirects, favicon and image
-metadata, Content Security Policy (CSP), the admin web interface,
-release-quality technical rendering, the NixOS module, Litestream wiring,
-Prometheus metrics and dashboard, and complete restore evidence remain
-incomplete. V1 rejects authored subscription and outbound-distribution
-configuration and stores no target-job state.
+canonical links, core non-image Open Graph fields, `BlogPosting` JSON-LD, and
+snapshot-scoped local asset delivery are present. Managed Git synchronization,
+redirects, favicon and image metadata, page Content Security Policy (CSP), the
+admin web interface, release-quality technical rendering, the NixOS module,
+Litestream wiring, Prometheus metrics and dashboard, and complete restore
+evidence remain incomplete. V1 rejects authored subscription and
+outbound-distribution configuration and stores no target-job state.
 
 > [!CAUTION]
 > Do not expose the loopback admin listener directly. Use the reviewed HTTPS
