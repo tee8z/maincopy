@@ -1,0 +1,67 @@
+{
+	admin off
+	persist_config off
+	auto_https off
+	default_bind 127.0.0.1 [::1]
+
+	servers {
+		protocols h1 h2
+		strict_sni_host on
+		0rtt off
+		max_header_size 64KiB
+	}
+}
+
+https://maincopy.localhost:8443 {
+	tls "{$MAINCOPY_DEV_TLS_CERTIFICATE}" "{$MAINCOPY_DEV_TLS_PRIVATE_KEY}"
+
+	@blocked_routes path /admin /admin/* /api/admin /api/admin/* /metrics /metrics/*
+	respond @blocked_routes 404
+
+	reverse_proxy 127.0.0.1:3000 {
+		lb_retries 0
+		lb_try_duration 0s
+
+		header_up -Forwarded
+		header_up -Via
+		header_up -X-Real-IP
+		header_up -X-Forwarded-*
+		header_up -X-Maincopy-Actor
+		header_up -X-Maincopy-Role
+		header_up -X-Maincopy-Scope
+
+		transport http {
+			compression off
+			keepalive off
+			dial_timeout 2s
+			response_header_timeout 30s
+		}
+	}
+}
+
+https://admin.localhost:8443 {
+	tls "{$MAINCOPY_DEV_TLS_CERTIFICATE}" "{$MAINCOPY_DEV_TLS_PRIVATE_KEY}"
+
+	@metrics_routes path /metrics /metrics/*
+	respond @metrics_routes 404
+
+	reverse_proxy 127.0.0.1:3001 {
+		lb_retries 0
+		lb_try_duration 0s
+
+		header_up -Forwarded
+		header_up -Via
+		header_up -X-Real-IP
+		header_up -X-Forwarded-*
+		header_up -X-Maincopy-Actor
+		header_up -X-Maincopy-Role
+		header_up -X-Maincopy-Scope
+
+		transport http {
+			compression off
+			keepalive off
+			dial_timeout 2s
+			response_header_timeout 30s
+		}
+	}
+}

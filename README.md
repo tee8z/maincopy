@@ -58,6 +58,10 @@ proofs, exact previews, and immediate or scheduled release foundations are
 present. The admin backend now uses a loopback-only HTTP listener. The CLI
 connects through the configured HTTPS admin origin.
 
+A checked, loopback-only HTTPS gateway and explicit local CA trust are present
+for the local-alpha workflow. This development harness is not the production
+gateway or NixOS module.
+
 The snapshot-backed RSS feed, sitemap, robots policy, HTML autodiscovery,
 canonical links, core non-image Open Graph fields, `BlogPosting` JSON-LD,
 authored-alias redirects, durable route ownership, and snapshot-scoped local
@@ -115,6 +119,8 @@ revision-artifact backups.
   boundaries, and data ownership.
 - [Implementation plan](docs/implementation.md) defines delivery order,
   dependencies, known transitions, and acceptance gates.
+- [Local alpha runbook](docs/local-alpha.md) starts the development gateway and
+  exercises login, preview, publication, RSS, and authored aliases.
 - [Engineering style](docs/quality.md) defines Rust, testing, documentation,
   and quality conventions. It also explains the manual CRAP report.
 
@@ -145,25 +151,24 @@ nix develop
 cargo test --locked --workspace --all-targets --all-features
 ```
 
-Bootstrap the included example in one Nix shell. The command reads the owner
-password from the terminal.
+Start the local alpha from the repository root:
 
 ```console
-cargo run --locked -p maincopy-server --bin maincopyd -- \
-  --config crates/server/examples/maincopy.toml \
-  identity bootstrap password --username owner
+scripts/dev-alpha.sh
 ```
 
-Then start the example service:
+The first run reads the owner password from the terminal. Keep the launcher
+open, then use `scripts/dev-maincopy.sh` from a second Nix shell.
+
+Use explicit browser trust only when the browser demonstration requires it:
 
 ```console
-cargo run --locked -p maincopy-server --bin maincopyd -- \
-  --config crates/server/examples/maincopy.toml
+scripts/dev-alpha.sh --trust-browser
 ```
 
-The example starts the public service and loopback admin backend. The HTTPS
-admin development gateway is not complete. Do not expose the backend directly.
-Stop the server with `Ctrl+C`.
+Follow the [local alpha runbook](docs/local-alpha.md) for the complete
+login-to-publication flow, trust removal, and safe state reset. Do not expose
+the loopback backends directly.
 
 Run the Linux continuous integration checks and build with:
 

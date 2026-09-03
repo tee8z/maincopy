@@ -133,6 +133,37 @@
             ${project.pkgs.nixfmt}/bin/nixfmt --check ${./flake.nix}
             touch "$out"
           '';
+
+          development-gateway =
+            project.pkgs.runCommand "maincopy-development-gateway"
+              {
+                nativeBuildInputs = [
+                  project.pkgs.caddy
+                  project.pkgs.curl
+                  project.pkgs.jq
+                  project.pkgs.openssl
+                  project.pkgs.shellcheck
+                ];
+              }
+              ''
+                openssl req -x509 -newkey rsa:2048 -nodes \
+                  -keyout "$TMPDIR/key.pem" \
+                  -out "$TMPDIR/certificate.pem" \
+                  -subj "/CN=admin.localhost" \
+                  -addext "subjectAltName=DNS:admin.localhost,DNS:maincopy.localhost" \
+                  -days 1 >/dev/null 2>&1
+                export MAINCOPY_DEV_TLS_CERTIFICATE="$TMPDIR/certificate.pem"
+                export MAINCOPY_DEV_TLS_PRIVATE_KEY="$TMPDIR/key.pem"
+                caddy validate --config ${./dev/Caddyfile} --adapter caddyfile
+                shellcheck \
+                  ${./scripts/dev-alpha.sh} \
+                  ${./scripts/dev-gateway.sh} \
+                  ${./scripts/dev-maincopy.sh} \
+                  ${./scripts/test-dev-gateway.sh}
+                ${project.pkgs.bash}/bin/bash \
+                  ${./scripts/test-dev-gateway.sh} ${./dev/Caddyfile}
+                touch "$out"
+              '';
         }
       );
 
@@ -147,9 +178,16 @@
           default = project.pkgs.mkShell {
             inputsFrom = [ project.maincopy ];
             packages = [
+              project.pkgs.caddy
+              project.pkgs.curl
+              project.pkgs.jq
               project.pkgs.litestream
+              project.pkgs.mkcert
               project.pkgs.nixfmt-tree
+              project.pkgs.nssTools
+              project.pkgs.shellcheck
               project.pkgs.sqlite
+              project.pkgs.util-linux
               project.rustToolchain
             ];
 

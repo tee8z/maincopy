@@ -27,6 +27,10 @@ pub(crate) struct Arguments {
     )]
     pub(crate) admin_origin: Box<str>,
 
+    /// Additional PEM certificate authorities trusted on Linux and macOS.
+    #[arg(long, global = true, value_name = "PEM_PATH")]
+    pub(crate) admin_ca_file: Option<PathBuf>,
+
     /// Protected credential context used for administration requests.
     #[arg(long, global = true, value_enum, default_value_t = AuthenticationContext::Human)]
     pub(crate) auth_context: AuthenticationContext,
@@ -156,6 +160,7 @@ mod tests {
         let arguments = Arguments::try_parse_from(["maincopy", "capabilities"]).unwrap();
 
         assert!(!arguments.json);
+        assert!(arguments.admin_ca_file.is_none());
         assert!(matches!(arguments.command, Command::Capabilities));
     }
 
@@ -175,6 +180,8 @@ mod tests {
             "--json",
             "--admin-origin",
             "https://admin.example.test",
+            "--admin-ca-file",
+            "development-ca.pem",
             "--auth-context",
             "agent",
         ])
@@ -184,6 +191,10 @@ mod tests {
         assert_eq!(
             arguments.admin_origin.as_ref(),
             "https://admin.example.test"
+        );
+        assert_eq!(
+            arguments.admin_ca_file.as_deref(),
+            Some(std::path::Path::new("development-ca.pem"))
         );
         assert_eq!(arguments.auth_context, AuthenticationContext::Agent);
     }

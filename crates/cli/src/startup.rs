@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::{
     client::{AdminClient, AdminClientError, PostPreview},
     models::{AgentKeyCommand, Arguments, Command},
+    transport::AdditionalRootCertificateError,
 };
 
 const SUCCESS: u8 = 0;
@@ -204,7 +205,11 @@ pub async fn run() -> ExitCode {
 }
 
 async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
-    let client = AdminClient::new(&arguments.admin_origin, arguments.auth_context)?;
+    let client = AdminClient::new(
+        &arguments.admin_origin,
+        arguments.auth_context,
+        arguments.admin_ca_file.as_deref(),
+    )?;
     match arguments.command {
         Command::Login { username } => login(&client, username).await,
         Command::Logout => client
@@ -768,6 +773,30 @@ fn error_exit(error: &CliError) -> u8 {
     };
 
     match error {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        AdminClientError::AdditionalRootCertificates(
+            AdditionalRootCertificateError::UnsupportedPlatform { .. },
+        ) => VALIDATION,
+        AdminClientError::AdditionalRootCertificates(
+            AdditionalRootCertificateError::Open { source, .. }
+            | AdditionalRootCertificateError::Read { source, .. },
+        ) if source.kind() == io::ErrorKind::PermissionDenied => PERMISSION,
+        AdminClientError::AdditionalRootCertificates(AdditionalRootCertificateError::Open {
+            source,
+            ..
+        }) if source.kind() == io::ErrorKind::NotFound => VALIDATION,
+        AdminClientError::AdditionalRootCertificates(
+            AdditionalRootCertificateError::Open { .. }
+            | AdditionalRootCertificateError::Read { .. },
+        ) => UNAVAILABLE,
+        AdminClientError::AdditionalRootCertificates(
+            AdditionalRootCertificateError::NotRegularFile { .. }
+            | AdditionalRootCertificateError::ChangedDuringOpen { .. }
+            | AdditionalRootCertificateError::TooLarge { .. }
+            | AdditionalRootCertificateError::UnexpectedPemSection { .. }
+            | AdditionalRootCertificateError::InvalidBundle { .. }
+            | AdditionalRootCertificateError::InvalidCount { .. },
+        ) => VALIDATION,
         AdminClientError::CredentialStore(_) | AdminClientError::Transport(_) => UNAVAILABLE,
         AdminClientError::InvalidAdminOrigin
         | AdminClientError::InvalidRequestTarget
@@ -1054,6 +1083,51 @@ mod tests {
             assert_eq!(error_exit(&invalid_request), VALIDATION);
             assert_eq!(error_category(&invalid_request, VALIDATION), "validation");
         }
+    }
+
+    #[test]
+    fn certificate_authority_failures_use_stable_exit_categories() {
+        let path = PathBuf::from("development-ca.pem");
+        let error = |source| CliError::Admin(AdminClientError::AdditionalRootCertificates(source));
+
+        let permission = error(AdditionalRootCertificateError::Open {
+            path: path.clone(),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        });
+        assert_eq!(error_exit(&permission), PERMISSION);
+
+        let missing = error(AdditionalRootCertificateError::Open {
+            path: path.clone(),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        });
+        assert_eq!(error_exit(&missing), VALIDATION);
+
+        let unavailable = error(AdditionalRootCertificateError::Read {
+            path: path.clone(),
+            source: io::Error::from(io::ErrorKind::BrokenPipe),
+        });
+        assert_eq!(error_exit(&unavailable), UNAVAILABLE);
+
+        for validation in [
+            AdditionalRootCertificateError::NotRegularFile { path: path.clone() },
+            AdditionalRootCertificateError::ChangedDuringOpen { path: path.clone() },
+            AdditionalRootCertificateError::TooLarge { path: path.clone() },
+            AdditionalRootCertificateError::UnexpectedPemSection { path: path.clone() },
+            AdditionalRootCertificateError::InvalidCount {
+                path: path.clone(),
+                count: 0,
+            },
+        ] {
+            assert_eq!(error_exit(&error(validation)), VALIDATION);
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(
+            error_exit(&error(
+                AdditionalRootCertificateError::UnsupportedPlatform { path }
+            )),
+            VALIDATION
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ Status: target delivery plan with open design gates
 Last updated: 2026-09-03
 
 Related documents: [project overview](../README.md), [system design](design.md),
-and [engineering style guide](quality.md).
+[local alpha runbook](local-alpha.md), and [engineering style guide](quality.md).
 
 ## Document role
 
@@ -40,12 +40,17 @@ release claim.
 | Canonical links, core non-image Open Graph fields, and `BlogPosting` JSON-LD | Implemented foundation |
 | Alias redirects, durable route ownership, snapshot-scoped content assets, and conditional application assets | Implemented |
 | Favicon and image metadata and page CSP | Planned |
-| HTTPS admin gateway and admin web interface | Planned |
+| Local HTTPS development gateway and explicit CLI CA trust | Implemented development harness; see the [runbook](local-alpha.md) |
+| Production HTTPS admin gateway and admin web interface | Planned; see work packages [4.5](#work-package-45-https-admin-gateway-contract) and [8.2](#work-package-82-nixos-module-and-admin-gateway) |
 | Profile-backed static Lightning Address tips | Implemented foundation |
 | Prometheus registry, loopback `/metrics`, and runtime dashboard | Planned |
 | NixOS module, Litestream, artifact backup, and restore | Planned |
 | Outbound distribution, subscription, and email delivery | Deferred until after v1 |
 | Distribution frontmatter and target-job schema | Removed from v1 |
+
+The `development-gateway` flake check validates the development Caddy
+configuration and launcher scripts. This evidence does not complete the
+production gateway or NixOS work packages.
 
 > [!WARNING]
 > Do not expose the loopback admin TCP listener directly. Keep it loopback-only

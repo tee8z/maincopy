@@ -23,9 +23,14 @@ uuid = { workspace = true, features = ["v4"] }
 zeroize.workspace = true
 rpassword.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { workspace = true, features = ["fs", "std"] }
+
 [[bin]]
 name = "maincopy"
 path = "src/main.rs"
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
+tokio-rustls.workspace = true

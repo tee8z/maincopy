@@ -1610,6 +1610,7 @@ dependencies = [
  "maincopy-shared",
  "reqwest",
  "rpassword",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1617,6 +1618,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tokio-rustls",
  "uuid",
  "zeroize",
 ]

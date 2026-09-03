@@ -1,4 +1,4 @@
-use std::{fmt, future::Future};
+use std::{fmt, future::Future, path::Path};
 
 use maincopy_shared::{
     CAPABILITIES_PATH, Capabilities,
@@ -29,7 +29,10 @@ use crate::{
     credentials::{CredentialKey, CredentialStoreError, PlatformCredentialStore, SecretValue},
     models::AuthenticationContext,
     nip98::{AgentPrivateKey, AgentPrivateKeyError, Nip98SigningError, authorization_proof},
-    transport::{HttpRequest, HttpResponse, RequestBody, ReqwestExecutor, TransportError},
+    transport::{
+        AdditionalRootCertificateError, AdditionalRootCertificates, HttpRequest, HttpResponse,
+        RequestBody, ReqwestExecutor, TransportError,
+    },
 };
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -111,12 +114,18 @@ impl AdminClient {
     pub(crate) fn new(
         admin_origin: &str,
         authentication: AuthenticationContext,
+        admin_ca_file: Option<&Path>,
     ) -> Result<Self, AdminClientError> {
+        let origin = AdminOrigin::parse(admin_origin)?;
+        let additional_roots = admin_ca_file
+            .map(AdditionalRootCertificates::from_file)
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
-            origin: AdminOrigin::parse(admin_origin)?,
+            origin,
             authentication,
             credentials: PlatformCredentialStore,
-            executor: ReqwestExecutor::new()?,
+            executor: ReqwestExecutor::new(additional_roots)?,
         })
     }
 
@@ -1071,6 +1080,9 @@ pub(crate) enum AdminClientError {
     #[error("the administration HTTPS request failed")]
     Transport(#[source] TransportError),
 
+    #[error(transparent)]
+    AdditionalRootCertificates(#[from] AdditionalRootCertificateError),
+
     #[error("the Nostr private key is invalid")]
     AgentPrivateKey(#[source] AgentPrivateKeyError),
 
@@ -1905,8 +1917,12 @@ mod tests {
         }
         assert!(HumanCredentials::from_set_cookie_headers(&HeaderMap::new()).is_err());
 
-        let client =
-            AdminClient::new("https://admin.example.test", AuthenticationContext::Agent).unwrap();
+        let client = AdminClient::new(
+            "https://admin.example.test",
+            AuthenticationContext::Agent,
+            None,
+        )
+        .unwrap();
         let diagnostics = format!("{client:?}");
         assert!(!diagnostics.contains(AGENT_KEY));
         assert!(!format!("{:?}", AdminClientError::StoredCredentialsInvalid).contains(AGENT_KEY));
