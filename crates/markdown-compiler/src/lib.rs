@@ -2,12 +2,14 @@
 
 mod assets;
 mod candidate_store;
+mod cli;
 mod content;
 pub mod identity;
 mod model;
 mod parser;
 mod path;
 mod resolver;
+mod startup;
 pub mod tree;
 mod tree_digest;
 mod validation;
@@ -43,6 +45,7 @@ pub use resolver::{
     ResolvedLocalAssetLookupError, ResolvedLocalAssetStore, ResolvedPostAssetLookupError,
     ResolvedPostAssetSet, ResolvedSiteAssetLookupError, resolve_content_assets,
 };
+pub use startup::run;
 pub use tree::{
     ContentDepthLimit, ContentEntryLimit, ContentFileByteLimit, ContentPathByteLimit,
     ContentTreeByteLimit, ContentTreeLimits, ContentTreeLimitsError, DiscoveredAsset,

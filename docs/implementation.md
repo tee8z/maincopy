@@ -161,6 +161,14 @@ The final two lines of `crates/server/src/main.rs` must remain:
 
 Keep `crates/server/src/main.rs` below 20 non-blank lines.
 
+Keep `crates/markdown-compiler/src/main.rs` below 10 non-blank lines. Its
+synchronous `main` delegates once to the exported `markdown_compiler::run`. It
+contains no argument parsing, file access, validation, serialization,
+reporting, or exit-policy logic. `crates/markdown-compiler/src/startup.rs`
+owns that process behavior, while the private
+`crates/markdown-compiler/src/cli.rs` module owns the standalone validator's
+typed command-line inputs and output records.
+
 `crates/server/src/startup.rs` owns server wiring and lifecycle behavior. It
 must:
 
@@ -727,6 +735,8 @@ Tests:
 - Inject a termination signal and verify one ordered shutdown request.
 - Check that `crates/server/src/main.rs` contains no listener, storage,
   scheduler, or worker wiring.
+- Check that `crates/markdown-compiler/src/main.rs` contains only its delegated
+  synchronous startup boundary.
 - Check that `maincopy-cli` has no dependency on `maincopy-server`.
 - Verify the stable JSON names of every foundation status and version enum.
 - Parse the generated OpenAPI document and verify the same enum values.
@@ -902,6 +912,8 @@ Tests:
 - CI runs on `master` and pull requests.
 - `crates/server/src/main.rs` remains below 20 non-blank lines.
 - `crates/server/src/startup.rs` owns all server wiring and lifecycle behavior.
+- `crates/markdown-compiler/src/main.rs` remains below 10 non-blank lines, and
+  its `startup.rs` owns standalone-validator process behavior.
 - No feature module performs process-wide initialization.
 
 ## Slice 1: Content model and compiler

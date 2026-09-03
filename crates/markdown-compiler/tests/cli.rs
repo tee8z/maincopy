@@ -70,6 +70,39 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
+fn process_entry_point_stays_a_thin_startup_boundary() {
+    let source = include_str!("../src/main.rs");
+    let non_blank_lines = source
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+
+    assert!(non_blank_lines < 10);
+    assert_eq!(source.matches("markdown_compiler::run()").count(), 1);
+    assert_eq!(
+        source,
+        concat!(
+            "fn main() -> std::process::ExitCode {\n",
+            "    markdown_compiler::run()\n",
+            "}\n",
+        )
+    );
+    for forbidden in [
+        "clap",
+        "Parser",
+        "fs::",
+        "File",
+        "Read",
+        "Write",
+        "validate_",
+        "serde",
+        "process::exit",
+    ] {
+        assert!(!source.contains(forbidden), "main.rs contains {forbidden}");
+    }
+}
+
+#[test]
 fn help_explains_what_single_file_validation_cannot_check() {
     let output = command()
         .arg("--help")
