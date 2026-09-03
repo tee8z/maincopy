@@ -27,6 +27,7 @@ use crate::domain::publication::{
 };
 use crate::frontend_assets::FrontendAssetManifest;
 
+use super::robots::{RenderedRobots, RobotsRenderError, render_robots};
 use super::rss::{RenderedRssFeed, RssItem, RssRenderError, render_rss};
 use super::sitemap::{RenderedSitemap, SitemapRenderError, render_sitemap};
 use super::{ContentCatalog, GeneratedPostAsset, RenderedPost, SnapshotAssetPath};
@@ -34,8 +35,8 @@ use super::{ContentCatalog, GeneratedPostAsset, RenderedPost, SnapshotAssetPath}
 const MAX_PAGE_BYTES: usize = 40 * 1024 * 1024;
 const MAX_PUBLIC_ROUTES: usize = 50_000;
 const MAX_RETAINED_HTML_BYTES: usize = 512 * 1024 * 1024;
-// Index, archive, feed, sitemap, and the two rendered fallback pages.
-const FIXED_PUBLIC_ROUTES: usize = 6;
+// Index, archive, feed, robots, sitemap, and the two rendered fallback pages.
+const FIXED_PUBLIC_ROUTES: usize = 7;
 
 #[cfg(test)]
 fn render_post_preview(
@@ -112,6 +113,7 @@ pub struct RenderedSiteShell {
     chronology: Arc<[usize]>,
     tags: BTreeMap<PostTag, Arc<[usize]>>,
     feed: RenderedRssFeed,
+    robots: RenderedRobots,
     sitemap: RenderedSitemap,
     pre_injection_output: SiteShellOutputDigest,
     tip_recipient: Option<TipRecipientProjection>,
@@ -125,6 +127,7 @@ impl fmt::Debug for RenderedSiteShell {
             .field("posts", &self.posts.len())
             .field("tags", &self.tags.len())
             .field("feed_digest", &self.feed.digest)
+            .field("robots_digest", &self.robots.digest)
             .field("sitemap_digest", &self.sitemap.digest)
             .finish_non_exhaustive()
     }
@@ -144,6 +147,7 @@ pub fn render_site_shell(
     validate_route_count(posts.len(), tags.len())?;
     let feed = render_public_feed(&catalog.publication, &posts, &chronology)?;
     let sitemap = render_public_sitemap(&catalog.publication, &posts, &tags)?;
+    let robots = render_public_robots(&catalog.publication)?;
 
     let renderer = SiteShellRendererIdentity::new(*frontend.bundle_digest.as_bytes());
     let pre_injection_output = render_pre_injection_shell(
@@ -152,8 +156,11 @@ pub fn render_site_shell(
         &posts,
         &chronology,
         &tags,
-        &feed,
-        &sitemap,
+        DiscoveryDocuments {
+            feed: &feed,
+            robots: &robots,
+            sitemap: &sitemap,
+        },
     )?;
 
     Ok(RenderedSiteShell {
@@ -165,6 +172,7 @@ pub fn render_site_shell(
         chronology: chronology.into(),
         tags,
         feed,
+        robots,
         sitemap,
         pre_injection_output,
         tip_recipient: None,
@@ -405,6 +413,14 @@ fn render_public_sitemap(
     render_sitemap(&locations).map_err(SiteSnapshotBuildError::sitemap)
 }
 
+fn render_public_robots(
+    publication: &PublicationSettings,
+) -> Result<RenderedRobots, SiteSnapshotBuildError> {
+    let sitemap_url =
+        CanonicalSiteUrl::for_path(&publication.site.base_url, &PublicPagePath::sitemap());
+    render_robots(&sitemap_url).map_err(SiteSnapshotBuildError::robots)
+}
+
 fn validate_route_count(posts: usize, tags: usize) -> Result<(), SiteSnapshotBuildError> {
     let routes = posts
         .checked_add(tags)
@@ -422,13 +438,13 @@ fn render_pre_injection_shell(
     posts: &[PublicPostView],
     chronology: &[usize],
     tags: &BTreeMap<PostTag, Arc<[usize]>>,
-    feed: &RenderedRssFeed,
-    sitemap: &RenderedSitemap,
+    discovery: DiscoveryDocuments<'_>,
 ) -> Result<SiteShellOutputDigest, SiteSnapshotBuildError> {
     let mut pages = BTreeMap::new();
     pages.insert(PublicPagePath::index(), PreInjectionPage::Index);
     pages.insert(PublicPagePath::archive(), PreInjectionPage::Archive);
     pages.insert(PublicPagePath::feed(), PreInjectionPage::Feed);
+    pages.insert(PublicPagePath::robots(), PreInjectionPage::Robots);
     pages.insert(PublicPagePath::sitemap(), PreInjectionPage::Sitemap);
     for (index, post) in posts.iter().enumerate() {
         pages.insert(post.public_path(), PreInjectionPage::Post(index));
@@ -462,11 +478,15 @@ fn render_pre_injection_shell(
                 render_archive(publication, frontend, posts, chronology).into_string(),
             ),
             PreInjectionPage::Feed => {
-                hasher.page(path.as_str(), feed.body.as_bytes());
+                hasher.page(path.as_str(), discovery.feed.body.as_bytes());
+                Ok(())
+            }
+            PreInjectionPage::Robots => {
+                hasher.page(path.as_str(), discovery.robots.body.as_bytes());
                 Ok(())
             }
             PreInjectionPage::Sitemap => {
-                hasher.page(path.as_str(), sitemap.body.as_bytes());
+                hasher.page(path.as_str(), discovery.sitemap.body.as_bytes());
                 Ok(())
             }
             PreInjectionPage::Post(index) => hash_pre_injection_html(
@@ -506,6 +526,13 @@ fn render_pre_injection_shell(
     Ok(hasher.finish())
 }
 
+#[derive(Clone, Copy)]
+struct DiscoveryDocuments<'documents> {
+    feed: &'documents RenderedRssFeed,
+    robots: &'documents RenderedRobots,
+    sitemap: &'documents RenderedSitemap,
+}
+
 fn hash_pre_injection_html(
     hasher: &mut SiteShellOutputHasher,
     retained: &mut RetainedHtmlBudget,
@@ -523,6 +550,7 @@ enum PreInjectionPage<'view> {
     Index,
     Archive,
     Feed,
+    Robots,
     Sitemap,
     Post(usize),
     Tag(&'view PostTag),
@@ -574,15 +602,23 @@ pub fn build_site_snapshot(
         &mut retained,
     )?;
     let feed = shell.feed.clone();
+    let robots = shell.robots.clone();
     let sitemap = shell.sitemap.clone();
     let assets = collect_public_assets(&shell, &digest)?;
-    let presentation_digest =
-        presentation_digest(&pages, &not_found, &method_not_allowed, &feed, &sitemap);
+    let presentation_digest = presentation_digest(
+        &pages,
+        &not_found,
+        &method_not_allowed,
+        &feed,
+        &robots,
+        &sitemap,
+    );
 
     Ok(SiteSnapshot {
         digest,
         presentation_digest,
         feed,
+        robots,
         sitemap,
         pages,
         not_found,
@@ -957,6 +993,7 @@ fn presentation_digest(
     not_found: &RenderedPage,
     method_not_allowed: &RenderedPage,
     feed: &RenderedRssFeed,
+    robots: &RenderedRobots,
     sitemap: &RenderedSitemap,
 ) -> PresentationDigest {
     let mut hasher = blake3::Hasher::new_derive_key("maincopy presentation snapshot v1");
@@ -971,6 +1008,8 @@ fn presentation_digest(
     hash_presentation_part(&mut hasher, method_not_allowed.html.as_bytes());
     hash_presentation_part(&mut hasher, PublicPagePath::feed().as_str().as_bytes());
     hash_presentation_part(&mut hasher, feed.body.as_bytes());
+    hash_presentation_part(&mut hasher, PublicPagePath::robots().as_str().as_bytes());
+    hash_presentation_part(&mut hasher, robots.body.as_bytes());
     hash_presentation_part(&mut hasher, PublicPagePath::sitemap().as_str().as_bytes());
     hash_presentation_part(&mut hasher, sitemap.body.as_bytes());
     PresentationDigest(*hasher.finalize().as_bytes())
@@ -993,6 +1032,7 @@ pub struct SiteSnapshot {
     pub(crate) digest: SiteSnapshotDigest,
     pub(crate) presentation_digest: PresentationDigest,
     pub(crate) feed: RenderedRssFeed,
+    pub(crate) robots: RenderedRobots,
     pub(crate) sitemap: RenderedSitemap,
     pages: BTreeMap<PageRoute, RenderedPage>,
     not_found: RenderedPage,
@@ -1009,6 +1049,7 @@ impl fmt::Debug for SiteSnapshot {
             .field("digest", &self.digest)
             .field("presentation_digest", &self.presentation_digest)
             .field("feed_digest", &self.feed.digest)
+            .field("robots_digest", &self.robots.digest)
             .field("sitemap_digest", &self.sitemap.digest)
             .field("pages", &self.pages.len())
             .field("assets", &self.assets.len())
@@ -1154,6 +1195,7 @@ pub enum SiteSnapshotBuildErrorCode {
     AssetCollision,
     ArticleProjectionFailed,
     RssRenderFailed,
+    RobotsRenderFailed,
     SitemapRenderFailed,
     QrCodeGenerationFailed,
     IdentityRejected,
@@ -1228,6 +1270,14 @@ impl SiteSnapshotBuildError {
     fn sitemap(error: SitemapRenderError) -> Self {
         Self::new(
             SiteSnapshotBuildErrorCode::SitemapRenderFailed,
+            None,
+            error.to_string(),
+        )
+    }
+
+    fn robots(error: RobotsRenderError) -> Self {
+        Self::new(
+            SiteSnapshotBuildErrorCode::RobotsRenderFailed,
             None,
             error.to_string(),
         )
@@ -2126,6 +2176,15 @@ mod tests {
         );
         assert!(!snapshot.feed.body.contains(SECOND_ID));
         assert!(!snapshot.feed.body.contains(DRAFT_ID));
+        assert_eq!(
+            snapshot.robots.body.as_ref(),
+            concat!(
+                "User-agent: *\n",
+                "Allow: /\n",
+                "\n",
+                "Sitemap: https://blog.example.com/sitemap.xml\n",
+            )
+        );
         assert!(
             snapshot
                 .sitemap
@@ -2180,6 +2239,35 @@ mod tests {
         let error = build_snapshot(&invalid, &ledger).unwrap_err();
 
         assert_eq!(error.code, SiteSnapshotBuildErrorCode::SitemapRenderFailed);
+        assert_eq!(error.post_id, None);
+        assert!(Arc::ptr_eq(&before, &reader.load_full()));
+    }
+
+    #[test]
+    fn robots_failure_rejects_the_candidate_without_changing_the_active_snapshot() {
+        let valid = fixture();
+        let ledger = PublicLedgerProjection::empty();
+        let active = build_snapshot(&valid, &ledger).unwrap();
+        let (reader, _activator) = snapshot_store(active);
+        let before = reader.load_full();
+
+        let oversized_origin = format!("https://{}bexample.com/", "a.".repeat(1_008));
+        let base_url = markdown_compiler::PublicationBaseUrl::parse(&oversized_origin).unwrap();
+        assert_eq!(
+            CanonicalSiteUrl::for_path(&base_url, &PublicPagePath::sitemap())
+                .as_str()
+                .chars()
+                .count(),
+            2_048
+        );
+        let mut invalid = fixture();
+        Arc::make_mut(&mut invalid.catalog)
+            .publication
+            .site
+            .base_url = base_url;
+        let error = build_snapshot(&invalid, &ledger).unwrap_err();
+
+        assert_eq!(error.code, SiteSnapshotBuildErrorCode::RobotsRenderFailed);
         assert_eq!(error.post_id, None);
         assert!(Arc::ptr_eq(&before, &reader.load_full()));
     }
@@ -2340,6 +2428,8 @@ mod tests {
         assert_eq!(snapshot.index_page(), rebuilt.index_page());
         assert_eq!(snapshot.feed.body, rebuilt.feed.body);
         assert_eq!(snapshot.feed.digest, rebuilt.feed.digest);
+        assert_eq!(snapshot.robots.body, rebuilt.robots.body);
+        assert_eq!(snapshot.robots.digest, rebuilt.robots.digest);
         assert_eq!(snapshot.sitemap.body, rebuilt.sitemap.body);
         assert_eq!(snapshot.sitemap.digest, rebuilt.sitemap.digest);
 
@@ -2364,14 +2454,18 @@ mod tests {
         let tags = tag_index(&posts, &chronology);
         let feed = render_public_feed(&fixture.catalog.publication, &posts, &chronology).unwrap();
         let sitemap = render_public_sitemap(&fixture.catalog.publication, &posts, &tags).unwrap();
+        let robots = render_public_robots(&fixture.catalog.publication).unwrap();
         let original = render_pre_injection_shell(
             &fixture.catalog.publication,
             embedded_manifest(),
             &posts,
             &chronology,
             &tags,
-            &feed,
-            &sitemap,
+            DiscoveryDocuments {
+                feed: &feed,
+                robots: &robots,
+                sitemap: &sitemap,
+            },
         )
         .unwrap();
         let mut changed_feed = feed.clone();
@@ -2382,8 +2476,26 @@ mod tests {
             &posts,
             &chronology,
             &tags,
-            &changed_feed,
-            &sitemap,
+            DiscoveryDocuments {
+                feed: &changed_feed,
+                robots: &robots,
+                sitemap: &sitemap,
+            },
+        )
+        .unwrap();
+        let mut changed_robots = robots.clone();
+        changed_robots.body = format!("{}\n", robots.body).into();
+        let robots_changed = render_pre_injection_shell(
+            &fixture.catalog.publication,
+            embedded_manifest(),
+            &posts,
+            &chronology,
+            &tags,
+            DiscoveryDocuments {
+                feed: &feed,
+                robots: &changed_robots,
+                sitemap: &sitemap,
+            },
         )
         .unwrap();
         let mut changed_sitemap = sitemap.clone();
@@ -2394,32 +2506,48 @@ mod tests {
             &posts,
             &chronology,
             &tags,
-            &feed,
-            &changed_sitemap,
+            DiscoveryDocuments {
+                feed: &feed,
+                robots: &robots,
+                sitemap: &changed_sitemap,
+            },
         )
         .unwrap();
 
         assert_ne!(original, feed_changed);
+        assert_ne!(original, robots_changed);
         assert_ne!(original, sitemap_changed);
     }
 
     #[test]
-    fn presentation_identity_binds_the_exact_sitemap_representation() {
+    fn presentation_identity_binds_exact_discovery_document_representations() {
         let fixture = fixture();
         let ledger = projection([entry(&fixture, FIRST_ID, 2_000)]);
         let snapshot = build_snapshot(&fixture, &ledger).unwrap();
+        let mut changed_robots = snapshot.robots.clone();
+        changed_robots.body = format!("{}\n", snapshot.robots.body).into();
         let mut changed_sitemap = snapshot.sitemap.clone();
         changed_sitemap.body = format!("{}\n", snapshot.sitemap.body).into();
 
-        let changed = presentation_digest(
+        let robots_changed = presentation_digest(
             &snapshot.pages,
             &snapshot.not_found,
             &snapshot.method_not_allowed,
             &snapshot.feed,
+            &changed_robots,
+            &snapshot.sitemap,
+        );
+        let sitemap_changed = presentation_digest(
+            &snapshot.pages,
+            &snapshot.not_found,
+            &snapshot.method_not_allowed,
+            &snapshot.feed,
+            &snapshot.robots,
             &changed_sitemap,
         );
 
-        assert_ne!(snapshot.presentation_digest, changed);
+        assert_ne!(snapshot.presentation_digest, robots_changed);
+        assert_ne!(snapshot.presentation_digest, sitemap_changed);
     }
 
     #[test]
@@ -2432,6 +2560,8 @@ mod tests {
         let old_presentation = old.presentation_digest;
         let old_feed_body = Arc::clone(&old.feed.body);
         let old_feed_digest = old.feed.digest;
+        let old_robots_body = Arc::clone(&old.robots.body);
+        let old_robots_digest = old.robots.digest;
         let old_sitemap_body = Arc::clone(&old.sitemap.body);
         let old_sitemap_digest = old.sitemap.digest;
         let revision = fixture.revisions[&post_id].clone();
@@ -2450,6 +2580,7 @@ mod tests {
             &next.not_found,
             &next.method_not_allowed,
             &next.feed,
+            &next.robots,
             &next.sitemap,
         );
 
@@ -2458,6 +2589,8 @@ mod tests {
         assert_ne!(next.presentation_digest, old_presentation);
         assert_eq!(next.feed.body, old_feed_body);
         assert_eq!(next.feed.digest, old_feed_digest);
+        assert_eq!(next.robots.body, old_robots_body);
+        assert_eq!(next.robots.digest, old_robots_digest);
         assert_eq!(next.sitemap.body, old_sitemap_body);
         assert_eq!(next.sitemap.digest, old_sitemap_digest);
 
@@ -2633,6 +2766,7 @@ mod tests {
             SiteSnapshotBuildErrorCode::AssetCollision,
             SiteSnapshotBuildErrorCode::ArticleProjectionFailed,
             SiteSnapshotBuildErrorCode::RssRenderFailed,
+            SiteSnapshotBuildErrorCode::RobotsRenderFailed,
             SiteSnapshotBuildErrorCode::SitemapRenderFailed,
             SiteSnapshotBuildErrorCode::QrCodeGenerationFailed,
             SiteSnapshotBuildErrorCode::IdentityRejected,
@@ -2652,6 +2786,7 @@ mod tests {
             "asset_collision",
             "article_projection_failed",
             "rss_render_failed",
+            "robots_render_failed",
             "sitemap_render_failed",
             "qr_code_generation_failed",
             "identity_rejected",

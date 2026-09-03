@@ -57,11 +57,11 @@ proofs, exact previews, and immediate or scheduled release foundations are
 present. The admin backend now uses a loopback-only HTTP listener. The CLI
 connects through the configured HTTPS admin origin.
 
-The snapshot-backed RSS feed, sitemap, and HTML autodiscovery link are present.
-Managed Git synchronization, the robots policy, Open Graph, JSON-LD, Content
-Security Policy (CSP), the admin web interface, release-quality technical
-rendering, the NixOS module, Litestream wiring, Prometheus metrics and
-dashboard, and complete restore evidence remain incomplete. V1 rejects
+The snapshot-backed RSS feed, sitemap, robots policy, and HTML autodiscovery
+link are present. Managed Git synchronization, redirects, Open Graph, JSON-LD,
+Content Security Policy (CSP), the admin web interface, release-quality
+technical rendering, the NixOS module, Litestream wiring, Prometheus metrics
+and dashboard, and complete restore evidence remain incomplete. V1 rejects
 authored subscription and outbound-distribution configuration and stores no
 target-job state.
 

@@ -36,8 +36,8 @@ release claim.
 | Initial publication, private previews, and local CLI commands | Implemented foundation |
 | Preview-gated update releases and complete release management | In progress |
 | Managed Git synchronization and restricted bootstrap | Planned |
-| Snapshot-backed RSS feed, sitemap, and HTML autodiscovery | Implemented foundation |
-| Robots, redirects, Open Graph, JSON-LD, and CSP | Planned |
+| Snapshot-backed RSS feed, sitemap, robots policy, and HTML autodiscovery | Implemented foundation |
+| Redirects, Open Graph, JSON-LD, and CSP | Planned |
 | HTTPS admin gateway and admin web interface | Planned |
 | Profile-backed static Lightning Address tips | Implemented foundation |
 | Prometheus registry, loopback `/metrics`, and runtime dashboard | Planned |
@@ -1711,10 +1711,53 @@ for the document shape and location limits. Follow
 [RFC 7303](https://www.rfc-editor.org/rfc/rfc7303) for the XML media type and
 UTF-8 declaration.
 
+The third vertical slice serves one policy only at `GET /robots.txt` and
+`HEAD /robots.txt`. Do not add robots aliases or redirects in this slice.
+
+Generate the policy once during immutable site snapshot construction. Store
+its exact UTF-8 bytes and typed content digest in that snapshot. The request
+handler must not query SQLite, inspect Git, parse Markdown, or build policy
+text.
+
+Emit these exact lines with LF separators and one final LF. Do not emit a byte
+order mark.
+
+```text
+User-agent: *
+Allow: /
+
+Sitemap: https://example.com/sitemap.xml
+```
+
+Replace the example origin with the configured canonical origin. Build the
+absolute sitemap URL through `CanonicalSiteUrl`, not from request authority or
+forwarding headers. Require the sitemap URL to contain fewer than 2,048
+characters.
+
+Permit crawling of all public resources. Do not name admin, preview, metrics,
+or other private paths in the policy. Robots rules are crawler guidance, not
+an authorization or confidentiality boundary.
+
+Compute a versioned, robots-domain-separated digest from the exact emitted
+bytes. Include the path and bytes in the site shell and presentation
+identities. A robots build failure must reject the candidate snapshot and
+preserve the active snapshot.
+
+Serve `text/plain; charset=utf-8`, `Cache-Control: no-cache`, and
+`X-Content-Type-Options: nosniff`. Use the exact-byte digest as a strong ETag.
+Return an empty `304 Not Modified` for matching conditional GET and HEAD
+requests.
+
+Follow [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309) for the robots policy.
+Follow the
+[Sitemaps protocol](https://www.sitemaps.org/protocol.html#submit_robots) for
+the absolute sitemap field.
+
 Deliverables:
 
 - The snapshot-backed `/feed.xml` contract defined above.
 - The snapshot-backed `/sitemap.xml` contract defined above.
+- The snapshot-backed `/robots.txt` contract defined above.
 - Absolute canonical URLs in RSS, sitemap, Open Graph, and JSON-LD output.
 - Stable post UUIDs as feed GUIDs.
 - XML-safe RSS and sitemap serialization through the selected XML writer.
@@ -1753,6 +1796,19 @@ Tests:
   unsupported methods at the canonical path.
 - Fail a candidate sitemap build without changing any active page, feed, or
   sitemap bytes.
+- Require byte-identical robots bytes and digests for identical snapshot
+  inputs.
+- Verify the exact allow-all policy, LF line endings, final LF, and absent byte
+  order mark.
+- Derive the absolute sitemap URL only from the configured canonical origin.
+- Ignore hostile request authority and forwarding headers.
+- Reject a sitemap URL with 2,048 characters.
+- Verify robots `GET`, `HEAD`, MIME type, cache policy, `nosniff`, strong ETags,
+  and conditional GET and HEAD `304` responses.
+- Return `404 Not Found` for robots aliases and `405 Method Not Allowed` for
+  unsupported methods at the canonical path.
+- Keep admin, preview, metrics, and other private path names out of the policy.
+- Fail a candidate robots build without changing the active snapshot.
 
 ### Work package 2.3: Redirects, assets, and HTTP caching
 

@@ -15,7 +15,7 @@ use axum::{
 use markdown_compiler::{PostSlug, PostTag};
 use serde::de::DeserializeOwned;
 
-use super::{RSS_FEED_PATH, SITEMAP_PATH};
+use super::{ROBOTS_PATH, RSS_FEED_PATH, SITEMAP_PATH};
 use crate::{
     frontend_assets::{FrontendAssetName, FrontendBundleDigest, IMMUTABLE_CACHE_CONTROL},
     render::{SiteSnapshot, SiteSnapshotReader},
@@ -23,6 +23,7 @@ use crate::{
 
 const HTML_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("text/html; charset=utf-8");
 const REVALIDATE_CACHE_POLICY: HeaderValue = HeaderValue::from_static("no-cache");
+const ROBOTS_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("text/plain; charset=utf-8");
 const RSS_CONTENT_TYPE: HeaderValue =
     HeaderValue::from_static("application/rss+xml; charset=utf-8");
 const SITEMAP_CONTENT_TYPE: HeaderValue =
@@ -37,6 +38,7 @@ pub(crate) fn router(snapshots: SiteSnapshotReader) -> Router {
         .route("/tags/{tag}", get(tag))
         .route("/archive", get(archive))
         .route(RSS_FEED_PATH, get(feed))
+        .route(ROBOTS_PATH, get(robots))
         .route(SITEMAP_PATH, get(sitemap))
         .route("/app-assets/{digest}/{name}", get(application_asset))
         .fallback(not_found)
@@ -142,6 +144,15 @@ async fn feed(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
         Arc::clone(&snapshot.feed.body),
         &snapshot.feed.digest,
         RSS_CONTENT_TYPE,
+        &headers,
+    )
+}
+
+async fn robots(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
+    snapshot_document_response(
+        Arc::clone(&snapshot.robots.body),
+        &snapshot.robots.digest,
+        ROBOTS_CONTENT_TYPE,
         &headers,
     )
 }
@@ -529,6 +540,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn robots_is_snapshot_backed_and_ignores_request_authority_headers() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/robots.txt")
+            .header(axum::http::header::HOST, "attacker.example")
+            .header("forwarded", "host=attacker.example;proto=http")
+            .header("x-forwarded-host", "attacker.example")
+            .header("x-forwarded-proto", "http")
+            .body(Body::empty())
+            .unwrap();
+        let response = public_router(published_example_state())
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&ROBOTS_CONTENT_TYPE)
+        );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&REVALIDATE_CACHE_POLICY)
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&NOSNIFF)
+        );
+        let current = etag(&response);
+        assert!(current.to_str().unwrap().starts_with("\"robots-b3-v1-"));
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            body.as_ref(),
+            concat!(
+                "User-agent: *\n",
+                "Allow: /\n",
+                "\n",
+                "Sitemap: https://example.test/sitemap.xml\n",
+            )
+            .as_bytes()
+        );
+        assert!(!body.starts_with(&[0xef, 0xbb, 0xbf]));
+        assert!(!body.contains(&b'\r'));
+        for private_name in ["admin", "preview", "metrics"] {
+            assert!(!String::from_utf8_lossy(&body).contains(private_name));
+        }
+    }
+
+    #[tokio::test]
+    async fn robots_head_and_conditional_reads_preserve_document_headers() {
+        let current = etag(&get("/robots.txt").await);
+
+        let head = request(Method::HEAD, "/robots.txt", &[]).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers().get(CONTENT_TYPE), Some(&ROBOTS_CONTENT_TYPE));
+        assert_eq!(
+            head.headers().get(CACHE_CONTROL),
+            Some(&REVALIDATE_CACHE_POLICY)
+        );
+        assert_eq!(head.headers().get(ETAG), Some(&current));
+        assert_eq!(head.headers().get("x-content-type-options"), Some(&NOSNIFF));
+        assert!(
+            to_bytes(head.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let weak = HeaderValue::from_str(&format!("W/{}", current.to_str().unwrap())).unwrap();
+        for method in [Method::GET, Method::HEAD] {
+            for validator in [current.clone(), weak.clone(), HeaderValue::from_static("*")] {
+                let conditional = request(method.clone(), "/robots.txt", &[validator]).await;
+                assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+                assert_eq!(
+                    conditional.headers().get(CACHE_CONTROL),
+                    Some(&REVALIDATE_CACHE_POLICY)
+                );
+                assert_eq!(conditional.headers().get(ETAG), Some(&current));
+                assert_eq!(
+                    conditional.headers().get("x-content-type-options"),
+                    Some(&NOSNIFF)
+                );
+                assert!(conditional.headers().get(CONTENT_TYPE).is_none());
+                assert!(
+                    to_bytes(conditional.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sitemap_is_snapshot_backed_and_contains_only_canonical_html_routes() {
         let response = get("/sitemap.xml").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -566,6 +671,7 @@ mod tests {
             prior = position;
         }
         assert!(!body.contains("feed.xml"));
+        assert!(!body.contains("robots.txt"));
         assert!(!body.contains("not-published"));
         assert!(!body.contains("<lastmod>"));
     }

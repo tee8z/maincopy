@@ -150,6 +150,45 @@ async fn empty_public_snapshot_serves_a_valid_sitemap() {
 }
 
 #[tokio::test]
+async fn empty_public_snapshot_serves_the_allow_all_robots_policy() {
+    let app = public_router(public_state(Readiness::new(true)));
+    let response = get(app, "/robots.txt").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-cache"
+    );
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert!(
+        response
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("\"robots-b3-v1-")
+    );
+    assert_eq!(
+        body_bytes(response).await.as_ref(),
+        concat!(
+            "User-agent: *\n",
+            "Allow: /\n",
+            "\n",
+            "Sitemap: https://example.test/sitemap.xml\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[tokio::test]
 async fn public_router_uses_snapshot_backed_error_pages() {
     let app = public_router(public_state(Readiness::new(true)));
 
@@ -161,7 +200,7 @@ async fn public_router_uses_snapshot_backed_error_pages() {
             .contains("Page not found")
     );
 
-    for path in ["/", "/feed.xml", "/sitemap.xml"] {
+    for path in ["/", "/feed.xml", "/robots.txt", "/sitemap.xml"] {
         let method = request(app.clone(), Method::POST, path).await;
         assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert!(
@@ -191,6 +230,15 @@ async fn sitemap_has_no_implicit_aliases() {
         "/sitemap_index.xml",
         "/SITEMAP.XML",
     ] {
+        assert_eq!(get(app.clone(), path).await.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn robots_policy_has_no_implicit_aliases() {
+    let app = public_router(public_state(Readiness::new(true)));
+
+    for path in ["/robots", "/robots.txt/", "/ROBOTS.TXT", "/Robots.txt"] {
         assert_eq!(get(app.clone(), path).await.status(), StatusCode::NOT_FOUND);
     }
 }

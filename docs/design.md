@@ -39,7 +39,7 @@ content root. The repository can contain many articles.
 | Operator-managed external checkout | GitHub App, OAuth, and pull-request workflow |
 | Production-faithful draft previews | Multiple publications and tenants |
 | Scheduled initial and update releases | Explicit unpublish and retraction workflow |
-| Canonical website, RSS, and sitemap | Mailing-list capture and email delivery |
+| Canonical website, RSS, sitemap, and robots policy | Mailing-list capture and email delivery |
 | Syntax highlighting, Mermaid, and sanitized SVG | X and Substack assisted distribution |
 | Maincopy TOML frontmatter | Obsidian-first source and YAML Properties |
 | Users, roles, profiles, and authenticated administration | Per-author publication identities |
@@ -402,6 +402,41 @@ ETag. A matching `If-None-Match` returns an empty `304 Not Modified` response.
 The sitemap follows the official
 [Sitemaps protocol](https://www.sitemaps.org/protocol.html). Its media type and
 UTF-8 declaration follow [RFC 7303](https://www.rfc-editor.org/rfc/rfc7303).
+
+V1 serves one robots policy only at `GET /robots.txt` and `HEAD /robots.txt`.
+The public router has no robots alias or redirect.
+
+The UTF-8 policy has no byte order mark. It uses LF line endings and one final
+LF. Its exact representation is:
+
+```text
+User-agent: *
+Allow: /
+
+Sitemap: https://example.com/sitemap.xml
+```
+
+Maincopy replaces the example origin with the configured canonical origin.
+The sitemap URL contains fewer than 2,048 characters. Request `Host`,
+`Forwarded`, and `X-Forwarded-*` headers cannot affect the policy.
+
+The policy permits crawling of all public resources. It does not list admin,
+preview, metrics, or other private paths. The robots policy is not an access
+control mechanism.
+
+Maincopy generates the policy during immutable snapshot construction. The
+snapshot stores its exact bytes and a typed, robots-domain-separated digest.
+A robots build failure rejects the candidate snapshot and preserves the active
+snapshot.
+
+The handler serves `text/plain; charset=utf-8`, `Cache-Control: no-cache`, and
+`X-Content-Type-Options: nosniff`. It uses the exact-byte digest as a strong
+ETag. Matching conditional GET and HEAD requests return an empty
+`304 Not Modified` response.
+
+The policy follows [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309). The
+absolute sitemap field follows the
+[Sitemaps protocol](https://www.sitemaps.org/protocol.html#submit_robots).
 
 Public pages include canonical links and structured metadata. Feeds use stable
 post identifiers and absolute canonical URLs.
