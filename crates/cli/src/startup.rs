@@ -3,6 +3,7 @@
 use std::{
     collections::HashSet,
     fs::OpenOptions,
+    future::Future,
     io::{self, Write as _},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -55,6 +56,60 @@ enum CommandOutput {
         idempotency_key: Uuid,
         response: PublishNowResponse,
     },
+}
+
+struct PreviewSelection {
+    post_id: Uuid,
+    output: PathBuf,
+    revision: Option<String>,
+    content_digest: Option<String>,
+}
+
+impl PreviewSelection {
+    fn new(
+        post_id: Uuid,
+        output: PathBuf,
+        revision: Option<String>,
+        content_digest: Option<String>,
+    ) -> Result<Self, CliError> {
+        validate_optional_digest(revision.as_deref(), POST_REVISION_PREFIX, "revision")?;
+        validate_optional_digest(
+            content_digest.as_deref(),
+            CONTENT_DIGEST_PREFIX,
+            "content_digest",
+        )?;
+        Ok(Self {
+            post_id,
+            output,
+            revision,
+            content_digest,
+        })
+    }
+
+    fn accept(self, preview: PostPreview) -> Result<CommandOutput, CliError> {
+        if let Some(expected) = self.revision
+            && expected.as_str() != preview.revision.as_ref()
+        {
+            return Err(CliError::PreviewRevisionMismatch {
+                expected: expected.into_boxed_str(),
+                actual: preview.revision.clone(),
+            });
+        }
+        if let Some(expected) = self.content_digest
+            && expected.as_str() != preview.content_digest.as_ref()
+        {
+            return Err(CliError::PreviewContentDigestMismatch {
+                expected: expected.into_boxed_str(),
+                actual: preview.content_digest.clone(),
+            });
+        }
+        write_preview_file(&self.output, &preview.html)?;
+        Ok(CommandOutput::Preview {
+            post_id: self.post_id,
+            output: self.output,
+            preview,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -151,18 +206,7 @@ pub async fn run() -> ExitCode {
 async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
     let client = AdminClient::new(&arguments.admin_origin, arguments.auth_context)?;
     match arguments.command {
-        Command::Login { username } => {
-            if client.human_session_is_stored()? {
-                return Err(AdminClientError::HumanSessionAlreadyStored.into());
-            }
-            let password =
-                rpassword::prompt_password("Password: ").map_err(CliError::SecretInput)?;
-            client
-                .login_with_password(username, SecretString::new(password.into_boxed_str()))
-                .await
-                .map(CommandOutput::Login)
-                .map_err(CliError::from)
-        }
+        Command::Login { username } => login(&client, username).await,
         Command::Logout => client
             .logout()
             .await
@@ -170,14 +214,7 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
             .map_err(CliError::from),
         Command::AgentKey {
             command: AgentKeyCommand::Set,
-        } => {
-            let key = rpassword::prompt_password("Nostr private key (lowercase hex): ")
-                .map_err(CliError::SecretInput)?;
-            client
-                .configure_agent_private_key(SecretString::new(key.into_boxed_str()))
-                .map(|public_key| CommandOutput::AgentKeyConfigured { public_key })
-                .map_err(CliError::from)
-        }
+        } => configure_agent_key(&client),
         Command::AgentKey {
             command: AgentKeyCommand::Remove,
         } => client
@@ -232,6 +269,25 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
     }
 }
 
+async fn login(client: &AdminClient, username: Box<str>) -> Result<CommandOutput, CliError> {
+    client.ensure_human_session_absent()?;
+    let password = rpassword::prompt_password("Password: ").map_err(CliError::SecretInput)?;
+    client
+        .login_with_password(username, SecretString::new(password.into_boxed_str()))
+        .await
+        .map(CommandOutput::Login)
+        .map_err(CliError::from)
+}
+
+fn configure_agent_key(client: &AdminClient) -> Result<CommandOutput, CliError> {
+    let key = rpassword::prompt_password("Nostr private key (lowercase hex): ")
+        .map_err(CliError::SecretInput)?;
+    client
+        .configure_agent_private_key(SecretString::new(key.into_boxed_str()))
+        .map(|public_key| CommandOutput::AgentKeyConfigured { public_key })
+        .map_err(CliError::from)
+}
+
 async fn preview_post(
     client: &AdminClient,
     post_id: Uuid,
@@ -239,37 +295,15 @@ async fn preview_post(
     revision: Option<String>,
     content_digest: Option<String>,
 ) -> Result<CommandOutput, CliError> {
-    validate_optional_digest(revision.as_deref(), POST_REVISION_PREFIX, "revision")?;
-    validate_optional_digest(
-        content_digest.as_deref(),
-        CONTENT_DIGEST_PREFIX,
-        "content_digest",
-    )?;
+    let selection = PreviewSelection::new(post_id, output, revision, content_digest)?;
     let preview = client
-        .preview_post(post_id, revision.as_deref(), content_digest.as_deref())
+        .preview_post(
+            selection.post_id,
+            selection.revision.as_deref(),
+            selection.content_digest.as_deref(),
+        )
         .await?;
-    if let Some(expected) = revision
-        && expected.as_str() != preview.revision.as_ref()
-    {
-        return Err(CliError::PreviewRevisionMismatch {
-            expected: expected.into_boxed_str(),
-            actual: preview.revision.clone(),
-        });
-    }
-    if let Some(expected) = content_digest
-        && expected.as_str() != preview.content_digest.as_ref()
-    {
-        return Err(CliError::PreviewContentDigestMismatch {
-            expected: expected.into_boxed_str(),
-            actual: preview.content_digest.clone(),
-        });
-    }
-    write_preview_file(&output, &preview.html)?;
-    Ok(CommandOutput::Preview {
-        post_id,
-        output,
-        preview,
-    })
+    selection.accept(preview)
 }
 
 fn validate_optional_digest(
@@ -349,7 +383,17 @@ async fn approve_publication(
 }
 
 async fn list_all_posts(client: &AdminClient) -> Result<ListPostsResponse, CliError> {
-    let first = client.list_posts_page(None, POSTS_PAGE_LIMIT).await?;
+    collect_post_pages(|cursor| client.list_posts_page(cursor, POSTS_PAGE_LIMIT)).await
+}
+
+async fn collect_post_pages<Fetch, FetchFuture>(
+    mut fetch: Fetch,
+) -> Result<ListPostsResponse, CliError>
+where
+    Fetch: FnMut(Option<Uuid>) -> FetchFuture,
+    FetchFuture: Future<Output = Result<ListPostsResponse, AdminClientError>>,
+{
+    let first = fetch(None).await?;
     let content_digest = first.content_digest.clone();
     let site_digest = first.site_digest.clone();
     let site_version = first.site_version;
@@ -372,9 +416,7 @@ async fn list_all_posts(client: &AdminClient) -> Result<ListPostsResponse, CliEr
             });
         }
 
-        let page = client
-            .list_posts_page(Some(cursor), POSTS_PAGE_LIMIT)
-            .await?;
+        let page = fetch(Some(cursor)).await?;
         if page.content_digest != content_digest
             || page.site_digest != site_digest
             || page.site_version != site_version
@@ -853,6 +895,8 @@ fn admin_error(error: &CliError) -> Option<&AdminClientError> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, future::ready};
+
     use maincopy_shared::FeatureVersions;
     use serde_json::json;
 
@@ -948,6 +992,32 @@ mod tests {
                 "content-b3-v1-3333333333333333333333333333333333333333333333333333333333333333"
                     .into(),
             canonical_url: "https://example.test/posts/ready".into(),
+        }
+    }
+
+    fn session_response() -> AdminSessionResponse {
+        serde_json::from_value(json!({
+            "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "user_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "provider": "password",
+            "roles": ["owner", "publisher"],
+            "scopes": ["content_read"],
+            "fresh_until": "2026-09-03T13:00:00Z",
+            "expires_at": "2026-09-04T12:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn post_page(posts: Vec<PostSummary>, next_cursor: Option<Uuid>) -> ListPostsResponse {
+        ListPostsResponse {
+            content_digest:
+                "content-b3-v1-3333333333333333333333333333333333333333333333333333333333333333"
+                    .into(),
+            site_digest:
+                "site-b3-v1-2222222222222222222222222222222222222222222222222222222222222222".into(),
+            site_version: 2,
+            posts,
+            next_cursor,
         }
     }
 
@@ -1127,6 +1197,223 @@ mod tests {
             assert!(matches!(error, CliError::InvalidPreviewSelector { .. }));
             assert_eq!(error_exit(&error), VALIDATION);
             assert_eq!(error_category(&error, VALIDATION), "validation");
+        }
+    }
+
+    #[test]
+    fn preview_selection_validates_server_identity_before_creating_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let post_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let revision = preview_response().revision.into_string();
+        let content_digest = preview_response().content_digest.into_string();
+
+        let revision_path = directory.path().join("revision-mismatch.html");
+        let selection = PreviewSelection::new(
+            post_id,
+            revision_path.clone(),
+            Some(format!("{POST_REVISION_PREFIX}{}", "9".repeat(64))),
+            Some(content_digest.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            selection.accept(preview_response()),
+            Err(CliError::PreviewRevisionMismatch { .. })
+        ));
+        assert!(!revision_path.exists());
+
+        let content_path = directory.path().join("content-mismatch.html");
+        let selection = PreviewSelection::new(
+            post_id,
+            content_path.clone(),
+            Some(revision.clone()),
+            Some(format!("{CONTENT_DIGEST_PREFIX}{}", "9".repeat(64))),
+        )
+        .unwrap();
+        assert!(matches!(
+            selection.accept(preview_response()),
+            Err(CliError::PreviewContentDigestMismatch { .. })
+        ));
+        assert!(!content_path.exists());
+
+        let output = directory.path().join("accepted.html");
+        let selection = PreviewSelection::new(
+            post_id,
+            output.clone(),
+            Some(revision),
+            Some(content_digest),
+        )
+        .unwrap();
+        assert!(matches!(
+            selection.accept(preview_response()).unwrap(),
+            CommandOutput::Preview { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap(),
+            "<!doctype html><title>Ready</title>"
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_combines_stable_pages_in_request_order() {
+        let mut expected = posts_response();
+        let second_post = expected.posts.pop().unwrap();
+        let first_post = expected.posts.pop().unwrap();
+        expected.posts = vec![first_post.clone(), second_post.clone()];
+        let cursor = second_post.post_id;
+        let mut pages = VecDeque::from([
+            Ok(post_page(vec![first_post], Some(cursor))),
+            Ok(post_page(vec![second_post], None)),
+        ]);
+        let mut requested = Vec::new();
+
+        let combined = collect_post_pages(|cursor| {
+            requested.push(cursor);
+            ready(pages.pop_front().unwrap())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(requested, [None, Some(cursor)]);
+        assert_eq!(combined, expected);
+    }
+
+    #[tokio::test]
+    async fn pagination_rejects_snapshot_changes_repeated_cursors_and_posts() {
+        let cursor = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        for change in ["content", "site", "version"] {
+            let first = post_page(Vec::new(), Some(cursor));
+            let mut changed = post_page(Vec::new(), None);
+            match change {
+                "content" => {
+                    changed.content_digest =
+                        format!("{CONTENT_DIGEST_PREFIX}{}", "4".repeat(64)).into()
+                }
+                "site" => changed.site_digest = format!("site-b3-v1-{}", "4".repeat(64)).into(),
+                "version" => changed.site_version += 1,
+                _ => unreachable!(),
+            }
+            let mut pages = VecDeque::from([Ok(first), Ok(changed)]);
+            let error = collect_post_pages(|_| ready(pages.pop_front().unwrap()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, CliError::PostsSnapshotChanged { .. }),
+                "{change}"
+            );
+        }
+
+        let repeated = post_page(Vec::new(), Some(cursor));
+        let mut pages = VecDeque::from([Ok(repeated.clone()), Ok(repeated)]);
+        let error = collect_post_pages(|_| ready(pages.pop_front().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::InvalidPostsPagination {
+                message: "next_cursor repeated an earlier cursor"
+            }
+        ));
+
+        let post = posts_response().posts.remove(0);
+        let mut pages = VecDeque::from([
+            Ok(post_page(vec![post.clone()], Some(cursor))),
+            Ok(post_page(vec![post], None)),
+        ]);
+        let error = collect_post_pages(|_| ready(pages.pop_front().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::InvalidPostsPagination {
+                message: "a post UUID appeared more than once"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pagination_enforces_the_page_count_safety_limit() {
+        let mut next = 1_u128;
+        let error = collect_post_pages(|_| {
+            let cursor = Uuid::from_u128(next);
+            next += 1;
+            ready(Ok(post_page(Vec::new(), Some(cursor))))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CliError::InvalidPostsPagination {
+                message: "the page count exceeded the client safety limit"
+            }
+        ));
+        assert_eq!(next, MAX_POSTS_PAGES as u128 + 1);
+    }
+
+    #[test]
+    fn authentication_and_agent_key_outputs_have_stable_human_and_json_forms() {
+        let session = session_response();
+        let mut json_output = Vec::new();
+        write_login(&mut json_output, session.clone(), true).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AdminSessionResponse>(&json_output).unwrap(),
+            session
+        );
+
+        let mut human_output = Vec::new();
+        write_login(&mut human_output, session, false).unwrap();
+        assert_eq!(
+            String::from_utf8(human_output).unwrap(),
+            concat!(
+                "Session: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
+                "User: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
+                "Provider: password\n",
+                "Roles: owner, publisher\n",
+                "Expires at: 2026-09-04 12:00:00.0 +00:00:00\n",
+            )
+        );
+
+        let revoked: RevokeAdminSessionResponse = serde_json::from_value(json!({
+            "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        }))
+        .unwrap();
+        let mut json_output = Vec::new();
+        write_logout(&mut json_output, revoked, true).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&json_output).unwrap(),
+            json!({"session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})
+        );
+        let mut human_output = Vec::new();
+        write_logout(&mut human_output, revoked, false).unwrap();
+        assert_eq!(
+            String::from_utf8(human_output).unwrap(),
+            "Revoked session: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n"
+        );
+
+        for json in [false, true] {
+            let mut configured = Vec::new();
+            write_agent_key_configured(&mut configured, "public-key", json).unwrap();
+            let configured = String::from_utf8(configured).unwrap();
+            if json {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&configured).unwrap(),
+                    json!({"public_key": "public-key", "configured": true})
+                );
+            } else {
+                assert_eq!(configured, "Agent public key: public-key\n");
+            }
+
+            let mut removed = Vec::new();
+            write_agent_key_removed(&mut removed, json).unwrap();
+            let removed = String::from_utf8(removed).unwrap();
+            if json {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&removed).unwrap(),
+                    json!({"removed": true})
+                );
+            } else {
+                assert_eq!(removed, "Agent key removed\n");
+            }
         }
     }
 

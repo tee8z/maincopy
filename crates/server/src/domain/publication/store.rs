@@ -833,15 +833,11 @@ fn decode_canonical_publication(
     let publication_id = Uuid::from_slice(&row.publication_id)
         .map_err(|_| StartupSnapshotLoadError::InvalidPublicationId)?;
     let command_kind = PublicationCommandKind::parse(&row.command_kind)?;
-    let activation_site_digest = row.activation_site_digest.map(site_digest).transpose()?;
-    let activation_site_version = row
-        .activation_site_version
-        .map(|version| positive_version(Some(version)))
-        .transpose()?;
-    let activation_site_activated_at = row
-        .activation_site_activated_at_ns
-        .map(publication_timestamp)
-        .transpose()?;
+    let activation_site = decode_activation_site(
+        row.activation_site_digest,
+        row.activation_site_version,
+        row.activation_site_activated_at_ns,
+    )?;
     let (stable_post_id, pinned_post_digest, pinned_slug) = decode_pinned_revision(
         row.stable_post_id,
         row.pinned_post_digest,
@@ -855,40 +851,20 @@ fn decode_canonical_publication(
     )?;
     let content_digest = content_tree_digest(row.content_tree_digest)?;
     let accepted_preview_digest = preview_digest(row.accepted_preview_digest)?;
-
-    let current_published_digest = row.current_published_digest.map(post_digest).transpose()?;
-    if current_published_digest.is_some() {
-        require_publishable(row.current_publication_status.as_deref(), false)?;
-    } else if row.current_publication_status.is_some() {
-        return Err(StartupSnapshotLoadError::MismatchedCurrentRevision);
-    }
-
-    let source_commit = row
-        .source_commit
-        .map(|value| {
-            decode_source_commit(value).ok_or(StartupSnapshotLoadError::InvalidSourceCommit)
-        })
-        .transpose()?;
-    let block_reason = row
-        .block_reason
-        .map(|reason| match reason.as_str() {
-            "revision_unavailable" => Ok(ActivationBlockReason::RevisionUnavailable),
-            _ => Err(StartupSnapshotLoadError::InvalidBlockReason),
-        })
-        .transpose()?;
+    let current_published_digest = decode_current_revision(
+        row.current_published_digest,
+        row.current_publication_status.as_deref(),
+    )?;
     let view = CanonicalPublicationView {
         state: canonical_state(&row.state)?,
         stable_post_id,
         pinned_post_digest,
-        source_commit,
+        source_commit: decode_stored_source_commit(row.source_commit)?,
         scheduled_at: publication_timestamp(row.scheduled_at_ns)?,
-        activation_started_at: row
-            .activation_at_ns
-            .map(publication_timestamp)
-            .transpose()?,
-        published_at: row.published_at_ns.map(publication_timestamp).transpose()?,
+        activation_started_at: optional_publication_timestamp(row.activation_at_ns)?,
+        published_at: optional_publication_timestamp(row.published_at_ns)?,
         current_published_digest,
-        block_reason,
+        block_reason: decode_block_reason(row.block_reason)?,
         version: u64::try_from(row.version)
             .map_err(|_| StartupSnapshotLoadError::InvalidPublicationVersion)?,
     };
@@ -898,15 +874,78 @@ fn decode_canonical_publication(
         publication_id,
         creation_key,
         command_kind,
-        activation_site_digest,
-        activation_site_version,
-        activation_site_activated_at,
+        activation_site_digest: activation_site.digest,
+        activation_site_version: activation_site.version,
+        activation_site_activated_at: activation_site.activated_at,
         requested_revision_digest,
         content_digest,
         accepted_preview_digest,
         pinned_slug,
         status,
     })
+}
+
+struct DecodedActivationSite {
+    digest: Option<SiteSnapshotDigest>,
+    version: Option<u64>,
+    activated_at: Option<OffsetDateTime>,
+}
+
+fn decode_activation_site(
+    digest: Option<Vec<u8>>,
+    version: Option<i64>,
+    activated_at_ns: Option<i64>,
+) -> Result<DecodedActivationSite, StartupSnapshotLoadError> {
+    Ok(DecodedActivationSite {
+        digest: digest.map(site_digest).transpose()?,
+        version: version
+            .map(|version| positive_version(Some(version)))
+            .transpose()?,
+        activated_at: optional_publication_timestamp(activated_at_ns)?,
+    })
+}
+
+fn decode_current_revision(
+    digest: Option<Vec<u8>>,
+    publication_status: Option<&str>,
+) -> Result<Option<PostRevisionDigest>, StartupSnapshotLoadError> {
+    let Some(digest) = digest else {
+        return if publication_status.is_some() {
+            Err(StartupSnapshotLoadError::MismatchedCurrentRevision)
+        } else {
+            Ok(None)
+        };
+    };
+    let digest = post_digest(digest)?;
+    require_publishable(publication_status, false)?;
+    Ok(Some(digest))
+}
+
+fn decode_stored_source_commit(
+    value: Option<Vec<u8>>,
+) -> Result<Option<SourceCommit>, StartupSnapshotLoadError> {
+    value
+        .map(|value| {
+            decode_source_commit(value).ok_or(StartupSnapshotLoadError::InvalidSourceCommit)
+        })
+        .transpose()
+}
+
+fn decode_block_reason(
+    reason: Option<String>,
+) -> Result<Option<ActivationBlockReason>, StartupSnapshotLoadError> {
+    reason
+        .map(|reason| match reason.as_str() {
+            "revision_unavailable" => Ok(ActivationBlockReason::RevisionUnavailable),
+            _ => Err(StartupSnapshotLoadError::InvalidBlockReason),
+        })
+        .transpose()
+}
+
+fn optional_publication_timestamp(
+    value: Option<i64>,
+) -> Result<Option<OffsetDateTime>, StartupSnapshotLoadError> {
+    value.map(publication_timestamp).transpose()
 }
 
 fn decode_publish_now_identity(
@@ -3271,6 +3310,10 @@ mod tests {
         assert!(matches!(
             require_publishable(None, false),
             Err(StartupSnapshotLoadError::MissingCurrentRevision)
+        ));
+        assert!(matches!(
+            decode_current_revision(Some(vec![0_u8; 31]), None),
+            Err(StartupSnapshotLoadError::InvalidPostDigest)
         ));
         assert!(validate_reload_states(&["applied".into(), "failed".into()]).is_ok());
         assert!(matches!(

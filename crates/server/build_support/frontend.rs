@@ -179,6 +179,13 @@ struct DiscoveredJavascript {
     directory: ConfinedDirectoryIdentity,
 }
 
+struct PreparedFrontend {
+    css: DiscoveredCss,
+    javascript: Option<DiscoveredJavascript>,
+    stylesheet: Vec<u8>,
+    manifest: String,
+}
+
 struct DiscoveryState {
     inputs: Vec<InputFile>,
     directories: Vec<ConfinedDirectoryIdentity>,
@@ -224,6 +231,86 @@ pub(crate) fn compile_frontend(
     manifest_dir: &Path,
     out_dir: &Path,
 ) -> Result<Vec<PathBuf>, FrontendBuildError> {
+    PreparedFrontend::compile(manifest_dir)?.write(out_dir)
+}
+
+impl PreparedFrontend {
+    fn compile(manifest_dir: &Path) -> Result<Self, FrontendBuildError> {
+        let (mut css, javascript) = discover_frontend(manifest_dir)?;
+        let combined = read_and_combine(&mut css.inputs)?;
+        let stylesheet = minify_css(&combined)?;
+        if stylesheet.is_empty() {
+            return Err(FrontendBuildError::EmptyStylesheet);
+        }
+        let javascript_bytes = javascript
+            .as_ref()
+            .map(|javascript| javascript.input.bytes.as_slice());
+        enforce_bundle_size(combined_bundle_size(stylesheet.len(), javascript_bytes)?)?;
+        let manifest = prepare_manifest(&stylesheet, javascript_bytes)?;
+        Ok(Self {
+            css,
+            javascript,
+            stylesheet,
+            manifest,
+        })
+    }
+
+    fn write(self, out_dir: &Path) -> Result<Vec<PathBuf>, FrontendBuildError> {
+        let output_directory = ConfinedDirectory::open_absolute(out_dir)?;
+        let output_root = out_dir.join(OUTPUT_ROOT);
+        let bundle_directory =
+            output_directory.ensure_output_directory(OsStr::new(OUTPUT_ROOT), &output_root)?;
+        bundle_directory
+            .write_atomic_with_hook(CSS_OUTPUT, &self.stylesheet, || self.css.verify_unchanged())?;
+        if let Some(javascript) = &self.javascript {
+            bundle_directory.write_atomic_with_hook(
+                JAVASCRIPT_OUTPUT,
+                &javascript.input.bytes,
+                || {
+                    self.css.verify_unchanged()?;
+                    javascript.verify_unchanged()
+                },
+            )?;
+        }
+        output_directory.write_atomic_with_hook(
+            GENERATED_MANIFEST,
+            self.manifest.as_bytes(),
+            || {
+                self.css.verify_unchanged()?;
+                if let Some(javascript) = &self.javascript {
+                    javascript.verify_unchanged()?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(self.input_paths())
+    }
+
+    fn input_paths(self) -> Vec<PathBuf> {
+        let mut inputs = self
+            .css
+            .inputs
+            .into_iter()
+            .map(|input| {
+                Path::new(FRONTEND_ROOT)
+                    .join("css")
+                    .join(input.logical_path)
+            })
+            .collect::<Vec<_>>();
+        if let Some(javascript) = self.javascript {
+            inputs.push(
+                Path::new(FRONTEND_ROOT)
+                    .join("js")
+                    .join(javascript.input.logical_path),
+            );
+        }
+        inputs
+    }
+}
+
+fn discover_frontend(
+    manifest_dir: &Path,
+) -> Result<(DiscoveredCss, Option<DiscoveredJavascript>), FrontendBuildError> {
     let manifest_root = ConfinedDirectory::open_absolute(manifest_dir)?;
     let frontend_path = manifest_dir.join(FRONTEND_ROOT);
     let frontend_root =
@@ -239,33 +326,37 @@ pub(crate) fn compile_frontend(
         };
     drop(frontend_root);
     drop(manifest_root);
-    let mut discovered = discover_css(&css_root, &css_directory)?;
+    let discovered = discover_css(&css_root, &css_directory)?;
     let javascript = javascript_directory
         .as_ref()
         .map(|directory| discover_javascript(&javascript_root, directory))
         .transpose()?;
-    let combined = read_and_combine(&mut discovered.inputs)?;
-    let minified = minify_css(&combined)?;
-    if minified.is_empty() {
-        return Err(FrontendBuildError::EmptyStylesheet);
-    }
-    let javascript_bytes = javascript
-        .as_ref()
-        .map(|javascript| javascript.input.bytes.as_slice());
-    let bundle_bytes = javascript_bytes
-        .map_or(Some(minified.len()), |bytes| {
-            minified.len().checked_add(bytes.len())
-        })
-        .ok_or(FrontendBuildError::BundleTooLarge {
-            bytes: usize::MAX,
-            limit: MAX_BUNDLE_BYTES,
-        })?;
-    enforce_bundle_size(bundle_bytes)?;
+    Ok((discovered, javascript))
+}
 
-    let css_digest = frontend_asset_digest(FrontendAssetKind::Css, &minified);
+fn combined_bundle_size(
+    stylesheet_bytes: usize,
+    javascript: Option<&[u8]>,
+) -> Result<usize, FrontendBuildError> {
+    match javascript {
+        Some(javascript) => stylesheet_bytes.checked_add(javascript.len()).ok_or(
+            FrontendBuildError::BundleTooLarge {
+                bytes: usize::MAX,
+                limit: MAX_BUNDLE_BYTES,
+            },
+        ),
+        None => Ok(stylesheet_bytes),
+    }
+}
+
+fn prepare_manifest(
+    stylesheet: &[u8],
+    javascript: Option<&[u8]>,
+) -> Result<String, FrontendBuildError> {
+    let css_digest = frontend_asset_digest(FrontendAssetKind::Css, stylesheet);
     let javascript_digest =
-        javascript_bytes.map(|bytes| frontend_asset_digest(FrontendAssetKind::JavaScript, bytes));
-    let bundle_digest = calculate_bundle_digest(&minified, javascript_bytes)?;
+        javascript.map(|bytes| frontend_asset_digest(FrontendAssetKind::JavaScript, bytes));
+    let bundle_digest = calculate_bundle_digest(stylesheet, javascript)?;
     let bundle_name = encoded_digest(FRONTEND_BUNDLE_PREFIX, &bundle_digest);
     let css_public_path = format!(
         "/app-assets/{bundle_name}/{}",
@@ -277,56 +368,14 @@ pub(crate) fn compile_frontend(
             FrontendAssetName::JavaScript
         )
     });
-    let generated = generated_manifest(
+    Ok(generated_manifest(
         &bundle_digest,
         &css_digest,
         &css_public_path,
         javascript_digest
             .as_ref()
             .zip(javascript_public_path.as_deref()),
-    );
-
-    let output_directory = ConfinedDirectory::open_absolute(out_dir)?;
-    let output_root = out_dir.join(OUTPUT_ROOT);
-    let bundle_directory =
-        output_directory.ensure_output_directory(OsStr::new(OUTPUT_ROOT), &output_root)?;
-    bundle_directory
-        .write_atomic_with_hook(CSS_OUTPUT, &minified, || discovered.verify_unchanged())?;
-    if let Some(javascript) = &javascript {
-        bundle_directory.write_atomic_with_hook(
-            JAVASCRIPT_OUTPUT,
-            &javascript.input.bytes,
-            || {
-                discovered.verify_unchanged()?;
-                javascript.verify_unchanged()
-            },
-        )?;
-    }
-    output_directory.write_atomic_with_hook(GENERATED_MANIFEST, generated.as_bytes(), || {
-        discovered.verify_unchanged()?;
-        if let Some(javascript) = &javascript {
-            javascript.verify_unchanged()?;
-        }
-        Ok(())
-    })?;
-
-    let mut inputs = discovered
-        .inputs
-        .into_iter()
-        .map(|input| {
-            Path::new(FRONTEND_ROOT)
-                .join("css")
-                .join(input.logical_path)
-        })
-        .collect::<Vec<_>>();
-    if let Some(javascript) = javascript {
-        inputs.push(
-            Path::new(FRONTEND_ROOT)
-                .join("js")
-                .join(javascript.input.logical_path),
-        );
-    }
-    Ok(inputs)
+    ))
 }
 
 fn calculate_bundle_digest(

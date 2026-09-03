@@ -70,6 +70,14 @@ pub(crate) struct PublishNow {
     pub accepted_preview_digest: PreviewDigest,
 }
 
+struct PreparedPublishNow {
+    selected: SelectedPost,
+    prebuilt: CandidateSnapshot,
+    requested_content_digest: ContentTreeDigest,
+    accepted_preview_digest: PreviewDigest,
+    requested: BeginPublishNow,
+}
+
 /// The exact durable publication produced by the coordinator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublishedPublication {
@@ -640,7 +648,18 @@ impl PublicationCoordinator {
         &mut self,
         command: PublishNow,
     ) -> Result<PublishedPublication, PublicationActivationError> {
-        let replay = self
+        let Some(replay) = self.publish_now_replay(&command).await? else {
+            let prepared = self.prepare_publish_now(command)?;
+            return self.begin_prepared_publish_now(prepared).await;
+        };
+        self.resume_publish_now_state(replay).await
+    }
+
+    async fn publish_now_replay(
+        &self,
+        command: &PublishNow,
+    ) -> Result<Option<PublishNowState>, PublicationActivationError> {
+        match self
             .store
             .publish_now_replay(LookupPublishNow {
                 creation_key: CommandIdempotencyKey::new(command.creation_key),
@@ -648,47 +667,61 @@ impl PublicationCoordinator {
                 expected_revision: command.expected_revision.clone(),
                 accepted_preview_digest: command.accepted_preview_digest.clone(),
             })
-            .await;
-        let replay = match replay {
-            Ok(replay) => replay,
+            .await
+        {
+            Ok(replay) => Ok(replay),
             Err(error @ PublishNowLookupError::InvalidStoredState) => {
                 let _safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
-                return Err(PublicationActivationError::Lookup(error));
+                Err(PublicationActivationError::Lookup(error))
             }
-            Err(error) => return Err(PublicationActivationError::Lookup(error)),
-        };
-        match replay {
-            Some(PublishNowState::Published(completed)) => {
-                return canonical_publication_result(&self.ledger, completed_result(completed));
-            }
-            Some(PublishNowState::Activating(begun)) => {
-                let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
-                let catalog = self.catalog_for_content_digest(&begun.content_digest)?;
-                let selected = select_stored_post(&catalog, begun.publication.view())?;
-                require_accepted_preview(
-                    reproduce_preview_digest(
-                        &catalog,
-                        self.frontend,
-                        &self.ledger,
-                        self.tip_recipient.as_ref(),
-                        &selected,
-                    )?,
-                    &begun.accepted_preview_digest,
-                )?;
-                let candidate = self.candidate_for_begun(
-                    catalog,
-                    &selected,
-                    begun.publication.view(),
-                    &begun.candidate_site_digest,
-                    None,
-                )?;
-                return self
-                    .activate_and_finish(begun, selected, candidate, &mut safety)
-                    .await;
-            }
-            None => {}
+            Err(error) => Err(PublicationActivationError::Lookup(error)),
         }
+    }
 
+    async fn resume_publish_now_state(
+        &mut self,
+        replay: PublishNowState,
+    ) -> Result<PublishedPublication, PublicationActivationError> {
+        match replay {
+            PublishNowState::Published(completed) => {
+                canonical_publication_result(&self.ledger, completed_result(completed))
+            }
+            PublishNowState::Activating(begun) => self.resume_publish_now(begun).await,
+        }
+    }
+
+    async fn resume_publish_now(
+        &mut self,
+        begun: BegunPublication,
+    ) -> Result<PublishedPublication, PublicationActivationError> {
+        let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
+        let catalog = self.catalog_for_content_digest(&begun.content_digest)?;
+        let selected = select_stored_post(&catalog, begun.publication.view())?;
+        require_accepted_preview(
+            reproduce_preview_digest(
+                &catalog,
+                self.frontend,
+                &self.ledger,
+                self.tip_recipient.as_ref(),
+                &selected,
+            )?,
+            &begun.accepted_preview_digest,
+        )?;
+        let candidate = self.candidate_for_begun(
+            catalog,
+            &selected,
+            begun.publication.view(),
+            &begun.candidate_site_digest,
+            None,
+        )?;
+        self.activate_and_finish(begun, selected, candidate, &mut safety)
+            .await
+    }
+
+    fn prepare_publish_now(
+        &self,
+        command: PublishNow,
+    ) -> Result<PreparedPublishNow, PublicationActivationError> {
         let selected = select_post(
             &self.catalog,
             &command.stable_post_id,
@@ -716,7 +749,6 @@ impl PublicationCoordinator {
         )?;
         let requested_content_digest = self.content_digest.clone();
         let accepted_preview_digest = command.accepted_preview_digest.clone();
-        let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
         let requested = BeginPublishNow {
             creation_key: CommandIdempotencyKey::new(command.creation_key),
             publication_id: command.publication_id,
@@ -730,7 +762,27 @@ impl PublicationCoordinator {
             now,
             candidate_site_digest: prebuilt.snapshot.digest.clone(),
         };
+        Ok(PreparedPublishNow {
+            selected,
+            prebuilt,
+            requested_content_digest,
+            accepted_preview_digest,
+            requested,
+        })
+    }
 
+    async fn begin_prepared_publish_now(
+        &mut self,
+        prepared: PreparedPublishNow,
+    ) -> Result<PublishedPublication, PublicationActivationError> {
+        let PreparedPublishNow {
+            selected,
+            prebuilt,
+            requested_content_digest,
+            accepted_preview_digest,
+            requested,
+        } = prepared;
+        let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
         let begun = match self.store.begin_publish_now(requested).await {
             Ok(PublishNowState::Activating(begun)) => begun,
             Ok(PublishNowState::Published(completed)) => {
@@ -748,28 +800,20 @@ impl PublicationCoordinator {
                 if definitely_unclaimed(&error) {
                     safety.disarm();
                 }
-                if prebuilt.already_published
-                    && matches!(
-                        error,
-                        DatabaseMutationError::Command(DatabaseCommandError::Rejected)
-                    )
-                {
-                    return Err(PublicationActivationError::AlreadyPublished {
-                        post_id: selected.stable_post_id,
-                    });
-                }
-                return Err(PublicationActivationError::Database(error));
+                return Err(publish_now_database_error(
+                    error,
+                    prebuilt.already_published,
+                    selected.stable_post_id,
+                ));
             }
         };
 
-        if prebuilt.already_published {
-            return Err(PublicationActivationError::DurableStateMismatch);
-        }
-        if begun.content_digest != requested_content_digest
-            || begun.accepted_preview_digest != accepted_preview_digest
-        {
-            return Err(PublicationActivationError::DurableStateMismatch);
-        }
+        validate_begun_publish_now(
+            &begun,
+            &prebuilt,
+            &requested_content_digest,
+            &accepted_preview_digest,
+        )?;
         let candidate = self.candidate_for_begun(
             Arc::clone(&self.catalog),
             &selected,
@@ -1412,6 +1456,38 @@ fn definitely_unclaimed(error: &DatabaseMutationError) -> bool {
                     | DatabaseCommandError::InvalidValue
             )
     )
+}
+
+fn publish_now_database_error(
+    error: DatabaseMutationError,
+    already_published: bool,
+    post_id: PostId,
+) -> PublicationActivationError {
+    if already_published
+        && matches!(
+            &error,
+            DatabaseMutationError::Command(DatabaseCommandError::Rejected)
+        )
+    {
+        PublicationActivationError::AlreadyPublished { post_id }
+    } else {
+        PublicationActivationError::Database(error)
+    }
+}
+
+fn validate_begun_publish_now(
+    begun: &BegunPublication,
+    prebuilt: &CandidateSnapshot,
+    requested_content_digest: &ContentTreeDigest,
+    accepted_preview_digest: &PreviewDigest,
+) -> Result<(), PublicationActivationError> {
+    if prebuilt.already_published
+        || &begun.content_digest != requested_content_digest
+        || &begun.accepted_preview_digest != accepted_preview_digest
+    {
+        return Err(PublicationActivationError::DurableStateMismatch);
+    }
+    Ok(())
 }
 
 struct FailClosedGuard {
@@ -2726,7 +2802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_conflict_fails_closed_and_startup_recovery_finishes_it() {
+    async fn activation_conflict_fails_closed_and_retry_resumes_the_durable_intent() {
         let catalog = catalog();
         let ledger = PublicLedgerProjection::empty();
         let initial = snapshot(&catalog, &ledger);
@@ -2774,10 +2850,9 @@ mod tests {
         assert!(!readiness.is_ready());
         assert!(cancellation.is_cancelled());
 
-        let mut durable = store.startup_snapshot_state().await.unwrap();
+        let durable = store.startup_snapshot_state().await.unwrap();
         assert!(durable.ledger.is_empty());
         assert_eq!(durable.activating.len(), 1);
-        let activation = durable.activating.pop().unwrap();
         let base = snapshot(&catalog, &durable.ledger);
         let (reader, activator) = snapshot_store(base);
         let recovery_cancellation = CancellationToken::new();
@@ -2799,7 +2874,7 @@ mod tests {
             readiness: Readiness::default(),
             cancellation: recovery_cancellation.clone(),
         };
-        let recovered = recovering.recover(activation).await.unwrap();
+        let recovered = recovering.publish_now(command()).await.unwrap();
         assert_eq!(recovered.stable_post_id.as_str(), PUBLISHABLE_ID);
         assert!(!recovery_cancellation.is_cancelled());
         assert!(

@@ -278,105 +278,196 @@ fn decode_candidate(
     expected_digest: &ContentTreeDigest,
     limits: ContentTreeLimits,
 ) -> Result<DiscoveredContentTree, ContentCandidateStoreError> {
-    let mut decoder = Decoder {
-        reader,
-        remaining: archive_bytes,
-    };
-    if decoder.fixed::<17>()? != *ARCHIVE_MAGIC {
-        return Err(ContentCandidateStoreError::InvalidArchive(
-            "unknown archive magic",
-        ));
-    }
-    if u16::from_be_bytes(decoder.fixed()?) != ARCHIVE_VERSION {
-        return Err(ContentCandidateStoreError::InvalidArchive(
-            "unsupported archive version",
-        ));
-    }
-    let stored_digest = ContentTreeDigest::from_bytes(decoder.fixed()?);
-    if &stored_digest != expected_digest {
-        return Err(ContentCandidateStoreError::DigestMismatch);
-    }
-    let stored_total = u64::from_be_bytes(decoder.fixed()?);
+    let mut decoder = CandidateDecoder::open(reader, archive_bytes, expected_digest, limits)?;
+    let publication = decoder.publication()?;
+    let posts = decoder.posts()?;
+    let assets = decoder.assets(posts.len())?;
+    decoder.finish(publication, posts, assets)
+}
 
-    let publication_path = decoder.string(limits.path_bytes.get())?;
-    validate_publication_path(&publication_path, limits)?;
-    let publication_source = decoder.utf8_bytes(limits.publication_file_bytes.get())?;
-    let mut total_bytes = publication_source.len() as u64;
-    ensure_total_within_limit(total_bytes, limits)?;
-    let publication = DiscoveredPublication {
-        path: LogicalContentPath::new(publication_path),
-        source: publication_source.into_boxed_str(),
-    };
+struct CandidateDecoder {
+    archive: Decoder,
+    limits: ContentTreeLimits,
+    stored_digest: ContentTreeDigest,
+    stored_total: u64,
+    total_bytes: u64,
+    paths: PathRegistry,
+}
 
-    let post_count = decoder.count(limits.entries.get().saturating_sub(1))?;
-    let mut posts = Vec::new();
-    let mut previous_post_path: Option<String> = None;
-    let mut paths = PathRegistry::default();
-    paths.register(publication.path.as_str())?;
-    for _ in 0..post_count {
-        let collection = parse_collection(decoder.byte()?)?;
-        let path = decoder.string(limits.path_bytes.get())?;
-        validate_post_path(&path, collection, limits)?;
-        ensure_canonical_path_order(previous_post_path.as_deref(), &path)?;
-        paths.register(&path)?;
-        previous_post_path = Some(path.clone());
-        let source = decoder.utf8_bytes(limits.post_file_bytes.get())?;
-        total_bytes = add_total(total_bytes, source.len(), limits)?;
-        posts.push(DiscoveredPost {
+impl CandidateDecoder {
+    fn open(
+        reader: BufReader<File>,
+        archive_bytes: u64,
+        expected_digest: &ContentTreeDigest,
+        limits: ContentTreeLimits,
+    ) -> Result<Self, ContentCandidateStoreError> {
+        let mut archive = Decoder {
+            reader,
+            remaining: archive_bytes,
+        };
+        if archive.fixed::<17>()? != *ARCHIVE_MAGIC {
+            return Err(ContentCandidateStoreError::InvalidArchive(
+                "unknown archive magic",
+            ));
+        }
+        if u16::from_be_bytes(archive.fixed()?) != ARCHIVE_VERSION {
+            return Err(ContentCandidateStoreError::InvalidArchive(
+                "unsupported archive version",
+            ));
+        }
+        let stored_digest = ContentTreeDigest::from_bytes(archive.fixed()?);
+        if &stored_digest != expected_digest {
+            return Err(ContentCandidateStoreError::DigestMismatch);
+        }
+        let stored_total = u64::from_be_bytes(archive.fixed()?);
+        Ok(Self {
+            archive,
+            limits,
+            stored_digest,
+            stored_total,
+            total_bytes: 0,
+            paths: PathRegistry::default(),
+        })
+    }
+
+    fn publication(&mut self) -> Result<DiscoveredPublication, ContentCandidateStoreError> {
+        let path = self.archive.string(self.limits.path_bytes.get())?;
+        validate_publication_path(&path, self.limits)?;
+        self.paths.register(&path)?;
+        let source = self
+            .archive
+            .utf8_bytes(self.limits.publication_file_bytes.get())?;
+        self.total_bytes = add_total(0, source.len(), self.limits)?;
+        Ok(DiscoveredPublication {
+            path: LogicalContentPath::new(path),
+            source: source.into_boxed_str(),
+        })
+    }
+
+    fn posts(&mut self) -> Result<Vec<DiscoveredPost>, ContentCandidateStoreError> {
+        let count = self
+            .archive
+            .count(self.limits.entries.get().saturating_sub(1))?;
+        let mut posts = Vec::new();
+        let mut previous_path: Option<String> = None;
+        for _ in 0..count {
+            let post = self.post(previous_path.as_deref())?;
+            previous_path = Some(post.path.as_str().to_owned());
+            posts.push(post);
+        }
+        Ok(posts)
+    }
+
+    fn post(
+        &mut self,
+        previous_path: Option<&str>,
+    ) -> Result<DiscoveredPost, ContentCandidateStoreError> {
+        let collection = parse_collection(self.archive.byte()?)?;
+        let path = self.archive.string(self.limits.path_bytes.get())?;
+        validate_post_path(&path, collection, self.limits)?;
+        ensure_canonical_path_order(previous_path, &path)?;
+        self.paths.register(&path)?;
+        let source = self.archive.utf8_bytes(self.limits.post_file_bytes.get())?;
+        self.total_bytes = add_total(self.total_bytes, source.len(), self.limits)?;
+        Ok(DiscoveredPost {
             path: LogicalContentPath::new(path),
             collection,
             source: source.into_boxed_str(),
-        });
+        })
     }
 
-    let remaining_entries = limits
-        .entries
-        .get()
-        .saturating_sub(1)
-        .saturating_sub(post_count);
-    let asset_count = decoder.count(remaining_entries)?;
-    let mut assets = Vec::new();
-    let mut previous_asset_path: Option<String> = None;
-    for _ in 0..asset_count {
-        let path = decoder.string(limits.path_bytes.get())?;
-        validate_asset_path(&path, limits)?;
-        ensure_canonical_path_order(previous_asset_path.as_deref(), &path)?;
-        paths.register(&path)?;
-        previous_asset_path = Some(path.clone());
-        let bytes = decoder.bytes(limits.asset_file_bytes.get())?;
-        total_bytes = add_total(total_bytes, bytes.len(), limits)?;
-        assets.push(DiscoveredAsset {
+    fn assets(
+        &mut self,
+        post_count: usize,
+    ) -> Result<Vec<DiscoveredAsset>, ContentCandidateStoreError> {
+        let remaining_entries = self
+            .limits
+            .entries
+            .get()
+            .saturating_sub(1)
+            .saturating_sub(post_count);
+        let count = self.archive.count(remaining_entries)?;
+        let mut assets = Vec::new();
+        let mut previous_path: Option<String> = None;
+        for _ in 0..count {
+            let asset = self.asset(previous_path.as_deref())?;
+            previous_path = Some(asset.path.as_str().to_owned());
+            assets.push(asset);
+        }
+        Ok(assets)
+    }
+
+    fn asset(
+        &mut self,
+        previous_path: Option<&str>,
+    ) -> Result<DiscoveredAsset, ContentCandidateStoreError> {
+        let path = self.archive.string(self.limits.path_bytes.get())?;
+        validate_asset_path(&path, self.limits)?;
+        ensure_canonical_path_order(previous_path, &path)?;
+        self.paths.register(&path)?;
+        let bytes = self.archive.bytes(self.limits.asset_file_bytes.get())?;
+        self.total_bytes = add_total(self.total_bytes, bytes.len(), self.limits)?;
+        Ok(DiscoveredAsset {
             path: LogicalAssetPath::parse(&path).map_err(|_| {
                 ContentCandidateStoreError::InvalidArchive("invalid logical asset path")
             })?,
             bytes: Arc::from(bytes),
-        });
+        })
     }
-    decoder.end()?;
 
-    if total_bytes != stored_total {
-        return Err(ContentCandidateStoreError::InvalidArchive(
-            "stored tree byte count is inconsistent",
-        ));
+    fn finish(
+        self,
+        publication: DiscoveredPublication,
+        posts: Vec<DiscoveredPost>,
+        assets: Vec<DiscoveredAsset>,
+    ) -> Result<DiscoveredContentTree, ContentCandidateStoreError> {
+        self.archive.end()?;
+        if self.total_bytes != self.stored_total {
+            return Err(ContentCandidateStoreError::InvalidArchive(
+                "stored tree byte count is inconsistent",
+            ));
+        }
+        let tree = DiscoveredContentTree::new(publication, posts, assets, self.total_bytes);
+        if tree.digest() != self.stored_digest {
+            return Err(ContentCandidateStoreError::DigestMismatch);
+        }
+        Ok(tree)
     }
-    let tree = DiscoveredContentTree::new(publication, posts, assets, total_bytes);
-    if tree.digest() != stored_digest {
-        return Err(ContentCandidateStoreError::DigestMismatch);
-    }
-    Ok(tree)
 }
 
 fn validate_tree(
     tree: &DiscoveredContentTree,
     limits: ContentTreeLimits,
 ) -> Result<(), ContentCandidateStoreError> {
-    let entry_count = 1usize
+    validate_tree_entry_count(tree, limits)?;
+    validate_publication_path(tree.publication.path.as_str(), limits)?;
+    ensure_file_size(
+        tree.publication.source.len(),
+        limits.publication_file_bytes.get(),
+    )?;
+    let mut validation = TreeValidation::new(tree.publication.source.len(), limits)?;
+    validation.paths.register(tree.publication.path.as_str())?;
+    validation.posts(&tree.posts)?;
+    validation.assets(&tree.assets)?;
+    if validation.total_bytes != tree.total_bytes {
+        return Err(ContentCandidateStoreError::InvalidArchive(
+            "tree byte count is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tree_entry_count(
+    tree: &DiscoveredContentTree,
+    limits: ContentTreeLimits,
+) -> Result<(), ContentCandidateStoreError> {
+    let count = 1usize
         .checked_add(tree.posts.len())
         .and_then(|count| count.checked_add(tree.assets.len()))
         .ok_or(ContentCandidateStoreError::LimitExceeded(
             "candidate entry count overflows",
         ))?;
-    if entry_count > limits.entries.get()
+    if count > limits.entries.get()
         || tree.posts.len() > u32::MAX as usize
         || tree.assets.len() > u32::MAX as usize
     {
@@ -384,35 +475,47 @@ fn validate_tree(
             "candidate has too many entries",
         ));
     }
-
-    validate_publication_path(tree.publication.path.as_str(), limits)?;
-    ensure_file_size(
-        tree.publication.source.len(),
-        limits.publication_file_bytes.get(),
-    )?;
-    let mut total = tree.publication.source.len() as u64;
-    ensure_total_within_limit(total, limits)?;
-    let mut paths = PathRegistry::default();
-    paths.register(tree.publication.path.as_str())?;
-
-    for post in &tree.posts {
-        validate_post_path(post.path.as_str(), post.collection, limits)?;
-        ensure_file_size(post.source.len(), limits.post_file_bytes.get())?;
-        paths.register(post.path.as_str())?;
-        total = add_total(total, post.source.len(), limits)?;
-    }
-    for asset in &tree.assets {
-        validate_asset_path(asset.path.as_str(), limits)?;
-        ensure_file_size(asset.bytes.len(), limits.asset_file_bytes.get())?;
-        paths.register(asset.path.as_str())?;
-        total = add_total(total, asset.bytes.len(), limits)?;
-    }
-    if total != tree.total_bytes {
-        return Err(ContentCandidateStoreError::InvalidArchive(
-            "tree byte count is inconsistent",
-        ));
-    }
     Ok(())
+}
+
+struct TreeValidation {
+    limits: ContentTreeLimits,
+    total_bytes: u64,
+    paths: PathRegistry,
+}
+
+impl TreeValidation {
+    fn new(
+        publication_bytes: usize,
+        limits: ContentTreeLimits,
+    ) -> Result<Self, ContentCandidateStoreError> {
+        let total_bytes = add_total(0, publication_bytes, limits)?;
+        Ok(Self {
+            limits,
+            total_bytes,
+            paths: PathRegistry::default(),
+        })
+    }
+
+    fn posts(&mut self, posts: &[DiscoveredPost]) -> Result<(), ContentCandidateStoreError> {
+        for post in posts {
+            validate_post_path(post.path.as_str(), post.collection, self.limits)?;
+            ensure_file_size(post.source.len(), self.limits.post_file_bytes.get())?;
+            self.paths.register(post.path.as_str())?;
+            self.total_bytes = add_total(self.total_bytes, post.source.len(), self.limits)?;
+        }
+        Ok(())
+    }
+
+    fn assets(&mut self, assets: &[DiscoveredAsset]) -> Result<(), ContentCandidateStoreError> {
+        for asset in assets {
+            validate_asset_path(asset.path.as_str(), self.limits)?;
+            ensure_file_size(asset.bytes.len(), self.limits.asset_file_bytes.get())?;
+            self.paths.register(asset.path.as_str())?;
+            self.total_bytes = add_total(self.total_bytes, asset.bytes.len(), self.limits)?;
+        }
+        Ok(())
+    }
 }
 
 fn validate_publication_path(
@@ -1204,6 +1307,21 @@ mod tests {
             store.load(&digest),
             Err(ContentCandidateStoreError::LimitExceeded(
                 "candidate has too many entries"
+            ))
+        ));
+
+        let permissive = ContentCandidateStore::open(
+            _state.path(),
+            ContentTreeLimits {
+                entries: crate::ContentEntryLimit::new(usize::MAX).unwrap(),
+                ..ContentTreeLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            permissive.load(&digest),
+            Err(ContentCandidateStoreError::InvalidArchive(
+                "candidate archive is truncated"
             ))
         ));
     }

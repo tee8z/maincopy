@@ -41,6 +41,7 @@ use crate::{
             scheduler::PublicationScheduler,
             store::{
                 InstallStartupSnapshot, ObservedPostRevision, RecoverablePublicationActivation,
+                StartupSnapshotState,
             },
         },
     },
@@ -581,6 +582,99 @@ fn find_retained_activation_catalog(
     })
 }
 
+fn rebuild_startup_snapshot(
+    startup: &StartupSnapshotState,
+    retained: &BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>,
+    preview_catalog: &Arc<ContentCatalog>,
+    frontend: &'static FrontendAssetManifest,
+    tip_recipient: Option<&TipRecipientProjection>,
+) -> Result<(Option<Arc<ContentCatalog>>, SiteSnapshot), ProcessError> {
+    let recovery_catalog = startup
+        .activating
+        .first()
+        .map(|activation| {
+            find_retained_activation_catalog(
+                retained,
+                &startup.ledger,
+                activation,
+                frontend,
+                tip_recipient,
+            )
+        })
+        .transpose()
+        .map_err(|error| {
+            startup_failure(
+                StartupStage::Content,
+                "rebuild the activating publication candidate",
+                error,
+            )
+        })?;
+    let snapshot =
+        rebuild_public_snapshot(startup, retained, preview_catalog, frontend, tip_recipient)?;
+    validate_rebuilt_startup_snapshot(startup, &snapshot)?;
+    Ok((recovery_catalog, snapshot))
+}
+
+fn rebuild_public_snapshot(
+    startup: &StartupSnapshotState,
+    retained: &BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>,
+    preview_catalog: &Arc<ContentCatalog>,
+    frontend: &'static FrontendAssetManifest,
+    tip_recipient: Option<&TipRecipientProjection>,
+) -> Result<SiteSnapshot, ProcessError> {
+    let Some(expected) = startup.site.as_ref() else {
+        let shell = render_site_shell(Arc::clone(preview_catalog), frontend, &startup.ledger)
+            .map_err(|error| {
+                startup_failure(StartupStage::Content, "render the site shell", error)
+            })?
+            .bind_tip_recipient(tip_recipient.cloned());
+        return build_site_snapshot(shell, &startup.ledger).map_err(|error| {
+            startup_failure(StartupStage::Content, "build the site snapshot", error)
+        });
+    };
+    find_retained_public_snapshot(
+        retained,
+        &startup.ledger,
+        &expected.digest,
+        frontend,
+        tip_recipient,
+    )
+    .map_err(|error| {
+        startup_failure(
+            StartupStage::Content,
+            "rebuild the approved public site snapshot",
+            error,
+        )
+    })
+}
+
+fn validate_rebuilt_startup_snapshot(
+    startup: &StartupSnapshotState,
+    snapshot: &SiteSnapshot,
+) -> Result<(), ProcessError> {
+    if !startup.activating.is_empty()
+        && startup.site.as_ref().map(|site| &site.digest) != Some(&snapshot.digest)
+    {
+        return Err(startup_failure(
+            StartupStage::Content,
+            "rebuild the durable pre-activation site snapshot",
+            StartupInvariantError::BaseSnapshotMismatch,
+        ));
+    }
+    if startup
+        .site
+        .as_ref()
+        .is_some_and(|expected| expected.digest != snapshot.digest)
+    {
+        return Err(startup_failure(
+            StartupStage::Content,
+            "rebuild the approved public site snapshot",
+            StartupInvariantError::PublicSnapshotMismatch,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 enum RetainedCatalogError {
     #[error("retained content candidates could not be loaded")]
@@ -686,70 +780,13 @@ async fn prepare_serving_state(
             error,
         )
     })?;
-    let recovery_catalog = startup_state
-        .activating
-        .first()
-        .map(|activation| {
-            find_retained_activation_catalog(
-                &retained_catalogs,
-                &ledger,
-                activation,
-                frontend,
-                tip_recipient.as_ref(),
-            )
-        })
-        .transpose()
-        .map_err(|error| {
-            startup_failure(
-                StartupStage::Content,
-                "rebuild the activating publication candidate",
-                error,
-            )
-        })?;
-    let snapshot = match startup_state.site.as_ref() {
-        Some(expected) => find_retained_public_snapshot(
-            &retained_catalogs,
-            &ledger,
-            &expected.digest,
-            frontend,
-            tip_recipient.as_ref(),
-        )
-        .map_err(|error| {
-            startup_failure(
-                StartupStage::Content,
-                "rebuild the approved public site snapshot",
-                error,
-            )
-        })?,
-        None => {
-            let shell = render_site_shell(Arc::clone(&preview_catalog), frontend, &ledger)
-                .map_err(|error| {
-                    startup_failure(StartupStage::Content, "render the site shell", error)
-                })?
-                .bind_tip_recipient(tip_recipient.clone());
-            build_site_snapshot(shell, &ledger).map_err(|error| {
-                startup_failure(StartupStage::Content, "build the site snapshot", error)
-            })?
-        }
-    };
-    if !startup_state.activating.is_empty()
-        && startup_state.site.as_ref().map(|site| &site.digest) != Some(&snapshot.digest)
-    {
-        return Err(startup_failure(
-            StartupStage::Content,
-            "rebuild the durable pre-activation site snapshot",
-            StartupInvariantError::BaseSnapshotMismatch,
-        ));
-    }
-    if let Some(expected) = startup_state.site.as_ref()
-        && expected.digest != snapshot.digest
-    {
-        return Err(startup_failure(
-            StartupStage::Content,
-            "rebuild the approved public site snapshot",
-            StartupInvariantError::PublicSnapshotMismatch,
-        ));
-    }
+    let (recovery_catalog, snapshot) = rebuild_startup_snapshot(
+        &startup_state,
+        &retained_catalogs,
+        &preview_catalog,
+        frontend,
+        tip_recipient.as_ref(),
+    )?;
     let installed_site = database
         .publications
         .install_startup_snapshot(InstallStartupSnapshot {

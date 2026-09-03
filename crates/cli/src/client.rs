@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, future::Future};
 
 use maincopy_shared::{
     CAPABILITIES_PATH, Capabilities,
@@ -29,7 +29,7 @@ use crate::{
     credentials::{CredentialKey, CredentialStoreError, PlatformCredentialStore, SecretValue},
     models::AuthenticationContext,
     nip98::{AgentPrivateKey, AgentPrivateKeyError, Nip98SigningError, authorization_proof},
-    transport::{HttpRequest, HttpResponse, ReqwestExecutor, TransportError},
+    transport::{HttpRequest, HttpResponse, RequestBody, ReqwestExecutor, TransportError},
 };
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -120,12 +120,15 @@ impl AdminClient {
         })
     }
 
-    /// Reports whether this origin already has a protected human session.
-    pub(crate) fn human_session_is_stored(&self) -> Result<bool, AdminClientError> {
-        self.credentials
-            .load(&CredentialKey::human(self.origin.as_str()))
-            .map(|credential| credential.is_some())
-            .map_err(AdminClientError::from)
+    /// Rejects a login preflight when this origin already has a protected human session.
+    pub(crate) fn ensure_human_session_absent(&self) -> Result<(), AdminClientError> {
+        match self
+            .credentials
+            .load(&CredentialKey::human(self.origin.as_str()))?
+        {
+            Some(_) => Err(AdminClientError::HumanSessionAlreadyStored),
+            None => Ok(()),
+        }
     }
 
     /// Fetches the versions advertised by the running server.
@@ -133,7 +136,7 @@ impl AdminClient {
         let response = self
             .authenticated_request(Method::GET, CAPABILITIES_PATH, Vec::new(), None)
             .await?;
-        decode_json(&require_status(response, StatusCode::OK)?)
+        decode_status_json(response, StatusCode::OK)
     }
 
     /// Lists one bounded page of post revisions loaded by the running server.
@@ -142,18 +145,11 @@ impl AdminClient {
         cursor: Option<Uuid>,
         limit: u16,
     ) -> Result<ListPostsResponse, AdminClientError> {
-        let mut url = self.origin.request_url(POSTS_PATH)?;
-        {
-            let mut query = url.query_pairs_mut();
-            query.append_pair("limit", &limit.to_string());
-            if let Some(cursor) = cursor {
-                query.append_pair("cursor", &cursor.hyphenated().to_string());
-            }
-        }
+        let url = posts_page_url(&self.origin, cursor, limit)?;
         let response = self
             .authenticated_request_url(Method::GET, url, Vec::new(), None)
             .await?;
-        decode_json(&require_status(response, StatusCode::OK)?)
+        decode_status_json(response, StatusCode::OK)
     }
 
     /// Fetches one exact private preview and its server-authenticated metadata.
@@ -163,17 +159,7 @@ impl AdminClient {
         revision: Option<&str>,
         content_digest: Option<&str>,
     ) -> Result<PostPreview, AdminClientError> {
-        let path = format!("{POSTS_PATH}/{post_id}/preview");
-        let mut url = self.origin.request_url(&path)?;
-        if revision.is_some() || content_digest.is_some() {
-            let mut query = url.query_pairs_mut();
-            if let Some(revision) = revision {
-                query.append_pair("revision", revision);
-            }
-            if let Some(content_digest) = content_digest {
-                query.append_pair("content_digest", content_digest);
-            }
-        }
+        let url = preview_url(&self.origin, post_id, revision, content_digest)?;
         let response = self
             .authenticated_request_url_with_limit(
                 Method::GET,
@@ -183,9 +169,7 @@ impl AdminClient {
                 MAX_PREVIEW_RESPONSE_BYTES,
             )
             .await?;
-        let response = require_status(response, StatusCode::OK)?;
-        require_content_type(&response.headers, "text/html; charset=utf-8")?;
-        decode_preview_response(response)
+        decode_preview_http_response(response)
     }
 
     /// Approves one exact post revision for immediate or scheduled publication.
@@ -198,9 +182,7 @@ impl AdminClient {
         let response = self
             .authenticated_request(Method::POST, PUBLICATIONS_PATH, body, Some(idempotency_key))
             .await?;
-        let response = require_status(response, StatusCode::OK)?;
-        require_content_type(&response.headers, "application/json")?;
-        decode_publication_response(&response.body, &request.preview_digest)
+        decode_publication_http_response(response, &request.preview_digest)
     }
 
     /// Creates and protects a password-authenticated browser session.
@@ -209,62 +191,38 @@ impl AdminClient {
         username: Box<str>,
         password: SecretString,
     ) -> Result<AdminSessionResponse, AdminClientError> {
-        let credential_key = CredentialKey::human(self.origin.as_str());
-        if self.human_session_is_stored()? {
-            return Err(AdminClientError::HumanSessionAlreadyStored);
-        }
-        let body = serde_json::to_vec(&CreateAdminSessionRequest::Password { username, password })
-            .map_err(AdminClientError::RequestEncoding)?
-            .into();
-        let url = self.origin.request_url(ADMIN_SESSIONS_PATH)?;
-        let mut headers = standard_headers(true);
-        headers.insert(ORIGIN, self.origin_header()?);
-        let response = self
-            .execute(
-                HttpRequest {
-                    method: Method::POST,
-                    url,
-                    headers,
-                    body,
-                },
-                MAX_JSON_RESPONSE_BYTES,
-            )
-            .await?;
-        let response = require_status(response, StatusCode::CREATED)?;
-        let session: AdminSessionResponse = decode_json(&response)?;
-        let credentials = HumanCredentials::from_set_cookie_headers(&response.headers)?;
-        if let Err(error) = self
-            .credentials
-            .save(&credential_key, &credentials.encode())
-        {
-            let _ = self.revoke_human_credentials(&credentials).await;
-            return Err(error.into());
-        }
-        Ok(session)
+        let PreparedPasswordLogin {
+            credential_key,
+            request,
+        } = prepare_password_login(&self.origin, username, password, |key| {
+            self.credentials.load(key)
+        })?;
+        let response = self.execute(request, MAX_JSON_RESPONSE_BYTES).await?;
+        complete_password_login(
+            &self.origin,
+            response,
+            credential_key,
+            |key, value| self.credentials.save(key, value),
+            |request| self.execute(request, MAX_JSON_RESPONSE_BYTES),
+        )
+        .await
     }
 
     /// Revokes the active human session before deleting its local credentials.
     pub(crate) async fn logout(&self) -> Result<RevokeAdminSessionResponse, AdminClientError> {
-        if self.authentication != AuthenticationContext::Human {
-            return Err(AdminClientError::HumanContextRequired);
-        }
-        let credential_key = CredentialKey::human(self.origin.as_str());
-        let encoded = self
-            .credentials
-            .load(&credential_key)?
-            .ok_or(AdminClientError::HumanCredentialsMissing)?;
-        let credentials = match HumanCredentials::decode(encoded) {
-            Ok(credentials) => credentials,
-            Err(error) => {
-                self.credentials.delete(&credential_key)?;
-                return Err(error);
-            }
-        };
-        let response = self.revoke_human_credentials(&credentials).await?;
-        let response = require_status(response, StatusCode::OK)?;
-        let revoked: RevokeAdminSessionResponse = decode_json(&response)?;
-        self.credentials.delete(&credential_key)?;
-        Ok(revoked)
+        let PreparedLogout {
+            credential_key,
+            request,
+        } = prepare_logout(
+            &self.origin,
+            self.authentication,
+            |key| self.credentials.load(key),
+            |key| self.credentials.delete(key),
+        )?;
+        let response = self.execute(request, MAX_JSON_RESPONSE_BYTES).await?;
+        complete_logout(response, &credential_key, |key| {
+            self.credentials.delete(key)
+        })
     }
 
     /// Validates and stores an agent private key in the platform credential store.
@@ -286,36 +244,6 @@ impl AdminClient {
         self.credentials
             .delete(&CredentialKey::agent(self.origin.as_str()))?;
         Ok(())
-    }
-
-    async fn revoke_human_credentials(
-        &self,
-        credentials: &HumanCredentials,
-    ) -> Result<HttpResponse, AdminClientError> {
-        let url = self.origin.request_url(CURRENT_ADMIN_SESSION_PATH)?;
-        let mut headers = standard_headers(false);
-        headers.insert(ORIGIN, self.origin_header()?);
-        let cookie = Zeroizing::new(format!(
-            "{SESSION_COOKIE_NAME}={}; {CSRF_COOKIE_NAME}={}",
-            credentials.session.expose_secret(),
-            credentials.csrf.expose_secret()
-        ));
-        insert_sensitive_header(&mut headers, COOKIE, &cookie)?;
-        insert_sensitive_header(
-            &mut headers,
-            CSRF_HEADER_NAME,
-            credentials.csrf.expose_secret(),
-        )?;
-        self.execute(
-            HttpRequest {
-                method: Method::DELETE,
-                url,
-                headers,
-                body: Vec::new().into(),
-            },
-            MAX_JSON_RESPONSE_BYTES,
-        )
-        .await
     }
 
     async fn authenticated_request(
@@ -355,54 +283,16 @@ impl AdminClient {
         idempotency_key: Option<Uuid>,
         maximum_response_bytes: usize,
     ) -> Result<HttpResponse, AdminClientError> {
-        if body.len() > MAX_REQUEST_BODY_BYTES {
-            return Err(AdminClientError::RequestBodyTooLarge);
-        }
-        if url.origin().ascii_serialization() != self.origin.as_str()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(AdminClientError::InvalidRequestTarget);
-        }
-        let mutation = !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
-        let mut headers = standard_headers(!body.is_empty());
-
-        match self.authentication {
-            AuthenticationContext::Human => {
-                let credentials = self.load_human_credentials()?;
-                authorize_human_request(
-                    &mut headers,
-                    &self.origin,
-                    &credentials,
-                    mutation,
-                    idempotency_key,
-                )?;
-            }
-            AuthenticationContext::Agent => {
-                let private_key = self.load_agent_private_key()?;
-                authorize_agent_request(
-                    &mut headers,
-                    &private_key,
-                    OffsetDateTime::now_utc().unix_timestamp(),
-                    &url,
-                    &method,
-                    &body,
-                    idempotency_key.unwrap_or_else(Uuid::new_v4),
-                )?;
-            }
-        }
-
-        self.execute(
-            HttpRequest {
-                method,
-                url,
-                headers,
-                body: body.into(),
-            },
-            maximum_response_bytes,
-        )
-        .await
+        let request = build_authorized_request(
+            &self.origin,
+            self.authentication,
+            method,
+            url,
+            body,
+            idempotency_key,
+            |key| self.credentials.load(key),
+        )?;
+        self.execute(request, maximum_response_bytes).await
     }
 
     async fn execute(
@@ -415,27 +305,262 @@ impl AdminClient {
             .await
             .map_err(AdminClientError::from)
     }
+}
 
-    fn load_human_credentials(&self) -> Result<HumanCredentials, AdminClientError> {
-        let value = self
-            .credentials
-            .load(&CredentialKey::human(self.origin.as_str()))?
-            .ok_or(AdminClientError::HumanCredentialsMissing)?;
-        HumanCredentials::decode(value)
+fn posts_page_url(
+    origin: &AdminOrigin,
+    cursor: Option<Uuid>,
+    limit: u16,
+) -> Result<Url, AdminClientError> {
+    let mut url = origin.request_url(POSTS_PATH)?;
+    let mut query = url.query_pairs_mut();
+    query.append_pair("limit", &limit.to_string());
+    if let Some(cursor) = cursor {
+        query.append_pair("cursor", &cursor.hyphenated().to_string());
+    }
+    drop(query);
+    Ok(url)
+}
+
+fn preview_url(
+    origin: &AdminOrigin,
+    post_id: Uuid,
+    revision: Option<&str>,
+    content_digest: Option<&str>,
+) -> Result<Url, AdminClientError> {
+    let path = format!("{POSTS_PATH}/{post_id}/preview");
+    let mut url = origin.request_url(&path)?;
+    if revision.is_some() || content_digest.is_some() {
+        let mut query = url.query_pairs_mut();
+        if let Some(revision) = revision {
+            query.append_pair("revision", revision);
+        }
+        if let Some(content_digest) = content_digest {
+            query.append_pair("content_digest", content_digest);
+        }
+    }
+    Ok(url)
+}
+
+fn decode_preview_http_response(response: HttpResponse) -> Result<PostPreview, AdminClientError> {
+    let response = require_status(response, StatusCode::OK)?;
+    require_content_type(&response.headers, "text/html; charset=utf-8")?;
+    decode_preview_response(response)
+}
+
+fn decode_publication_http_response(
+    response: HttpResponse,
+    expected_preview: &PreviewDigest,
+) -> Result<PublishNowResponse, AdminClientError> {
+    let response = require_status(response, StatusCode::OK)?;
+    require_content_type(&response.headers, "application/json")?;
+    decode_publication_response(&response.body, expected_preview)
+}
+
+fn build_authorized_request<LoadCredential>(
+    origin: &AdminOrigin,
+    authentication: AuthenticationContext,
+    method: Method,
+    url: Url,
+    body: Vec<u8>,
+    idempotency_key: Option<Uuid>,
+    load_credential: LoadCredential,
+) -> Result<HttpRequest, AdminClientError>
+where
+    LoadCredential: FnOnce(&CredentialKey) -> Result<Option<SecretValue>, CredentialStoreError>,
+{
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        return Err(AdminClientError::RequestBodyTooLarge);
+    }
+    if url.origin().ascii_serialization() != origin.as_str()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(AdminClientError::InvalidRequestTarget);
     }
 
-    fn load_agent_private_key(&self) -> Result<AgentPrivateKey, AdminClientError> {
-        let value = self
-            .credentials
-            .load(&CredentialKey::agent(self.origin.as_str()))?
-            .ok_or(AdminClientError::AgentCredentialsMissing)?;
-        AgentPrivateKey::parse(value.expose_secret()).map_err(AdminClientError::from)
+    let mutation = !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+    let mut headers = standard_headers(!body.is_empty());
+    match authentication {
+        AuthenticationContext::Human => {
+            let key = CredentialKey::human(origin.as_str());
+            let value = load_credential(&key)?.ok_or(AdminClientError::HumanCredentialsMissing)?;
+            let credentials = HumanCredentials::decode(value)?;
+            authorize_human_request(
+                &mut headers,
+                origin,
+                &credentials,
+                mutation,
+                idempotency_key,
+            )?;
+        }
+        AuthenticationContext::Agent => {
+            let key = CredentialKey::agent(origin.as_str());
+            let private_key = {
+                let value =
+                    load_credential(&key)?.ok_or(AdminClientError::AgentCredentialsMissing)?;
+                AgentPrivateKey::parse(value.expose_secret())?
+            };
+            authorize_agent_request(
+                &mut headers,
+                &private_key,
+                OffsetDateTime::now_utc().unix_timestamp(),
+                &url,
+                &method,
+                &body,
+                idempotency_key.unwrap_or_else(Uuid::new_v4),
+            )?;
+        }
     }
+    Ok(HttpRequest {
+        method,
+        url,
+        headers,
+        body: body.into(),
+    })
+}
 
-    fn origin_header(&self) -> Result<HeaderValue, AdminClientError> {
-        HeaderValue::from_str(self.origin.as_str())
-            .map_err(|_| AdminClientError::InvalidAdminOrigin)
+fn origin_header(origin: &AdminOrigin) -> Result<HeaderValue, AdminClientError> {
+    HeaderValue::from_str(origin.as_str()).map_err(|_| AdminClientError::InvalidAdminOrigin)
+}
+
+struct PreparedPasswordLogin {
+    credential_key: CredentialKey,
+    request: HttpRequest,
+}
+
+fn prepare_password_login<LoadCredential>(
+    origin: &AdminOrigin,
+    username: Box<str>,
+    password: SecretString,
+    load_credential: LoadCredential,
+) -> Result<PreparedPasswordLogin, AdminClientError>
+where
+    LoadCredential: FnOnce(&CredentialKey) -> Result<Option<SecretValue>, CredentialStoreError>,
+{
+    let credential_key = CredentialKey::human(origin.as_str());
+    if load_credential(&credential_key)?.is_some() {
+        return Err(AdminClientError::HumanSessionAlreadyStored);
     }
+    let url = origin.request_url(ADMIN_SESSIONS_PATH)?;
+    let mut headers = standard_headers(true);
+    headers.insert(ORIGIN, origin_header(origin)?);
+    let body: RequestBody =
+        serde_json::to_vec(&CreateAdminSessionRequest::Password { username, password })
+            .map_err(AdminClientError::RequestEncoding)?
+            .into();
+    Ok(PreparedPasswordLogin {
+        credential_key,
+        request: HttpRequest {
+            method: Method::POST,
+            url,
+            headers,
+            body,
+        },
+    })
+}
+
+async fn complete_password_login<SaveCredential, SendRequest, SendFuture>(
+    origin: &AdminOrigin,
+    response: HttpResponse,
+    credential_key: CredentialKey,
+    save_credential: SaveCredential,
+    send_request: SendRequest,
+) -> Result<AdminSessionResponse, AdminClientError>
+where
+    SaveCredential: FnOnce(&CredentialKey, &SecretValue) -> Result<(), CredentialStoreError>,
+    SendRequest: FnOnce(HttpRequest) -> SendFuture,
+    SendFuture: Future<Output = Result<HttpResponse, AdminClientError>>,
+{
+    let response = require_status(response, StatusCode::CREATED)?;
+    let session = decode_json(&response)?;
+    let credentials = HumanCredentials::from_set_cookie_headers(&response.headers)?;
+    drop(response);
+    let save_result = {
+        let encoded = credentials.encode();
+        save_credential(&credential_key, &encoded)
+    };
+    if let Err(error) = save_result {
+        if let Ok(request) = revoke_session_request(origin, &credentials) {
+            let _ = send_request(request).await;
+        }
+        return Err(error.into());
+    }
+    Ok(session)
+}
+
+fn revoke_session_request(
+    origin: &AdminOrigin,
+    credentials: &HumanCredentials,
+) -> Result<HttpRequest, AdminClientError> {
+    let url = origin.request_url(CURRENT_ADMIN_SESSION_PATH)?;
+    let mut headers = standard_headers(false);
+    headers.insert(ORIGIN, origin_header(origin)?);
+    let cookie = Zeroizing::new(format!(
+        "{SESSION_COOKIE_NAME}={}; {CSRF_COOKIE_NAME}={}",
+        credentials.session.expose_secret(),
+        credentials.csrf.expose_secret()
+    ));
+    insert_sensitive_header(&mut headers, COOKIE, &cookie)?;
+    insert_sensitive_header(
+        &mut headers,
+        CSRF_HEADER_NAME,
+        credentials.csrf.expose_secret(),
+    )?;
+    Ok(HttpRequest {
+        method: Method::DELETE,
+        url,
+        headers,
+        body: Vec::new().into(),
+    })
+}
+
+struct PreparedLogout {
+    credential_key: CredentialKey,
+    request: HttpRequest,
+}
+
+fn prepare_logout<LoadCredential, DeleteCredential>(
+    origin: &AdminOrigin,
+    authentication: AuthenticationContext,
+    load_credential: LoadCredential,
+    delete_credential: DeleteCredential,
+) -> Result<PreparedLogout, AdminClientError>
+where
+    LoadCredential: FnOnce(&CredentialKey) -> Result<Option<SecretValue>, CredentialStoreError>,
+    DeleteCredential: FnOnce(&CredentialKey) -> Result<(), CredentialStoreError>,
+{
+    if authentication != AuthenticationContext::Human {
+        return Err(AdminClientError::HumanContextRequired);
+    }
+    let credential_key = CredentialKey::human(origin.as_str());
+    let encoded =
+        load_credential(&credential_key)?.ok_or(AdminClientError::HumanCredentialsMissing)?;
+    let credentials = match HumanCredentials::decode(encoded) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            delete_credential(&credential_key)?;
+            return Err(error);
+        }
+    };
+    Ok(PreparedLogout {
+        request: revoke_session_request(origin, &credentials)?,
+        credential_key,
+    })
+}
+
+fn complete_logout<DeleteCredential>(
+    response: HttpResponse,
+    credential_key: &CredentialKey,
+    delete_credential: DeleteCredential,
+) -> Result<RevokeAdminSessionResponse, AdminClientError>
+where
+    DeleteCredential: FnOnce(&CredentialKey) -> Result<(), CredentialStoreError>,
+{
+    let revoked = decode_status_json(response, StatusCode::OK)?;
+    delete_credential(credential_key)?;
+    Ok(revoked)
 }
 
 fn insert_idempotency_header(headers: &mut HeaderMap, idempotency_key: Uuid) -> String {
@@ -685,6 +810,16 @@ where
 {
     require_content_type(&response.headers, "application/json")?;
     serde_json::from_slice(&response.body).map_err(AdminClientError::InvalidResponse)
+}
+
+fn decode_status_json<Value>(
+    response: HttpResponse,
+    expected: StatusCode,
+) -> Result<Value, AdminClientError>
+where
+    Value: serde::de::DeserializeOwned,
+{
+    decode_json(&require_status(response, expected)?)
 }
 
 fn require_content_type(
@@ -985,6 +1120,8 @@ impl From<Nip98SigningError> for AdminClientError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
     use base64::{Engine as _, engine::general_purpose};
     use reqwest::header::HeaderValue;
     use serde_json::json;
@@ -1024,6 +1161,126 @@ mod tests {
             headers,
             body,
         }
+    }
+
+    fn json_response(status: StatusCode, body: Vec<u8>) -> HttpResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        HttpResponse {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    fn session_response() -> AdminSessionResponse {
+        serde_json::from_value(json!({
+            "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "user_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "provider": "password",
+            "roles": ["publisher"],
+            "scopes": ["content_read"],
+            "fresh_until": "2026-09-03T13:00:00Z",
+            "expires_at": "2026-09-04T12:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn request_targets_preserve_the_configured_origin_and_exact_query() {
+        let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
+        assert_eq!(
+            origin.request_url("/api/admin/v1/capabilities").unwrap(),
+            Url::parse("https://admin.example.test/api/admin/v1/capabilities").unwrap()
+        );
+        assert_eq!(
+            origin.request_url("/path?one=two").unwrap(),
+            Url::parse("https://admin.example.test/path?one=two").unwrap()
+        );
+
+        for target in [
+            "api/admin/v1/posts",
+            "//other.example/posts",
+            "/posts#fragment",
+        ] {
+            assert!(matches!(
+                origin.request_url(target),
+                Err(AdminClientError::InvalidRequestTarget)
+            ));
+        }
+
+        let cursor = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        assert_eq!(
+            posts_page_url(&origin, None, 100).unwrap().as_str(),
+            "https://admin.example.test/api/admin/v1/posts?limit=100"
+        );
+        assert_eq!(
+            posts_page_url(&origin, Some(cursor), 25).unwrap().as_str(),
+            "https://admin.example.test/api/admin/v1/posts?limit=25&cursor=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+
+        let post_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        assert_eq!(
+            preview_url(&origin, post_id, None, None).unwrap().as_str(),
+            "https://admin.example.test/api/admin/v1/posts/11111111-1111-4111-8111-111111111111/preview"
+        );
+        assert_eq!(
+            preview_url(&origin, post_id, Some(REVISION), Some(CONTENT_DIGEST))
+                .unwrap()
+                .as_str(),
+            concat!(
+                "https://admin.example.test/api/admin/v1/posts/11111111-1111-4111-8111-111111111111/preview?",
+                "revision=post-b3-v1-2222222222222222222222222222222222222222222222222222222222222222&",
+                "content_digest=content-b3-v1-3333333333333333333333333333333333333333333333333333333333333333",
+            )
+        );
+    }
+
+    #[test]
+    fn authorized_request_rejects_size_and_origin_confusion_before_credential_access() {
+        let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
+        let credential_loads = Cell::new(0);
+        let oversized = build_authorized_request(
+            &origin,
+            AuthenticationContext::Human,
+            Method::POST,
+            Url::parse("https://admin.example.test/path?query=1").unwrap(),
+            vec![0; MAX_REQUEST_BODY_BYTES + 1],
+            None,
+            |_| {
+                credential_loads.set(credential_loads.get() + 1);
+                Ok(None)
+            },
+        );
+        assert!(matches!(
+            oversized,
+            Err(AdminClientError::RequestBodyTooLarge)
+        ));
+
+        for target in [
+            "https://other.example.test/path",
+            "https://user@admin.example.test/path",
+            "https://user:pass@admin.example.test/path",
+            "https://admin.example.test/path#fragment",
+        ] {
+            let rejected = build_authorized_request(
+                &origin,
+                AuthenticationContext::Human,
+                Method::GET,
+                Url::parse(target).unwrap(),
+                Vec::new(),
+                None,
+                |_| {
+                    credential_loads.set(credential_loads.get() + 1);
+                    Ok(None)
+                },
+            );
+            assert!(matches!(
+                rejected,
+                Err(AdminClientError::InvalidRequestTarget)
+            ));
+        }
+        assert_eq!(credential_loads.get(), 0);
     }
 
     #[test]
@@ -1089,6 +1346,39 @@ mod tests {
             "https://example.test/posts/ready"
         );
         assert_eq!(preview.html.as_ref(), "<!doctype html><title>Ready</title>");
+    }
+
+    #[test]
+    fn preview_http_response_requires_exact_status_and_media_type() {
+        let mut valid = preview_response(
+            preview_headers(),
+            b"<!doctype html><title>Ready</title>".to_vec(),
+        );
+        valid.headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        assert!(decode_preview_http_response(valid).is_ok());
+
+        let mut wrong_status = preview_response(preview_headers(), b"preview".to_vec());
+        wrong_status.status = StatusCode::CREATED;
+        wrong_status.headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        assert!(matches!(
+            decode_preview_http_response(wrong_status),
+            Err(AdminClientError::UnexpectedSuccessStatus { .. })
+        ));
+
+        let mut wrong_type = preview_response(preview_headers(), b"preview".to_vec());
+        wrong_type
+            .headers
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        assert!(matches!(
+            decode_preview_http_response(wrong_type),
+            Err(AdminClientError::InvalidContentType { .. })
+        ));
     }
 
     #[test]
@@ -1172,6 +1462,15 @@ mod tests {
             decode_publication_response(&mismatched, &expected),
             Err(AdminClientError::InvalidPublicationResponse { .. })
         ));
+
+        let response = json_response(StatusCode::OK, matching);
+        assert!(decode_publication_http_response(response, &expected).is_ok());
+
+        let response = json_response(StatusCode::CREATED, b"{}".to_vec());
+        assert!(matches!(
+            decode_publication_http_response(response, &expected),
+            Err(AdminClientError::UnexpectedSuccessStatus { .. })
+        ));
     }
 
     const SESSION_TOKEN: &str =
@@ -1179,6 +1478,10 @@ mod tests {
     const CSRF_TOKEN: &str =
         "mcc1_2222222222222222222222222222222222222222222222222222222222222222";
     const AGENT_KEY: &str = "0303030303030303030303030303030303030303030303030303030303030303";
+
+    fn stored_human_credentials() -> SecretValue {
+        SecretValue::new(format!("{SESSION_TOKEN}\n{CSRF_TOKEN}"))
+    }
 
     fn authentication_cookie_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1199,45 +1502,299 @@ mod tests {
         headers
     }
 
-    #[test]
-    fn human_credentials_apply_exact_read_and_mutation_boundaries() {
-        let credentials =
-            HumanCredentials::from_set_cookie_headers(&authentication_cookie_headers()).unwrap();
-        let decoded = HumanCredentials::decode(credentials.encode()).unwrap();
-        let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
-
-        let mut read = standard_headers(false);
-        authorize_human_request(&mut read, &origin, &decoded, false, None).unwrap();
-        assert_eq!(
-            read[COOKIE],
-            format!("{SESSION_COOKIE_NAME}={SESSION_TOKEN}")
+    fn password_login_response() -> HttpResponse {
+        let mut response = json_response(
+            StatusCode::CREATED,
+            serde_json::to_vec(&session_response()).unwrap(),
         );
-        assert!(read[COOKIE].is_sensitive());
-        assert!(!read.contains_key(CSRF_HEADER_NAME));
-        assert!(!read.contains_key(ORIGIN));
-        assert!(!read.contains_key(IDEMPOTENCY_KEY_HEADER));
+        for value in authentication_cookie_headers().get_all(SET_COOKIE) {
+            response.headers.append(SET_COOKIE, value.clone());
+        }
+        response
+    }
 
-        let idempotency_key = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
-        let mut mutation = standard_headers(true);
-        authorize_human_request(
-            &mut mutation,
+    #[test]
+    fn password_login_preparation_checks_storage_and_builds_the_exact_request() {
+        let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
+        let expected_key = CredentialKey::human(origin.as_str());
+        let loads = Cell::new(0);
+        let existing = prepare_password_login(
             &origin,
-            &decoded,
-            true,
-            Some(idempotency_key),
+            "publisher".into(),
+            SecretString::new("correct horse battery staple"),
+            |key| {
+                assert_eq!(key, &expected_key);
+                loads.set(loads.get() + 1);
+                Ok(Some(SecretValue::new("already-stored")))
+            },
+        );
+        assert!(matches!(
+            existing,
+            Err(AdminClientError::HumanSessionAlreadyStored)
+        ));
+
+        let prepared = prepare_password_login(
+            &origin,
+            "publisher".into(),
+            SecretString::new("correct horse battery staple"),
+            |key| {
+                assert_eq!(key, &expected_key);
+                loads.set(loads.get() + 1);
+                Ok(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(loads.get(), 2);
+        assert_eq!(prepared.credential_key, expected_key);
+        assert_eq!(prepared.request.method, Method::POST);
+        assert_eq!(
+            prepared.request.url.as_str(),
+            "https://admin.example.test/api/admin/v1/auth/sessions"
+        );
+        assert_eq!(prepared.request.headers[ORIGIN], origin.as_str());
+        assert_eq!(prepared.request.headers[CONTENT_TYPE], "application/json");
+        assert_eq!(prepared.request.headers[ACCEPT], "application/json");
+    }
+
+    #[tokio::test]
+    async fn password_login_revokes_the_remote_session_after_a_local_save_failure() {
+        let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
+        let expected_key = CredentialKey::human(origin.as_str());
+        let events = RefCell::new(Vec::new());
+        let result = complete_password_login(
+            &origin,
+            password_login_response(),
+            expected_key,
+            |key, encoded| {
+                assert_eq!(key, &CredentialKey::human(origin.as_str()));
+                assert_eq!(
+                    encoded.expose_secret(),
+                    format!("{SESSION_TOKEN}\n{CSRF_TOKEN}")
+                );
+                events.borrow_mut().push("save");
+                Err(CredentialStoreError::Save(keyring::Error::NoEntry))
+            },
+            |request| {
+                assert_eq!(events.borrow().as_slice(), ["save"]);
+                events.borrow_mut().push("revoke");
+                assert_eq!(request.method, Method::DELETE);
+                assert_eq!(
+                    request.url.as_str(),
+                    "https://admin.example.test/api/admin/v1/auth/session"
+                );
+                assert_eq!(request.headers[ORIGIN], origin.as_str());
+                assert_eq!(
+                    request.headers[COOKIE],
+                    format!(
+                        "{SESSION_COOKIE_NAME}={SESSION_TOKEN}; {CSRF_COOKIE_NAME}={CSRF_TOKEN}"
+                    )
+                );
+                assert!(request.headers[COOKIE].is_sensitive());
+                assert_eq!(request.headers[CSRF_HEADER_NAME], CSRF_TOKEN);
+                assert!(request.headers[CSRF_HEADER_NAME].is_sensitive());
+                std::future::ready(Err(AdminClientError::InvalidRequestTarget))
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AdminClientError::CredentialStore(
+                CredentialStoreError::Save(_)
+            ))
+        ));
+        assert_eq!(events.into_inner(), ["save", "revoke"]);
+
+        let revoke_called = Cell::new(false);
+        let session = complete_password_login(
+            &origin,
+            password_login_response(),
+            CredentialKey::human(origin.as_str()),
+            |_, _| Ok(()),
+            |_| {
+                revoke_called.set(true);
+                std::future::ready(Ok(json_response(StatusCode::OK, Vec::new())))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(session, session_response());
+        assert!(!revoke_called.get());
+    }
+
+    #[test]
+    fn logout_preparation_rejects_the_context_and_cleans_up_corrupt_credentials() {
+        let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
+        let loads = Cell::new(0);
+        let deletes = Cell::new(0);
+        let wrong_context = prepare_logout(
+            &origin,
+            AuthenticationContext::Agent,
+            |_| {
+                loads.set(loads.get() + 1);
+                Ok(None)
+            },
+            |_| {
+                deletes.set(deletes.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            wrong_context,
+            Err(AdminClientError::HumanContextRequired)
+        ));
+        assert_eq!((loads.get(), deletes.get()), (0, 0));
+
+        let missing = prepare_logout(
+            &origin,
+            AuthenticationContext::Human,
+            |key| {
+                assert_eq!(key, &CredentialKey::human(origin.as_str()));
+                loads.set(loads.get() + 1);
+                Ok(None)
+            },
+            |_| {
+                deletes.set(deletes.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            missing,
+            Err(AdminClientError::HumanCredentialsMissing)
+        ));
+        assert_eq!((loads.get(), deletes.get()), (1, 0));
+
+        let corrupt = prepare_logout(
+            &origin,
+            AuthenticationContext::Human,
+            |_| {
+                loads.set(loads.get() + 1);
+                Ok(Some(SecretValue::new("not-valid-credentials")))
+            },
+            |key| {
+                assert_eq!(key, &CredentialKey::human(origin.as_str()));
+                deletes.set(deletes.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            corrupt,
+            Err(AdminClientError::StoredCredentialsInvalid)
+        ));
+        assert_eq!((loads.get(), deletes.get()), (2, 1));
+
+        let prepared = prepare_logout(
+            &origin,
+            AuthenticationContext::Human,
+            |_| Ok(Some(stored_human_credentials())),
+            |_| panic!("valid credentials must not be deleted before remote revocation"),
         )
         .unwrap();
         assert_eq!(
-            mutation[COOKIE],
+            prepared.credential_key,
+            CredentialKey::human(origin.as_str())
+        );
+        assert_eq!(prepared.request.method, Method::DELETE);
+        assert_eq!(
+            prepared.request.url.as_str(),
+            "https://admin.example.test/api/admin/v1/auth/session"
+        );
+        assert_eq!(
+            prepared.request.headers[COOKIE],
             format!("{SESSION_COOKIE_NAME}={SESSION_TOKEN}; {CSRF_COOKIE_NAME}={CSRF_TOKEN}")
         );
-        assert_eq!(mutation[CSRF_HEADER_NAME], CSRF_TOKEN);
-        assert!(mutation[CSRF_HEADER_NAME].is_sensitive());
-        assert_eq!(mutation[ORIGIN], "https://admin.example.test");
+        assert!(prepared.request.headers[COOKIE].is_sensitive());
+        assert_eq!(prepared.request.headers[CSRF_HEADER_NAME], CSRF_TOKEN);
+        assert!(prepared.request.headers[CSRF_HEADER_NAME].is_sensitive());
+    }
+
+    #[test]
+    fn logout_deletes_local_credentials_only_after_a_valid_revocation_response() {
+        let key = CredentialKey::human("https://admin.example.test");
+        let deletes = Cell::new(0);
+        assert!(matches!(
+            complete_logout(
+                json_response(StatusCode::NO_CONTENT, Vec::new()),
+                &key,
+                |_| {
+                    deletes.set(deletes.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(AdminClientError::UnexpectedSuccessStatus { .. })
+        ));
+        assert_eq!(deletes.get(), 0);
+
+        let revoked = RevokeAdminSessionResponse {
+            session_id: session_response().session_id,
+        };
+        let completed = complete_logout(
+            json_response(StatusCode::OK, serde_json::to_vec(&revoked).unwrap()),
+            &key,
+            |deleted| {
+                assert_eq!(deleted, &key);
+                deletes.set(deletes.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(completed, revoked);
+        assert_eq!(deletes.get(), 1);
+    }
+
+    #[test]
+    fn authorized_request_dispatches_the_human_read_and_mutation_contracts() {
+        let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
+        let url = Url::parse("https://admin.example.test/api/admin/v1/posts").unwrap();
+
+        let read = build_authorized_request(
+            &origin,
+            AuthenticationContext::Human,
+            Method::GET,
+            url.clone(),
+            Vec::new(),
+            None,
+            |key| {
+                assert_eq!(key, &CredentialKey::human(origin.as_str()));
+                Ok(Some(stored_human_credentials()))
+            },
+        )
+        .unwrap();
         assert_eq!(
-            mutation[IDEMPOTENCY_KEY_HEADER],
+            read.headers[COOKIE],
+            format!("{SESSION_COOKIE_NAME}={SESSION_TOKEN}")
+        );
+        assert!(read.headers[COOKIE].is_sensitive());
+        assert!(!read.headers.contains_key(CSRF_HEADER_NAME));
+        assert!(!read.headers.contains_key(ORIGIN));
+        assert!(!read.headers.contains_key(IDEMPOTENCY_KEY_HEADER));
+        assert!(!read.headers.contains_key(CONTENT_TYPE));
+
+        let idempotency_key = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let mutation = build_authorized_request(
+            &origin,
+            AuthenticationContext::Human,
+            Method::POST,
+            url,
+            br#"{"exact":"body"}"#.to_vec(),
+            Some(idempotency_key),
+            |key| {
+                assert_eq!(key, &CredentialKey::human(origin.as_str()));
+                Ok(Some(stored_human_credentials()))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mutation.headers[COOKIE],
+            format!("{SESSION_COOKIE_NAME}={SESSION_TOKEN}; {CSRF_COOKIE_NAME}={CSRF_TOKEN}")
+        );
+        assert_eq!(mutation.headers[CSRF_HEADER_NAME], CSRF_TOKEN);
+        assert!(mutation.headers[CSRF_HEADER_NAME].is_sensitive());
+        assert_eq!(mutation.headers[ORIGIN], "https://admin.example.test");
+        assert_eq!(
+            mutation.headers[IDEMPOTENCY_KEY_HEADER],
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         );
+        assert_eq!(mutation.headers[CONTENT_TYPE], "application/json");
     }
 
     fn decode_authorization(headers: &HeaderMap) -> serde_json::Value {
@@ -1249,42 +1806,45 @@ mod tests {
     }
 
     #[test]
-    fn agent_requests_bind_unique_or_caller_supplied_idempotency_keys() {
-        let private_key = AgentPrivateKey::parse(AGENT_KEY).unwrap();
+    fn authorized_request_dispatches_agent_proofs_with_exact_request_identity() {
+        let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
         let url = Url::parse("https://admin.example.test/api/admin/v1/posts").unwrap();
-        let first_key = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
-        let second_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
-
-        let mut first_headers = standard_headers(false);
-        authorize_agent_request(
-            &mut first_headers,
-            &private_key,
-            1_800_000_000,
-            &url,
-            &Method::GET,
-            b"",
-            first_key,
+        let first_request = build_authorized_request(
+            &origin,
+            AuthenticationContext::Agent,
+            Method::GET,
+            url.clone(),
+            Vec::new(),
+            None,
+            |key| {
+                assert_eq!(key, &CredentialKey::agent(origin.as_str()));
+                Ok(Some(SecretValue::new(AGENT_KEY)))
+            },
         )
         .unwrap();
-        let mut second_headers = standard_headers(false);
-        authorize_agent_request(
-            &mut second_headers,
-            &private_key,
-            1_800_000_000,
-            &url,
-            &Method::GET,
-            b"",
-            second_key,
+        let second_request = build_authorized_request(
+            &origin,
+            AuthenticationContext::Agent,
+            Method::GET,
+            url.clone(),
+            Vec::new(),
+            None,
+            |_| Ok(Some(SecretValue::new(AGENT_KEY))),
         )
         .unwrap();
 
-        let first = decode_authorization(&first_headers);
-        let second = decode_authorization(&second_headers);
+        let first = decode_authorization(&first_request.headers);
+        let second = decode_authorization(&second_request.headers);
         assert_ne!(first["id"], second["id"]);
-        for (headers, event, expected_key) in [
-            (&first_headers, &first, first_key),
-            (&second_headers, &second, second_key),
+        let first_key = first["tags"][3][1].as_str().unwrap();
+        let second_key = second["tags"][3][1].as_str().unwrap();
+        assert_ne!(first_key, second_key);
+        for (request, event, expected_key) in [
+            (&first_request, &first, first_key),
+            (&second_request, &second, second_key),
         ] {
+            assert_eq!(request.method, Method::GET);
+            assert_eq!(request.url, url);
             assert_eq!(event["kind"], 27_235);
             assert_eq!(event["content"], "");
             assert_eq!(event["tags"][0], json!(["u", url.as_str()]));
@@ -1293,35 +1853,29 @@ mod tests {
                 event["tags"][2],
                 json!(["payload", format!("{:x}", sha2::Sha256::digest(b""))])
             );
-            assert_eq!(
-                event["tags"][3],
-                json!(["idempotency", expected_key.hyphenated().to_string()])
-            );
-            assert_eq!(
-                headers[IDEMPOTENCY_KEY_HEADER],
-                expected_key.hyphenated().to_string()
-            );
-            assert!(headers[AUTHORIZATION].is_sensitive());
+            assert_eq!(event["tags"][3], json!(["idempotency", expected_key]));
+            assert!(canonical_uuid(expected_key).is_some());
+            assert_eq!(request.headers[IDEMPOTENCY_KEY_HEADER], expected_key);
+            assert!(request.headers[AUTHORIZATION].is_sensitive());
         }
 
         let publication_url =
             Url::parse("https://admin.example.test/api/admin/v1/publications").unwrap();
         let body = br#"{"preserve":[1,2,3]}"#;
         let caller_key = Uuid::parse_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
-        let mut publication_headers = standard_headers(true);
-        authorize_agent_request(
-            &mut publication_headers,
-            &private_key,
-            1_800_000_001,
-            &publication_url,
-            &Method::POST,
-            body,
-            caller_key,
+        let publication_request = build_authorized_request(
+            &origin,
+            AuthenticationContext::Agent,
+            Method::POST,
+            publication_url,
+            body.to_vec(),
+            Some(caller_key),
+            |_| Ok(Some(SecretValue::new(AGENT_KEY))),
         )
         .unwrap();
-        let publication = decode_authorization(&publication_headers);
+        let publication = decode_authorization(&publication_request.headers);
         assert_eq!(
-            publication_headers[IDEMPOTENCY_KEY_HEADER],
+            publication_request.headers[IDEMPOTENCY_KEY_HEADER],
             caller_key.hyphenated().to_string()
         );
         assert_eq!(

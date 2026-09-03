@@ -133,24 +133,13 @@ impl AuthStore {
         .bind(user_id.as_uuid().as_bytes().as_slice())
         .fetch_optional(&mut *transaction)
         .await?;
-        let mut credentials = Vec::with_capacity(2);
-        if let Some(password) = password {
-            credentials.push(StoredHumanCredential::Password {
-                username: CanonicalUsername::parse(&password.canonical_username)
-                    .map_err(|_| AuthLoadError::InvalidUsername)?,
-                version: positive_u64(password.version).ok_or(AuthLoadError::InvalidVersion)?,
-                created_at: timestamp(password.created_at_ns)?,
-                updated_at: timestamp(password.updated_at_ns)?,
-            });
-        }
-        if let Some(nostr) = nostr {
-            credentials.push(StoredHumanCredential::Nostr {
-                public_key: nostr_public_key(nostr.public_key)?,
-                version: positive_u64(nostr.version).ok_or(AuthLoadError::InvalidVersion)?,
-                created_at: timestamp(nostr.created_at_ns)?,
-                updated_at: timestamp(nostr.updated_at_ns)?,
-            });
-        }
+        let credentials = [
+            password.map(StoredHumanCredential::try_from).transpose()?,
+            nostr.map(StoredHumanCredential::try_from).transpose()?,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         transaction.commit().await?;
         Ok(Some(credentials))
     }
@@ -325,13 +314,7 @@ impl AuthStore {
         .fetch_optional(&mut *transaction)
         .await?;
         let record = match row {
-            Some(row) => {
-                let credential_id = agent_credential_id(&row.agent_credential_id)?;
-                let owner_id = user_id(&row.owner_user_id)?;
-                let roles = load_roles(&mut transaction, owner_id).await?;
-                let scopes = load_agent_scopes(&mut transaction, credential_id).await?;
-                Some(row.try_into_record(roles, scopes)?)
-            }
+            Some(row) => Some(rehydrate_agent_credential(&mut transaction, row).await?),
             None => None,
         };
         transaction.commit().await?;
@@ -343,27 +326,7 @@ impl AuthStore {
         credential_id: AgentCredentialId,
     ) -> Result<Option<StoredAgentCredential>, AuthLoadError> {
         let mut transaction = self.readers.begin().await?;
-        let row = sqlx::query_as::<_, AgentCredentialRow>(
-            "SELECT agent.agent_credential_id, agent.owner_user_id, agent.issuer_user_id, \
-                    agent.public_key, agent.label, agent.version, agent.created_at_ns, \
-                    agent.expires_at_ns, agent.last_used_at_ns, agent.revoked_at_ns, \
-                    users.status AS owner_status, users.version AS owner_version \
-             FROM agent_credentials AS agent \
-             JOIN users ON users.user_id = agent.owner_user_id \
-             WHERE agent.agent_credential_id = ?",
-        )
-        .bind(credential_id.as_uuid().as_bytes().as_slice())
-        .fetch_optional(&mut *transaction)
-        .await?;
-        let record = match row {
-            Some(row) => {
-                let owner_id = user_id(&row.owner_user_id)?;
-                let roles = load_roles(&mut transaction, owner_id).await?;
-                let scopes = load_agent_scopes(&mut transaction, credential_id).await?;
-                Some(row.try_into_record(roles, scopes)?)
-            }
-            None => None,
-        };
+        let record = load_agent_credential(&mut transaction, credential_id).await?;
         transaction.commit().await?;
         Ok(record)
     }
@@ -401,23 +364,11 @@ impl AuthStore {
         let mut credentials = Vec::with_capacity(identifiers.len().min(usize::from(limit)));
         for encoded in identifiers.into_iter().take(usize::from(limit)) {
             let credential_id = agent_credential_id(&encoded)?;
-            let row = sqlx::query_as::<_, AgentCredentialRow>(
-                "SELECT agent.agent_credential_id, agent.owner_user_id, agent.issuer_user_id, \
-                        agent.public_key, agent.label, agent.version, agent.created_at_ns, \
-                        agent.expires_at_ns, agent.last_used_at_ns, agent.revoked_at_ns, \
-                        users.status AS owner_status, users.version AS owner_version \
-                 FROM agent_credentials AS agent \
-                 JOIN users ON users.user_id = agent.owner_user_id \
-                 WHERE agent.agent_credential_id = ?",
-            )
-            .bind(credential_id.as_uuid().as_bytes().as_slice())
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(AuthLoadError::PaginationInvariant)?;
-            let owner_id = user_id(&row.owner_user_id)?;
-            let roles = load_roles(&mut transaction, owner_id).await?;
-            let scopes = load_agent_scopes(&mut transaction, credential_id).await?;
-            credentials.push(row.try_into_record(roles, scopes)?);
+            credentials.push(
+                load_agent_credential(&mut transaction, credential_id)
+                    .await?
+                    .ok_or(AuthLoadError::PaginationInvariant)?,
+            );
         }
         let next_cursor = has_more.then(|| {
             credentials
@@ -940,12 +891,39 @@ struct HumanPasswordCredentialRow {
     updated_at_ns: i64,
 }
 
+impl TryFrom<HumanPasswordCredentialRow> for StoredHumanCredential {
+    type Error = AuthLoadError;
+
+    fn try_from(row: HumanPasswordCredentialRow) -> Result<Self, Self::Error> {
+        Ok(Self::Password {
+            username: CanonicalUsername::parse(&row.canonical_username)
+                .map_err(|_| AuthLoadError::InvalidUsername)?,
+            version: positive_u64(row.version).ok_or(AuthLoadError::InvalidVersion)?,
+            created_at: timestamp(row.created_at_ns)?,
+            updated_at: timestamp(row.updated_at_ns)?,
+        })
+    }
+}
+
 #[derive(FromRow)]
 struct HumanNostrCredentialRow {
     public_key: Vec<u8>,
     version: i64,
     created_at_ns: i64,
     updated_at_ns: i64,
+}
+
+impl TryFrom<HumanNostrCredentialRow> for StoredHumanCredential {
+    type Error = AuthLoadError;
+
+    fn try_from(row: HumanNostrCredentialRow) -> Result<Self, Self::Error> {
+        Ok(Self::Nostr {
+            public_key: nostr_public_key(row.public_key)?,
+            version: positive_u64(row.version).ok_or(AuthLoadError::InvalidVersion)?,
+            created_at: timestamp(row.created_at_ns)?,
+            updated_at: timestamp(row.updated_at_ns)?,
+        })
+    }
 }
 
 #[derive(FromRow)]
@@ -1181,6 +1159,39 @@ impl AgentCredentialRow {
             revoked_at: self.revoked_at_ns.map(timestamp).transpose()?,
         })
     }
+}
+
+async fn load_agent_credential(
+    transaction: &mut Transaction<'_, Sqlite>,
+    credential_id: AgentCredentialId,
+) -> Result<Option<StoredAgentCredential>, AuthLoadError> {
+    let row = sqlx::query_as::<_, AgentCredentialRow>(
+        "SELECT agent.agent_credential_id, agent.owner_user_id, agent.issuer_user_id, \
+                agent.public_key, agent.label, agent.version, agent.created_at_ns, \
+                agent.expires_at_ns, agent.last_used_at_ns, agent.revoked_at_ns, \
+                users.status AS owner_status, users.version AS owner_version \
+         FROM agent_credentials AS agent \
+         JOIN users ON users.user_id = agent.owner_user_id \
+         WHERE agent.agent_credential_id = ?",
+    )
+    .bind(credential_id.as_uuid().as_bytes().as_slice())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    match row {
+        Some(row) => Ok(Some(rehydrate_agent_credential(transaction, row).await?)),
+        None => Ok(None),
+    }
+}
+
+async fn rehydrate_agent_credential(
+    transaction: &mut Transaction<'_, Sqlite>,
+    row: AgentCredentialRow,
+) -> Result<StoredAgentCredential, AuthLoadError> {
+    let credential_id = agent_credential_id(&row.agent_credential_id)?;
+    let owner_id = user_id(&row.owner_user_id)?;
+    let roles = load_roles(transaction, owner_id).await?;
+    let scopes = load_agent_scopes(transaction, credential_id).await?;
+    row.try_into_record(roles, scopes)
 }
 
 async fn load_user(
@@ -2069,20 +2080,14 @@ pub(crate) async fn set_user_status(
     )
     .await?;
     require_version(user.version, command.expected_version)?;
-    if command.occurred_at < user.updated_at {
-        return Err(AuthCommandError::InvalidValue.into());
-    }
-    if command.status == UserStatus::Enabled
-        && !user_has_accepted_credential(&user, command.configured_providers)
-    {
-        return Err(AuthCommandError::EnabledUserRequiresCredential.into());
-    }
-    if user.status == UserStatus::Enabled
-        && command.status == UserStatus::Disabled
-        && user.roles.contains(&UserRole::Owner)
-    {
-        require_another_enabled_owner(transaction, command.user_id).await?;
-    }
+    validate_user_status_replacement(
+        transaction,
+        &user,
+        command.status,
+        command.configured_providers,
+        command.occurred_at,
+    )
+    .await?;
     let next_version = checked_next_version(user.version)?;
     let result = sqlx::query(
         "UPDATE users SET status = ?, version = ?, updated_at_ns = ? \
@@ -2149,32 +2154,16 @@ pub(crate) async fn replace_user_roles(
     .await?;
     let user = required_user(transaction, command.user_id).await?;
     require_version(user.version, command.expected_version)?;
-    if command.occurred_at < user.updated_at {
-        return Err(AuthCommandError::InvalidValue.into());
-    }
-    if user.status == UserStatus::Enabled
-        && user.roles.contains(&UserRole::Owner)
-        && !command.roles.contains(&UserRole::Owner)
-    {
-        require_another_enabled_owner(transaction, command.user_id).await?;
-    }
-    sqlx::query("DELETE FROM user_roles WHERE user_id = ?")
-        .bind(command.user_id.as_uuid().as_bytes().as_slice())
-        .execute(&mut **transaction)
-        .await?;
+    validate_user_role_replacement(transaction, &user, &command.roles, command.occurred_at).await?;
     let assigned_at = command_timestamp(command.occurred_at)?;
-    for role in command.roles {
-        sqlx::query(
-            "INSERT INTO user_roles (user_id, role, assigned_by_user_id, assigned_at_ns) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(command.user_id.as_uuid().as_bytes().as_slice())
-        .bind(role.as_str())
-        .bind(command.assigned_by_user_id.as_uuid().as_bytes().as_slice())
-        .bind(assigned_at)
-        .execute(&mut **transaction)
-        .await?;
-    }
+    replace_stored_user_roles(
+        transaction,
+        command.user_id,
+        command.assigned_by_user_id,
+        &command.roles,
+        assigned_at,
+    )
+    .await?;
     let next_version = checked_next_version(user.version)?;
     let result = sqlx::query(
         "UPDATE users SET version = ?, updated_at_ns = ? WHERE user_id = ? AND version = ?",
@@ -2236,40 +2225,14 @@ pub(crate) async fn put_human_credential(
     if command.occurred_at < user.created_at {
         return Err(AuthCommandError::InvalidValue.into());
     }
-    let provider = command.credential.provider();
-    let current = credential_state(transaction, command.user_id, provider).await?;
-    match (current, command.expected_version) {
-        (None, None) => {
-            insert_new_credential(
-                transaction,
-                command.user_id,
-                command.credential,
-                command_timestamp(command.occurred_at)?,
-            )
-            .await?;
-            Ok::<(), AuthApplyError>(())
-        }
-        (Some(_), None) => Err(AuthCommandError::Conflict.into()),
-        (None, Some(_)) => Err(AuthCommandError::NotFound.into()),
-        (Some(current), Some(expected)) => {
-            require_version(current.version, expected)?;
-            if command.occurred_at < current.created_at {
-                return Err(AuthCommandError::InvalidValue.into());
-            }
-            let next = checked_next_version(current.version)?;
-            update_credential(
-                transaction,
-                command.user_id,
-                command.credential,
-                expected,
-                next,
-                command_timestamp(command.occurred_at)?,
-            )
-            .await?;
-            revoke_user_sessions(transaction, command.user_id, command.occurred_at).await?;
-            Ok(())
-        }
-    }?;
+    put_stored_human_credential(
+        transaction,
+        command.user_id,
+        command.credential,
+        command.expected_version,
+        command.occurred_at,
+    )
+    .await?;
     let next_user_version = checked_next_version(user.version)?;
     let updated = sqlx::query(
         "UPDATE users SET version = ?, updated_at_ns = ? WHERE user_id = ? AND version = ?",
@@ -2328,50 +2291,22 @@ pub(crate) async fn remove_human_credential(
         AdminScope::CredentialManage,
     )
     .await?;
-    let provider = command.kind.provider();
-    let current = credential_state(transaction, command.user_id, provider)
-        .await?
-        .ok_or(AuthCommandError::NotFound)?;
-    require_version(current.version, command.expected_version)?;
-    if command.occurred_at < current.created_at {
-        return Err(AuthCommandError::InvalidValue.into());
-    }
-    if user.status == UserStatus::Enabled {
-        let retained = match command.kind {
-            HumanCredentialKind::Password => {
-                user.has_nostr
-                    && command
-                        .configured_providers
-                        .accepts(HumanLoginProvider::Nostr)
-            }
-            HumanCredentialKind::Nostr => {
-                user.has_password
-                    && command
-                        .configured_providers
-                        .accepts(HumanLoginProvider::Password)
-            }
-        };
-        if !retained {
-            return Err(AuthCommandError::EnabledUserRequiresCredential.into());
-        }
-    }
-    let result = match command.kind {
-        HumanCredentialKind::Password => {
-            sqlx::query("DELETE FROM user_password_credentials WHERE user_id = ? AND version = ?")
-                .bind(command.user_id.as_uuid().as_bytes().as_slice())
-                .bind(version_i64(command.expected_version)?)
-                .execute(&mut **transaction)
-                .await?
-        }
-        HumanCredentialKind::Nostr => {
-            sqlx::query("DELETE FROM user_nostr_credentials WHERE user_id = ? AND version = ?")
-                .bind(command.user_id.as_uuid().as_bytes().as_slice())
-                .bind(version_i64(command.expected_version)?)
-                .execute(&mut **transaction)
-                .await?
-        }
-    };
-    require_one_row(result.rows_affected())?;
+    require_removable_human_credential(
+        transaction,
+        &user,
+        command.kind,
+        command.expected_version,
+        command.configured_providers,
+        command.occurred_at,
+    )
+    .await?;
+    delete_human_credential(
+        transaction,
+        command.user_id,
+        command.kind,
+        command.expected_version,
+    )
+    .await?;
     revoke_user_sessions(transaction, command.user_id, command.occurred_at).await?;
     let next_user_version = checked_next_version(user.version)?;
     let updated = sqlx::query(
@@ -2442,53 +2377,66 @@ pub(crate) async fn create_login_challenge(
     })
 }
 
-pub(crate) async fn create_browser_session(
-    transaction: &mut Transaction<'_, Sqlite>,
-    command: CreateBrowserSession,
-) -> Result<BrowserSessionMutationResult, AuthApplyError> {
+fn validate_browser_session(command: &CreateBrowserSession) -> Result<(), AuthApplyError> {
     if command.fresh_until < command.authenticated_at
         || command.expires_at < command.fresh_until
         || command.session_token_digest.as_bytes() == command.csrf_token_digest.as_bytes()
     {
-        return Err(AuthCommandError::InvalidValue.into());
+        Err(AuthCommandError::InvalidValue.into())
+    } else {
+        Ok(())
     }
-    cleanup_login_challenges(transaction, command.authenticated_at).await?;
-    cleanup_browser_sessions(transaction, command.authenticated_at).await?;
+}
+
+async fn require_browser_session_capacity(
+    transaction: &mut Transaction<'_, Sqlite>,
+    authenticated_at: OffsetDateTime,
+) -> Result<(), AuthApplyError> {
+    cleanup_login_challenges(transaction, authenticated_at).await?;
+    cleanup_browser_sessions(transaction, authenticated_at).await?;
     let live_sessions: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM browser_sessions \
          WHERE revoked_at_ns IS NULL AND expires_at_ns > ?",
     )
-    .bind(command_timestamp(command.authenticated_at)?)
+    .bind(command_timestamp(authenticated_at)?)
     .fetch_one(&mut **transaction)
     .await?;
     if live_sessions >= MAX_LIVE_BROWSER_SESSIONS {
-        return Err(AuthCommandError::SessionCapacity.into());
+        Err(AuthCommandError::SessionCapacity.into())
+    } else {
+        Ok(())
     }
-    let instance_version: i64 =
+}
+
+async fn current_instance_version(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<u64, AuthApplyError> {
+    let version: i64 =
         sqlx::query_scalar("SELECT version FROM instance_identity WHERE singleton = 1")
             .fetch_optional(&mut **transaction)
             .await?
             .ok_or(AuthCommandError::BootstrapRequired)?;
-    let instance_version =
-        positive_u64(instance_version).ok_or(AuthApplyError::CorruptStoredState)?;
-    let user = required_user(transaction, command.user_id).await?;
-    if user.status != UserStatus::Enabled {
-        return Err(AuthCommandError::NotFound.into());
-    }
-    require_version(user.version, command.expected_user_version)?;
-    let provider = match command.evidence {
+    positive_u64(version).ok_or(AuthApplyError::CorruptStoredState)
+}
+
+async fn authenticate_browser_session(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user: &StoredUser,
+    evidence: &SessionAuthenticationEvidence,
+    authenticated_at: OffsetDateTime,
+) -> Result<HumanLoginProvider, AuthApplyError> {
+    match evidence {
         SessionAuthenticationEvidence::Password {
             expected_credential_version,
         } => {
             if !user.has_password {
                 return Err(AuthCommandError::NotFound.into());
             }
-            let actual =
-                credential_state(transaction, command.user_id, HumanLoginProvider::Password)
-                    .await?
-                    .ok_or(AuthCommandError::NotFound)?;
-            require_version(actual.version, expected_credential_version)?;
-            HumanLoginProvider::Password
+            let actual = credential_state(transaction, user.user_id, HumanLoginProvider::Password)
+                .await?
+                .ok_or(AuthCommandError::NotFound)?;
+            require_version(actual.version, *expected_credential_version)?;
+            Ok(HumanLoginProvider::Password)
         }
         SessionAuthenticationEvidence::Nostr {
             expected_credential_version,
@@ -2500,19 +2448,20 @@ pub(crate) async fn create_browser_session(
             if !user.has_nostr {
                 return Err(AuthCommandError::InvalidChallenge.into());
             }
-            let actual = credential_state(transaction, command.user_id, HumanLoginProvider::Nostr)
+            let actual = credential_state(transaction, user.user_id, HumanLoginProvider::Nostr)
                 .await?
                 .ok_or(AuthCommandError::NotFound)?;
-            require_version(actual.version, expected_credential_version)?;
+            require_version(actual.version, *expected_credential_version)?;
+            let authenticated_at_ns = command_timestamp(authenticated_at)?;
             let result = sqlx::query(
                 "UPDATE login_challenges SET consumed_at_ns = ? \
                  WHERE challenge_id = ? AND provider = 'nostr' AND challenge_digest = ? \
                    AND consumed_at_ns IS NULL AND expires_at_ns > ?",
             )
-            .bind(command_timestamp(command.authenticated_at)?)
+            .bind(authenticated_at_ns)
             .bind(challenge_id.as_uuid().as_bytes().as_slice())
             .bind(challenge_digest.as_bytes().as_slice())
-            .bind(command_timestamp(command.authenticated_at)?)
+            .bind(authenticated_at_ns)
             .execute(&mut **transaction)
             .await?;
             if result.rows_affected() != 1 {
@@ -2520,15 +2469,36 @@ pub(crate) async fn create_browser_session(
             }
             insert_replay_event(
                 transaction,
-                event_id,
-                ReplayPrincipal::Human(command.user_id),
-                command.authenticated_at,
-                proof_created_at,
+                *event_id,
+                ReplayPrincipal::Human(user.user_id),
+                authenticated_at,
+                *proof_created_at,
             )
             .await?;
-            HumanLoginProvider::Nostr
+            Ok(HumanLoginProvider::Nostr)
         }
-    };
+    }
+}
+
+pub(crate) async fn create_browser_session(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: CreateBrowserSession,
+) -> Result<BrowserSessionMutationResult, AuthApplyError> {
+    validate_browser_session(&command)?;
+    require_browser_session_capacity(transaction, command.authenticated_at).await?;
+    let instance_version = current_instance_version(transaction).await?;
+    let user = required_user(transaction, command.user_id).await?;
+    if user.status != UserStatus::Enabled {
+        return Err(AuthCommandError::NotFound.into());
+    }
+    require_version(user.version, command.expected_user_version)?;
+    let provider = authenticate_browser_session(
+        transaction,
+        &user,
+        &command.evidence,
+        command.authenticated_at,
+    )
+    .await?;
     let insertion = sqlx::query(
         "INSERT INTO browser_sessions (\
             session_id, user_id, provider, session_token_digest, csrf_token_digest, \
@@ -2722,6 +2692,59 @@ pub(crate) async fn register_agent_credential(
     )
 }
 
+struct AgentScopeReplacementTarget {
+    owner_user_id: UserId,
+    version: u64,
+}
+
+async fn load_agent_scope_replacement_target(
+    transaction: &mut Transaction<'_, Sqlite>,
+    credential_id: AgentCredentialId,
+    expected_version: u64,
+) -> Result<AgentScopeReplacementTarget, AuthApplyError> {
+    let row: Option<(Vec<u8>, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT owner_user_id, version, revoked_at_ns FROM agent_credentials \
+         WHERE agent_credential_id = ?",
+    )
+    .bind(credential_id.as_uuid().as_bytes().as_slice())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let (owner, version, revoked_at) = row.ok_or(AuthCommandError::NotFound)?;
+    let target = AgentScopeReplacementTarget {
+        owner_user_id: user_id(&owner).map_err(AuthApplyError::from_load)?,
+        version: positive_u64(version).ok_or(AuthApplyError::CorruptStoredState)?,
+    };
+    require_version(target.version, expected_version)?;
+    if revoked_at.is_some() {
+        return Err(AuthCommandError::NotFound.into());
+    }
+    Ok(target)
+}
+
+async fn replace_stored_agent_scopes(
+    transaction: &mut Transaction<'_, Sqlite>,
+    credential_id: AgentCredentialId,
+    expected_version: u64,
+    next_version: u64,
+    scopes: &BTreeSet<AdminScope>,
+) -> Result<(), AuthApplyError> {
+    sqlx::query("DELETE FROM agent_credential_scopes WHERE agent_credential_id = ?")
+        .bind(credential_id.as_uuid().as_bytes().as_slice())
+        .execute(&mut **transaction)
+        .await?;
+    insert_agent_scopes(transaction, credential_id, scopes).await?;
+    let result = sqlx::query(
+        "UPDATE agent_credentials SET version = ? \
+         WHERE agent_credential_id = ? AND version = ? AND revoked_at_ns IS NULL",
+    )
+    .bind(version_i64(next_version)?)
+    .bind(credential_id.as_uuid().as_bytes().as_slice())
+    .bind(version_i64(expected_version)?)
+    .execute(&mut **transaction)
+    .await?;
+    require_one_row(result.rows_affected())
+}
+
 pub(crate) async fn replace_agent_scopes(
     transaction: &mut Transaction<'_, Sqlite>,
     command: ReplaceAgentScopes,
@@ -2749,44 +2772,35 @@ pub(crate) async fn replace_agent_scopes(
     if command.scopes.is_empty() {
         return Err(AuthCommandError::InvalidValue.into());
     }
-    let row: Option<(Vec<u8>, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT owner_user_id, version, revoked_at_ns FROM agent_credentials \
-         WHERE agent_credential_id = ?",
+    let target = load_agent_scope_replacement_target(
+        transaction,
+        command.credential_id,
+        command.expected_version,
     )
-    .bind(command.credential_id.as_uuid().as_bytes().as_slice())
-    .fetch_optional(&mut **transaction)
     .await?;
-    let (owner, version, revoked_at) = row.ok_or(AuthCommandError::NotFound)?;
-    let owner = user_id(&owner).map_err(AuthApplyError::from_load)?;
-    let version = positive_u64(version).ok_or(AuthApplyError::CorruptStoredState)?;
-    require_version(version, command.expected_version)?;
-    if revoked_at.is_some() {
-        return Err(AuthCommandError::NotFound.into());
-    }
     require_user_management_authority(
         transaction,
         command.issuer_user_id,
-        owner,
+        target.owner_user_id,
         AdminScope::CredentialManage,
     )
     .await?;
-    require_scope_subset(transaction, owner, command.issuer_user_id, &command.scopes).await?;
-    sqlx::query("DELETE FROM agent_credential_scopes WHERE agent_credential_id = ?")
-        .bind(command.credential_id.as_uuid().as_bytes().as_slice())
-        .execute(&mut **transaction)
-        .await?;
-    insert_agent_scopes(transaction, command.credential_id, &command.scopes).await?;
-    let next = checked_next_version(version)?;
-    let result = sqlx::query(
-        "UPDATE agent_credentials SET version = ? \
-         WHERE agent_credential_id = ? AND version = ? AND revoked_at_ns IS NULL",
+    require_scope_subset(
+        transaction,
+        target.owner_user_id,
+        command.issuer_user_id,
+        &command.scopes,
     )
-    .bind(version_i64(next)?)
-    .bind(command.credential_id.as_uuid().as_bytes().as_slice())
-    .bind(version_i64(command.expected_version)?)
-    .execute(&mut **transaction)
     .await?;
-    require_one_row(result.rows_affected())?;
+    let next = checked_next_version(target.version)?;
+    replace_stored_agent_scopes(
+        transaction,
+        command.credential_id,
+        command.expected_version,
+        next,
+        &command.scopes,
+    )
+    .await?;
     agent_mutation_result(
         complete_identity_mutation(
             transaction,
@@ -3325,6 +3339,72 @@ fn validate_new_credentials(credentials: &[NewHumanCredential]) -> Result<(), Au
     Ok(())
 }
 
+async fn validate_user_status_replacement(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user: &StoredUser,
+    next_status: UserStatus,
+    providers: ConfiguredLoginProviders,
+    occurred_at: OffsetDateTime,
+) -> Result<(), AuthApplyError> {
+    if occurred_at < user.updated_at {
+        return Err(AuthCommandError::InvalidValue.into());
+    }
+    if next_status == UserStatus::Enabled && !user_has_accepted_credential(user, providers) {
+        return Err(AuthCommandError::EnabledUserRequiresCredential.into());
+    }
+    if user.status == UserStatus::Enabled
+        && next_status == UserStatus::Disabled
+        && user.roles.contains(&UserRole::Owner)
+    {
+        require_another_enabled_owner(transaction, user.user_id).await?;
+    }
+    Ok(())
+}
+
+async fn validate_user_role_replacement(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user: &StoredUser,
+    next_roles: &BTreeSet<UserRole>,
+    occurred_at: OffsetDateTime,
+) -> Result<(), AuthApplyError> {
+    if occurred_at < user.updated_at {
+        return Err(AuthCommandError::InvalidValue.into());
+    }
+    if user.status == UserStatus::Enabled
+        && user.roles.contains(&UserRole::Owner)
+        && !next_roles.contains(&UserRole::Owner)
+    {
+        require_another_enabled_owner(transaction, user.user_id).await?;
+    }
+    Ok(())
+}
+
+async fn replace_stored_user_roles(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user_id: UserId,
+    assigned_by_user_id: UserId,
+    roles: &BTreeSet<UserRole>,
+    assigned_at: i64,
+) -> Result<(), AuthApplyError> {
+    sqlx::query("DELETE FROM user_roles WHERE user_id = ?")
+        .bind(user_id.as_uuid().as_bytes().as_slice())
+        .execute(&mut **transaction)
+        .await?;
+    for role in roles {
+        sqlx::query(
+            "INSERT INTO user_roles (user_id, role, assigned_by_user_id, assigned_at_ns) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(user_id.as_uuid().as_bytes().as_slice())
+        .bind(role.as_str())
+        .bind(assigned_by_user_id.as_uuid().as_bytes().as_slice())
+        .bind(assigned_at)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
 fn user_has_accepted_credential(user: &StoredUser, providers: ConfiguredLoginProviders) -> bool {
     (user.has_password && providers.accepts(HumanLoginProvider::Password))
         || (user.has_nostr && providers.accepts(HumanLoginProvider::Nostr))
@@ -3352,6 +3432,107 @@ async fn require_another_enabled_owner(
 struct CredentialState {
     version: u64,
     created_at: OffsetDateTime,
+}
+
+async fn put_stored_human_credential(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user_id: UserId,
+    credential: NewHumanCredential,
+    expected_version: Option<u64>,
+    occurred_at: OffsetDateTime,
+) -> Result<(), AuthApplyError> {
+    let provider = credential.provider();
+    let current = credential_state(transaction, user_id, provider).await?;
+    match (current, expected_version) {
+        (None, None) => {
+            insert_new_credential(
+                transaction,
+                user_id,
+                credential,
+                command_timestamp(occurred_at)?,
+            )
+            .await
+        }
+        (Some(_), None) => Err(AuthCommandError::Conflict.into()),
+        (None, Some(_)) => Err(AuthCommandError::NotFound.into()),
+        (Some(current), Some(expected)) => {
+            require_version(current.version, expected)?;
+            if occurred_at < current.created_at {
+                return Err(AuthCommandError::InvalidValue.into());
+            }
+            let next = checked_next_version(current.version)?;
+            update_credential(
+                transaction,
+                user_id,
+                credential,
+                expected,
+                next,
+                command_timestamp(occurred_at)?,
+            )
+            .await?;
+            revoke_user_sessions(transaction, user_id, occurred_at).await
+        }
+    }
+}
+
+async fn require_removable_human_credential(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user: &StoredUser,
+    kind: HumanCredentialKind,
+    expected_version: u64,
+    providers: ConfiguredLoginProviders,
+    occurred_at: OffsetDateTime,
+) -> Result<(), AuthApplyError> {
+    let current = credential_state(transaction, user.user_id, kind.provider())
+        .await?
+        .ok_or(AuthCommandError::NotFound)?;
+    require_version(current.version, expected_version)?;
+    if occurred_at < current.created_at {
+        return Err(AuthCommandError::InvalidValue.into());
+    }
+    if user.status == UserStatus::Enabled
+        && !credential_removal_preserves_access(user, kind, providers)
+    {
+        return Err(AuthCommandError::EnabledUserRequiresCredential.into());
+    }
+    Ok(())
+}
+
+fn credential_removal_preserves_access(
+    user: &StoredUser,
+    removed: HumanCredentialKind,
+    providers: ConfiguredLoginProviders,
+) -> bool {
+    match removed {
+        HumanCredentialKind::Password => {
+            user.has_nostr && providers.accepts(HumanLoginProvider::Nostr)
+        }
+        HumanCredentialKind::Nostr => {
+            user.has_password && providers.accepts(HumanLoginProvider::Password)
+        }
+    }
+}
+
+async fn delete_human_credential(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user_id: UserId,
+    kind: HumanCredentialKind,
+    expected_version: u64,
+) -> Result<(), AuthApplyError> {
+    let statement = match kind {
+        HumanCredentialKind::Password => {
+            "DELETE FROM user_password_credentials WHERE user_id = ? AND version = ?"
+        }
+        HumanCredentialKind::Nostr => {
+            "DELETE FROM user_nostr_credentials WHERE user_id = ? AND version = ?"
+        }
+    };
+    let result = sqlx::query(statement)
+        .bind(user_id.as_uuid().as_bytes().as_slice())
+        .bind(version_i64(expected_version)?)
+        .execute(&mut **transaction)
+        .await?;
+    require_one_row(result.rows_affected())
 }
 
 async fn credential_state(
@@ -4008,12 +4189,31 @@ mod tests {
     async fn enabled_users_keep_a_configured_credential_and_the_last_owner() {
         let harness = Harness::start().await;
         let owner = user(20);
+        assert_eq!(
+            harness.store.auth.user_credentials(owner).await.unwrap(),
+            None
+        );
         harness
             .store
             .auth
             .bootstrap_identity(bootstrap_with(owner, password_credential()))
             .await
             .unwrap();
+        assert!(matches!(
+            harness
+                .store
+                .auth
+                .user_credentials(owner)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some([StoredHumanCredential::Password {
+                username,
+                version: 1,
+                created_at,
+                updated_at,
+            }]) if username.as_str() == "owner" && *created_at == at(10) && *updated_at == at(10)
+        ));
         assert!(matches!(
             harness
                 .store
@@ -4056,6 +4256,27 @@ mod tests {
             })
             .await
             .unwrap();
+        let credentials = harness
+            .store
+            .auth
+            .user_credentials(owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            credentials.as_slice(),
+            [
+                StoredHumanCredential::Password { version: 1, .. },
+                StoredHumanCredential::Nostr {
+                    public_key,
+                    version: 1,
+                    created_at,
+                    updated_at,
+                },
+            ] if public_key == &NostrPublicKey::parse(OWNER_KEY).unwrap()
+                && *created_at == at(12)
+                && *updated_at == at(12)
+        ));
         harness
             .store
             .auth
@@ -4076,6 +4297,16 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(matches!(
+            harness
+                .store
+                .auth
+                .user_credentials(owner)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some([StoredHumanCredential::Nostr { version: 1, .. }])
+        ));
         assert!(
             harness
                 .store
@@ -4235,6 +4466,167 @@ mod tests {
                 })
                 .await,
             AuthCommandError::IdempotencyConflict,
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn disabling_a_user_revokes_live_sessions_and_agents_but_not_human_credentials() {
+        let harness = Harness::start().await;
+        let owner = user(27);
+        harness
+            .store
+            .auth
+            .bootstrap_identity(bootstrap_with(owner, password_credential()))
+            .await
+            .unwrap();
+        let other_owner = user(28);
+        harness
+            .store
+            .auth
+            .create_user(CreateUser {
+                user_id: other_owner,
+                created_by_user_id: owner,
+                status: UserStatus::Enabled,
+                roles: BTreeSet::from([UserRole::Owner]),
+                credentials: vec![nostr_credential(PUBLISHER_KEY)],
+                configured_providers: providers(),
+                occurred_at: at(11),
+                audit: mutation_audit(owner, 70),
+            })
+            .await
+            .unwrap();
+
+        let credential_id = agent(29);
+        harness
+            .store
+            .auth
+            .register_agent_credential(RegisterAgentCredential {
+                credential_id,
+                owner_user_id: owner,
+                issuer_user_id: other_owner,
+                public_key: NostrPublicKey::parse(AGENT_KEY).unwrap(),
+                label: "owner assistant".into(),
+                scopes: BTreeSet::from([AdminScope::PreviewRead]),
+                created_at: at(12),
+                expires_at: None,
+                audit: mutation_audit(other_owner, 71),
+            })
+            .await
+            .unwrap();
+        let token_digest = SessionTokenDigest::from_bytes([0x71; 32]);
+        harness
+            .store
+            .auth
+            .create_browser_session(CreateBrowserSession {
+                session_id: session(29),
+                user_id: owner,
+                expected_user_version: 1,
+                session_token_digest: token_digest,
+                csrf_token_digest: CsrfTokenDigest::from_bytes([0x72; 32]),
+                evidence: SessionAuthenticationEvidence::Password {
+                    expected_credential_version: 1,
+                },
+                authenticated_at: at(13),
+                fresh_until: at(14),
+                expires_at: at(30),
+                audit: session_audit(29),
+            })
+            .await
+            .unwrap();
+
+        let disabled = harness
+            .store
+            .auth
+            .set_user_status(SetUserStatus {
+                user_id: owner,
+                changed_by_user_id: other_owner,
+                expected_version: 1,
+                status: UserStatus::Disabled,
+                configured_providers: providers(),
+                occurred_at: at(14),
+                audit: mutation_audit(other_owner, 72),
+            })
+            .await
+            .unwrap();
+        assert_eq!(disabled.version, 2);
+        let stored_session = harness
+            .store
+            .auth
+            .browser_session(token_digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_session.revoked_at, Some(at(14)));
+        assert!(!stored_session.is_active_at(at(14)));
+        let stored_agent = harness
+            .store
+            .auth
+            .agent_credential_by_id(credential_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_agent.version, 2);
+        assert_eq!(stored_agent.revoked_at, Some(at(14)));
+
+        let enabled = harness
+            .store
+            .auth
+            .set_user_status(SetUserStatus {
+                user_id: owner,
+                changed_by_user_id: other_owner,
+                expected_version: 2,
+                status: UserStatus::Enabled,
+                configured_providers: providers(),
+                occurred_at: at(15),
+                audit: mutation_audit(other_owner, 73),
+            })
+            .await
+            .unwrap();
+        assert_eq!(enabled.version, 3);
+        assert!(matches!(
+            harness
+                .store
+                .auth
+                .user_credentials(owner)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some([StoredHumanCredential::Password { version: 1, .. }])
+        ));
+
+        let credentialless = user(29);
+        harness
+            .store
+            .auth
+            .create_user(CreateUser {
+                user_id: credentialless,
+                created_by_user_id: owner,
+                status: UserStatus::Disabled,
+                roles: BTreeSet::from([UserRole::Publisher]),
+                credentials: Vec::new(),
+                configured_providers: providers(),
+                occurred_at: at(16),
+                audit: mutation_audit(owner, 74),
+            })
+            .await
+            .unwrap();
+        assert_command_error(
+            harness
+                .store
+                .auth
+                .set_user_status(SetUserStatus {
+                    user_id: credentialless,
+                    changed_by_user_id: owner,
+                    expected_version: 1,
+                    status: UserStatus::Enabled,
+                    configured_providers: providers(),
+                    occurred_at: at(17),
+                    audit: mutation_audit(owner, 75),
+                })
+                .await,
+            AuthCommandError::EnabledUserRequiresCredential,
         );
 
         harness.stop().await;
@@ -4411,6 +4803,214 @@ mod tests {
                 })
                 .await,
             AuthCommandError::StaleVersion,
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn agent_management_is_pageable_idempotent_versioned_and_durably_revocable() {
+        let harness = Harness::start().await;
+        let owner = user(37);
+        harness
+            .store
+            .auth
+            .bootstrap_identity(bootstrap_with(owner, nostr_credential(OWNER_KEY)))
+            .await
+            .unwrap();
+        let first_id = agent(38);
+        let second_id = agent(39);
+        for (credential_id, public_key, label, audit_value) in [
+            (first_id, AGENT_KEY, "publishing assistant", 100),
+            (second_id, PUBLISHER_KEY, "preview assistant", 101),
+        ] {
+            harness
+                .store
+                .auth
+                .register_agent_credential(RegisterAgentCredential {
+                    credential_id,
+                    owner_user_id: owner,
+                    issuer_user_id: owner,
+                    public_key: NostrPublicKey::parse(public_key).unwrap(),
+                    label: label.into(),
+                    scopes: BTreeSet::from([AdminScope::PreviewRead]),
+                    created_at: at(11),
+                    expires_at: None,
+                    audit: mutation_audit(owner, audit_value),
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            harness
+                .store
+                .auth
+                .agent_credential_by_id(agent(99))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let first_page = harness
+            .store
+            .auth
+            .agent_credentials_page(None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first_page.items.len(), 1);
+        assert_eq!(first_page.items[0].credential_id, first_id);
+        assert_eq!(first_page.next_cursor, Some(first_id));
+        let second_page = harness
+            .store
+            .auth
+            .agent_credentials_page(first_page.next_cursor, 1)
+            .await
+            .unwrap();
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].credential_id, second_id);
+        assert_eq!(second_page.next_cursor, None);
+
+        assert_command_error(
+            harness
+                .store
+                .auth
+                .replace_agent_scopes(ReplaceAgentScopes {
+                    credential_id: first_id,
+                    expected_version: 1,
+                    issuer_user_id: owner,
+                    scopes: BTreeSet::new(),
+                    occurred_at: at(12),
+                    audit: mutation_audit(owner, 102),
+                })
+                .await,
+            AuthCommandError::InvalidValue,
+        );
+        let replacement = ReplaceAgentScopes {
+            credential_id: first_id,
+            expected_version: 1,
+            issuer_user_id: owner,
+            scopes: BTreeSet::from([AdminScope::AuditRead, AdminScope::ReleaseManage]),
+            occurred_at: at(12),
+            audit: mutation_audit(owner, 103),
+        };
+        let replaced = harness
+            .store
+            .auth
+            .replace_agent_scopes(replacement.clone())
+            .await
+            .unwrap();
+        assert_eq!(replaced.version, 2);
+        assert_eq!(
+            harness
+                .store
+                .auth
+                .replace_agent_scopes(replacement)
+                .await
+                .unwrap(),
+            replaced
+        );
+        let stored = harness
+            .store
+            .auth
+            .agent_credential_by_id(first_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.version, 2);
+        assert_eq!(
+            stored.scopes,
+            BTreeSet::from([AdminScope::AuditRead, AdminScope::ReleaseManage])
+        );
+        assert_command_error(
+            harness
+                .store
+                .auth
+                .replace_agent_scopes(ReplaceAgentScopes {
+                    credential_id: first_id,
+                    expected_version: 1,
+                    issuer_user_id: owner,
+                    scopes: BTreeSet::from([AdminScope::PreviewRead]),
+                    occurred_at: at(13),
+                    audit: mutation_audit(owner, 104),
+                })
+                .await,
+            AuthCommandError::StaleVersion,
+        );
+
+        let revocation = RevokeAgentCredential {
+            credential_id: first_id,
+            revoked_by_user_id: owner,
+            expected_version: 2,
+            revoked_at: at(14),
+            audit: mutation_audit(owner, 105),
+        };
+        let revoked = harness
+            .store
+            .auth
+            .revoke_agent_credential(revocation.clone())
+            .await
+            .unwrap();
+        assert_eq!(revoked.version, 3);
+        assert_eq!(
+            harness
+                .store
+                .auth
+                .revoke_agent_credential(revocation)
+                .await
+                .unwrap(),
+            revoked
+        );
+        let stored = harness
+            .store
+            .auth
+            .agent_credential(&NostrPublicKey::parse(AGENT_KEY).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.revoked_at, Some(at(14)));
+        assert!(!stored.is_active_at(at(15)));
+
+        assert_command_error(
+            harness
+                .store
+                .auth
+                .revoke_agent_credential(RevokeAgentCredential {
+                    credential_id: first_id,
+                    revoked_by_user_id: owner,
+                    expected_version: 2,
+                    revoked_at: at(15),
+                    audit: mutation_audit(owner, 106),
+                })
+                .await,
+            AuthCommandError::StaleVersion,
+        );
+        assert_command_error(
+            harness
+                .store
+                .auth
+                .revoke_agent_credential(RevokeAgentCredential {
+                    credential_id: first_id,
+                    revoked_by_user_id: owner,
+                    expected_version: 3,
+                    revoked_at: at(15),
+                    audit: mutation_audit(owner, 107),
+                })
+                .await,
+            AuthCommandError::NotFound,
+        );
+        assert_command_error(
+            harness
+                .store
+                .auth
+                .revoke_agent_credential(RevokeAgentCredential {
+                    credential_id: agent(99),
+                    revoked_by_user_id: owner,
+                    expected_version: 1,
+                    revoked_at: at(15),
+                    audit: mutation_audit(owner, 108),
+                })
+                .await,
+            AuthCommandError::NotFound,
         );
 
         harness.stop().await;

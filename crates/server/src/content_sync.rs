@@ -56,10 +56,7 @@ impl ContentSync {
     pub(crate) async fn run(mut self) -> Result<(), ContentSyncError> {
         let mut interval = tokio::time::interval(CONTENT_POLL_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut pending: Option<ObservedCandidate> = None;
-        let mut retained: Option<CompiledCandidate> = None;
-        let mut rejected: Option<CandidateKey> = None;
-        let mut last_discovery_error: Option<Box<str>> = None;
+        let mut state = ContentSyncState::default();
 
         loop {
             tokio::select! {
@@ -67,143 +64,251 @@ impl ContentSync {
                 () = self.cancellation.cancelled() => return Ok(()),
                 _ = interval.tick() => {}
             }
-
-            let observed = match observe_tree(self.root.clone(), self.limits).await? {
-                Ok(observed) => observed,
-                Err(message) => {
-                    pending = None;
-                    if last_discovery_error.as_deref() != Some(message.as_ref()) {
-                        tracing::warn!(error = %message, "content sync kept the last good snapshot");
-                        last_discovery_error = Some(message);
-                    }
-                    continue;
-                }
-            };
-            last_discovery_error = None;
-
-            if observed.key == self.active {
-                pending = None;
-                retained = None;
-                rejected = None;
-                continue;
-            }
-            if rejected.as_ref() == Some(&observed.key) {
-                pending = None;
-                retained = None;
-                continue;
-            }
-
-            let candidate = if let Some(candidate) = retained
-                .take()
-                .filter(|candidate| candidate.key == observed.key)
-            {
-                candidate
-            } else {
-                let stable = pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.key == observed.key);
-                if !stable {
-                    pending = Some(observed);
-                    continue;
-                }
-
-                let candidate = match compile_observed(observed, self.root.clone()).await? {
-                    Ok(candidate) => candidate,
-                    Err(failure) => {
-                        tracing::warn!(
-                            content_etag = %failure.key.digest,
-                            error = %failure.message,
-                            "content sync rejected a compiler candidate and kept the last good snapshot"
-                        );
-                        rejected = Some(failure.key);
-                        pending = None;
-                        continue;
-                    }
-                };
-                let candidate_key = candidate.key.clone();
-                let confirmed = match observe_tree(self.root.clone(), self.limits).await? {
-                    Ok(confirmed) => confirmed,
-                    Err(message) => {
-                        tracing::warn!(
-                            error = %message,
-                            "content changed during compilation; the last good snapshot remains active"
-                        );
-                        pending = None;
-                        continue;
-                    }
-                };
-                if confirmed.key != candidate_key {
-                    pending = Some(confirmed);
-                    continue;
-                }
-
-                retain_candidate(candidate, self.candidate_store.clone()).await?
-            };
-            let candidate_key = candidate.key.clone();
-            let confirmed = match observe_tree(self.root.clone(), self.limits).await? {
-                Ok(confirmed) => confirmed,
-                Err(message) => {
-                    tracing::warn!(
-                        error = %message,
-                        "content changed while awaiting activation; the last good snapshot remains active"
-                    );
-                    pending = None;
-                    retained = Some(candidate);
-                    continue;
-                }
-            };
-            if confirmed.key != candidate_key {
-                pending = Some(confirmed);
-                continue;
-            }
-            // Once the bounded actor accepts this command, wait for its durable
-            // outcome even if process cancellation arrives concurrently.
-            let result = self
-                .publications
-                .apply_content_catalog(
-                    Arc::clone(&candidate.catalog),
-                    candidate.key.digest.clone(),
-                    candidate.source_commit.clone(),
-                )
-                .await;
-            match result {
-                Ok(site) => {
-                    tracing::info!(
-                        content_etag = %candidate_key.digest,
-                        site_etag = %site.digest,
-                        site_version = site.version,
-                        "live content snapshot synchronized"
-                    );
-                    self.active = candidate_key;
-                    pending = None;
-                    rejected = None;
-                }
-                Err(error) if reload_is_retryable(&error) => {
-                    tracing::warn!(error = %error, "content sync will retry the stable candidate");
-                    pending = None;
-                    retained = Some(candidate);
-                }
-                Err(ContentReloadError::Coordinator(PublicationCoordinatorUnavailable::Closed))
-                    if self.cancellation.is_cancelled() =>
-                {
-                    return Ok(());
-                }
-                Err(error) if reload_is_fatal(&error) => {
-                    return Err(ContentSyncError::Reload(error));
-                }
-                Err(_) if self.cancellation.is_cancelled() => return Ok(()),
-                Err(error) => {
-                    tracing::warn!(
-                        content_etag = %candidate_key.digest,
-                        error = %error,
-                        "content sync rejected a candidate and kept the last good snapshot"
-                    );
-                    rejected = Some(candidate_key);
-                    pending = None;
-                }
+            if self.synchronize(&mut state).await? == SyncControl::Stop {
+                return Ok(());
             }
         }
     }
+
+    async fn synchronize(
+        &mut self,
+        state: &mut ContentSyncState,
+    ) -> Result<SyncControl, ContentSyncError> {
+        let observed = match observe_tree(self.root.clone(), self.limits).await? {
+            Ok(observed) => observed,
+            Err(message) => {
+                state.discovery_failed(message);
+                return Ok(SyncControl::Continue);
+            }
+        };
+        let Some(observed) = state.select_observed(observed, &self.active) else {
+            return Ok(SyncControl::Continue);
+        };
+        let Some(candidate) = self.prepare_candidate(observed, state).await? else {
+            return Ok(SyncControl::Continue);
+        };
+        let Some(candidate) = self.confirm_activation_candidate(candidate, state).await? else {
+            return Ok(SyncControl::Continue);
+        };
+        self.activate_candidate(candidate, state).await
+    }
+
+    async fn prepare_candidate(
+        &self,
+        observed: ObservedCandidate,
+        state: &mut ContentSyncState,
+    ) -> Result<Option<CompiledCandidate>, ContentSyncError> {
+        if let Some(candidate) = state
+            .retained
+            .take()
+            .filter(|candidate| candidate.key == observed.key)
+        {
+            return Ok(Some(candidate));
+        }
+        self.compile_repeated_candidate(observed, state).await
+    }
+
+    async fn compile_repeated_candidate(
+        &self,
+        observed: ObservedCandidate,
+        state: &mut ContentSyncState,
+    ) -> Result<Option<CompiledCandidate>, ContentSyncError> {
+        if !state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.key == observed.key)
+        {
+            state.pending = Some(observed);
+            return Ok(None);
+        }
+        let compiled = compile_observed(observed, self.root.clone()).await?;
+        let Some(candidate) = state.accept_compiled(compiled) else {
+            return Ok(None);
+        };
+        let Some(candidate) = self.confirm_compiled_candidate(candidate, state).await? else {
+            return Ok(None);
+        };
+        retain_candidate(candidate, self.candidate_store.clone())
+            .await
+            .map(Some)
+    }
+
+    async fn confirm_compiled_candidate(
+        &self,
+        candidate: CompiledCandidate,
+        state: &mut ContentSyncState,
+    ) -> Result<Option<CompiledCandidate>, ContentSyncError> {
+        let confirmed = match observe_tree(self.root.clone(), self.limits).await? {
+            Ok(confirmed) => confirmed,
+            Err(message) => {
+                tracing::warn!(
+                    error = %message,
+                    "content changed during compilation; the last good snapshot remains active"
+                );
+                state.pending = None;
+                return Ok(None);
+            }
+        };
+        if confirmed.key != candidate.key {
+            state.pending = Some(confirmed);
+            return Ok(None);
+        }
+        Ok(Some(candidate))
+    }
+
+    async fn confirm_activation_candidate(
+        &self,
+        candidate: CompiledCandidate,
+        state: &mut ContentSyncState,
+    ) -> Result<Option<CompiledCandidate>, ContentSyncError> {
+        let confirmed = match observe_tree(self.root.clone(), self.limits).await? {
+            Ok(confirmed) => confirmed,
+            Err(message) => {
+                tracing::warn!(
+                    error = %message,
+                    "content changed while awaiting activation; the last good snapshot remains active"
+                );
+                state.pending = None;
+                state.retained = Some(candidate);
+                return Ok(None);
+            }
+        };
+        if confirmed.key != candidate.key {
+            state.pending = Some(confirmed);
+            return Ok(None);
+        }
+        Ok(Some(candidate))
+    }
+
+    async fn activate_candidate(
+        &mut self,
+        candidate: CompiledCandidate,
+        state: &mut ContentSyncState,
+    ) -> Result<SyncControl, ContentSyncError> {
+        let candidate_key = candidate.key.clone();
+        // Once the bounded actor accepts this command, wait for its durable
+        // outcome even if process cancellation arrives concurrently.
+        let result = self
+            .publications
+            .apply_content_catalog(
+                Arc::clone(&candidate.catalog),
+                candidate.key.digest.clone(),
+                candidate.source_commit.clone(),
+            )
+            .await;
+        match result {
+            Ok(site) => {
+                tracing::info!(
+                    content_etag = %candidate_key.digest,
+                    site_etag = %site.digest,
+                    site_version = site.version,
+                    "live content snapshot synchronized"
+                );
+                self.active = candidate_key;
+                state.pending = None;
+                state.rejected = None;
+                Ok(SyncControl::Continue)
+            }
+            Err(error) => {
+                state.handle_reload_failure(error, candidate, candidate_key, &self.cancellation)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ContentSyncState {
+    pending: Option<ObservedCandidate>,
+    retained: Option<CompiledCandidate>,
+    rejected: Option<CandidateKey>,
+    last_discovery_error: Option<Box<str>>,
+}
+
+impl ContentSyncState {
+    fn discovery_failed(&mut self, message: Box<str>) {
+        self.pending = None;
+        if self.last_discovery_error.as_deref() != Some(message.as_ref()) {
+            tracing::warn!(error = %message, "content sync kept the last good snapshot");
+            self.last_discovery_error = Some(message);
+        }
+    }
+
+    fn select_observed(
+        &mut self,
+        observed: ObservedCandidate,
+        active: &CandidateKey,
+    ) -> Option<ObservedCandidate> {
+        self.last_discovery_error = None;
+        if &observed.key == active {
+            self.pending = None;
+            self.retained = None;
+            self.rejected = None;
+            return None;
+        }
+        if self.rejected.as_ref() == Some(&observed.key) {
+            self.pending = None;
+            self.retained = None;
+            return None;
+        }
+        Some(observed)
+    }
+
+    fn accept_compiled(
+        &mut self,
+        compiled: Result<CompiledCandidate, CandidateFailure>,
+    ) -> Option<CompiledCandidate> {
+        match compiled {
+            Ok(candidate) => Some(candidate),
+            Err(failure) => {
+                tracing::warn!(
+                    content_etag = %failure.key.digest,
+                    error = %failure.message,
+                    "content sync rejected a compiler candidate and kept the last good snapshot"
+                );
+                self.rejected = Some(failure.key);
+                self.pending = None;
+                None
+            }
+        }
+    }
+
+    fn handle_reload_failure(
+        &mut self,
+        error: ContentReloadError,
+        candidate: CompiledCandidate,
+        candidate_key: CandidateKey,
+        cancellation: &CancellationToken,
+    ) -> Result<SyncControl, ContentSyncError> {
+        if reload_is_retryable(&error) {
+            tracing::warn!(error = %error, "content sync will retry the stable candidate");
+            self.pending = None;
+            self.retained = Some(candidate);
+            return Ok(SyncControl::Continue);
+        }
+        if closed_during_cancellation(&error, cancellation) {
+            return Ok(SyncControl::Stop);
+        }
+        if reload_is_fatal(&error) {
+            return Err(ContentSyncError::Reload(error));
+        }
+        if cancellation.is_cancelled() {
+            return Ok(SyncControl::Stop);
+        }
+        tracing::warn!(
+            content_etag = %candidate_key.digest,
+            error = %error,
+            "content sync rejected a candidate and kept the last good snapshot"
+        );
+        self.rejected = Some(candidate_key);
+        self.pending = None;
+        Ok(SyncControl::Continue)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncControl {
+    Continue,
+    Stop,
 }
 
 async fn retain_candidate(
@@ -312,6 +417,17 @@ fn reload_is_retryable(error: &ContentReloadError) -> bool {
     )
 }
 
+fn closed_during_cancellation(
+    error: &ContentReloadError,
+    cancellation: &CancellationToken,
+) -> bool {
+    cancellation.is_cancelled()
+        && matches!(
+            error,
+            ContentReloadError::Coordinator(PublicationCoordinatorUnavailable::Closed)
+        )
+}
+
 fn reload_is_fatal(error: &ContentReloadError) -> bool {
     matches!(
         error,
@@ -343,7 +459,7 @@ pub(crate) enum ContentSyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use markdown_compiler::PostCollection;
+    use markdown_compiler::{PostCollection, PostId, PostRevisionDigest};
 
     use crate::content_fixtures::{content_tree, post, publication};
 
@@ -392,6 +508,18 @@ mod tests {
         }
     }
 
+    fn retention_reload_error(candidate: &CompiledCandidate) -> ContentReloadError {
+        let mut catalog = candidate.catalog.as_ref().clone();
+        let missing_revision = (
+            PostId::parse("11111111-1111-4111-8111-111111111111").unwrap(),
+            PostRevisionDigest::from_bytes([0x77; 32]),
+        );
+        catalog
+            .retain_revisions_from(&candidate.catalog, std::iter::once(missing_revision))
+            .unwrap_err()
+            .into()
+    }
+
     #[tokio::test]
     async fn retention_worker_preserves_the_exact_observed_tree() {
         let state = tempfile::tempdir().unwrap();
@@ -429,5 +557,80 @@ mod tests {
             retain_candidate(candidate, store).await,
             Err(ContentSyncError::Retention(_))
         ));
+    }
+
+    #[test]
+    fn reload_failures_retry_only_safe_outcomes_and_preserve_rejection_state() {
+        let candidate = compiled_candidate();
+        let candidate_key = candidate.key.clone();
+        let mut retry = ContentSyncState {
+            pending: Some(ObservedCandidate {
+                key: candidate.key.clone(),
+                tree: candidate.observed.tree.clone(),
+            }),
+            ..ContentSyncState::default()
+        };
+        assert_eq!(
+            retry
+                .handle_reload_failure(
+                    ContentReloadError::Database(DatabaseAdmissionError::QueueFull.into()),
+                    candidate,
+                    candidate_key.clone(),
+                    &CancellationToken::new(),
+                )
+                .unwrap(),
+            SyncControl::Continue
+        );
+        assert!(retry.pending.is_none());
+        assert_eq!(
+            retry.retained.as_ref().map(|candidate| &candidate.key),
+            Some(&candidate_key)
+        );
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let candidate = compiled_candidate();
+        let mut stopped = ContentSyncState::default();
+        assert_eq!(
+            stopped
+                .handle_reload_failure(
+                    ContentReloadError::Coordinator(PublicationCoordinatorUnavailable::Closed),
+                    candidate,
+                    candidate_key.clone(),
+                    &cancellation,
+                )
+                .unwrap(),
+            SyncControl::Stop
+        );
+
+        let candidate = compiled_candidate();
+        let mut fatal = ContentSyncState::default();
+        assert!(matches!(
+            fatal.handle_reload_failure(
+                ContentReloadError::Database(DatabaseAdmissionError::WriterClosed.into()),
+                candidate,
+                candidate_key.clone(),
+                &CancellationToken::new(),
+            ),
+            Err(ContentSyncError::Reload(ContentReloadError::Database(_)))
+        ));
+
+        let candidate = compiled_candidate();
+        let rejection = retention_reload_error(&candidate);
+        let mut rejected = ContentSyncState::default();
+        assert_eq!(
+            rejected
+                .handle_reload_failure(
+                    rejection,
+                    candidate,
+                    candidate_key.clone(),
+                    &CancellationToken::new(),
+                )
+                .unwrap(),
+            SyncControl::Continue
+        );
+        assert_eq!(rejected.rejected, Some(candidate_key));
+        assert!(rejected.pending.is_none());
+        assert!(rejected.retained.is_none());
     }
 }
