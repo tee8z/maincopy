@@ -1212,11 +1212,12 @@ mod tests {
         async fn restart(self) -> Self {
             let Self {
                 root,
-                store: _,
+                store,
                 shutdown,
                 writer,
                 owner,
             } = self;
+            drop(store);
             shutdown.cancel();
             writer.await.unwrap();
 
@@ -1238,18 +1239,27 @@ mod tests {
         }
 
         async fn stop(self) {
-            self.shutdown.cancel();
-            self.writer.await.unwrap();
+            let Self {
+                root: _root,
+                store,
+                shutdown,
+                writer,
+                owner: _,
+            } = self;
+            drop(store);
+            shutdown.cancel();
+            writer.await.unwrap();
         }
 
         async fn stop_and_open_writer(self) -> (tempfile::TempDir, SqliteConnection, UserId) {
             let Self {
                 root,
-                store: _,
+                store,
                 shutdown,
                 writer,
                 owner,
             } = self;
+            drop(store);
             shutdown.cancel();
             writer.await.unwrap();
             let path = root.path().join("state/maincopy.db");
