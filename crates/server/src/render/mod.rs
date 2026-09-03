@@ -3,6 +3,7 @@
 mod asset_path;
 mod catalog;
 mod markdown;
+mod metadata;
 mod robots;
 mod rss;
 mod site;

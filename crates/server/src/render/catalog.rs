@@ -290,10 +290,15 @@ mod tests {
     use super::*;
     use crate::domain::publication::PublicLedgerProjection;
     use crate::domain::publication::PublishedPostRevision;
+    use crate::frontend_assets::embedded_manifest;
+    use crate::render::{
+        SiteSnapshotBuildErrorCode, build_site_snapshot, render_site_shell, snapshot_store,
+    };
     use markdown_compiler::{
         DiscoveredContentTree, LogicalAssetPath, PostCollection, SiteSnapshotDigest,
         resolve_content_assets,
     };
+    use time::{Date, Month, OffsetDateTime, Time};
 
     use crate::content_fixtures::{asset, content_tree, post, publication, validated_content};
 
@@ -644,6 +649,41 @@ mod tests {
                 .current_preview_asset(&LogicalAssetPath::parse("assets/not-present.png").unwrap())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn metadata_failure_rejects_the_candidate_without_replacing_the_active_snapshot() {
+        let mut catalog = compile_tree(tree("Catalog", &[], true));
+        let post_id = PostId::parse(SECOND_ID).unwrap();
+        let revision = catalog.current_post(&post_id).unwrap().revision.clone();
+        let ledger = PublicLedgerProjection::try_from_exact_entries([PublishedPostRevision::new(
+            post_id.clone(),
+            revision.clone(),
+            OffsetDateTime::from_unix_timestamp(2_000).unwrap(),
+        )])
+        .unwrap();
+        let valid_shell =
+            render_site_shell(Arc::new(catalog.clone()), embedded_manifest(), &ledger).unwrap();
+        let active = build_site_snapshot(valid_shell, &ledger).unwrap();
+        let (reader, _activator) = snapshot_store(active);
+        let before = reader.load_full();
+
+        let retained = catalog
+            .revisions
+            .get_mut(&(post_id.clone(), revision))
+            .unwrap();
+        Arc::make_mut(&mut retained.rendered)
+            .document
+            .metadata
+            .authored_at = Date::from_calendar_date(-1, Month::January, 1)
+            .unwrap()
+            .with_time(Time::MIDNIGHT)
+            .assume_utc();
+        let error = render_site_shell(Arc::new(catalog), embedded_manifest(), &ledger).unwrap_err();
+
+        assert_eq!(error.code, SiteSnapshotBuildErrorCode::MetadataRenderFailed);
+        assert_eq!(error.post_id.as_ref(), Some(&post_id));
+        assert!(Arc::ptr_eq(&before, &reader.load_full()));
     }
 
     #[test]

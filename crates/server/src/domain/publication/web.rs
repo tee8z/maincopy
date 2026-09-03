@@ -449,6 +449,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_metadata_ignores_request_authority_headers() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/posts/hello-maincopy")
+            .header(axum::http::header::HOST, "attacker.example")
+            .header("forwarded", "host=attacker.example;proto=http")
+            .header("x-forwarded-host", "attacker.example")
+            .header("x-forwarded-proto", "http")
+            .body(Body::empty())
+            .unwrap();
+        let response = public_router(published_example_state())
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let canonical_url = "https://example.test/posts/hello-maincopy";
+        assert!(body.contains(&format!(
+            "<link rel=\"canonical\" href=\"{canonical_url}\">"
+        )));
+        assert!(body.contains(&format!(
+            "<meta property=\"og:url\" content=\"{canonical_url}\">"
+        )));
+        assert!(body.contains(&format!("\"url\":\"{canonical_url}\"")));
+        assert!(body.contains(&format!("\"mainEntityOfPage\":\"{canonical_url}\"")));
+        assert!(!body.contains("attacker.example"));
+    }
+
+    #[tokio::test]
     async fn rss_feed_is_snapshot_backed_and_discoverable() {
         let response = get("/feed.xml").await;
         assert_eq!(response.status(), StatusCode::OK);

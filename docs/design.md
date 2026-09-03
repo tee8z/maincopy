@@ -438,8 +438,32 @@ The policy follows [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309). The
 absolute sitemap field follows the
 [Sitemaps protocol](https://www.sitemaps.org/protocol.html#submit_robots).
 
-Public pages include canonical links and structured metadata. Feeds use stable
-post identifiers and absolute canonical URLs.
+Each successful canonical HTML page contains one self-referencing absolute
+canonical link. The index, archive, and each nonempty tag page use Open Graph
+type `website`. A current public post uses type `article`. Every one of these
+pages emits its page title and description, configured site name, and canonical
+URL as core Open Graph fields. Request `Host`, `Forwarded`, and
+`X-Forwarded-*` headers cannot affect any metadata URL. Error pages emit no
+canonical link or structured metadata.
+
+Each post also contains one JSON-LD `BlogPosting`. It includes the authored
+headline, description, tags, author, creation time, optional authored update
+time, and canonical URL. A public post uses the original canonical SQLite
+`published_at` for `datePublished`; an unpublished private preview omits that
+field. `url` and `mainEntityOfPage` equal the canonical link. V1 treats the
+required publication `author.name` as a person and emits a `Person`; supporting
+an organization requires a later typed author-kind field.
+
+JSON-LD passes through a JSON serializer and one private trusted-script sink.
+That boundary escapes every character that could terminate or reinterpret the
+HTML script text node. Ordinary metadata attributes remain Maud-escaped.
+
+This is deliberately core, non-image Open Graph metadata. The
+[Open Graph protocol](https://ogp.me/) also requires `og:image`, so Maincopy
+does not claim complete Open Graph support yet and does not substitute the
+favicon. Work package 2.5 adds Open Graph and JSON-LD image fields only after
+it can project validated external images and snapshot-scoped local image URLs.
+Feeds use stable post identifiers and absolute canonical URLs.
 
 Request handlers read only the active immutable snapshot. They do not parse
 Markdown, inspect Git, or query mutable source files.

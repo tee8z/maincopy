@@ -23,7 +23,7 @@ and quality conventions.
 
 ## Current implementation audit
 
-This table describes the implementation reviewed on 2026-09-02. It is not a
+This table describes the implementation reviewed on 2026-09-03. It is not a
 release claim.
 
 | Area | Reviewed status |
@@ -37,7 +37,8 @@ release claim.
 | Preview-gated update releases and complete release management | In progress |
 | Managed Git synchronization and restricted bootstrap | Planned |
 | Snapshot-backed RSS feed, sitemap, robots policy, and HTML autodiscovery | Implemented foundation |
-| Redirects, Open Graph, JSON-LD, and CSP | Planned |
+| Canonical links, core non-image Open Graph fields, and `BlogPosting` JSON-LD | Implemented foundation |
+| Redirects, favicon and image metadata, and CSP | Planned |
 | HTTPS admin gateway and admin web interface | Planned |
 | Profile-backed static Lightning Address tips | Implemented foundation |
 | Prometheus registry, loopback `/metrics`, and runtime dashboard | Planned |
@@ -1620,7 +1621,8 @@ Tests:
 
 ### Work package 2.2: Feeds and discovery documents
 
-Implement RSS, sitemap, robots, Open Graph, and JSON-LD output.
+Implement RSS, sitemap, robots, canonical metadata, Open Graph groundwork, and
+JSON-LD output.
 
 The first vertical slice serves one RSS 2.0 resource at `GET /feed.xml` and
 `HEAD /feed.xml`. Do not add feed aliases or redirects in this slice.
@@ -1753,16 +1755,63 @@ Follow the
 [Sitemaps protocol](https://www.sitemaps.org/protocol.html#submit_robots) for
 the absolute sitemap field.
 
+The fourth vertical slice renders canonical links, core non-image Open Graph
+fields, and post JSON-LD while constructing the immutable page shell. It does
+not derive metadata from an HTTP request.
+
+Emit one self-referencing absolute canonical link on the index, archive, each
+nonempty tag page, and each current public post. Emit no canonical link on the
+not-found or method-not-allowed page. For every canonical page, emit exactly
+one each of `og:title`, `og:type`, `og:url`, `og:description`, and
+`og:site_name`. Use `website` for index, archive, and tag pages and `article`
+for posts. `og:url` must equal the canonical link. Derive both only from the
+validated publication base URL and a typed public path. Ignore request `Host`,
+`Forwarded`, and `X-Forwarded-*` headers.
+
+For a post, also emit the canonical SQLite `published_at` as
+`article:published_time` when it exists, the authored `updated_at` as
+`article:modified_time` when it exists, and one `article:tag` per authored tag.
+An unpublished private preview uses its future canonical post URL but omits
+publication time. A preview of an already-published post uses the preserved
+canonical publication time.
+
+Emit exactly one JSON-LD `BlogPosting` on each post page and private post
+preview. Its fields are `@context`, `@type`, `headline`, `description`, `url`,
+`mainEntityOfPage`, `dateCreated`, optional `datePublished`, optional
+`dateModified`, `author`, and `keywords`. The required V1 `author.name`
+represents a person, so the author object uses type `Person`. The two URL fields
+must equal the canonical link. Use Git-authored values for creation,
+modification, text, and tags. Use only SQLite's original canonical
+`published_at` for publication time. This shape follows the
+[Schema.org `BlogPosting` type](https://schema.org/BlogPosting) and
+[Google Article structured-data guidance](https://developers.google.com/search/docs/appearance/structured-data/article).
+
+Serialize JSON-LD with `serde_json`. Before inserting it through the sole
+trusted Maud script sink, escape literal `<`, `>`, `&`, U+2028, and U+2029 so
+authored text cannot close or reinterpret the script element. A timestamp or
+serialization failure is a typed candidate-build failure and cannot replace an
+active snapshot. Authored metadata and the canonical URL participate in the
+preview identity. The preview digest deliberately excludes a supplied
+publication time because activation owns that value. Exact public metadata
+bytes participate in the site-shell and presentation identities.
+
+Do not emit `og:image`, a JSON-LD `image`, or a favicon fallback in this work
+package. The [Open Graph protocol](https://ogp.me/) defines `og:image` as a
+required property, so this vertical slice is explicitly groundwork rather than
+complete Open Graph support. Work package 2.5 owns validated external image
+projection, immutable snapshot-scoped local image URLs, and both image metadata
+fields.
+
 Deliverables:
 
 - The snapshot-backed `/feed.xml` contract defined above.
 - The snapshot-backed `/sitemap.xml` contract defined above.
 - The snapshot-backed `/robots.txt` contract defined above.
-- Absolute canonical URLs in RSS, sitemap, Open Graph, and JSON-LD output.
+- Absolute canonical URLs in RSS, sitemap, core Open Graph, and JSON-LD output.
 - Stable post UUIDs as feed GUIDs.
 - XML-safe RSS and sitemap serialization through the selected XML writer.
 - `BlogPosting` JSON-LD.
-- Open Graph and canonical-link metadata.
+- Core non-image Open Graph and canonical-link metadata.
 
 Tests:
 
@@ -1809,6 +1858,21 @@ Tests:
   unsupported methods at the canonical path.
 - Keep admin, preview, metrics, and other private path names out of the policy.
 - Fail a candidate robots build without changing the active snapshot.
+- Require one canonical link and one core Open Graph field set on every
+  successful canonical HTML page, with no structured metadata on error pages.
+- Parse complete post-page JSON-LD and require its URL fields to equal the
+  canonical link.
+- Verify canonical SQLite publication time, authored modification time, and
+  repeated article tags in both Open Graph and JSON-LD output.
+- Keep `datePublished` absent from unpublished previews and require exact
+  preview/public head parity when their publication state is equal.
+- Keep hostile punctuation, mixed-case script terminators, Unicode separators,
+  quotes, and backslashes inside the decoded JSON values.
+- Ignore hostile request authority and forwarding headers when serving page
+  metadata.
+- Require identical inputs to render byte-identical metadata. Bind authored
+  metadata changes into preview identity and exact public metadata changes into
+  site-shell and presentation identities.
 
 ### Work package 2.3: Redirects, assets, and HTTP caching
 
@@ -3291,9 +3355,10 @@ Deliverables:
 - A generic Copy action for reuse on another service without calling that
   service a supported channel.
 - A requirement that the linked public page already exposes its canonical URL
-  and Open Graph metadata from WP2.2, including the configured preview image
-  when one exists, before the kit is returned. Maincopy does not claim that a
-  platform will consume that metadata or render a particular link preview.
+  and core Open Graph metadata from WP2.2, plus the configured preview image
+  from WP2.5 when one exists, before the kit is returned. Maincopy does not
+  claim that a platform will consume that metadata or render a particular link
+  preview.
 - No OAuth grant, API token, provider credential, account connection, browser
   automation, target schedule, delivery worker, lease, retry, remote attempt,
   or completion state.

@@ -27,6 +27,9 @@ use crate::domain::publication::{
 };
 use crate::frontend_assets::FrontendAssetManifest;
 
+use super::metadata::{
+    MetadataRenderError, PostHeadMetadataInput, RenderedPostHeadMetadata, render_post_head_metadata,
+};
 use super::robots::{RenderedRobots, RobotsRenderError, render_robots};
 use super::rss::{RenderedRssFeed, RssItem, RssRenderError, render_rss};
 use super::sitemap::{RenderedSitemap, SitemapRenderError, render_sitemap};
@@ -266,6 +269,10 @@ fn render_bound_preview(
                 error.to_string(),
             )
         })?;
+    let canonical_url = CanonicalSiteUrl::for_path(
+        &catalog.publication.site.base_url,
+        &PublicPagePath::post(&rendered.document.metadata.slug),
+    );
     let page = PostPageView::from_rendered(rendered, published_at);
     let tips_enabled = page.tips_enabled(&catalog.publication);
     let tip_handoff = if tips_enabled {
@@ -277,24 +284,22 @@ fn render_bound_preview(
         &catalog.publication,
         frontend,
         page,
+        &canonical_url,
         ArticleBody::Projected(&article),
         tip_handoff.as_ref(),
-    )
+    )?
     .into_string();
     validate_page_size(html.len())?;
     let pre_injection_shell = render_post(
         &catalog.publication,
         frontend,
         PostPageView::from_rendered(rendered, None),
+        &canonical_url,
         ArticleBody::Omitted,
         None,
-    )
+    )?
     .into_string();
     validate_page_size(pre_injection_shell.len())?;
-    let canonical_url = CanonicalSiteUrl::for_path(
-        &catalog.publication.site.base_url,
-        &PublicPagePath::post(&rendered.document.metadata.slug),
-    );
     let renderer = SiteShellRendererIdentity::new(*frontend.bundle_digest.as_bytes());
     let profile_projection = if tips_enabled {
         tip_recipient
@@ -497,9 +502,10 @@ fn render_pre_injection_shell(
                     publication,
                     frontend,
                     PostPageView::from_public(&posts[index]),
+                    &posts[index].canonical_url,
                     ArticleBody::Omitted,
                     None,
-                )
+                )?
                 .into_string(),
             ),
             PreInjectionPage::Tag(tag) => hash_pre_injection_html(
@@ -715,9 +721,10 @@ fn render_snapshot_pages(
                 publication,
                 shell.frontend,
                 PostPageView::from_public(post),
+                &post.canonical_url,
                 ArticleBody::Projected(&article),
                 tip_handoff,
-            )
+            )?
             .into_string(),
             publication,
             retained,
@@ -1197,6 +1204,7 @@ pub enum SiteSnapshotBuildErrorCode {
     RssRenderFailed,
     RobotsRenderFailed,
     SitemapRenderFailed,
+    MetadataRenderFailed,
     QrCodeGenerationFailed,
     IdentityRejected,
 }
@@ -1283,6 +1291,14 @@ impl SiteSnapshotBuildError {
         )
     }
 
+    fn metadata(post_id: &PostId, error: MetadataRenderError) -> Self {
+        Self::post(
+            SiteSnapshotBuildErrorCode::MetadataRenderFailed,
+            post_id.clone(),
+            error.to_string(),
+        )
+    }
+
     fn route_limit() -> Self {
         Self::new(
             SiteSnapshotBuildErrorCode::RouteLimitExceeded,
@@ -1308,6 +1324,8 @@ fn render_index(
     posts: &[PublicPostView],
     chronology: &[usize],
 ) -> Markup {
+    let canonical_url =
+        CanonicalSiteUrl::for_path(&publication.site.base_url, &PublicPagePath::index());
     let content = html! {
         section aria-labelledby="recent-posts-heading" {
             h1 id="recent-posts-heading" { "Recent posts" }
@@ -1321,7 +1339,14 @@ fn render_index(
     render_layout(
         publication,
         frontend,
-        publication.site.title.as_str(),
+        PageHead {
+            title: publication.site.title.as_str(),
+            description: publication.site.description.as_str(),
+            canonical: Some(CanonicalPageHead {
+                url: &canonical_url,
+                kind: CanonicalPageKind::Website,
+            }),
+        },
         content,
     )
 }
@@ -1332,6 +1357,12 @@ fn render_archive(
     posts: &[PublicPostView],
     chronology: &[usize],
 ) -> Markup {
+    let canonical_url =
+        CanonicalSiteUrl::for_path(&publication.site.base_url, &PublicPagePath::archive());
+    let description = format!(
+        "Browse every published post from {}.",
+        publication.site.title.as_str()
+    );
     let content = html! {
         section aria-labelledby="archive-heading" {
             h1 id="archive-heading" { "Archive" }
@@ -1342,7 +1373,19 @@ fn render_archive(
             }
         }
     };
-    render_layout(publication, frontend, "Archive", content)
+    render_layout(
+        publication,
+        frontend,
+        PageHead {
+            title: "Archive",
+            description: &description,
+            canonical: Some(CanonicalPageHead {
+                url: &canonical_url,
+                kind: CanonicalPageKind::Website,
+            }),
+        },
+        content,
+    )
 }
 
 fn render_tag(
@@ -1353,13 +1396,32 @@ fn render_tag(
     indexes: &[usize],
 ) -> Markup {
     let title = format!("Posts tagged {}", tag.as_str());
+    let description = format!(
+        "Browse published posts tagged “{}” on {}.",
+        tag.as_str(),
+        publication.site.title.as_str()
+    );
+    let canonical_url =
+        CanonicalSiteUrl::for_path(&publication.site.base_url, &PublicPagePath::tag(tag));
     let content = html! {
         section aria-labelledby="tag-heading" {
             h1 id="tag-heading" { "Posts tagged “" (tag.as_str()) "”" }
             (render_post_list(posts, indexes))
         }
     };
-    render_layout(publication, frontend, &title, content)
+    render_layout(
+        publication,
+        frontend,
+        PageHead {
+            title: &title,
+            description: &description,
+            canonical: Some(CanonicalPageHead {
+                url: &canonical_url,
+                kind: CanonicalPageKind::Website,
+            }),
+        },
+        content,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1370,6 +1432,7 @@ enum ArticleBody<'article> {
 
 #[derive(Clone, Copy)]
 struct PostPageView<'post> {
+    post_id: &'post PostId,
     title: &'post PostTitle,
     description: &'post PostDescription,
     tags: &'post [PostTag],
@@ -1382,6 +1445,7 @@ struct PostPageView<'post> {
 impl<'post> PostPageView<'post> {
     fn from_public(post: &'post PublicPostView) -> Self {
         Self {
+            post_id: &post.post_id,
             title: &post.title,
             description: &post.description,
             tags: &post.tags,
@@ -1395,6 +1459,7 @@ impl<'post> PostPageView<'post> {
     fn from_rendered(rendered: &'post RenderedPost, published_at: Option<OffsetDateTime>) -> Self {
         let metadata = &rendered.document.metadata;
         Self {
+            post_id: &metadata.id,
             title: &metadata.title,
             description: &metadata.description,
             tags: &metadata.tags,
@@ -1489,9 +1554,21 @@ fn render_post(
     publication: &PublicationSettings,
     frontend: &'static FrontendAssetManifest,
     post: PostPageView<'_>,
+    canonical_url: &CanonicalSiteUrl,
     article: ArticleBody<'_>,
     tip_handoff: Option<&TipHandoff<'_>>,
-) -> Markup {
+) -> Result<Markup, SiteSnapshotBuildError> {
+    let metadata = render_post_head_metadata(PostHeadMetadataInput {
+        title: post.title,
+        description: post.description,
+        tags: post.tags,
+        authored_at: post.authored_at,
+        updated_at: post.updated_at,
+        published_at: post.published_at,
+        canonical_url,
+        author: &publication.author.name,
+    })
+    .map_err(|error| SiteSnapshotBuildError::metadata(post.post_id, error))?;
     let tips_enabled = post.tips_enabled(publication);
     let content = html! {
         article {
@@ -1538,7 +1615,22 @@ fn render_post(
             }
         }
     };
-    render_layout(publication, frontend, post.title.as_str(), content)
+    Ok(render_layout(
+        publication,
+        frontend,
+        PageHead {
+            title: post.title.as_str(),
+            description: post.description.as_str(),
+            canonical: Some(CanonicalPageHead {
+                url: canonical_url,
+                kind: CanonicalPageKind::Article {
+                    metadata: &metadata,
+                    tags: post.tags,
+                },
+            }),
+        },
+        content,
+    ))
 }
 
 fn render_post_list(posts: &[PublicPostView], indexes: &[usize]) -> Markup {
@@ -1583,7 +1675,11 @@ fn render_error(
     render_layout(
         publication,
         frontend,
-        title,
+        PageHead {
+            title,
+            description: explanation,
+            canonical: None,
+        },
         html! {
             section class="error-page" {
                 h1 { (title) }
@@ -1594,28 +1690,73 @@ fn render_error(
     )
 }
 
+#[derive(Clone, Copy)]
+struct PageHead<'head> {
+    title: &'head str,
+    description: &'head str,
+    canonical: Option<CanonicalPageHead<'head>>,
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalPageHead<'head> {
+    url: &'head CanonicalSiteUrl,
+    kind: CanonicalPageKind<'head>,
+}
+
+#[derive(Clone, Copy)]
+enum CanonicalPageKind<'head> {
+    Website,
+    Article {
+        metadata: &'head RenderedPostHeadMetadata,
+        tags: &'head [PostTag],
+    },
+}
+
 fn render_layout(
     publication: &PublicationSettings,
     frontend: &'static FrontendAssetManifest,
-    page_title: &str,
+    head: PageHead<'_>,
     content: Markup,
 ) -> Markup {
     let site = &publication.site;
     let feed_url = CanonicalSiteUrl::for_path(&site.base_url, &PublicPagePath::feed());
     let feed_title = format!("{} RSS feed", site.title.as_str());
-    let full_title = if page_title == site.title.as_str() {
-        page_title.to_owned()
+    let full_title = if head.title == site.title.as_str() {
+        head.title.to_owned()
     } else {
-        format!("{page_title} — {}", site.title.as_str())
+        format!("{} — {}", head.title, site.title.as_str())
     };
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" prefix="og: https://ogp.me/ns# article: https://ogp.me/ns/article#" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                meta name="description" content=(site.description.as_str());
+                meta name="description" content=(head.description);
                 title { (full_title) }
+                @if let Some(canonical) = head.canonical {
+                    link rel="canonical" href=(canonical.url.as_str());
+                    meta property="og:title" content=(head.title);
+                    meta property="og:type" content=(match canonical.kind {
+                        CanonicalPageKind::Website => "website",
+                        CanonicalPageKind::Article { .. } => "article",
+                    });
+                    meta property="og:url" content=(canonical.url.as_str());
+                    meta property="og:description" content=(head.description);
+                    meta property="og:site_name" content=(site.title.as_str());
+                    @if let CanonicalPageKind::Article { metadata, tags } = canonical.kind {
+                        @if let Some(published_time) = &metadata.published_time {
+                            meta property="article:published_time" content=(published_time);
+                        }
+                        @if let Some(modified_time) = &metadata.modified_time {
+                            meta property="article:modified_time" content=(modified_time);
+                        }
+                        @for tag in tags {
+                            meta property="article:tag" content=(tag.as_str());
+                        }
+                        (metadata.json_ld_script())
+                    }
+                }
                 link rel="alternate" type="application/rss+xml"
                     title=(feed_title) href=(feed_url.as_str());
                 link rel="stylesheet" href=(frontend.css.public_path);
@@ -1875,6 +2016,70 @@ mod tests {
             .clone()
     }
 
+    fn assert_core_page_metadata(
+        page: &str,
+        title: &str,
+        description: &str,
+        canonical_url: &str,
+        object_type: &str,
+    ) {
+        assert_eq!(page.matches("<link rel=\"canonical\"").count(), 1);
+        assert!(page.contains(&format!(
+            "<link rel=\"canonical\" href=\"{canonical_url}\">"
+        )));
+        for property in [
+            "og:title",
+            "og:type",
+            "og:url",
+            "og:description",
+            "og:site_name",
+        ] {
+            assert_eq!(
+                page.matches(&format!("<meta property=\"{property}\""))
+                    .count(),
+                1,
+                "unexpected {property} count in {page}"
+            );
+        }
+        assert!(page.contains(&format!("<meta property=\"og:title\" content=\"{title}\">")));
+        assert!(page.contains(&format!(
+            "<meta property=\"og:type\" content=\"{object_type}\">"
+        )));
+        assert!(page.contains(&format!(
+            "<meta property=\"og:url\" content=\"{canonical_url}\">"
+        )));
+        assert!(page.contains(&format!(
+            "<meta property=\"og:description\" content=\"{description}\">"
+        )));
+        assert!(page.contains(
+            "<meta property=\"og:site_name\" content=\"Site &lt;unsafe&gt; &amp; title\">"
+        ));
+        assert!(!page.contains("property=\"og:image\""));
+    }
+
+    fn post_json_ld(page: &str) -> serde_json::Value {
+        const OPEN: &str = "<script type=\"application/ld+json\">";
+        assert_eq!(page.matches(OPEN).count(), 1);
+        let json = page
+            .split_once(OPEN)
+            .unwrap()
+            .1
+            .split_once("</script>")
+            .unwrap()
+            .0;
+        assert!(!json.contains(['<', '>', '&']));
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn rendered_head(page: &str) -> &str {
+        page.split_once("<head>")
+            .unwrap()
+            .1
+            .split_once("</head>")
+            .unwrap()
+            .0
+    }
+
     #[test]
     fn projection_rejects_duplicate_post_ids() {
         let fixture = fixture();
@@ -1943,6 +2148,15 @@ mod tests {
         assert!(draft.contains("<h1>Draft</h1>"));
         assert!(draft.contains(&format!("{asset_endpoint}?path=assets/draft.png")));
         assert!(!draft.contains("class=\"publication-time\""));
+        assert_core_page_metadata(
+            &draft,
+            "Draft post",
+            "Description &lt;unsafe&gt; &amp; text.",
+            "https://blog.example.com/posts/draft-post",
+            "article",
+        );
+        assert!(!draft.contains("property=\"article:published_time\""));
+        assert!(post_json_ld(&draft).get("datePublished").is_none());
 
         let unpublished = render_post_preview(
             &fixture.catalog,
@@ -1968,6 +2182,19 @@ mod tests {
         .unwrap();
         assert!(published.contains("class=\"publication-time\""));
         assert!(published.contains("1970-01-01 0:33:20.0 +00:00:00"));
+        assert!(published.contains(
+            "<meta property=\"article:published_time\" content=\"1970-01-01T00:33:20Z\">"
+        ));
+        assert_eq!(
+            post_json_ld(&published)["datePublished"],
+            "1970-01-01T00:33:20Z"
+        );
+        let public =
+            build_snapshot(&fixture, &projection([entry(&fixture, FIRST_ID, 2_000)])).unwrap();
+        let public_post = public
+            .post_page(&PostSlug::parse("first-post").unwrap())
+            .unwrap();
+        assert_eq!(rendered_head(&published), rendered_head(&public_post));
 
         assert!(
             render_post_preview(
@@ -2082,6 +2309,10 @@ mod tests {
             .current_post(&PostId::parse(FIRST_ID).unwrap())
             .unwrap();
         let mut publication = fixture.catalog.publication.clone();
+        let canonical_url = CanonicalSiteUrl::for_path(
+            &publication.site.base_url,
+            &PublicPagePath::post(&rendered.document.metadata.slug),
+        );
         let projection = tip_projection(Some("Alice"), "alice@example.com");
         let handoff = TipHandoff::new(&projection).unwrap();
         let mut page = PostPageView::from_rendered(rendered, None);
@@ -2092,9 +2323,11 @@ mod tests {
             &publication,
             embedded_manifest(),
             page,
+            &canonical_url,
             ArticleBody::Omitted,
             Some(&handoff),
         )
+        .unwrap()
         .into_string();
         assert!(!inherited_disabled.contains("class=\"tip-cta\""));
 
@@ -2103,9 +2336,11 @@ mod tests {
             &publication,
             embedded_manifest(),
             page,
+            &canonical_url,
             ArticleBody::Omitted,
             Some(&handoff),
         )
+        .unwrap()
         .into_string();
         assert!(post_enabled.contains("class=\"tip-cta\""));
 
@@ -2115,9 +2350,11 @@ mod tests {
             &publication,
             embedded_manifest(),
             page,
+            &canonical_url,
             ArticleBody::Omitted,
             Some(&handoff),
         )
+        .unwrap()
         .into_string();
         assert!(!post_disabled.contains("class=\"tip-cta\""));
     }
@@ -2200,6 +2437,93 @@ mod tests {
         assert!(!snapshot.sitemap.body.contains("second-post"));
         assert!(!snapshot.sitemap.body.contains("draft-post"));
         assert!(!snapshot.sitemap.body.contains("draft-tag"));
+    }
+
+    #[test]
+    fn canonical_pages_render_exact_core_open_graph_and_blog_posting_metadata() {
+        let fixture = fixture();
+        let ledger = projection([
+            entry(&fixture, FIRST_ID, 2_000),
+            entry(&fixture, SECOND_ID, 3_000),
+        ]);
+        let snapshot = build_snapshot(&fixture, &ledger).unwrap();
+
+        assert_core_page_metadata(
+            &snapshot.index_page(),
+            "Site &lt;unsafe&gt; &amp; title",
+            "A &lt;careful&gt; site.",
+            "https://blog.example.com/",
+            "website",
+        );
+        assert_core_page_metadata(
+            &snapshot.archive_page(),
+            "Archive",
+            "Browse every published post from Site &lt;unsafe&gt; &amp; title.",
+            "https://blog.example.com/archive",
+            "website",
+        );
+        let tag_page = snapshot.tag_page(&PostTag::parse("rust").unwrap()).unwrap();
+        assert_core_page_metadata(
+            &tag_page,
+            "Posts tagged rust",
+            "Browse published posts tagged “rust” on Site &lt;unsafe&gt; &amp; title.",
+            "https://blog.example.com/tags/rust",
+            "website",
+        );
+
+        let first_page = snapshot
+            .post_page(&PostSlug::parse("first-post").unwrap())
+            .unwrap();
+        assert_core_page_metadata(
+            &first_page,
+            "First &lt;script&gt;alert(1)&lt;/script&gt;",
+            "Description &lt;unsafe&gt; &amp; text.",
+            "https://blog.example.com/posts/first-post",
+            "article",
+        );
+        assert!(first_page.contains(
+            "<meta property=\"article:published_time\" content=\"1970-01-01T00:33:20Z\">"
+        ));
+        assert!(first_page.contains(
+            "<meta property=\"article:modified_time\" content=\"2026-08-29T16:00:00-04:00\">"
+        ));
+        assert_eq!(first_page.matches("property=\"article:tag\"").count(), 1);
+        assert!(first_page.contains("<meta property=\"article:tag\" content=\"rust\">"));
+
+        let document = post_json_ld(&first_page);
+        assert_eq!(document["@context"], "https://schema.org");
+        assert_eq!(document["@type"], "BlogPosting");
+        assert_eq!(document["headline"], "First <script>alert(1)</script>");
+        assert_eq!(document["description"], "Description <unsafe> & text.");
+        assert_eq!(document["url"], "https://blog.example.com/posts/first-post");
+        assert_eq!(document["mainEntityOfPage"], document["url"]);
+        assert_eq!(document["dateCreated"], "2026-08-29T15:00:00-04:00");
+        assert_eq!(document["datePublished"], "1970-01-01T00:33:20Z");
+        assert_eq!(document["dateModified"], "2026-08-29T16:00:00-04:00");
+        assert_eq!(document["author"]["@type"], "Person");
+        assert_eq!(document["author"]["name"], "Author <unsafe>");
+        assert_eq!(document["keywords"], serde_json::json!(["rust"]));
+        assert!(document.get("image").is_none());
+
+        let second_page = snapshot
+            .post_page(&PostSlug::parse("second-post").unwrap())
+            .unwrap();
+        assert_eq!(second_page.matches("property=\"article:tag\"").count(), 2);
+        assert!(second_page.contains("<meta property=\"article:tag\" content=\"rust\">"));
+        assert!(second_page.contains("<meta property=\"article:tag\" content=\"sqlite\">"));
+        assert_eq!(
+            post_json_ld(&second_page)["keywords"],
+            serde_json::json!(["rust", "sqlite"])
+        );
+
+        for error_page in [
+            snapshot.not_found_page(),
+            snapshot.method_not_allowed_page(),
+        ] {
+            assert!(!error_page.contains("<link rel=\"canonical\""));
+            assert!(!error_page.contains("<meta property=\"og:"));
+            assert!(!error_page.contains("application/ld+json"));
+        }
     }
 
     #[test]
@@ -2768,6 +3092,7 @@ mod tests {
             SiteSnapshotBuildErrorCode::RssRenderFailed,
             SiteSnapshotBuildErrorCode::RobotsRenderFailed,
             SiteSnapshotBuildErrorCode::SitemapRenderFailed,
+            SiteSnapshotBuildErrorCode::MetadataRenderFailed,
             SiteSnapshotBuildErrorCode::QrCodeGenerationFailed,
             SiteSnapshotBuildErrorCode::IdentityRejected,
         ];
@@ -2788,6 +3113,7 @@ mod tests {
             "rss_render_failed",
             "robots_render_failed",
             "sitemap_render_failed",
+            "metadata_render_failed",
             "qr_code_generation_failed",
             "identity_rejected",
         ];
