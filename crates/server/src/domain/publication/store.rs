@@ -1,10 +1,14 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
 
 use markdown_compiler::{
-    ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
+    ContentTreeDigest, DraftStatus, PostAlias, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
     SiteSnapshotDigest,
 };
-use sqlx::{Executor, FromRow, Sqlite, Transaction, error::ErrorKind};
+use sqlx::{Executor, FromRow, QueryBuilder, Sqlite, Transaction, error::ErrorKind};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::{mpsc, oneshot};
@@ -16,11 +20,13 @@ use crate::database::store::{
 
 use super::{
     ActivationBlockReason, CanonicalPublication, CanonicalPublicationStatus,
-    CanonicalPublicationView, CanonicalState, PublicLedgerProjection, PublishedPostRevision,
-    RehydrationError, SourceCommit, canonical,
+    CanonicalPublicationView, CanonicalState, MAX_PUBLIC_ROUTES, PublicLedgerProjection,
+    PublishedPostRevision, RehydrationError, SourceCommit, canonical,
 };
 
 const MAX_STARTUP_POST_REVISIONS: usize = 10_000;
+const ROUTE_OWNERSHIP_QUERY_BATCH_SIZE: usize = 500;
+const ROUTE_VALIDATION_BATCH_SIZE: i64 = 500;
 
 /// Publication queries and mutations backed by Maincopy's database.
 #[derive(Clone)]
@@ -34,6 +40,47 @@ impl PublicationStore {
         Self { readers, mutations }
     }
 
+    /// Checks permanent route ownership before the coordinator swaps public visibility.
+    pub(crate) async fn ensure_routes_available(
+        &self,
+        stable_post_id: &PostId,
+        slug: &PostSlug,
+        aliases: &[PostAlias],
+    ) -> Result<(), PublicationRouteOwnershipError> {
+        validate_publication_routes(slug, aliases)?;
+        let routes: Vec<_> = publication_routes(slug, aliases).collect();
+        let route_by_value: BTreeMap<_, _> = routes
+            .iter()
+            .map(|route| (route.as_str(), *route))
+            .collect();
+        let mut transaction = self.readers.begin().await?;
+        for routes in routes.chunks(ROUTE_OWNERSHIP_QUERY_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT route, stable_post_id FROM publication_routes WHERE route IN (",
+            );
+            let mut values = query.separated(", ");
+            for route in routes {
+                values.push_bind(route.as_str());
+            }
+            values.push_unseparated(")");
+            let claimed: Vec<(String, Vec<u8>)> =
+                query.build_query_as().fetch_all(&mut *transaction).await?;
+            for (value, owner) in claimed {
+                if owner.as_slice() == stable_post_id.as_uuid().as_bytes() {
+                    continue;
+                }
+                let route = route_by_value
+                    .get(value.as_str())
+                    .expect("the ownership query returns only requested routes");
+                return Err(PublicationRouteOwnershipError::Conflict {
+                    route: route.to_owned_route(),
+                });
+            }
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Loads the exact durable publication view used to build the startup snapshot.
     pub(crate) async fn startup_snapshot_state(
         &self,
@@ -44,6 +91,7 @@ impl PublicationStore {
                 .fetch_all(&mut *transaction)
                 .await?;
         validate_reload_states(&reload_states)?;
+        validate_publication_route_claims(&mut transaction).await?;
 
         let site = load_site_head(&mut *transaction).await?;
         let rows = sqlx::query_as::<_, CanonicalPublicationRow>(LOAD_CANONICAL_PUBLICATIONS)
@@ -401,6 +449,9 @@ pub(crate) struct SchedulePublication {
     pub source_commit: Option<SourceCommit>,
     pub content_digest: ContentTreeDigest,
     pub accepted_preview_digest: PreviewDigest,
+    pub slug: PostSlug,
+    pub aliases: Arc<[PostAlias]>,
+    pub accepted_at: OffsetDateTime,
     pub scheduled_at: OffsetDateTime,
 }
 
@@ -487,6 +538,7 @@ pub(crate) struct FinishPublication {
     pub expected_site: SiteHead,
     pub candidate_site_digest: SiteSnapshotDigest,
     pub slug: PostSlug,
+    pub aliases: Arc<[PostAlias]>,
 }
 
 /// A fully committed canonical publication and its activated site head.
@@ -653,6 +705,70 @@ struct CanonicalPublicationRow {
     pinned_publication_status: Option<String>,
     pinned_slug: Option<String>,
     current_publication_status: Option<String>,
+}
+
+#[derive(FromRow)]
+struct PublicationRouteClaimRow {
+    route: String,
+    stable_post_id: Vec<u8>,
+    revision_digest: Vec<u8>,
+    kind: String,
+}
+
+async fn validate_publication_route_claims(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), StartupSnapshotLoadError> {
+    let mut after: Option<String> = None;
+    loop {
+        let rows = match after.as_deref() {
+            Some(after) => {
+                sqlx::query_as::<_, PublicationRouteClaimRow>(
+                    "SELECT route, stable_post_id, revision_digest, kind \
+                     FROM publication_routes WHERE route > ? ORDER BY route \
+                     LIMIT ?",
+                )
+                .bind(after)
+                .bind(ROUTE_VALIDATION_BATCH_SIZE)
+                .fetch_all(&mut **transaction)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, PublicationRouteClaimRow>(
+                    "SELECT route, stable_post_id, revision_digest, kind \
+                     FROM publication_routes ORDER BY route LIMIT ?",
+                )
+                .bind(ROUTE_VALIDATION_BATCH_SIZE)
+                .fetch_all(&mut **transaction)
+                .await?
+            }
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for row in &rows {
+            validate_publication_route_claim(row)?;
+        }
+        after = rows.last().map(|row| row.route.clone());
+    }
+}
+
+fn validate_publication_route_claim(
+    row: &PublicationRouteClaimRow,
+) -> Result<(), StartupSnapshotLoadError> {
+    match row.kind.as_str() {
+        "post" => PostSlug::parse(&row.route)
+            .map(PublicationRoute::Canonical)
+            .map_err(|_| StartupSnapshotLoadError::InvalidPublicationRoute)?,
+        "alias" => PostAlias::parse(&row.route)
+            .map(PublicationRoute::Alias)
+            .map_err(|_| StartupSnapshotLoadError::InvalidPublicationRoute)?,
+        _ => return Err(StartupSnapshotLoadError::InvalidPublicationRouteKind),
+    };
+    decode_post_id(row.stable_post_id.clone())
+        .map_err(|_| StartupSnapshotLoadError::InvalidPublicationRouteOwner)?;
+    post_digest(row.revision_digest.clone())
+        .map_err(|_| StartupSnapshotLoadError::InvalidPublicationRouteRevision)?;
+    Ok(())
 }
 
 async fn load_site_head<'executor>(
@@ -1149,6 +1265,14 @@ pub(crate) enum StartupSnapshotLoadError {
     InvalidPostId,
     #[error("a stored post digest is invalid")]
     InvalidPostDigest,
+    #[error("a publication route claim has an invalid route kind")]
+    InvalidPublicationRouteKind,
+    #[error("a publication route claim has an invalid route value")]
+    InvalidPublicationRoute,
+    #[error("a publication route claim has an invalid stable post owner")]
+    InvalidPublicationRouteOwner,
+    #[error("a publication route claim has an invalid revision digest")]
+    InvalidPublicationRouteRevision,
     #[error("a stored content-tree digest is invalid")]
     InvalidContentTreeDigest,
     #[error("a stored accepted preview digest is invalid")]
@@ -1307,7 +1431,7 @@ pub(crate) async fn install_startup(
 /// Persists revision metadata for a validated private-preview candidate.
 ///
 /// This operation deliberately does not alter the canonical publication ledger,
-/// published routes, retained public snapshots, or the durable site head.
+/// publication route claims, retained public snapshots, or the durable site head.
 pub(crate) async fn index_content_catalog(
     transaction: &mut Transaction<'_, Sqlite>,
     command: IndexContentCatalog,
@@ -1529,6 +1653,13 @@ pub(crate) async fn schedule_publication(
     transaction: &mut Transaction<'_, Sqlite>,
     command: SchedulePublication,
 ) -> Result<ScheduledPublication, PublicationMutationError> {
+    validate_publication_routes(&command.slug, &command.aliases)
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    if command.accepted_at >= command.scheduled_at {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::InvalidValue,
+        ));
+    }
     if let Some(stored) = load_canonical_by_creation_key(transaction, command.creation_key).await? {
         if stored.command_kind != PublicationCommandKind::Scheduled
             || !publish_now_fingerprint_matches(
@@ -1588,6 +1719,8 @@ pub(crate) async fn schedule_publication(
     let view = publication.view();
     let scheduled_at_ns = i64::try_from(view.scheduled_at.unix_timestamp_nanos())
         .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    let accepted_at_ns = i64::try_from(command.accepted_at.unix_timestamp_nanos())
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
     sqlx::query(
         "INSERT INTO canonical_publications (\
             publication_id, command_kind, stable_post_id, requested_revision_digest, pinned_post_digest, \
@@ -1612,6 +1745,14 @@ pub(crate) async fn schedule_publication(
     .execute(&mut **transaction)
     .await
     .map_err(PublicationMutationError::insert_sql)?;
+    reserve_publication_routes(
+        transaction,
+        &command.slug,
+        &command.aliases,
+        view,
+        accepted_at_ns,
+    )
+    .await?;
 
     Ok(ScheduledPublication {
         publication_id: command.publication_id,
@@ -2137,6 +2278,8 @@ pub(crate) async fn finish_publication(
 ) -> Result<FinishedPublication, PublicationMutationError> {
     i64::try_from(command.expected_publication_version)
         .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    validate_publication_routes(&command.slug, &command.aliases)
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
     let stored = load_canonical_by_id(transaction, command.publication_id)
         .await?
         .ok_or(PublicationMutationError::Command(
@@ -2193,7 +2336,9 @@ async fn finish_retry(
             DatabaseCommandError::Rejected,
         ));
     }
-    require_claimed_route(transaction, &command.slug, publication.view()).await?;
+    for route in publication_routes(&command.slug, &command.aliases) {
+        require_claimed_route(transaction, route, publication.view()).await?;
+    }
     let site = load_retained_site_head(transaction, &command.candidate_site_digest).await?;
     Ok(FinishedPublication {
         publication_id,
@@ -2251,10 +2396,11 @@ async fn finish_activation(
     )
     .await?;
     supersede_current_publication(transaction, publication_id, published.view()).await?;
-    advance_published_routes(transaction, published.view()).await?;
-    claim_published_route(
+    advance_owned_routes(transaction, published.view()).await?;
+    claim_publication_routes(
         transaction,
         &command.slug,
+        &command.aliases,
         published.view(),
         published_at_ns,
     )
@@ -2328,13 +2474,13 @@ async fn supersede_current_publication(
     Ok(())
 }
 
-async fn advance_published_routes(
+async fn advance_owned_routes(
     transaction: &mut Transaction<'_, Sqlite>,
     replacement: &CanonicalPublicationView,
 ) -> Result<(), PublicationMutationError> {
     sqlx::query(
-        "UPDATE published_routes SET revision_digest = ? \
-         WHERE stable_post_id = ? AND kind = 'post'",
+        "UPDATE publication_routes SET revision_digest = ? \
+         WHERE stable_post_id = ?",
     )
     .bind(replacement.pinned_post_digest.as_bytes().as_slice())
     .bind(replacement.stable_post_id.as_uuid().as_bytes().as_slice())
@@ -2427,41 +2573,197 @@ async fn persist_published(
     Ok(())
 }
 
-async fn claim_published_route(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationRouteKind {
+    Post,
+    Alias,
+}
+
+impl PublicationRouteKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Post => "post",
+            Self::Alias => "alias",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PublicationRouteRef<'a> {
+    Canonical(&'a PostSlug),
+    Alias(&'a PostAlias),
+}
+
+impl<'a> PublicationRouteRef<'a> {
+    fn as_str(self) -> &'a str {
+        match self {
+            Self::Canonical(slug) => slug.as_str(),
+            Self::Alias(alias) => alias.as_str(),
+        }
+    }
+
+    const fn kind(self) -> PublicationRouteKind {
+        match self {
+            Self::Canonical(_) => PublicationRouteKind::Post,
+            Self::Alias(_) => PublicationRouteKind::Alias,
+        }
+    }
+
+    fn to_owned_route(self) -> PublicationRoute {
+        match self {
+            Self::Canonical(slug) => PublicationRoute::Canonical(slug.clone()),
+            Self::Alias(alias) => PublicationRoute::Alias(alias.clone()),
+        }
+    }
+}
+
+fn publication_routes<'a>(
+    slug: &'a PostSlug,
+    aliases: &'a [PostAlias],
+) -> impl Iterator<Item = PublicationRouteRef<'a>> {
+    std::iter::once(PublicationRouteRef::Canonical(slug))
+        .chain(aliases.iter().map(PublicationRouteRef::Alias))
+}
+
+fn validate_publication_routes(
+    slug: &PostSlug,
+    aliases: &[PostAlias],
+) -> Result<(), PublicationRouteSetError> {
+    let maximum_aliases = MAX_PUBLIC_ROUTES - 1;
+    if aliases.len() > maximum_aliases {
+        return Err(PublicationRouteSetError::TooManyAliases {
+            count: aliases.len(),
+            maximum: maximum_aliases,
+        });
+    }
+    let mut unique = BTreeSet::from([slug.as_str()]);
+    for alias in aliases {
+        if !unique.insert(alias.as_str()) {
+            return Err(PublicationRouteSetError::Duplicate {
+                route: PublicationRoute::Alias(alias.clone()),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn claim_publication_routes(
     transaction: &mut Transaction<'_, Sqlite>,
     slug: &PostSlug,
+    aliases: &[PostAlias],
+    publication: &CanonicalPublicationView,
+    claimed_at_ns: i64,
+) -> Result<(), PublicationMutationError> {
+    for route in publication_routes(slug, aliases) {
+        claim_publication_route(transaction, route, publication, claimed_at_ns).await?;
+    }
+    Ok(())
+}
+
+async fn reserve_publication_routes(
+    transaction: &mut Transaction<'_, Sqlite>,
+    slug: &PostSlug,
+    aliases: &[PostAlias],
+    publication: &CanonicalPublicationView,
+    claimed_at_ns: i64,
+) -> Result<(), PublicationMutationError> {
+    for route in publication_routes(slug, aliases) {
+        reserve_publication_route(transaction, route, publication, claimed_at_ns).await?;
+    }
+    Ok(())
+}
+
+async fn reserve_publication_route(
+    transaction: &mut Transaction<'_, Sqlite>,
+    route: PublicationRouteRef<'_>,
     publication: &CanonicalPublicationView,
     claimed_at_ns: i64,
 ) -> Result<(), PublicationMutationError> {
     let stable_post_id = publication.stable_post_id.as_uuid();
     let inserted = sqlx::query(
-        "INSERT INTO published_routes (\
+        "INSERT INTO publication_routes (\
             route, stable_post_id, revision_digest, kind, claimed_at_ns\
-         ) VALUES (?, ?, ?, 'post', ?) \
+         ) VALUES (?, ?, ?, ?, ?) \
          ON CONFLICT(route) DO NOTHING",
     )
-    .bind(slug.as_str())
+    .bind(route.as_str())
     .bind(stable_post_id.as_bytes().as_slice())
     .bind(publication.pinned_post_digest.as_bytes().as_slice())
+    .bind(route.kind().as_str())
+    .bind(claimed_at_ns)
+    .execute(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)?;
+    if inserted.rows_affected() == 1 {
+        return Ok(());
+    }
+    let owner: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT stable_post_id FROM publication_routes WHERE route = ?")
+            .bind(route.as_str())
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(PublicationMutationError::Operation)?;
+    if owner.is_some_and(|owner| owner.as_slice() == stable_post_id.as_bytes()) {
+        Ok(())
+    } else {
+        Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ))
+    }
+}
+
+async fn claim_publication_route(
+    transaction: &mut Transaction<'_, Sqlite>,
+    route: PublicationRouteRef<'_>,
+    publication: &CanonicalPublicationView,
+    claimed_at_ns: i64,
+) -> Result<(), PublicationMutationError> {
+    let stable_post_id = publication.stable_post_id.as_uuid();
+    let updated = sqlx::query(
+        "UPDATE publication_routes SET revision_digest = ?, kind = ? \
+         WHERE route = ? AND stable_post_id = ?",
+    )
+    .bind(publication.pinned_post_digest.as_bytes().as_slice())
+    .bind(route.kind().as_str())
+    .bind(route.as_str())
+    .bind(stable_post_id.as_bytes().as_slice())
+    .execute(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)?;
+    if updated.rows_affected() == 1 {
+        return Ok(());
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO publication_routes (\
+            route, stable_post_id, revision_digest, kind, claimed_at_ns\
+         ) VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(route) DO NOTHING",
+    )
+    .bind(route.as_str())
+    .bind(stable_post_id.as_bytes().as_slice())
+    .bind(publication.pinned_post_digest.as_bytes().as_slice())
+    .bind(route.kind().as_str())
     .bind(claimed_at_ns)
     .execute(&mut **transaction)
     .await
     .map_err(PublicationMutationError::Operation)?;
     if inserted.rows_affected() == 0 {
-        require_claimed_route(transaction, slug, publication).await?;
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
     }
     Ok(())
 }
 
 async fn require_claimed_route(
     transaction: &mut Transaction<'_, Sqlite>,
-    slug: &PostSlug,
+    route: PublicationRouteRef<'_>,
     publication: &CanonicalPublicationView,
 ) -> Result<(), PublicationMutationError> {
     let claimed: Option<(Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
-        "SELECT stable_post_id, revision_digest, kind FROM published_routes WHERE route = ?",
+        "SELECT stable_post_id, revision_digest, kind FROM publication_routes WHERE route = ?",
     )
-    .bind(slug.as_str())
+    .bind(route.as_str())
     .fetch_optional(&mut **transaction)
     .await
     .map_err(PublicationMutationError::Operation)?;
@@ -2469,7 +2771,7 @@ async fn require_claimed_route(
     let matches = claimed.is_some_and(|(post_id, digest, kind)| {
         post_id == stable_post_id.as_bytes().as_slice()
             && digest == publication.pinned_post_digest.as_bytes().as_slice()
-            && kind == "post"
+            && kind == route.kind().as_str()
     });
     if !matches {
         return Err(PublicationMutationError::Command(
@@ -2507,6 +2809,45 @@ async fn load_retained_site_head(
         digest: digest.clone(),
         version,
     })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationRoute {
+    Canonical(PostSlug),
+    Alias(PostAlias),
+}
+
+impl PublicationRoute {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Canonical(slug) => slug.as_str(),
+            Self::Alias(alias) => alias.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for PublicationRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub(crate) enum PublicationRouteSetError {
+    #[error("publication has {count} aliases; the maximum is {maximum}")]
+    TooManyAliases { count: usize, maximum: usize },
+    #[error("publication route {route} appears more than once")]
+    Duplicate { route: PublicationRoute },
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum PublicationRouteOwnershipError {
+    #[error(transparent)]
+    InvalidRouteSet(#[from] PublicationRouteSetError),
+    #[error("publication route {route} is permanently owned by another post")]
+    Conflict { route: PublicationRoute },
+    #[error("publication route ownership could not be queried")]
+    Query(#[from] sqlx::Error),
 }
 
 pub(crate) enum PublicationMutationError {
@@ -2558,6 +2899,39 @@ mod tests {
     const PUBLICATION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+    #[test]
+    fn publication_route_kinds_have_stable_storage_encodings() {
+        assert_eq!(PublicationRouteKind::Post.as_str(), "post");
+        assert_eq!(PublicationRouteKind::Alias.as_str(), "alias");
+    }
+
+    #[test]
+    fn publication_route_set_rejects_typed_duplicate_routes() {
+        let slug = PostSlug::parse("same-route").unwrap();
+        let aliases = [PostAlias::parse("same-route").unwrap()];
+
+        assert_eq!(
+            validate_publication_routes(&slug, &aliases),
+            Err(PublicationRouteSetError::Duplicate {
+                route: PublicationRoute::Alias(aliases[0].clone()),
+            })
+        );
+    }
+
+    #[test]
+    fn publication_route_set_rejects_one_route_over_the_limit() {
+        let slug = PostSlug::parse("canonical").unwrap();
+        let aliases = vec![PostAlias::parse("alias").unwrap(); MAX_PUBLIC_ROUTES];
+
+        assert_eq!(
+            validate_publication_routes(&slug, &aliases),
+            Err(PublicationRouteSetError::TooManyAliases {
+                count: MAX_PUBLIC_ROUTES,
+                maximum: MAX_PUBLIC_ROUTES - 1,
+            })
+        );
+    }
+
     async fn startup_store() -> (PublicationStore, SqlitePool) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -2578,6 +2952,12 @@ mod tests {
                 publication_status TEXT NOT NULL, first_observed_at_ns INTEGER NOT NULL, \
                 slug TEXT NOT NULL, source_commit BLOB, \
                 PRIMARY KEY (stable_post_id, revision_digest)\
+             ) STRICT",
+            "CREATE TABLE publication_routes (\
+                route TEXT PRIMARY KEY, stable_post_id BLOB NOT NULL, \
+                revision_digest BLOB NOT NULL, kind TEXT NOT NULL, claimed_at_ns INTEGER NOT NULL, \
+                FOREIGN KEY (stable_post_id, revision_digest) \
+                    REFERENCES post_revisions (stable_post_id, revision_digest)\
              ) STRICT",
             "CREATE TABLE canonical_publications (\
                 publication_id BLOB PRIMARY KEY, creation_key BLOB UNIQUE, \
@@ -2601,6 +2981,148 @@ mod tests {
         }
         let (mutations, _receiver) = mpsc::channel(1);
         (PublicationStore::new(pool.clone(), mutations), pool)
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_malformed_publication_route_claims() {
+        let (store, pool) = startup_store().await;
+        let post_id = uuid_bytes(POST_ID);
+        let revision = [0x11_u8; 32];
+        sqlx::query(
+            "INSERT INTO post_revisions (\
+                stable_post_id, revision_digest, publication_status, first_observed_at_ns, slug\
+             ) VALUES (?, ?, 'publishable', 1, 'valid-route')",
+        )
+        .bind(&post_id)
+        .bind(revision.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO publication_routes (\
+                route, stable_post_id, revision_digest, kind, claimed_at_ns\
+             ) VALUES ('valid-route', ?, ?, 'unknown', 1)",
+        )
+        .bind(&post_id)
+        .bind(revision.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            store.startup_snapshot_state().await,
+            Err(StartupSnapshotLoadError::InvalidPublicationRouteKind)
+        ));
+        sqlx::query("UPDATE publication_routes SET kind = 'post', route = 'INVALID ROUTE'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.startup_snapshot_state().await,
+            Err(StartupSnapshotLoadError::InvalidPublicationRoute)
+        ));
+        sqlx::query("DELETE FROM publication_routes")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let invalid_owner = [0x22_u8; 15];
+        let owner_revision = [0x22_u8; 32];
+        sqlx::query(
+            "INSERT INTO post_revisions (\
+                stable_post_id, revision_digest, publication_status, first_observed_at_ns, slug\
+             ) VALUES (?, ?, 'publishable', 2, 'owner-route')",
+        )
+        .bind(invalid_owner.as_slice())
+        .bind(owner_revision.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO publication_routes (\
+                route, stable_post_id, revision_digest, kind, claimed_at_ns\
+             ) VALUES ('owner-route', ?, ?, 'post', 2)",
+        )
+        .bind(invalid_owner.as_slice())
+        .bind(owner_revision.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.startup_snapshot_state().await,
+            Err(StartupSnapshotLoadError::InvalidPublicationRouteOwner)
+        ));
+
+        sqlx::query("DELETE FROM publication_routes")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let invalid_revision = [0x33_u8; 31];
+        sqlx::query(
+            "INSERT INTO post_revisions (\
+                stable_post_id, revision_digest, publication_status, first_observed_at_ns, slug\
+             ) VALUES (?, ?, 'publishable', 3, 'revision-route')",
+        )
+        .bind(&post_id)
+        .bind(invalid_revision.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO publication_routes (\
+                route, stable_post_id, revision_digest, kind, claimed_at_ns\
+             ) VALUES ('revision-route', ?, ?, 'post', 3)",
+        )
+        .bind(&post_id)
+        .bind(invalid_revision.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.startup_snapshot_state().await,
+            Err(StartupSnapshotLoadError::InvalidPublicationRouteRevision)
+        ));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn startup_validates_publication_route_claims_after_the_first_batch() {
+        let (store, pool) = startup_store().await;
+        let post_id = uuid_bytes(POST_ID);
+        let revision = [0x44_u8; 32];
+        sqlx::query(
+            "INSERT INTO post_revisions (\
+                stable_post_id, revision_digest, publication_status, first_observed_at_ns, slug\
+             ) VALUES (?, ?, 'publishable', 1, 'canonical')",
+        )
+        .bind(&post_id)
+        .bind(revision.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut insert = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO publication_routes (\
+                route, stable_post_id, revision_digest, kind, claimed_at_ns) ",
+        );
+        insert.push_values(0..=500, |mut values, index| {
+            let route = if index == 500 {
+                "zz invalid".to_owned()
+            } else {
+                format!("route-{index:04}")
+            };
+            values
+                .push_bind(route)
+                .push_bind(post_id.as_slice())
+                .push_bind(revision.as_slice())
+                .push_bind("alias")
+                .push_bind(1_i64);
+        });
+        insert.build().execute(&pool).await.unwrap();
+
+        assert!(matches!(
+            store.startup_snapshot_state().await,
+            Err(StartupSnapshotLoadError::InvalidPublicationRoute)
+        ));
+        pool.close().await;
     }
 
     async fn insert_site_head(pool: &SqlitePool, digest: &[u8], version: i64) {
@@ -2681,6 +3203,111 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    fn published_route_view(revision: u8) -> CanonicalPublicationView {
+        let revision = PostRevisionDigest::from_bytes([revision; 32]);
+        CanonicalPublicationView {
+            state: CanonicalState::Published,
+            stable_post_id: PostId::parse(POST_ID).unwrap(),
+            pinned_post_digest: revision.clone(),
+            source_commit: None,
+            scheduled_at: OffsetDateTime::from_unix_timestamp(10).unwrap(),
+            activation_started_at: Some(OffsetDateTime::from_unix_timestamp(20).unwrap()),
+            published_at: Some(OffsetDateTime::from_unix_timestamp(20).unwrap()),
+            current_published_digest: Some(revision),
+            block_reason: None,
+            version: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn same_post_can_change_a_durable_route_between_alias_and_canonical_use() {
+        let (_store, pool) = startup_store().await;
+        for (revision, observed_at) in [(0x11_u8, 1_i64), (0x12, 2), (0x13, 3)] {
+            sqlx::query(
+                "INSERT INTO post_revisions (\
+                    stable_post_id, revision_digest, publication_status, first_observed_at_ns, slug\
+                 ) VALUES (?, ?, 'publishable', ?, 'changing-route')",
+            )
+            .bind(uuid_bytes(POST_ID))
+            .bind([revision; 32].as_slice())
+            .bind(observed_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let alias = PostAlias::parse("changing-route").unwrap();
+        let slug = PostSlug::parse("changing-route").unwrap();
+
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(
+            claim_publication_route(
+                &mut transaction,
+                PublicationRouteRef::Alias(&alias),
+                &published_route_view(0x11),
+                100,
+            )
+            .await
+            .is_ok()
+        );
+        transaction.commit().await.unwrap();
+
+        let second = published_route_view(0x12);
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(
+            advance_owned_routes(&mut transaction, &second)
+                .await
+                .is_ok()
+        );
+        assert!(
+            claim_publication_route(
+                &mut transaction,
+                PublicationRouteRef::Canonical(&slug),
+                &second,
+                200,
+            )
+            .await
+            .is_ok()
+        );
+        transaction.commit().await.unwrap();
+        let canonical: (Vec<u8>, Vec<u8>, String, i64) = sqlx::query_as(
+            "SELECT stable_post_id, revision_digest, kind, claimed_at_ns \
+             FROM publication_routes WHERE route = 'changing-route'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(canonical.0, uuid_bytes(POST_ID));
+        assert_eq!(canonical.1, [0x12; 32]);
+        assert_eq!(canonical.2, PublicationRouteKind::Post.as_str());
+        assert_eq!(canonical.3, 100);
+
+        let third = published_route_view(0x13);
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(advance_owned_routes(&mut transaction, &third).await.is_ok());
+        assert!(
+            claim_publication_route(
+                &mut transaction,
+                PublicationRouteRef::Alias(&alias),
+                &third,
+                300,
+            )
+            .await
+            .is_ok()
+        );
+        transaction.commit().await.unwrap();
+        let alias_kind: (Vec<u8>, String, i64) = sqlx::query_as(
+            "SELECT revision_digest, kind, claimed_at_ns \
+             FROM publication_routes WHERE route = 'changing-route'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(alias_kind.0, [0x13; 32]);
+        assert_eq!(alias_kind.1, PublicationRouteKind::Alias.as_str());
+        assert_eq!(alias_kind.2, 100);
+        pool.close().await;
     }
 
     async fn insert_clock_rollback_history(pool: &SqlitePool) -> ([u8; 32], [u8; 32]) {

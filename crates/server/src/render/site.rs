@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::{self, Write as _},
     sync::Arc,
 };
@@ -11,7 +11,7 @@ use markdown_compiler::identity::{
 };
 use markdown_compiler::{
     AssetDigest, AssetRevisionReference, DefaultPostTipPolicy, DigestedAsset, DraftStatus,
-    LogicalAssetPath, PostDescription, PostId, PostRevisionDigest, PostSlug, PostTag,
+    LogicalAssetPath, PostAlias, PostDescription, PostId, PostRevisionDigest, PostSlug, PostTag,
     PostTipPolicy, PostTitle, PreviewDigest, PublicationSettings, ResolvedLocalAssetStore,
     ResolvedPostAssets, RevisionIdentityError, SiteShellRendererIdentity, SiteSnapshotDigest,
 };
@@ -23,8 +23,8 @@ use time::OffsetDateTime;
 
 use crate::domain::profile::TipRecipientProjection;
 use crate::domain::publication::{
-    CanonicalSiteUrl, PublicLedgerProjection, PublicPagePath, PublishedPostRevision,
-    assets::AssetDelivery,
+    CanonicalSiteUrl, MAX_PUBLIC_ROUTES, PublicLedgerProjection, PublicPagePath,
+    PublishedPostRevision, assets::AssetDelivery,
 };
 use crate::frontend_assets::FrontendAssetManifest;
 
@@ -37,7 +37,6 @@ use super::sitemap::{RenderedSitemap, SitemapRenderError, render_sitemap};
 use super::{ContentCatalog, GeneratedPostAsset, RenderedPost, SnapshotAssetPath};
 
 const MAX_PAGE_BYTES: usize = 40 * 1024 * 1024;
-const MAX_PUBLIC_ROUTES: usize = 50_000;
 const MAX_RETAINED_HTML_BYTES: usize = 512 * 1024 * 1024;
 const MAX_PUBLIC_ASSETS: usize = 50_000;
 const MAX_RETAINED_ASSET_BYTES: usize = 512 * 1024 * 1024;
@@ -71,10 +70,11 @@ struct PublicPostView {
     slug: PostSlug,
     description: PostDescription,
     tags: Arc<[PostTag]>,
+    aliases: Arc<[PostAlias]>,
     authored_at: OffsetDateTime,
     updated_at: Option<OffsetDateTime>,
     published_at: OffsetDateTime,
-    canonical_url: CanonicalSiteUrl,
+    canonical_url: Arc<CanonicalSiteUrl>,
     tips: PostTipPolicy,
 }
 
@@ -93,10 +93,14 @@ impl PublicPostView {
             slug: metadata.slug.clone(),
             description: metadata.description.clone(),
             tags: Arc::from(metadata.tags.as_slice()),
+            aliases: Arc::from(metadata.aliases.as_slice()),
             authored_at: metadata.authored_at,
             updated_at: metadata.updated_at,
             published_at: entry.published_at,
-            canonical_url: CanonicalSiteUrl::for_path(&publication.site.base_url, &path),
+            canonical_url: Arc::new(CanonicalSiteUrl::for_path(
+                &publication.site.base_url,
+                &path,
+            )),
             tips: metadata.tips,
         }
     }
@@ -118,6 +122,7 @@ pub struct RenderedSiteShell {
     posts: Arc<[PublicPostView]>,
     chronology: Arc<[usize]>,
     tags: BTreeMap<PostTag, Arc<[usize]>>,
+    redirects: BTreeMap<PostAlias, Arc<CanonicalSiteUrl>>,
     feed: RenderedRssFeed,
     robots: RenderedRobots,
     sitemap: RenderedSitemap,
@@ -132,6 +137,7 @@ impl fmt::Debug for RenderedSiteShell {
             .field("ledger_entries", &self.ledger.len())
             .field("posts", &self.posts.len())
             .field("tags", &self.tags.len())
+            .field("redirects", &self.redirects.len())
             .field("feed_digest", &self.feed.digest)
             .field("robots_digest", &self.robots.digest)
             .field("sitemap_digest", &self.sitemap.digest)
@@ -150,7 +156,12 @@ pub fn render_site_shell(
     let posts = select_public_posts(&catalog, ledger)?;
     let chronology = chronology(&posts);
     let tags = tag_index(&posts, &chronology);
-    validate_route_count(posts.len(), tags.len())?;
+    let alias_count = posts
+        .iter()
+        .try_fold(0_usize, |count, post| count.checked_add(post.aliases.len()));
+    let alias_count = alias_count.ok_or_else(SiteSnapshotBuildError::route_limit)?;
+    validate_route_count(posts.len(), tags.len(), alias_count)?;
+    let redirects = alias_redirect_index(&posts)?;
     let feed = render_public_feed(&catalog.publication, &posts, &chronology)?;
     let sitemap = render_public_sitemap(&catalog.publication, &posts, &tags)?;
     let robots = render_public_robots(&catalog.publication)?;
@@ -162,6 +173,7 @@ pub fn render_site_shell(
         &posts,
         &chronology,
         &tags,
+        &redirects,
         DiscoveryDocuments {
             feed: &feed,
             robots: &robots,
@@ -177,6 +189,7 @@ pub fn render_site_shell(
         posts: posts.into(),
         chronology: chronology.into(),
         tags,
+        redirects,
         feed,
         robots,
         sitemap,
@@ -337,6 +350,7 @@ fn select_public_posts(
     ledger: &PublicLedgerProjection,
 ) -> Result<Vec<PublicPostView>, SiteSnapshotBuildError> {
     let mut posts = Vec::with_capacity(ledger.len());
+    let mut known_route_count = FIXED_PUBLIC_ROUTES;
     for entry in ledger.published_posts() {
         let Some(rendered) = catalog.get(&entry.post_id, &entry.revision) else {
             return Err(SiteSnapshotBuildError::post(
@@ -352,6 +366,11 @@ fn select_public_posts(
                 "the public ledger selected a draft revision",
             ));
         }
+        known_route_count = known_route_count
+            .checked_add(1)
+            .and_then(|count| count.checked_add(rendered.document.metadata.aliases.len()))
+            .filter(|count| *count <= MAX_PUBLIC_ROUTES)
+            .ok_or_else(SiteSnapshotBuildError::route_limit)?;
         posts.push(PublicPostView::from_rendered(
             rendered,
             entry,
@@ -382,6 +401,32 @@ fn tag_index(posts: &[PublicPostView], chronology: &[usize]) -> BTreeMap<PostTag
     tags.into_iter()
         .map(|(tag, posts)| (tag, posts.into()))
         .collect()
+}
+
+fn alias_redirect_index(
+    posts: &[PublicPostView],
+) -> Result<BTreeMap<PostAlias, Arc<CanonicalSiteUrl>>, SiteSnapshotBuildError> {
+    let canonical_slugs: BTreeSet<_> = posts.iter().map(|post| post.slug.as_str()).collect();
+    let mut redirects = BTreeMap::new();
+    for post in posts {
+        for alias in &*post.aliases {
+            if canonical_slugs.contains(alias.as_str())
+                || redirects
+                    .insert(alias.clone(), Arc::clone(&post.canonical_url))
+                    .is_some()
+            {
+                return Err(SiteSnapshotBuildError::post(
+                    SiteSnapshotBuildErrorCode::RouteCollision,
+                    post.post_id.clone(),
+                    format!(
+                        "published alias {} conflicts with another public post route",
+                        alias.as_str()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(redirects)
 }
 
 fn render_public_feed(
@@ -429,9 +474,14 @@ fn render_public_robots(
     render_robots(&sitemap_url).map_err(SiteSnapshotBuildError::robots)
 }
 
-fn validate_route_count(posts: usize, tags: usize) -> Result<(), SiteSnapshotBuildError> {
+fn validate_route_count(
+    posts: usize,
+    tags: usize,
+    aliases: usize,
+) -> Result<(), SiteSnapshotBuildError> {
     let routes = posts
         .checked_add(tags)
+        .and_then(|count| count.checked_add(aliases))
         .and_then(|count| count.checked_add(FIXED_PUBLIC_ROUTES))
         .ok_or_else(SiteSnapshotBuildError::route_limit)?;
     if routes > MAX_PUBLIC_ROUTES {
@@ -446,6 +496,7 @@ fn render_pre_injection_shell(
     posts: &[PublicPostView],
     chronology: &[usize],
     tags: &BTreeMap<PostTag, Arc<[usize]>>,
+    redirects: &BTreeMap<PostAlias, Arc<CanonicalSiteUrl>>,
     discovery: DiscoveryDocuments<'_>,
 ) -> Result<SiteShellOutputDigest, SiteSnapshotBuildError> {
     let mut pages = BTreeMap::new();
@@ -459,6 +510,12 @@ fn render_pre_injection_shell(
     }
     for tag in tags.keys() {
         pages.insert(PublicPagePath::tag(tag), PreInjectionPage::Tag(tag));
+    }
+    for (alias, target) in redirects {
+        pages.insert(
+            PublicPagePath::post_alias(alias),
+            PreInjectionPage::Redirect(target.as_ref()),
+        );
     }
     pages.insert(
         PublicPagePath::error_identity_marker("not-found"),
@@ -524,6 +581,10 @@ fn render_pre_injection_shell(
                 )
                 .into_string(),
             ),
+            PreInjectionPage::Redirect(target) => {
+                hasher.page(path.as_str(), target.as_str().as_bytes());
+                Ok(())
+            }
             PreInjectionPage::Error(error) => hash_pre_injection_html(
                 &mut hasher,
                 &mut retained,
@@ -563,6 +624,7 @@ enum PreInjectionPage<'view> {
     Sitemap,
     Post(usize),
     Tag(&'view PostTag),
+    Redirect(&'view CanonicalSiteUrl),
     Error(PublicErrorPage),
 }
 
@@ -614,8 +676,10 @@ pub fn build_site_snapshot(
     let robots = shell.robots.clone();
     let sitemap = shell.sitemap.clone();
     let assets = collect_public_assets(&shell, &digest)?;
+    let redirects = shell.redirects;
     let presentation_digest = presentation_digest(
         &pages,
+        &redirects,
         &not_found,
         &method_not_allowed,
         &feed,
@@ -630,6 +694,7 @@ pub fn build_site_snapshot(
         robots,
         sitemap,
         pages,
+        redirects,
         not_found,
         method_not_allowed,
         assets,
@@ -1065,6 +1130,7 @@ impl fmt::Display for PresentationDigest {
 
 fn presentation_digest(
     pages: &BTreeMap<PageRoute, RenderedPage>,
+    redirects: &BTreeMap<PostAlias, Arc<CanonicalSiteUrl>>,
     not_found: &RenderedPage,
     method_not_allowed: &RenderedPage,
     feed: &RenderedRssFeed,
@@ -1076,6 +1142,14 @@ fn presentation_digest(
     for (route, page) in pages {
         hash_presentation_part(&mut hasher, route.public_path().as_str().as_bytes());
         hash_presentation_part(&mut hasher, page.html.as_bytes());
+    }
+    hash_presentation_part(&mut hasher, &(redirects.len() as u64).to_be_bytes());
+    for (alias, target) in redirects {
+        hash_presentation_part(
+            &mut hasher,
+            PublicPagePath::post_alias(alias).as_str().as_bytes(),
+        );
+        hash_presentation_part(&mut hasher, target.as_str().as_bytes());
     }
     hash_presentation_part(&mut hasher, b"not-found");
     hash_presentation_part(&mut hasher, not_found.html.as_bytes());
@@ -1110,6 +1184,7 @@ pub struct SiteSnapshot {
     pub(crate) robots: RenderedRobots,
     pub(crate) sitemap: RenderedSitemap,
     pages: BTreeMap<PageRoute, RenderedPage>,
+    redirects: BTreeMap<PostAlias, Arc<CanonicalSiteUrl>>,
     not_found: RenderedPage,
     method_not_allowed: RenderedPage,
     assets: BTreeMap<SnapshotAssetPath, SnapshotPublicAsset>,
@@ -1127,6 +1202,7 @@ impl fmt::Debug for SiteSnapshot {
             .field("robots_digest", &self.robots.digest)
             .field("sitemap_digest", &self.sitemap.digest)
             .field("pages", &self.pages.len())
+            .field("redirects", &self.redirects.len())
             .field("assets", &self.assets.len())
             .field("retained_html_bytes", &self.retained_html_bytes)
             .finish_non_exhaustive()
@@ -1142,6 +1218,10 @@ impl SiteSnapshot {
 
     pub(crate) fn public_asset(&self, path: &SnapshotAssetPath) -> Option<&SnapshotPublicAsset> {
         self.assets.get(path)
+    }
+
+    pub(crate) fn alias_target(&self, alias: &PostAlias) -> Option<&CanonicalSiteUrl> {
+        self.redirects.get(alias).map(Arc::as_ref)
     }
 
     pub(crate) fn index_page(&self) -> Arc<str> {
@@ -1911,10 +1991,15 @@ mod tests {
         revisions: BTreeMap<PostId, PostRevisionDigest>,
     }
 
+    struct PostRoutes<'route> {
+        slug: &'route str,
+        aliases: &'route [&'route str],
+    }
+
     fn post_source(
         id: &str,
         title: &str,
-        slug: &str,
+        routes: PostRoutes<'_>,
         tags: &[&str],
         image: Option<&str>,
         body: &str,
@@ -1925,7 +2010,14 @@ mod tests {
             .map(|tag| format!("{tag:?}"))
             .collect::<Vec<_>>()
             .join(", ");
+        let aliases = routes
+            .aliases
+            .iter()
+            .map(|alias| format!("{alias:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let image = image.map_or_else(String::new, |path| format!("image = {path:?}\n"));
+        let slug = routes.slug;
         format!(
             "+++\n\
              id = {id:?}\n\
@@ -1936,6 +2028,7 @@ mod tests {
              description = \"Description <unsafe> & text.\"\n\
              {image}\
              tags = [{tags}]\n\
+             aliases = [{aliases}]\n\
              draft = {draft}\n\
              +++\n\
              {body}"
@@ -1950,6 +2043,24 @@ mod tests {
     }
 
     fn fixture_with_first(first_body: &str, public_asset: &[u8]) -> Fixture {
+        fixture_with_routes(
+            first_body,
+            public_asset,
+            "first-post",
+            &["original-first-post"],
+            "second-post",
+            &["original-second-post"],
+        )
+    }
+
+    fn fixture_with_routes(
+        first_body: &str,
+        public_asset: &[u8],
+        first_slug: &str,
+        first_aliases: &[&str],
+        second_slug: &str,
+        second_aliases: &[&str],
+    ) -> Fixture {
         let publication_source = "[site]\n\
              title = \"Site <unsafe> & title\"\n\
              base_url = \"https://blog.example.com/\"\n\
@@ -1966,7 +2077,10 @@ mod tests {
                     post_source(
                         FIRST_ID,
                         "First <script>alert(1)</script>",
-                        "first-post",
+                        PostRoutes {
+                            slug: first_slug,
+                            aliases: first_aliases,
+                        },
                         &["rust"],
                         Some("assets/first-cover.png"),
                         first_body,
@@ -1979,7 +2093,10 @@ mod tests {
                     post_source(
                         SECOND_ID,
                         "Second post",
-                        "second-post",
+                        PostRoutes {
+                            slug: second_slug,
+                            aliases: second_aliases,
+                        },
                         &["rust", "sqlite"],
                         Some("assets/second-cover.png"),
                         "# Second\n![private](assets/private.png)\n",
@@ -1992,7 +2109,10 @@ mod tests {
                     post_source(
                         DRAFT_ID,
                         "Draft post",
-                        "draft-post",
+                        PostRoutes {
+                            slug: "draft-post",
+                            aliases: &["draft-post-alias"],
+                        },
                         &["draft-tag"],
                         Some("assets/draft-cover.png"),
                         "# Draft\n![draft](assets/draft.png)\n",
@@ -2733,6 +2853,115 @@ mod tests {
     }
 
     #[test]
+    fn mixed_retained_revisions_reject_alias_route_collisions_without_touching_the_active_snapshot()
+    {
+        for (second_slug, second_aliases) in [
+            ("shared-route", &["current-second-alias"][..]),
+            ("current-second", &["shared-route"][..]),
+        ] {
+            let prior = fixture_with_routes(
+                "# Prior first\n",
+                b"prior public bytes",
+                "prior-first",
+                &["shared-route"],
+                "prior-second",
+                &["prior-second-alias"],
+            );
+            let mut current = fixture_with_routes(
+                "# Current first\n",
+                b"current public bytes",
+                "current-first",
+                &["current-first-alias"],
+                second_slug,
+                second_aliases,
+            );
+            let ledger = projection([
+                entry(&prior, FIRST_ID, 1_000),
+                entry(&current, SECOND_ID, 2_000),
+            ]);
+            Arc::make_mut(&mut current.catalog)
+                .retain_revisions_from(&prior.catalog, ledger.revision_keys())
+                .unwrap();
+
+            let active = build_snapshot(&current, &PublicLedgerProjection::empty()).unwrap();
+            let (reader, _activator) = snapshot_store(active);
+            let before = reader.load_full();
+            let error =
+                render_site_shell(Arc::clone(&current.catalog), embedded_manifest(), &ledger)
+                    .unwrap_err();
+
+            assert_eq!(error.code, SiteSnapshotBuildErrorCode::RouteCollision);
+            assert!(Arc::ptr_eq(&before, &reader.load_full()));
+        }
+    }
+
+    #[test]
+    fn snapshot_activation_replaces_canonical_and_authored_alias_routes_together() {
+        let prior = fixture_with_routes(
+            "# Prior first\n",
+            b"prior public bytes",
+            "first-post",
+            &["original-first-post"],
+            "second-post",
+            &["original-second-post"],
+        );
+        let current = fixture_with_routes(
+            "# Current first\n",
+            b"current public bytes",
+            "renamed-first-post",
+            &["first-post"],
+            "second-post",
+            &["original-second-post"],
+        );
+        let prior_ledger = projection([entry(&prior, FIRST_ID, 1_000)]);
+        let current_ledger = projection([entry(&current, FIRST_ID, 1_000)]);
+        let old = build_snapshot(&prior, &prior_ledger).unwrap();
+        let old_digest = old.digest.clone();
+        let next = build_snapshot(&current, &current_ledger).unwrap();
+        let (reader, mut activator) = snapshot_store(old);
+
+        let observed = reader.load_full();
+        assert!(
+            observed
+                .post_page(&PostSlug::parse("first-post").unwrap())
+                .is_some()
+        );
+        assert!(
+            observed
+                .alias_target(&PostAlias::parse("first-post").unwrap())
+                .is_none()
+        );
+
+        assert_eq!(
+            activator.activate(&old_digest, next).unwrap(),
+            SnapshotActivationOutcome::Activated
+        );
+        let observed = reader.load_full();
+        assert!(
+            observed
+                .post_page(&PostSlug::parse("first-post").unwrap())
+                .is_none()
+        );
+        assert!(
+            observed
+                .post_page(&PostSlug::parse("renamed-first-post").unwrap())
+                .is_some()
+        );
+        assert_eq!(
+            observed
+                .alias_target(&PostAlias::parse("first-post").unwrap())
+                .unwrap()
+                .as_str(),
+            "https://blog.example.com/posts/renamed-first-post"
+        );
+        assert!(
+            observed
+                .alias_target(&PostAlias::parse("original-first-post").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn asset_collection_covers_each_source_dedupes_and_fails_closed() {
         let fixture = fixture();
         let favicon = catalog_asset(&fixture, "assets/favicon.png");
@@ -2909,6 +3138,7 @@ mod tests {
         let posts = select_public_posts(&fixture.catalog, &ledger).unwrap();
         let chronology = chronology(&posts);
         let tags = tag_index(&posts, &chronology);
+        let redirects = alias_redirect_index(&posts).unwrap();
         let feed = render_public_feed(&fixture.catalog.publication, &posts, &chronology).unwrap();
         let sitemap = render_public_sitemap(&fixture.catalog.publication, &posts, &tags).unwrap();
         let robots = render_public_robots(&fixture.catalog.publication).unwrap();
@@ -2918,6 +3148,7 @@ mod tests {
             &posts,
             &chronology,
             &tags,
+            &redirects,
             DiscoveryDocuments {
                 feed: &feed,
                 robots: &robots,
@@ -2933,6 +3164,7 @@ mod tests {
             &posts,
             &chronology,
             &tags,
+            &redirects,
             DiscoveryDocuments {
                 feed: &changed_feed,
                 robots: &robots,
@@ -2948,6 +3180,7 @@ mod tests {
             &posts,
             &chronology,
             &tags,
+            &redirects,
             DiscoveryDocuments {
                 feed: &feed,
                 robots: &changed_robots,
@@ -2963,6 +3196,7 @@ mod tests {
             &posts,
             &chronology,
             &tags,
+            &redirects,
             DiscoveryDocuments {
                 feed: &feed,
                 robots: &robots,
@@ -2970,10 +3204,33 @@ mod tests {
             },
         )
         .unwrap();
+        let mut changed_redirects = redirects.clone();
+        changed_redirects.insert(
+            PostAlias::parse("original-first-post").unwrap(),
+            Arc::new(CanonicalSiteUrl::for_path(
+                &fixture.catalog.publication.site.base_url,
+                &PublicPagePath::post(&PostSlug::parse("changed-target").unwrap()),
+            )),
+        );
+        let redirects_changed = render_pre_injection_shell(
+            &fixture.catalog.publication,
+            embedded_manifest(),
+            &posts,
+            &chronology,
+            &tags,
+            &changed_redirects,
+            DiscoveryDocuments {
+                feed: &feed,
+                robots: &robots,
+                sitemap: &sitemap,
+            },
+        )
+        .unwrap();
 
         assert_ne!(original, feed_changed);
         assert_ne!(original, robots_changed);
         assert_ne!(original, sitemap_changed);
+        assert_ne!(original, redirects_changed);
     }
 
     #[test]
@@ -2985,9 +3242,18 @@ mod tests {
         changed_robots.body = format!("{}\n", snapshot.robots.body).into();
         let mut changed_sitemap = snapshot.sitemap.clone();
         changed_sitemap.body = format!("{}\n", snapshot.sitemap.body).into();
+        let mut changed_redirects = snapshot.redirects.clone();
+        changed_redirects.insert(
+            PostAlias::parse("original-first-post").unwrap(),
+            Arc::new(CanonicalSiteUrl::for_path(
+                &fixture.catalog.publication.site.base_url,
+                &PublicPagePath::post(&PostSlug::parse("changed-target").unwrap()),
+            )),
+        );
 
         let robots_changed = presentation_digest(
             &snapshot.pages,
+            &snapshot.redirects,
             &snapshot.not_found,
             &snapshot.method_not_allowed,
             &snapshot.feed,
@@ -2996,15 +3262,26 @@ mod tests {
         );
         let sitemap_changed = presentation_digest(
             &snapshot.pages,
+            &snapshot.redirects,
             &snapshot.not_found,
             &snapshot.method_not_allowed,
             &snapshot.feed,
             &snapshot.robots,
             &changed_sitemap,
         );
+        let redirects_changed = presentation_digest(
+            &snapshot.pages,
+            &changed_redirects,
+            &snapshot.not_found,
+            &snapshot.method_not_allowed,
+            &snapshot.feed,
+            &snapshot.robots,
+            &snapshot.sitemap,
+        );
 
         assert_ne!(snapshot.presentation_digest, robots_changed);
         assert_ne!(snapshot.presentation_digest, sitemap_changed);
+        assert_ne!(snapshot.presentation_digest, redirects_changed);
     }
 
     #[test]
@@ -3034,6 +3311,7 @@ mod tests {
         page.html = html.into();
         next.presentation_digest = presentation_digest(
             &next.pages,
+            &next.redirects,
             &next.not_found,
             &next.method_not_allowed,
             &next.feed,
@@ -3103,9 +3381,9 @@ mod tests {
             validate_page_size(MAX_PAGE_BYTES + 1).unwrap_err().code,
             SiteSnapshotBuildErrorCode::PageLimitExceeded
         );
-        assert!(validate_route_count(MAX_PUBLIC_ROUTES - FIXED_PUBLIC_ROUTES, 0).is_ok());
+        assert!(validate_route_count(0, 0, MAX_PUBLIC_ROUTES - FIXED_PUBLIC_ROUTES).is_ok());
         assert_eq!(
-            validate_route_count(MAX_PUBLIC_ROUTES - FIXED_PUBLIC_ROUTES + 1, 0)
+            validate_route_count(0, 0, MAX_PUBLIC_ROUTES - FIXED_PUBLIC_ROUTES + 1)
                 .unwrap_err()
                 .code,
             SiteSnapshotBuildErrorCode::RouteLimitExceeded

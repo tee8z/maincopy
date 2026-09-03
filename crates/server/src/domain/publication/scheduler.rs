@@ -13,7 +13,10 @@ use super::{
         PublicationActivationError, PublicationCoordinatorHandle,
         PublicationCoordinatorUnavailable, PublishedPublication,
     },
-    store::{PublicationStore, ScheduledPublication, StartupSnapshotLoadError},
+    store::{
+        PublicationRouteOwnershipError, PublicationStore, ScheduledPublication,
+        StartupSnapshotLoadError,
+    },
 };
 
 const RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -155,7 +158,7 @@ fn retryable(error: &PublicationActivationError) -> bool {
                 | DatabaseMutationError::Command(
                     DatabaseCommandError::IdempotencyConflict | DatabaseCommandError::Rejected
                 )
-        )
+        ) | PublicationActivationError::RouteOwnership(PublicationRouteOwnershipError::Query(_))
     )
 }
 
@@ -205,7 +208,9 @@ pub(crate) enum PublicationSchedulerError {
 mod tests {
     use std::{future::Future, path::Path};
 
-    use markdown_compiler::{ContentTreeDigest, PostCollection, PostId, resolve_content_assets};
+    use markdown_compiler::{
+        ContentTreeDigest, PostCollection, PostId, PostSlug, resolve_content_assets,
+    };
     use tokio::task::JoinHandle;
 
     use super::*;
@@ -219,7 +224,10 @@ mod tests {
         domain::publication::{
             PublicLedgerProjection,
             activation::{PublicationCoordinator, observed_post_revisions},
-            store::{CommandIdempotencyKey, InstallStartupSnapshot, SchedulePublication},
+            store::{
+                CommandIdempotencyKey, InstallStartupSnapshot, PublicationRoute,
+                SchedulePublication,
+            },
         },
         frontend_assets::embedded_manifest,
         render::{
@@ -369,6 +377,9 @@ mod tests {
                     source_commit: None,
                     content_digest: self.coordinator.content_digest.clone(),
                     accepted_preview_digest,
+                    slug: rendered.document.metadata.slug.clone(),
+                    aliases: rendered.document.metadata.aliases.clone().into(),
+                    accepted_at: scheduled_at - time::Duration::hours(1),
                     scheduled_at,
                 })
                 .await
@@ -479,13 +490,22 @@ mod tests {
             PublicationActivationError::Database(DatabaseCommandError::OutcomeUnknown.into());
         let invalid =
             PublicationActivationError::Database(DatabaseCommandError::InvalidValue.into());
+        let route_query = PublicationActivationError::RouteOwnership(
+            PublicationRouteOwnershipError::Query(sqlx::Error::PoolTimedOut),
+        );
+        let route_conflict =
+            PublicationActivationError::RouteOwnership(PublicationRouteOwnershipError::Conflict {
+                route: PublicationRoute::Canonical(PostSlug::parse("claimed-route").unwrap()),
+            });
 
         assert!(retryable(&queue_full));
         assert!(retryable(&rejected));
         assert!(retryable(&idempotency_conflict));
+        assert!(retryable(&route_query));
         assert!(!retryable(&writer_closed));
         assert!(!retryable(&uncertain));
         assert!(!retryable(&invalid));
+        assert!(!retryable(&route_conflict));
         assert!(!retryable(
             &PublicationActivationError::DurableStateMismatch
         ));
@@ -555,6 +575,10 @@ mod tests {
         assert!(tokio::time::Instant::now().duration_since(started) >= RETRY_DELAY);
         assert!(readiness.is_ready());
         assert!(running.handle.read().ledger.is_empty());
+        // SQLx's pool acquisition deadline also uses Tokio time. Restore the
+        // real clock before inspecting durable state so automatic advancement
+        // cannot race a returned read connection under parallel test load.
+        tokio::time::resume();
         let durable = running.store.startup_snapshot_state().await.unwrap();
         assert_eq!(durable.scheduled.len(), 1);
         assert_eq!(durable.scheduled[0].publication_id, publication_id);

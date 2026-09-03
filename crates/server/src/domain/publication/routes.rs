@@ -1,11 +1,12 @@
 use std::fmt;
 
-use markdown_compiler::{PostSlug, PostTag, PublicationBaseUrl};
+use markdown_compiler::{PostAlias, PostSlug, PostTag, PublicationBaseUrl};
 use serde::Serialize;
 
 pub(crate) const RSS_FEED_PATH: &str = "/feed.xml";
 pub(crate) const ROBOTS_PATH: &str = "/robots.txt";
 pub(crate) const SITEMAP_PATH: &str = "/sitemap.xml";
+pub(crate) const MAX_PUBLIC_ROUTES: usize = 50_000;
 
 /// A canonical absolute URL derived only from validated publication settings.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -59,6 +60,10 @@ impl PublicPagePath {
 
     pub(crate) fn post(slug: &PostSlug) -> Self {
         Self(format!("/posts/{}", slug.as_str()).into_boxed_str())
+    }
+
+    pub(crate) fn post_alias(alias: &PostAlias) -> Self {
+        Self(format!("/posts/{}", alias.as_str()).into_boxed_str())
     }
 
     pub(crate) fn tag(tag: &PostTag) -> Self {

@@ -38,8 +38,8 @@ release claim.
 | Managed Git synchronization and restricted bootstrap | Planned |
 | Snapshot-backed RSS feed, sitemap, robots policy, and HTML autodiscovery | Implemented foundation |
 | Canonical links, core non-image Open Graph fields, and `BlogPosting` JSON-LD | Implemented foundation |
-| Snapshot-scoped local content assets and conditional application assets | Implemented foundation |
-| Redirects, favicon and image metadata, and page CSP | Planned |
+| Alias redirects, durable route ownership, snapshot-scoped content assets, and conditional application assets | Implemented |
+| Favicon and image metadata and page CSP | Planned |
 | HTTPS admin gateway and admin web interface | Planned |
 | Profile-backed static Lightning Address tips | Implemented foundation |
 | Prometheus registry, loopback `/metrics`, and runtime dashboard | Planned |
@@ -360,6 +360,10 @@ Every slice must preserve these invariants:
     accept no arbitrary SQL, and require exclusive process ownership.
 43. `maincopyd` serves `/metrics` only from a dedicated loopback listener. The
     public and admin routers do not mount this route.
+44. An accepted scheduled release or successful immediate release permanently
+    assigns each canonical slug and authored alias to its stable `PostId`. A
+    reservation does not create public visibility, and cancelling the release
+    does not release its routes.
 
 ### Strong-type policy
 
@@ -591,6 +595,7 @@ A fixed row is binding. Resolve each selection row before its due work starts.
 | Preview precondition | Require an accepted preview digest plus the expected post and site revision for every first-publication or update schedule and publish-now action. | Fixed | 5.1 and 5.3 |
 | Preview evidence | Treat `PreviewDigest` as an exact content and presentation binding, not proof that a person viewed it. The browser UI must show the preview before confirmation; API clients can submit a reproducible correct digest without a prior preview operation. | Fixed | 4.3 and 5.1 |
 | V1 unpublish boundary | A Git deletion or draft change cannot silently retract a live article. Keep its current revision public and show the ineligible source change. Defer an explicit unpublish/retraction workflow. | Fixed | 1.5 |
+| Publication route ownership | Permanently bind each approved canonical slug and authored alias to its stable `PostId`. Scheduled reservations create no public route and survive cancellation. Stop serving routes omitted by the active revision, but never reassign them. Permit route-kind changes only for the same post. | Fixed | 2.3 and 5.2 |
 | V1 outbound boundary | Defer assisted and automatic article distribution, subscription capture, and email delivery. Store no provider credential, job, delivery state, subscriber data, or email-control token. | Fixed | 0.5 and 3.1 |
 | OpenAPI generator | Use `utoipa` schemas plus one `utoipa-axum` registry that creates routes and operations together. | Fixed | 0.1 |
 | Managed source | Use one read-only SSH remote, one branch, one local mirror, polling, and admin `Sync now`. | Fixed | 1.7 |
@@ -1891,21 +1896,46 @@ Tests:
 
 Serve aliases and immutable assets with explicit cache behavior.
 
-Current status: the active `SiteSnapshot` owns the exact bytes for every
-selected local site or published-post asset. The public content-asset route
-accepts only its canonical snapshot-scoped raw path and never reads the source
-tree. It serves allowlisted passive authored media inline; active or unknown
-authored formats and every unsanitized renderer output are inert downloads.
-The authenticated preview route applies the same trust decision while retaining
-`private, no-store` caching. Content and application assets support GET, HEAD,
-strong ETags, weak validator comparison, and immutable caching. Content assets
-also carry `nosniff` and a sandboxing CSP. The content delivery-policy version
-is an input to the site snapshot identity. Alias redirects remain unfinished,
-so this work package is not complete.
+Current status: implemented. The active `SiteSnapshot` owns every serving alias
+route. SQLite owns permanent claims for every approved slug and alias. The
+snapshot also owns the exact bytes for every selected local site or
+published-post asset. The public content-asset route accepts only its canonical
+snapshot-scoped raw path and never reads the source tree. It serves allowlisted
+passive authored media inline. Active, unknown, and unsanitized generated
+formats are inert downloads. The authenticated preview route applies the same
+trust decision with `private, no-store` caching. Content and application assets
+support GET, HEAD, strong ETags, weak validator comparison, and immutable
+caching. Content assets also carry `nosniff` and a sandboxing CSP. The content
+delivery-policy version is an input to the site snapshot identity.
 
 Deliverables:
 
-- Alias redirects to the current canonical slug.
+- Exact authored aliases from each active published revision. An alias that
+  appears only in a candidate, draft, scheduled, or unreleased revision creates
+  no public route.
+- Each accepted schedule reserves its canonical slug and aliases without
+  creating a public route. Cancelling the release does not release those
+  reservations. A successful immediate release claims its routes during
+  activation.
+- Inactive claims retained after a route leaves the active revision. The route
+  stops serving but cannot be reassigned to another post.
+- Canonical-slug to alias and alias to canonical-slug transitions for the same
+  stable post. A route-kind change never changes its owner.
+- Route-ownership validation before the snapshot swap and again inside the
+  serialized publication commit.
+- Alias requests under `/posts/{alias}` return a direct `308 Permanent Redirect`
+  for `GET` and `HEAD`. They include `Cache-Control: no-cache` and an empty body.
+- An absolute `Location` derived only from validated publication configuration
+  and the active revision's current canonical slug.
+- No request-query propagation, automatic old-slug alias, or redirect chain.
+- Exact alias matching. Case variants and trailing-slash variants return
+  `404 Not Found`.
+- Alias routes included in the inclusive 50,000-public-route ceiling.
+- Snapshot rejection for a slug or alias collision across selected retained
+  revisions. Reject a durable claim owned by another stable post. The active
+  snapshot remains unchanged.
+- Canonical-only RSS items, sitemap locations, canonical links, Open Graph URLs,
+  and JSON-LD URLs.
 - Content-asset routes scoped to the active compiled snapshot, with exact bytes
   retained independently of the source checkout.
 - An application-asset route scoped to the generated frontend manifest.
@@ -1928,8 +1958,32 @@ Deliverables:
   MiB of retained asset bytes. Exact duplicate references count once; a
   conflicting identity, bytes, or provenance at one path rejects the snapshot.
 
-Failure tests:
+Tests:
 
+- Return a direct `308 Permanent Redirect` for `GET` and `HEAD` on each exact
+  authored alias of an active published revision.
+- Return an absolute current canonical URL in `Location`, the
+  `Cache-Control: no-cache` policy, and an empty response body.
+- Drop the request query and ignore hostile request authority and forwarding
+  headers when constructing `Location`.
+- Return `404 Not Found` for case variants, trailing-slash variants, unknown
+  aliases, and aliases that appear only in candidate, draft, scheduled, or
+  unreleased revisions.
+- Reserve scheduled slug and alias ownership atomically. Roll back every new
+  reservation if one route conflicts.
+- Remove a route from the active revision and return `404 Not Found` while its
+  durable claim remains owned by the same stable post.
+- Do not synthesize an old-slug alias or follow an alias through another alias.
+- Reject another post that attempts to publish a previously claimed inactive
+  route. Preserve this rejection across restart.
+- Permit one post to change its own claimed route from canonical slug to alias
+  and from alias to canonical slug.
+- Keep alias locations out of RSS, sitemap, canonical links, Open Graph, and
+  JSON-LD output.
+- Count aliases toward the inclusive route limit. Reject one route over the
+  limit without replacing the active snapshot.
+- Reject slug and alias collisions across mixed retained revisions without
+  replacing the active snapshot.
 - Reject unknown snapshot digests, malformed paths, encoded or literal
   traversal attempts, over-limit paths, and unsupported methods.
 - Serve identical snapshot-owned bytes after removing the authored source tree.
@@ -2046,7 +2100,13 @@ Deliverables:
 - No v1 article-distribution, remote-publication, social-credential, remote
   attempt, delivery-lease, or completion table.
 - `site_revisions`, one explicit singleton `site_state`, `post_revisions`, and
-  `published_routes`.
+  `publication_routes`.
+- Permanent `publication_routes` ownership by exact route value and stable
+  `PostId`. Approved canonical slugs and aliases share this namespace.
+- Retention of inactive route claims. A later revision can stop serving a route
+  but cannot release its ownership to another post.
+- Same-post route-kind changes between canonical slug and alias. The writer
+  changes the kind without changing the stable owner.
 - A `reload_operations` ledger for the `Applying`, `Applied`, and `Failed`
   catalog and permitted site-presentation reload states.
 - A `reload_post_changes` ledger with expected and candidate post digests.
@@ -2102,6 +2162,12 @@ Tests:
 - Persist and recover every reload state without inferring the current site
   head from row order.
 - Reject a draft revision as a public-route candidate.
+- Persist canonical-slug and alias ownership through revision changes and
+  restart.
+- Reject reassignment of an inactive claim to another stable post.
+- Permit a route-kind change when the stable post owner does not change.
+- Reject malformed route values, kinds, owners, and revision digests while
+  loading startup state.
 - Prove that the Slice 3 schema contains no release actor field before the
   Slice 4 user and principal schema exists.
 
@@ -2993,7 +3059,8 @@ Deliverables:
 - Atomic creation of an initial or update schedule with the accepted preview
   binding.
 - Atomic cancellation of an eligible scheduled release. Cancelling an update
-  keeps the current public revision unchanged.
+  keeps the current public revision unchanged and preserves every route
+  reservation created when the release was accepted.
 - A version-checked schedule-time update while the record is `Scheduled`.
 - Retention of the accepted preview binding when only the schedule time
   changes.
@@ -3043,6 +3110,8 @@ Tests:
   or no longer reproduce the stored preview digest.
 - Retry a blocked release after its pinned revision becomes available.
 - Cancel a blocked release and create a replacement for a new revision.
+- Cancel a scheduled or blocked release, restart, and reject another `PostId`
+  that requests any retained route reservation.
 - Keep canonical `published_at` absent for scheduled or cancelled initial
   releases. Preserve it while an update release is scheduled, blocked, or
   cancelled.
@@ -3071,11 +3140,18 @@ Deliverables:
 - A durable activation timestamp for public rendering and reconciliation.
 - A pre-claim check that reproduces the accepted preview digest from the
   retained revision and current bound presentation inputs.
+- A pre-swap check that rejects any canonical slug or alias claimed by another
+  stable post.
 - An atomic `Arc` snapshot swap that adds an initial revision or replaces the
   current public revision with an approved update.
 - A later writer command that commits the release as `Published`, updates the
   canonical current digest, assigns original `published_at` only for the
   initial release, and releases no external work.
+- Route-claim validation inside that serialized writer command. The command
+  creates new claims, advances same-post claim metadata, and never reassigns an
+  owner.
+- Retention of claims omitted by an update. Those routes become inactive after
+  the swap but remain reserved to the stable post.
 - A publish-now command that uses the same activation workflow.
 - An `Activating` to `Blocked` command for unavailable activation inputs. A
   blocked update leaves the prior public revision active.
@@ -3103,6 +3179,13 @@ Failure tests:
 - Block an unavailable initial activation without exposing the post. A blocked
   update keeps the prior public article available.
 - Keep the prior public revision live until an update's snapshot swap succeeds.
+- Reject another post's durable route claim before the snapshot swap.
+- Reject a conflicting claim during the serialized finish command if ownership
+  changed after the pre-swap check.
+- Publish same-post canonical-slug and alias transitions without transferring
+  route ownership.
+- Stop serving a removed route after activation. Preserve its claim through
+  restart and reject reassignment to another post.
 - Crash after `Activating` and before the swap.
 - Crash after the swap and before the `Published` commit.
 - Restart and reconcile both crash positions before listener binding.
@@ -4805,6 +4888,12 @@ V1 is ready for owner approval when all of these statements are true:
   ineligible source change.
 - Canonical publication survives activation crashes without early visibility or
   partial public state.
+- Each release-approved canonical slug and authored alias remains permanently
+  owned by its stable `PostId`, including routes reserved by a cancelled
+  schedule. An inactive route returns `404 Not Found` but cannot be assigned to
+  another post.
+- A post can change one of its own claimed routes between canonical-slug and
+  alias use without creating a redirect chain.
 - V1 stores no subscriber or outbound-provider credential and has no email
   transport, article-distribution adapter, provider schedule, delivery worker,
   browser automation, completion tracking, Nostr article signing, or relay

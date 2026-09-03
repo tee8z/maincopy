@@ -12,6 +12,7 @@ pub(crate) mod web;
 
 pub use provenance::{SourceCommit, SourceCommitAlgorithm, SourceCommitParseError};
 pub use routes::CanonicalSiteUrl;
+pub(crate) use routes::MAX_PUBLIC_ROUTES;
 pub(crate) use routes::{PublicPagePath, ROBOTS_PATH, RSS_FEED_PATH, SITEMAP_PATH};
 pub use visibility::{PublicLedgerProjection, PublishedPostRevision};
 

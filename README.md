@@ -20,6 +20,7 @@ V1 has these product boundaries:
 - An administrator previews the exact rendered revision before publication.
 - An administrator can publish now or schedule canonical website visibility.
 - A Git sync cannot silently replace an already published revision.
+- Approved slugs and aliases remain reserved to their stable `PostId`.
 - The canonical website and RSS are the only article outputs.
 - Technical Markdown includes syntax highlighting, Mermaid diagrams, and
   sanitized Scalable Vector Graphics (SVG) output.
@@ -58,13 +59,14 @@ present. The admin backend now uses a loopback-only HTTP listener. The CLI
 connects through the configured HTTPS admin origin.
 
 The snapshot-backed RSS feed, sitemap, robots policy, HTML autodiscovery,
-canonical links, core non-image Open Graph fields, `BlogPosting` JSON-LD, and
-snapshot-scoped local asset delivery are present. Managed Git synchronization,
-redirects, favicon and image metadata, page Content Security Policy (CSP), the
-admin web interface, release-quality technical rendering, the NixOS module,
-Litestream wiring, Prometheus metrics and dashboard, and complete restore
-evidence remain incomplete. V1 rejects authored subscription and
-outbound-distribution configuration and stores no target-job state.
+canonical links, core non-image Open Graph fields, `BlogPosting` JSON-LD,
+authored-alias redirects, durable route ownership, and snapshot-scoped local
+asset delivery are present. Managed Git synchronization, favicon and image
+metadata, page Content Security Policy (CSP), the admin web interface,
+release-quality technical rendering, the NixOS module, Litestream wiring,
+Prometheus metrics and dashboard, and complete restore evidence remain
+incomplete. V1 rejects authored subscription and outbound-distribution
+configuration and stores no target-job state.
 
 > [!CAUTION]
 > Do not expose the loopback admin listener directly. Use the reviewed HTTPS

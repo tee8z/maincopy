@@ -8,17 +8,20 @@ use axum::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
             CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY,
-            CONTENT_TYPE, ETAG, IF_NONE_MATCH, X_CONTENT_TYPE_OPTIONS,
+            CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, X_CONTENT_TYPE_OPTIONS,
         },
         request::Parts,
     },
     response::Response,
     routing::get,
 };
-use markdown_compiler::{PostSlug, PostTag};
+use markdown_compiler::{PostAlias, PostSlug, PostTag};
 use serde::de::DeserializeOwned;
 
-use super::{ROBOTS_PATH, RSS_FEED_PATH, SITEMAP_PATH, assets::AssetDelivery};
+use super::{
+    CanonicalSiteUrl, PublicPagePath, ROBOTS_PATH, RSS_FEED_PATH, SITEMAP_PATH,
+    assets::AssetDelivery,
+};
 use crate::{
     frontend_assets::{FrontendAssetName, FrontendBundleDigest, IMMUTABLE_CACHE_CONTROL},
     render::{SiteSnapshot, SiteSnapshotReader, SnapshotAssetPath, SnapshotPublicAsset},
@@ -108,19 +111,42 @@ async fn index(PublicRequest { snapshot, headers }: PublicRequest) -> Response {
 }
 
 async fn post(
+    OriginalUri(uri): OriginalUri,
     PublicPath {
         snapshot,
         headers,
         value,
     }: PublicPath<String>,
 ) -> Response {
-    let Ok(slug) = PostSlug::parse(value) else {
+    let Ok(slug) = PostSlug::parse(value.clone()) else {
         return not_found_response(&snapshot, &headers);
     };
-    snapshot.post_page(&slug).map_or_else(
+    if let Some(page) = snapshot.post_page(&slug) {
+        return html_response(StatusCode::OK, page, &snapshot, &headers);
+    }
+    let Ok(alias) = PostAlias::parse(value) else {
+        return not_found_response(&snapshot, &headers);
+    };
+    if uri.path() != PublicPagePath::post_alias(&alias).as_str() {
+        return not_found_response(&snapshot, &headers);
+    }
+    snapshot.alias_target(&alias).map_or_else(
         || not_found_response(&snapshot, &headers),
-        |page| html_response(StatusCode::OK, page, &snapshot, &headers),
+        alias_redirect_response,
     )
+}
+
+fn alias_redirect_response(target: &CanonicalSiteUrl) -> Response {
+    let Ok(location) = HeaderValue::from_str(target.as_str()) else {
+        return internal_error_response();
+    };
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::PERMANENT_REDIRECT;
+    response.headers_mut().insert(LOCATION, location);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, REVALIDATE_CACHE_POLICY);
+    response
 }
 
 async fn tag(
@@ -483,12 +509,24 @@ mod tests {
         fs::write(path, bytes).expect("content fixture file must be written");
     }
 
-    fn content_asset_post(id: &str, slug: &str, draft: bool, body: &str) -> String {
+    fn content_asset_post(
+        id: &str,
+        slug: &str,
+        aliases: &[&str],
+        draft: bool,
+        body: &str,
+    ) -> String {
+        let aliases = aliases
+            .iter()
+            .map(|alias| format!("{alias:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "+++\n\
              id = {id:?}\n\
              title = {slug:?}\n\
              slug = {slug:?}\n\
+             aliases = [{aliases}]\n\
              authored_at = 2026-08-29T12:00:00Z\n\
              description = \"Content asset route fixture.\"\n\
              draft = {draft}\n\
@@ -518,6 +556,7 @@ mod tests {
             content_asset_post(
                 "11111111-1111-4111-8111-111111111111",
                 "published-assets",
+                &["old-published-assets", "legacy-published-assets"],
                 false,
                 "![inline](assets/published.png)\n\n[download](assets/published.html)",
             )
@@ -529,6 +568,7 @@ mod tests {
             content_asset_post(
                 "22222222-2222-4222-8222-222222222222",
                 "unpublished-assets",
+                &["unpublished-assets-alias"],
                 false,
                 "![unpublished](assets/unpublished.png)",
             )
@@ -540,6 +580,7 @@ mod tests {
             content_asset_post(
                 "33333333-3333-4333-8333-333333333333",
                 "draft-assets",
+                &["draft-assets-alias"],
                 true,
                 "![draft](assets/draft.png)",
             )
@@ -914,6 +955,96 @@ mod tests {
             .expect("method-not-allowed response must stay within the test limit");
         assert!(!String::from_utf8_lossy(&body).contains(removed_source.as_ref()));
         assert_ne!(body.as_ref(), PUBLISHED_PNG);
+    }
+
+    #[tokio::test]
+    async fn exact_published_aliases_redirect_directly_to_the_configured_canonical_url() {
+        let fixture = content_asset_fixture();
+        assert!(!fixture.removed_source_root.exists());
+
+        for method in [Method::GET, Method::HEAD] {
+            for alias in ["old-published-assets", "legacy-published-assets"] {
+                let path = format!("/posts/{alias}?ignored=request-query");
+                let request = Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .header(axum::http::header::HOST, "attacker.example")
+                    .header("forwarded", "host=attacker.example;proto=http")
+                    .header("x-forwarded-host", "attacker.example")
+                    .header("x-forwarded-proto", "http")
+                    .body(Body::empty())
+                    .expect("alias request must be valid");
+                let response = fixture.app.clone().oneshot(request).await.unwrap();
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::PERMANENT_REDIRECT,
+                    "{method}"
+                );
+                assert_eq!(
+                    response.headers().get(LOCATION).unwrap(),
+                    "https://assets.example.test/posts/published-assets"
+                );
+                assert_eq!(
+                    response.headers().get(CACHE_CONTROL),
+                    Some(&REVALIDATE_CACHE_POLICY)
+                );
+                assert!(
+                    to_bytes(response.into_body(), TEST_RESPONSE_LIMIT)
+                        .await
+                        .expect("alias response must stay within the test limit")
+                        .is_empty()
+                );
+            }
+        }
+
+        assert_eq!(
+            content_asset_request(&fixture.app, Method::GET, "/posts/published-assets", &[],)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn aliases_outside_the_active_published_revision_are_not_public_routes() {
+        let fixture = content_asset_fixture();
+        for path in [
+            "/posts/unpublished-assets-alias",
+            "/posts/draft-assets-alias",
+            "/posts/OLD-published-assets",
+            "/posts/old-published-assets/",
+            "/posts/%6Fld-published-assets",
+            "/posts/old%2Dpublished-assets",
+            "/posts/not-an-authored-alias",
+        ] {
+            assert_eq!(
+                content_asset_request(&fixture.app, Method::GET, path, &[])
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            content_asset_request(
+                &fixture.app,
+                Method::POST,
+                "/posts/old-published-assets",
+                &[],
+            )
+            .await
+            .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        for path in ["/feed.xml", "/sitemap.xml"] {
+            let response = content_asset_request(&fixture.app, Method::GET, path, &[]).await;
+            let body = to_bytes(response.into_body(), TEST_RESPONSE_LIMIT)
+                .await
+                .expect("discovery document must stay within the test limit");
+            assert!(!String::from_utf8_lossy(&body).contains("old-published-assets"));
+        }
     }
 
     #[tokio::test]

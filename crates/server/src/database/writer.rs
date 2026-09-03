@@ -584,6 +584,7 @@ mod tests {
         future::Future as _,
         path::{Path, PathBuf},
         process::Command,
+        sync::Arc,
         task::{Context, Poll, Waker},
     };
 
@@ -596,12 +597,13 @@ mod tests {
         database,
         domain::publication::store::{
             BeginPublishNow, BeginScheduledActivation, FinishPublication, InstallStartupSnapshot,
-            ObservedPostRevision, PublishNowState, SchedulePublication, SiteHead,
+            ObservedPostRevision, PublicationRoute, PublicationRouteOwnershipError,
+            PublishNowState, SchedulePublication, SiteHead,
         },
     };
     use markdown_compiler::{
-        ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
-        SiteSnapshotDigest,
+        ContentTreeDigest, DraftStatus, PostAlias, PostId, PostRevisionDigest, PostSlug,
+        PreviewDigest, SiteSnapshotDigest,
     };
 
     const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -736,6 +738,12 @@ mod tests {
             source_commit: None,
             content_digest: retained_content,
             accepted_preview_digest: preview_digest(0x55),
+            slug: PostSlug::parse("first").unwrap(),
+            aliases: Arc::from([
+                PostAlias::parse("former-first").unwrap(),
+                PostAlias::parse("legacy-first").unwrap(),
+            ]),
+            accepted_at: OffsetDateTime::from_unix_timestamp(20).unwrap(),
             scheduled_at: OffsetDateTime::from_unix_timestamp(30).unwrap(),
         }
     }
@@ -751,6 +759,10 @@ mod tests {
             expected_site,
             candidate_site_digest: candidate,
             slug: PostSlug::parse("first").unwrap(),
+            aliases: Arc::from([
+                PostAlias::parse("former-first").unwrap(),
+                PostAlias::parse("legacy-first").unwrap(),
+            ]),
         }
     }
 
@@ -1034,16 +1046,24 @@ mod tests {
         stop_writer(shutdown, task).await;
         drop(store);
         let mut reopened = database::bootstrap(configuration(&path)).await.unwrap();
-        let route: (Vec<u8>, Vec<u8>, String) = sqlx::query_as(
-            "SELECT stable_post_id, revision_digest, kind \
-             FROM published_routes WHERE route = 'first'",
+        let routes: Vec<(String, Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
+            "SELECT route, stable_post_id, revision_digest, kind \
+             FROM publication_routes ORDER BY route",
         )
-        .fetch_one(&mut reopened._writer)
+        .fetch_all(&mut reopened._writer)
         .await
         .unwrap();
-        assert_eq!(route.0, uuid(POST_ID).as_bytes());
-        assert_eq!(route.1, REVISION_BYTES);
-        assert_eq!(route.2, "post");
+        assert_eq!(routes.len(), 3);
+        for (_, post_id, revision, _) in &routes {
+            assert_eq!(post_id, uuid(POST_ID).as_bytes());
+            assert_eq!(revision, &REVISION_BYTES);
+        }
+        assert_eq!(routes[0].0, "first");
+        assert_eq!(routes[0].3, "post");
+        assert_eq!(routes[1].0, "former-first");
+        assert_eq!(routes[1].3, "alias");
+        assert_eq!(routes[2].0, "legacy-first");
+        assert_eq!(routes[2].3, "alias");
         let canonical: (String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
             "SELECT state, creation_key, activation_site_digest, content_tree_digest, \
                     accepted_preview_digest \
@@ -1062,15 +1082,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduled_publication_replay_returns_the_original_retained_content_digest() {
+    async fn publication_finish_rejects_a_route_claimed_after_activation_began() {
+        let (_root, _path, database) = empty_database().await;
+        let (store, writer) = database.into_store(8);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(writer.run(shutdown.clone()));
+
+        let mut startup = startup_command(None, site_digest(0x31));
+        startup.posts.push(ObservedPostRevision {
+            stable_post_id: PostId::parse(OTHER_POST_ID).unwrap(),
+            revision_digest: PostRevisionDigest::from_bytes([0x22; 32]),
+            publication_status: DraftStatus::Publishable,
+            slug: PostSlug::parse("second").unwrap(),
+        });
+        let initial = store
+            .publications
+            .install_startup_snapshot(startup)
+            .await
+            .unwrap();
+        let candidate = site_digest(0x32);
+        let activating = store
+            .publications
+            .begin_publish_now(begin_publication(
+                COMMAND_ID,
+                PUBLICATION_ID,
+                initial.clone(),
+                candidate.clone(),
+                20,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(activating, PublishNowState::Activating(_)));
+
+        let mut competing = schedule_command(
+            OTHER_COMMAND_ID,
+            OTHER_PUBLICATION_ID,
+            initial.clone(),
+            content_digest(0x52),
+        );
+        competing.stable_post_id = PostId::parse(OTHER_POST_ID).unwrap();
+        competing.pinned_post_digest = PostRevisionDigest::from_bytes([0x22; 32]);
+        competing.slug = PostSlug::parse("second").unwrap();
+        competing.aliases = Arc::from([PostAlias::parse("legacy-first").unwrap()]);
+        store
+            .publications
+            .schedule_publication(competing)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .publications
+                .finish_publication(finish_publication_command(
+                    PUBLICATION_ID,
+                    initial.clone(),
+                    candidate,
+                ))
+                .await,
+            Err(DatabaseMutationError::Command(
+                DatabaseCommandError::Rejected
+            ))
+        );
+        let durable = store.publications.startup_snapshot_state().await.unwrap();
+        assert_eq!(durable.site, Some(initial));
+        assert_eq!(durable.activating.len(), 1);
+        assert_eq!(durable.scheduled.len(), 1);
+        assert!(
+            store
+                .publications
+                .ensure_routes_available(
+                    &PostId::parse(POST_ID).unwrap(),
+                    &PostSlug::parse("first").unwrap(),
+                    &[PostAlias::parse("former-first").unwrap()],
+                )
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            store
+                .publications
+                .ensure_routes_available(
+                    &PostId::parse(POST_ID).unwrap(),
+                    &PostSlug::parse("unclaimed").unwrap(),
+                    &[PostAlias::parse("legacy-first").unwrap()],
+                )
+                .await,
+            Err(PublicationRouteOwnershipError::Conflict {
+                route: PublicationRoute::Alias(alias),
+            }) if alias.as_str() == "legacy-first"
+        ));
+
+        stop_writer(shutdown, task).await;
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn scheduled_publication_reserves_routes_and_replays_retained_content() {
         let (_root, path, database) = empty_database().await;
         let (store, writer) = database.into_store(8);
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(writer.run(shutdown.clone()));
 
+        let mut startup = startup_command(None, site_digest(0x21));
+        startup.posts.push(ObservedPostRevision {
+            stable_post_id: PostId::parse(OTHER_POST_ID).unwrap(),
+            revision_digest: PostRevisionDigest::from_bytes([0x22; 32]),
+            publication_status: DraftStatus::Publishable,
+            slug: PostSlug::parse("second").unwrap(),
+        });
         let initial = store
             .publications
-            .install_startup_snapshot(startup_command(None, site_digest(0x21)))
+            .install_startup_snapshot(startup)
             .await
             .unwrap();
         let retained = content_digest(0x51);
@@ -1086,7 +1208,53 @@ mod tests {
             .unwrap();
         assert_eq!(scheduled.content_digest, retained);
         assert_eq!(scheduled.accepted_preview_digest, preview_digest(0x55));
+        assert!(matches!(
+            store
+                .publications
+                .ensure_routes_available(
+                    &PostId::parse(OTHER_POST_ID).unwrap(),
+                    &PostSlug::parse("unrelated").unwrap(),
+                    &[PostAlias::parse("former-first").unwrap()],
+                )
+                .await,
+            Err(PublicationRouteOwnershipError::Conflict {
+                route: PublicationRoute::Alias(alias),
+            }) if alias.as_str() == "former-first"
+        ));
 
+        let mut route_conflict = schedule_command(
+            OTHER_COMMAND_ID,
+            OTHER_PUBLICATION_ID,
+            initial.clone(),
+            content_digest(0x54),
+        );
+        route_conflict.stable_post_id = PostId::parse(OTHER_POST_ID).unwrap();
+        route_conflict.pinned_post_digest = PostRevisionDigest::from_bytes([0x22; 32]);
+        route_conflict.slug = PostSlug::parse("second").unwrap();
+        route_conflict.aliases = Arc::from([
+            PostAlias::parse("new-reservation").unwrap(),
+            PostAlias::parse("former-first").unwrap(),
+        ]);
+        assert_eq!(
+            store
+                .publications
+                .schedule_publication(route_conflict)
+                .await,
+            Err(DatabaseMutationError::Command(
+                DatabaseCommandError::Rejected
+            ))
+        );
+        assert!(
+            store
+                .publications
+                .ensure_routes_available(
+                    &PostId::parse("33333333-3333-4333-8333-333333333333").unwrap(),
+                    &PostSlug::parse("second").unwrap(),
+                    &[PostAlias::parse("new-reservation").unwrap()],
+                )
+                .await
+                .is_ok()
+        );
         let replay = store
             .publications
             .schedule_publication(schedule_command(
@@ -1153,6 +1321,11 @@ mod tests {
         stop_writer(shutdown, task).await;
         drop(store);
         let mut reopened = database::bootstrap(configuration(&path)).await.unwrap();
+        let reserved_routes: i64 = sqlx::query_scalar("SELECT count(*) FROM publication_routes")
+            .fetch_one(&mut reopened._writer)
+            .await
+            .unwrap();
+        assert_eq!(reserved_routes, 3);
         let persisted: (Vec<u8>, Vec<u8>) = sqlx::query_as(
             "SELECT content_tree_digest, accepted_preview_digest \
              FROM canonical_publications WHERE publication_id = ?",
@@ -1163,7 +1336,24 @@ mod tests {
         .unwrap();
         assert_eq!(persisted.0, retained.as_bytes());
         assert_eq!(persisted.1, preview_digest(0x55).as_bytes());
-        reopened.close().await.unwrap();
+        let (reopened_store, reopened_writer) = reopened.into_store(8);
+        let reopened_shutdown = CancellationToken::new();
+        let reopened_task = tokio::spawn(reopened_writer.run(reopened_shutdown.clone()));
+        assert!(matches!(
+            reopened_store
+                .publications
+                .ensure_routes_available(
+                    &PostId::parse(OTHER_POST_ID).unwrap(),
+                    &PostSlug::parse("unrelated").unwrap(),
+                    &[PostAlias::parse("former-first").unwrap()],
+                )
+                .await,
+            Err(PublicationRouteOwnershipError::Conflict {
+                route: PublicationRoute::Alias(alias),
+            }) if alias.as_str() == "former-first"
+        ));
+        stop_writer(reopened_shutdown, reopened_task).await;
+        drop(reopened_store);
     }
 
     #[tokio::test]

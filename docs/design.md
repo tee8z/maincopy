@@ -180,6 +180,7 @@ recovery transport, recovery API, or continuing authentication bypass.
 | Post tip enablement | Git repository | The post cannot select a recipient. |
 | Managed remote, branch, content root, and polling policy | SQLite | Host configuration selects managed mode. |
 | Canonical release schedule and current public revision | SQLite | Sync and reload cannot advance visibility. |
+| Approved slug and alias ownership | SQLite | A stable `PostId` keeps each claim permanently. |
 | Users, roles, profiles, and active tip recipient | SQLite | Profile changes use resource versions. |
 | Password credentials | SQLite | Store only versioned Argon2id PHC strings. |
 | Nostr login and agent identities | SQLite | Store public keys and scoped metadata only. |
@@ -202,7 +203,8 @@ Post frontmatter contains article metadata and the optional tip enablement
 flag. It does not contain a Lightning Address or V1 distribution settings.
 
 SQLite contains mutable control-plane state. This state includes source
-settings, users, profiles, releases, sessions, and audit records.
+settings, users, profiles, releases, permanent route claims, sessions, and
+audit records.
 
 Host configuration contains runtime paths, listener settings, hard limits,
 source mode, and named secret references. Secret values stay outside the host
@@ -345,6 +347,22 @@ submit a reproducible digest without a prior preview request.
 One stable canonical publication stores the original `published_at` and
 `current_published_digest`. Historical release rows do not grant visibility.
 
+Each accepted scheduled release reserves its revision's canonical slug and
+authored aliases in SQLite. A successful immediate release makes the same
+claims during activation. The stable `PostId` owns each claim permanently.
+
+A reservation does not create a public route. Cancellation before activation
+also does not release the route for use by another post.
+
+Later releases can change a claimed route between canonical-slug and alias use
+for the same `PostId`. They cannot transfer ownership to another post.
+
+A route omitted from the active published revision stops serving. Its durable
+claim remains, so another post cannot publish that value.
+
+Activation checks route ownership before the snapshot swap. The serialized
+writer checks it again while committing the published revision and route claims.
+
 Each release has kind `Initial` or `Update`.
 
 ```mermaid
@@ -370,6 +388,32 @@ an ineligible source change for administrator review.
 
 The public router serves the publication index, canonical articles, tags,
 archive, RSS, sitemap, robots policy, immutable assets, and health resources.
+
+Only an exact authored alias from the active published post revision creates a
+public redirect. An alias that appears only in a candidate, draft, scheduled,
+or unreleased revision remains unreachable.
+
+`GET` or `HEAD` at `/posts/{alias}` returns `308 Permanent Redirect` with an
+empty body and `Cache-Control: no-cache`. `Location` is the absolute URL for the
+same revision's current canonical slug. Maincopy derives this URL only from
+validated publication configuration.
+
+The redirect drops the request query. It does not inspect the request authority
+or forwarding headers. Alias matching is exact. Case variants and
+trailing-slash variants return `404 Not Found`.
+
+Maincopy does not synthesize an alias from an old slug. An omitted old slug
+returns `404 Not Found`, but its durable ownership claim remains. Each active
+alias maps directly to the current canonical URL, so redirect chains cannot
+form.
+
+Aliases count toward the inclusive 50,000-route snapshot ceiling. An active
+route collision across mixed retained revisions rejects the candidate snapshot.
+A durable claim owned by another `PostId` also rejects activation. Neither
+failure changes the active snapshot.
+
+RSS items, sitemap locations, canonical links, Open Graph URLs, and JSON-LD URLs
+use only canonical paths. They never emit alias locations.
 
 V1 serves one RSS 2.0 feed at `GET /feed.xml` and `HEAD /feed.xml`. The feed
 contains summaries and absolute links to complete canonical articles.
@@ -796,6 +840,11 @@ V1 must prove these properties:
 - Every release binds its exact preview and canonical URL.
 - Draft and preview assets are absent from the public origin.
 - Historical releases cannot grant current visibility.
+- Each release-approved canonical slug and authored alias remains permanently
+  owned by its stable `PostId`, including routes reserved by a cancelled
+  schedule.
+- Removing a route stops serving it without releasing its durable ownership.
+- One post can change its own claimed route between canonical-slug and alias use.
 - Public routing exposes no admin endpoint.
 - The public router and an authenticated admin request return `404 Not Found`
   for `/metrics`.

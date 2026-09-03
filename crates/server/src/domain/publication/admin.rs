@@ -46,7 +46,10 @@ use super::{
         ScheduledApprovalOutcome,
     },
     assets::AssetDelivery,
-    store::{PublishNowLookupError, SchedulePublicationLookupError, SiteHead},
+    store::{
+        PublicationRouteOwnershipError, PublishNowLookupError, SchedulePublicationLookupError,
+        SiteHead,
+    },
 };
 
 const MAX_PUBLICATION_REQUEST_BYTES: usize = 4 * 1024;
@@ -992,7 +995,10 @@ fn activation_error(error: &PublicationActivationError) -> ErrorSpec {
         ))
         | PublicationActivationError::DurableStateMismatch
         | PublicationActivationError::SnapshotActivationConflict
-        | PublicationActivationError::CandidateDigestMismatch { .. } => publication_unavailable(),
+        | PublicationActivationError::CandidateDigestMismatch { .. }
+        | PublicationActivationError::RouteOwnership(PublicationRouteOwnershipError::Query(_)) => {
+            publication_unavailable()
+        }
         PublicationActivationError::Database(DatabaseMutationError::Command(
             DatabaseCommandError::IdempotencyConflict,
         ))
@@ -1013,13 +1019,19 @@ fn activation_error(error: &PublicationActivationError) -> ErrorSpec {
         ) => publication_unavailable(),
         PublicationActivationError::Database(DatabaseMutationError::Command(
             DatabaseCommandError::Rejected,
-        )) => ErrorSpec::conflict(
+        ))
+        | PublicationActivationError::RouteOwnership(PublicationRouteOwnershipError::Conflict {
+            ..
+        }) => ErrorSpec::conflict(
             "publication_conflict",
             "the command conflicts with current publication state",
         ),
         PublicationActivationError::Database(DatabaseMutationError::Command(
             DatabaseCommandError::InvalidValue,
-        )) => ErrorSpec::internal(
+        ))
+        | PublicationActivationError::RouteOwnership(
+            PublicationRouteOwnershipError::InvalidRouteSet(_),
+        ) => ErrorSpec::internal(
             "invalid_publication_state",
             "the publication command could not be represented safely",
         ),
@@ -1065,7 +1077,9 @@ mod tests {
         domain::{
             profile::ProfileStore,
             publication::{
-                PublishedPostRevision, activation::PublicationCoordinator, store::PublicationStore,
+                MAX_PUBLIC_ROUTES, PublishedPostRevision,
+                activation::PublicationCoordinator,
+                store::{PublicationRoute, PublicationRouteSetError, PublicationStore},
             },
         },
         frontend_assets::embedded_manifest,
@@ -1073,7 +1087,7 @@ mod tests {
         web::Readiness,
     };
     use markdown_compiler::{
-        DiscoveredAsset, LogicalAssetPath, PostCollection, SiteSnapshotDigest,
+        DiscoveredAsset, LogicalAssetPath, PostAlias, PostCollection, SiteSnapshotDigest,
         resolve_content_assets,
     };
 
@@ -1797,6 +1811,27 @@ mod tests {
                 ),
                 StatusCode::SERVICE_UNAVAILABLE,
                 "publication_unavailable",
+            ),
+            (
+                PublicationActivationError::RouteOwnership(
+                    PublicationRouteOwnershipError::Conflict {
+                        route: PublicationRoute::Alias(PostAlias::parse("claimed-route").unwrap()),
+                    },
+                ),
+                StatusCode::CONFLICT,
+                "publication_conflict",
+            ),
+            (
+                PublicationActivationError::RouteOwnership(
+                    PublicationRouteOwnershipError::InvalidRouteSet(
+                        PublicationRouteSetError::TooManyAliases {
+                            count: MAX_PUBLIC_ROUTES,
+                            maximum: MAX_PUBLIC_ROUTES - 1,
+                        },
+                    ),
+                ),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_publication_state",
             ),
         ];
 

@@ -26,7 +26,7 @@ CREATE TABLE post_revisions (
     PRIMARY KEY (stable_post_id, revision_digest)
 ) STRICT;
 
-CREATE TABLE published_routes (
+CREATE TABLE publication_routes (
     route TEXT PRIMARY KEY,
     stable_post_id BLOB NOT NULL,
     revision_digest BLOB NOT NULL,

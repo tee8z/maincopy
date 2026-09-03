@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::ArcSwap;
 use markdown_compiler::{
-    ContentTreeDigest, DraftStatus, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
+    ContentTreeDigest, DraftStatus, PostAlias, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
     SiteSnapshotDigest,
 };
 use thiserror::Error;
@@ -35,9 +35,10 @@ use crate::{
 use super::store::{
     BeginPublishNow, BeginScheduledActivation, BegunPublication, CommandIdempotencyKey,
     CompletedPublication, FinishPublication, FinishedPublication, IndexContentCatalog,
-    LookupPublishNow, LookupSchedulePublication, ObservedPostRevision, PublicationStore,
-    PublishNowLookupError, PublishNowState, RecoverablePublicationActivation, SchedulePublication,
-    SchedulePublicationLookupError, SchedulePublicationReplay, ScheduledPublication, SiteHead,
+    LookupPublishNow, LookupSchedulePublication, ObservedPostRevision,
+    PublicationRouteOwnershipError, PublicationStore, PublishNowLookupError, PublishNowState,
+    RecoverablePublicationActivation, SchedulePublication, SchedulePublicationLookupError,
+    SchedulePublicationReplay, ScheduledPublication, SiteHead,
 };
 use super::{PublicLedgerProjection, PublishedPostRevision, SourceCommit};
 
@@ -707,6 +708,7 @@ impl PublicationCoordinator {
             )?,
             &begun.accepted_preview_digest,
         )?;
+        self.ensure_routes_available(&selected).await?;
         let candidate = self.candidate_for_begun(
             catalog,
             &selected,
@@ -782,6 +784,7 @@ impl PublicationCoordinator {
             accepted_preview_digest,
             requested,
         } = prepared;
+        self.ensure_routes_available(&selected).await?;
         let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
         let begun = match self.store.begin_publish_now(requested).await {
             Ok(PublishNowState::Activating(begun)) => begun,
@@ -898,6 +901,9 @@ impl PublicationCoordinator {
                 source_commit: self.source_commit.clone(),
                 content_digest: self.content_digest.clone(),
                 accepted_preview_digest: command.accepted_preview_digest.clone(),
+                slug: selected.slug.clone(),
+                aliases: Arc::clone(&selected.aliases),
+                accepted_at: now,
                 scheduled_at: command.scheduled_at,
             })
             .await?;
@@ -995,6 +1001,7 @@ impl PublicationCoordinator {
             )?,
             &scheduled.accepted_preview_digest,
         )?;
+        self.ensure_routes_available(&selected).await?;
         let prebuilt = build_candidate(
             catalog,
             self.frontend,
@@ -1064,6 +1071,7 @@ impl PublicationCoordinator {
             )?,
             &activation.accepted_preview_digest,
         )?;
+        self.ensure_routes_available(&selected).await?;
         let candidate = self.candidate_for_begun(
             catalog,
             &selected,
@@ -1081,6 +1089,19 @@ impl PublicationCoordinator {
         };
         self.activate_and_finish(begun, selected, candidate, &mut safety)
             .await
+    }
+
+    async fn ensure_routes_available(
+        &self,
+        selected: &SelectedPost,
+    ) -> Result<(), PublicationActivationError> {
+        // The coordinator is the sole production route claimant and serializes every
+        // publication command. A successful ownership read therefore remains valid
+        // until this command claims the same routes in `finish_publication`.
+        self.store
+            .ensure_routes_available(&selected.stable_post_id, &selected.slug, &selected.aliases)
+            .await?;
+        Ok(())
     }
 
     fn candidate_for_begun(
@@ -1163,6 +1184,7 @@ impl PublicationCoordinator {
                 expected_site: begun.site,
                 candidate_site_digest: begun.candidate_site_digest,
                 slug: selected.slug.clone(),
+                aliases: Arc::clone(&selected.aliases),
             })
             .await?;
         let result = canonical_publication_result(
@@ -1198,6 +1220,7 @@ struct SelectedPost {
     stable_post_id: PostId,
     revision: PostRevisionDigest,
     slug: PostSlug,
+    aliases: Arc<[PostAlias]>,
 }
 
 fn select_post(
@@ -1229,6 +1252,7 @@ fn select_post(
         stable_post_id: rendered.document.metadata.id.clone(),
         revision: rendered.revision.clone(),
         slug: rendered.document.metadata.slug.clone(),
+        aliases: rendered.document.metadata.aliases.clone().into(),
     })
 }
 
@@ -1267,6 +1291,7 @@ fn select_stored_post(
         stable_post_id: rendered.document.metadata.id.clone(),
         revision: rendered.revision.clone(),
         slug: rendered.document.metadata.slug.clone(),
+        aliases: rendered.document.metadata.aliases.clone().into(),
     })
 }
 
@@ -1565,6 +1590,8 @@ pub(crate) enum PublicationActivationError {
     #[error(transparent)]
     ScheduleLookup(#[from] SchedulePublicationLookupError),
     #[error(transparent)]
+    RouteOwnership(#[from] PublicationRouteOwnershipError),
+    #[error(transparent)]
     Database(#[from] DatabaseMutationError),
 }
 
@@ -1612,7 +1639,7 @@ mod tests {
                 },
             },
             profile::ProfilePrecondition,
-            publication::store::{InstallStartupSnapshot, ObservedPostRevision},
+            publication::store::{InstallStartupSnapshot, ObservedPostRevision, PublicationRoute},
         },
         frontend_assets::embedded_manifest,
         render::{
@@ -1628,6 +1655,7 @@ mod tests {
 
     const PUBLISHABLE_ID: &str = "11111111-1111-4111-8111-111111111111";
     const DRAFT_ID: &str = "22222222-2222-4222-8222-222222222222";
+    const OTHER_PUBLISHABLE_ID: &str = "33333333-3333-4333-8333-333333333333";
     const OWNER_NOSTR_KEY: &str =
         "63fe6318dc58583cfe16810f86dd09e18bfd76aabc24a0081ce2856f330504ed";
     const RECIPIENT_NOSTR_KEY: &str =
@@ -1656,6 +1684,21 @@ mod tests {
         )])
     }
 
+    fn catalog_with_alias(alias: &str) -> Arc<ContentCatalog> {
+        compile_catalog(vec![
+            post(
+                "posts/publishable.md",
+                PostCollection::Posts,
+                post_source_with_alias(PUBLISHABLE_ID, "publishable", Some(alias)),
+            ),
+            post(
+                "drafts/draft.md",
+                PostCollection::Drafts,
+                post_source(DRAFT_ID, "draft", true),
+            ),
+        ])
+    }
+
     fn revised_catalog() -> Arc<ContentCatalog> {
         compile_catalog(vec![
             post(
@@ -1674,6 +1717,26 @@ mod tests {
                 "drafts/draft.md",
                 PostCollection::Drafts,
                 post_source(DRAFT_ID, "draft", true),
+            ),
+        ])
+    }
+
+    fn route_ownership_catalog(
+        first_alias: Option<&str>,
+        second_alias: Option<&str>,
+        first_body: &str,
+    ) -> Arc<ContentCatalog> {
+        compile_catalog(vec![
+            post(
+                "posts/first.md",
+                PostCollection::Posts,
+                post_source_with_alias(PUBLISHABLE_ID, "first", first_alias)
+                    .replace("Publication body.", first_body),
+            ),
+            post(
+                "posts/second.md",
+                PostCollection::Posts,
+                post_source_with_alias(OTHER_PUBLISHABLE_ID, "second", second_alias),
             ),
         ])
     }
@@ -1765,6 +1828,17 @@ mod tests {
 
     fn post_source(id: &str, slug: &str, draft: bool) -> String {
         post_source_with_metadata(id, slug, slug, "Activation fixture.", draft)
+    }
+
+    fn post_source_with_alias(id: &str, slug: &str, alias: Option<&str>) -> String {
+        let source = post_source(id, slug, false);
+        match alias {
+            Some(alias) => source.replace(
+                "authored_at = 2026-08-29T15:00:00-04:00\n",
+                &format!("authored_at = 2026-08-29T15:00:00-04:00\naliases = [{alias:?}]\n"),
+            ),
+            None => source,
+        }
     }
 
     fn post_source_with_metadata(
@@ -2098,12 +2172,6 @@ mod tests {
         }
     }
 
-    fn schedule_command(scheduled_at: OffsetDateTime) -> Schedule {
-        let catalog = catalog();
-        let ledger = PublicLedgerProjection::empty();
-        schedule_command_for(&catalog, &ledger, scheduled_at)
-    }
-
     fn schedule_command_for(
         catalog: &ContentCatalog,
         ledger: &PublicLedgerProjection,
@@ -2124,11 +2192,37 @@ mod tests {
         reproduce_preview_digest(catalog, embedded_manifest(), ledger, None, &selected).unwrap()
     }
 
+    fn publish_command_for(
+        catalog: &ContentCatalog,
+        ledger: &PublicLedgerProjection,
+        post_id: &str,
+        expected_revision: Option<PostRevisionDigest>,
+        discriminator: u128,
+    ) -> PublishNow {
+        let post_id = PostId::parse(post_id).unwrap();
+        let selected = select_post(catalog, &post_id, expected_revision.as_ref()).unwrap();
+        PublishNow {
+            creation_key: fixture_uuid(1_000 + discriminator),
+            publication_id: fixture_uuid(2_000 + discriminator),
+            stable_post_id: post_id,
+            expected_revision,
+            accepted_preview_digest: reproduce_preview_digest(
+                catalog,
+                embedded_manifest(),
+                ledger,
+                None,
+                &selected,
+            )
+            .unwrap(),
+        }
+    }
+
     async fn coordinator_fixture(
         catalog: Arc<ContentCatalog>,
     ) -> (
         tempfile::TempDir,
         PublicationCoordinator,
+        SiteSnapshotReader,
         PublicationStore,
         CancellationToken,
         JoinHandle<()>,
@@ -2138,7 +2232,7 @@ mod tests {
         let initial_digest = initial.digest.clone();
         let (root, store, profiles, _auth, head, writer_shutdown, writer_task) =
             start_store(&catalog, initial_digest).await;
-        let (_, activator) = snapshot_store(initial);
+        let (reader, activator) = snapshot_store(initial);
         let content_digest = ContentTreeDigest::from_bytes([0x11; 32]);
         let writer_keepalive = store.clone();
         let coordinator = PublicationCoordinator {
@@ -2161,6 +2255,7 @@ mod tests {
         (
             root,
             coordinator,
+            reader,
             writer_keepalive,
             writer_shutdown,
             writer_task,
@@ -2194,7 +2289,7 @@ mod tests {
         )
         .unwrap()
         .revision;
-        let (root, coordinator, writer_keepalive, writer_shutdown, writer_task) =
+        let (root, coordinator, _reader, writer_keepalive, writer_shutdown, writer_task) =
             coordinator_fixture(initial_catalog).await;
         let (handle, actor) = coordinator.into_actor(2);
         let before = handle.read();
@@ -2247,7 +2342,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_actor_mailbox_preserves_fifo_command_order() {
-        let (root, coordinator, writer_keepalive, writer_shutdown, writer_task) =
+        let (root, coordinator, _reader, writer_keepalive, writer_shutdown, writer_task) =
             coordinator_fixture(catalog()).await;
         let (handle, actor) = coordinator.into_actor(1);
         let first_digest = ContentTreeDigest::from_bytes([0x22; 32]);
@@ -2302,7 +2397,7 @@ mod tests {
 
     #[tokio::test]
     async fn actor_shutdown_closes_admission_and_drains_an_accepted_command() {
-        let (root, coordinator, writer_keepalive, writer_shutdown, writer_task) =
+        let (root, coordinator, _reader, writer_keepalive, writer_shutdown, writer_task) =
             coordinator_fixture(catalog()).await;
         let (handle, actor) = coordinator.into_actor(1);
         let accepted_digest = ContentTreeDigest::from_bytes([0x44; 32]);
@@ -2707,6 +2802,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_alias_owner_rejects_another_post_before_snapshot_activation() {
+        let reserved_alias = PostAlias::parse("reserved-route").unwrap();
+        let initial_catalog = route_ownership_catalog(
+            Some(reserved_alias.as_str()),
+            None,
+            "First publication body.",
+        );
+        let (_root, mut coordinator, reader, store, writer_shutdown, writer_task) =
+            coordinator_fixture(Arc::clone(&initial_catalog)).await;
+
+        let first = coordinator
+            .publish_now(publish_command_for(
+                &initial_catalog,
+                &coordinator.ledger,
+                PUBLISHABLE_ID,
+                None,
+                1,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader
+                .load_full()
+                .alias_target(&reserved_alias)
+                .unwrap()
+                .as_str(),
+            "https://example.com/posts/first"
+        );
+
+        let without_alias = route_ownership_catalog(None, None, "Revised first body.");
+        coordinator
+            .apply_content_catalog(
+                Arc::clone(&without_alias),
+                ContentTreeDigest::from_bytes([0x42; 32]),
+                None,
+            )
+            .await
+            .unwrap();
+        let revised = select_post(
+            &without_alias,
+            &PostId::parse(PUBLISHABLE_ID).unwrap(),
+            None,
+        )
+        .unwrap();
+        coordinator
+            .publish_now(publish_command_for(
+                &without_alias,
+                &coordinator.ledger,
+                PUBLISHABLE_ID,
+                Some(revised.revision),
+                2,
+            ))
+            .await
+            .unwrap();
+        assert!(reader.load_full().alias_target(&reserved_alias).is_none());
+
+        let conflicting_catalog =
+            route_ownership_catalog(None, Some(reserved_alias.as_str()), "Revised first body.");
+        coordinator
+            .apply_content_catalog(
+                Arc::clone(&conflicting_catalog),
+                ContentTreeDigest::from_bytes([0x43; 32]),
+                None,
+            )
+            .await
+            .unwrap();
+        let active_before = reader.load_full();
+        let site_before = coordinator.site.clone();
+        let ledger_before = coordinator.ledger.clone();
+        let error = coordinator
+            .publish_now(publish_command_for(
+                &conflicting_catalog,
+                &coordinator.ledger,
+                OTHER_PUBLISHABLE_ID,
+                None,
+                3,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PublicationActivationError::RouteOwnership(
+                PublicationRouteOwnershipError::Conflict {
+                    route: PublicationRoute::Alias(alias),
+                }
+            ) if alias == reserved_alias
+        ));
+        assert!(Arc::ptr_eq(&active_before, &reader.load_full()));
+        assert_eq!(coordinator.site, site_before);
+        assert_eq!(coordinator.ledger, ledger_before);
+        assert!(coordinator.readiness.is_ready());
+        assert!(!coordinator.cancellation.is_cancelled());
+        assert!(
+            store
+                .startup_snapshot_state()
+                .await
+                .unwrap()
+                .activating
+                .is_empty()
+        );
+        assert_eq!(first.stable_post_id.as_str(), PUBLISHABLE_ID);
+
+        drop(coordinator);
+        writer_shutdown.cancel();
+        writer_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn publishes_through_the_real_store_and_replays_the_creation_key() {
         let catalog = catalog();
         let ledger = PublicLedgerProjection::empty();
@@ -2894,7 +3097,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduled_release_replays_the_exact_pin_and_only_activates_when_due() {
-        let catalog = catalog();
+        let scheduled_alias = PostAlias::parse("scheduled-alias").unwrap();
+        let catalog = catalog_with_alias(scheduled_alias.as_str());
         let ledger = PublicLedgerProjection::empty();
         let initial = snapshot(&catalog, &ledger);
         let initial_digest = initial.digest.clone();
@@ -2908,7 +3112,7 @@ mod tests {
             catalog: Arc::clone(&catalog),
             content_digest: content_digest.clone(),
             candidates: candidate_catalogs(&catalog, content_digest),
-            ledger,
+            ledger: ledger.clone(),
             site: head,
             activator,
             store: store.clone(),
@@ -2927,7 +3131,7 @@ mod tests {
         let pinned = selected.revision.clone();
         let canonical_url = format!("https://example.com/posts/{}", selected.slug.as_str());
         let scheduled_at = OffsetDateTime::now_utc() + time::Duration::hours(1);
-        let request = schedule_command(scheduled_at);
+        let request = schedule_command_for(&catalog, &ledger, scheduled_at);
         let ScheduledApprovalOutcome::Scheduled(approval) =
             coordinator.schedule(request.clone()).await.unwrap()
         else {
@@ -2940,6 +3144,7 @@ mod tests {
         );
         assert!(!reader.load_full().feed.body.contains(PUBLISHABLE_ID));
         assert!(!reader.load_full().sitemap.body.contains(&canonical_url));
+        assert!(reader.load_full().alias_target(&scheduled_alias).is_none());
 
         let durable = store.next_scheduled_publication().await.unwrap().unwrap();
         assert_eq!(durable.publication_id, approval.publication_id);
@@ -2983,6 +3188,10 @@ mod tests {
         let active = reader.load_full();
         assert!(active.feed.body.contains(PUBLISHABLE_ID));
         assert!(active.sitemap.body.contains(&canonical_url));
+        assert_eq!(
+            active.alias_target(&scheduled_alias).unwrap().as_str(),
+            canonical_url
+        );
         assert!(
             active.feed.body.contains(
                 &published

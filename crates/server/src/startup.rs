@@ -2018,7 +2018,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
-    async fn restart_keeps_public_revision_pinned_until_the_stopped_edit_is_approved() {
+    async fn restart_keeps_public_revision_and_aliases_pinned_until_stopped_edit_is_approved() {
         use maincopy_shared::{
             posts::{ListPostsResponse, POSTS_PATH, PostPublicationState},
             publication::{PUBLICATIONS_PATH, PublishNowRequest, PublishNowResponse},
@@ -2027,6 +2027,15 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
         let content_root = root.path().join("content");
         write_durable_post(&content_root);
+        let durable_post_path = content_root.join("posts/durable-publication.md");
+        fs::write(
+            &durable_post_path,
+            DURABLE_POST.replace(
+                "slug = \"durable-publication\"\n",
+                "slug = \"durable-publication\"\naliases = [\"original-durable-alias\"]\n",
+            ),
+        )
+        .unwrap();
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
         let application = build_test_application(startup).await.unwrap();
@@ -2049,10 +2058,24 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let published: PublishNowResponse = admin_json(response).await;
-        let public = reqwest::Client::builder().no_proxy().build().unwrap();
+        let public = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
         let initial_public_url = format!(
             "http://{}/posts/durable-publication",
             application.public_addr
+        );
+        let initial_alias_url = format!(
+            "http://{}/posts/original-durable-alias",
+            application.public_addr
+        );
+        let initial_alias = public.get(&initial_alias_url).send().await.unwrap();
+        assert_eq!(initial_alias.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            initial_alias.headers()[reqwest::header::LOCATION],
+            "https://startup.example.test/posts/durable-publication"
         );
         let initial = public.get(&initial_public_url).send().await.unwrap();
         let initial_etag = initial.headers()[reqwest::header::ETAG].clone();
@@ -2065,14 +2088,16 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         );
         stop_built_application(application).await;
 
-        fs::write(
-            content_root.join("posts/durable-publication.md"),
-            DURABLE_POST.replace(
+        let stopped_edit = DURABLE_POST
+            .replace(
+                "slug = \"durable-publication\"\n",
+                "slug = \"durable-publication\"\naliases = [\"edited-durable-alias\"]\n",
+            )
+            .replace(
                 "Durable article body.",
                 "This edit was made while Maincopy was stopped.",
-            ),
-        )
-        .unwrap();
+            );
+        fs::write(&durable_post_path, stopped_edit).unwrap();
         let arguments = root.path().join("maincopy.toml");
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
@@ -2083,6 +2108,24 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let pinned_body = pinned.text().await.unwrap();
         assert!(pinned_body.contains("Durable article body."));
         assert!(!pinned_body.contains("This edit was made while Maincopy was stopped."));
+        let pinned_alias_url = format!(
+            "http://{}/posts/original-durable-alias",
+            restarted.public_addr
+        );
+        let pinned_alias = public.get(&pinned_alias_url).send().await.unwrap();
+        assert_eq!(pinned_alias.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            pinned_alias.headers()[reqwest::header::LOCATION],
+            "https://startup.example.test/posts/durable-publication"
+        );
+        let edited_alias_url = format!(
+            "http://{}/posts/edited-durable-alias",
+            restarted.public_addr
+        );
+        assert_eq!(
+            public.get(&edited_alias_url).send().await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
 
         let admin = admin_client(&restarted);
         let posts: ListPostsResponse = admin_json(admin_get(&admin, POSTS_PATH).await).await;
@@ -2127,6 +2170,16 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let updated_body = updated.text().await.unwrap();
         assert!(updated_body.contains("This edit was made while Maincopy was stopped."));
         assert!(!updated_body.contains("Durable article body."));
+        assert_eq!(
+            public.get(&pinned_alias_url).send().await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        let updated_alias = public.get(&edited_alias_url).send().await.unwrap();
+        assert_eq!(updated_alias.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            updated_alias.headers()[reqwest::header::LOCATION],
+            "https://startup.example.test/posts/durable-publication"
+        );
 
         stop_built_application(restarted).await;
     }
