@@ -23,8 +23,8 @@ fi
 readonly maincopy_data_root
 readonly root_certificate="$maincopy_data_root/maincopy/dev-ca/rootCA.pem"
 
-[[ -x $client ]] || die "the development client is not built; start scripts/dev-alpha.sh first"
-[[ -f $root_certificate ]] || die "the development CA is missing; start scripts/dev-alpha.sh first"
+[[ -x $client ]] || die "the development client is not built; start scripts/dev.sh first"
+[[ -f $root_certificate ]] || die "the development CA is missing; start scripts/dev.sh first"
 
 exec "$client" \
   --admin-origin https://admin.localhost:8443 \

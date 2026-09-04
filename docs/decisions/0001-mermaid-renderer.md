@@ -9,10 +9,8 @@ Decision date: 2026-09-03
 This architecture decision record (ADR) selects the local Mermaid engine for
 Maincopy v1. It also fixes the process boundary and initial resource targets.
 
-The decision resolves the renderer selection in
-[work package 6.2](../implementation.md#work-package-62-mermaid-implementation-spike).
-The supervised and sanitized corpus evidence is completed by work packages
-6.3 and 6.4.
+The decision resolves the renderer selection. The implementation includes the
+supervised helper, SVG sanitizer, and representative corpus evidence.
 
 ## Context
 
@@ -61,8 +59,8 @@ The spike built the exact 0.3.1 release with SVG-only CLI features:
 cargo build --release --locked --no-default-features --features cli
 ```
 
-The spike extracted all ten Mermaid fences from `docs/design.md` and
-`docs/implementation.md`. The corpus contains six flowcharts, two sequence
+The spike extracted ten Mermaid fences from the design and delivery-plan
+revision under review. The corpus contained six flowcharts, two sequence
 diagrams, and two state diagrams.
 
 The renderer completed 10 of 10 diagrams. Two fresh processes produced the
@@ -122,7 +120,7 @@ The trust flow is:
 validated Mermaid source
   -> supervised maincopy-mermaid helper
   -> untrusted raw SVG
-  -> WP6.3 sanitizer
+  -> SVG sanitizer
   -> sanitized inline-SVG capability
 
 any failure
@@ -130,7 +128,7 @@ any failure
   -> retain the active snapshot
 ```
 
-Raw SVG never receives inline delivery capability. The WP6.3 sanitizer parses
+Raw SVG never receives inline delivery capability. The SVG sanitizer parses
 and canonicalizes accepted SVG through an explicit element, attribute, and
 value allowlist. It rejects scripts, event attributes, foreign objects, and
 remote resource references. HTTPS and root-relative anchors remain inert
@@ -160,7 +158,7 @@ URLs remain outside the inline-SVG capability.
 
 These values are enforced implementation limits. Inclusive byte limits accept
 a value equal to the stated limit; the wider release stress matrix remains
-part of WP6.4.
+part of the wider release stress matrix.
 
 | Boundary | Selected target | Owner |
 | --- | --- | --- |
@@ -241,12 +239,11 @@ source and ship under the package's MIT license. The 0.3.1 crate declares no
 separate asset license for those byte strings; their exact digests remain part
 of Maincopy's renderer-version-specific sanitizer policy.
 
-WP6.2 runs all ten selected diagrams through the supervised helper and fixes
-their raw-output digests. WP6.3 provides the distinct sanitized-inline-SVG
-capability, removes the known inline-style CSP mismatch, and fixes separately
-scoped sanitizer-output digests. WP6.4 binds the application-wide admission
-capability, preview/public equivalence, structural limits, identity mutation,
-and Nix license closure into the release gate.
+The renderer corpus runs all ten selected diagrams through the supervised
+helper and fixes their raw-output digests. The sanitizer provides the distinct
+sanitized-inline-SVG capability and fixes separately scoped output digests.
+Application-wide admission, preview and public equivalence, structural limits,
+identity mutation, and Nix license closure form the release evidence.
 
 Reconsider `merman` when it publishes a stable release with the evaluated
 resource, cancellation, sanitizer, and diagram-family contracts.

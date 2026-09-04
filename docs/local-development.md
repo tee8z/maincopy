@@ -1,10 +1,13 @@
-# Run the local alpha
+# Run Maincopy locally
 
 Status: supported development workflow
 
+Last reviewed: 2026-09-04
+
 Related: [project overview](../README.md),
 [managed source runbook](managed-source.md),
-[implementation plan](implementation.md), and [engineering style](quality.md).
+[remaining implementation work](implementation.md), and
+[engineering style](quality.md).
 
 Use this runbook to publish the included Markdown post through the local HTTPS
 gateway. Start with the browser walkthrough. Use the command-line interface
@@ -22,7 +25,7 @@ production deployment or NixOS acceptance test.
 | Public loopback upstream | `127.0.0.1:3000` | Caddy access only |
 | Administration loopback upstream | `127.0.0.1:3001` | Caddy access only |
 
-The local-alpha fixture is in `crates/server/examples/local-alpha/`. Runtime
+The development fixture is in `crates/server/examples/development/`. Runtime
 state persists in `target/maincopy-dev/` between launcher restarts.
 
 This fixture uses `external_checkout`, the default source mode. The launcher
@@ -67,10 +70,10 @@ Enter the development shell from the repository root:
 nix develop
 ```
 
-Start the local alpha and install its CA in supported browser stores:
+Start the local environment and install its CA in supported browser stores:
 
 ```console
-scripts/dev-alpha.sh --trust-browser
+scripts/dev.sh --trust-browser
 ```
 
 The launcher builds `maincopyd`, its isolated `maincopy-mermaid` renderer, and
@@ -104,7 +107,7 @@ Save this password now. Maincopy will not display it after identity setup.
 Wait for this output:
 
 ```text
-Maincopy local alpha is ready.
+Maincopy development environment is ready.
 
   Public: https://maincopy.localhost:8443
   Admin:  https://admin.localhost:8443/admin/login
@@ -162,7 +165,7 @@ still reports a certificate error.
 To run only CLI diagnostics, start the launcher without changing browser trust:
 
 ```console
-scripts/dev-alpha.sh
+scripts/dev.sh
 ```
 
 To remove browser trust, first stop the launcher. Then run:
@@ -180,11 +183,11 @@ This section preserves the detailed API checks for development and fault
 diagnosis. Browser trust is not required because the CLI uses the CA file
 directly.
 
-If the local alpha is not running, start it from the repository root:
+If the local environment is not running, start it from the repository root:
 
 ```console
 nix develop
-scripts/dev-alpha.sh
+scripts/dev.sh
 ```
 
 Open a second terminal at the repository root. Enter `nix develop` with the
@@ -300,7 +303,7 @@ The CLI never overwrites an existing preview file. Create a new destination
 when you repeat this step.
 
 The file preserves the reviewed HTML bytes. Some root-relative styles and
-protected assets do not load from a `file:` URL in the current alpha.
+protected assets do not load from a `file:` URL in this workflow.
 
 ### 4. Publish the reviewed preview
 
@@ -361,7 +364,7 @@ Verify its redirect:
 curl --noproxy '*' --cacert "$ROOT_CERTIFICATE" --max-time 5 \
   --silent --show-error --output /dev/null \
   --write-out '%{http_code} %{redirect_url}\n' \
-  "$PUBLIC_ORIGIN/posts/welcome?source=local-alpha"
+  "$PUBLIC_ORIGIN/posts/welcome?source=local-development"
 ```
 
 Expected output:
@@ -419,19 +422,19 @@ its launcher scripts. The gateway binds both virtual hosts to loopback. It
 removes untrusted identity headers, disables upstream retries, and blocks
 metrics forwarding.
 
-This evidence applies only to the local-alpha harness. The gateway runs with
-the developer's identity and uses a workstation CA.
+This evidence applies only to the local development harness. The gateway runs
+with the developer's identity and uses a workstation CA.
 
 The fixture does not test an SSH server, deploy key, or managed mirror. Use the
 [managed source runbook](managed-source.md) for that configuration contract.
 
-[Work package 4.5](implementation.md#work-package-45-https-admin-gateway-contract)
-still requires the complete production gateway contract. It includes remote
-exposure policy, browser routes, logging evidence, and security tests.
+The [remaining implementation work](implementation.md) still requires the
+complete production gateway contract. It includes remote exposure policy,
+browser routes, logging evidence, and security tests.
 
-[Work package 8.2](implementation.md#work-package-82-nixos-module-and-admin-gateway)
-still requires the NixOS module. It includes separate service identities,
-firewall enforcement, protected credentials, and virtual-machine evidence.
+The remaining deployment work also requires the NixOS module. It includes
+separate service identities, firewall enforcement, protected credentials, and
+virtual-machine evidence.
 
 ## Troubleshooting
 
@@ -451,17 +454,17 @@ the operating system credential manager. Confirm the target before removal.
 ### The generated owner password was not saved
 
 If no human session exists, stop the launcher and move the disposable local
-alpha state aside with the reset procedure above. Restart the launcher, then
+development state aside with the reset procedure above. Restart the launcher, then
 save the new password before the readiness message appears.
 
 If a session exists, log out before the reset. Maincopy does not redisplay the
-initial password, and the current alpha does not provide a completed browser
+initial password, and the current build does not provide a completed browser
 password-rotation flow.
 
 ### The development CA is missing
 
 Use the same `XDG_DATA_HOME` value in both terminals. If the CA does not exist,
-restart `scripts/dev-alpha.sh` to create it.
+restart `scripts/dev.sh` to create it.
 
 The launcher creates a fresh disposable leaf certificate from the durable CA
 on each start. A changed `XDG_DATA_HOME` therefore cannot leave the gateway

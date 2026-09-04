@@ -3,7 +3,7 @@
 Status: active project convention
 
 Related: [README](../README.md), [design](design.md), and
-[implementation plan](implementation.md).
+[remaining implementation work](implementation.md).
 
 These rules are normative for new code. Existing deviations are cleanup debt,
 not precedent. Reviews must approve and document exceptions.

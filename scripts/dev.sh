@@ -4,7 +4,7 @@ export LC_ALL=C
 
 usage() {
   cat <<'EOF'
-Usage: scripts/dev-alpha.sh [--trust-browser]
+Usage: scripts/dev.sh [--trust-browser]
 
 Build and run the example Maincopy server plus its loopback HTTPS gateway.
 On fresh state, the daemon prints a generated owner password exactly once.
@@ -39,7 +39,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 readonly script_dir
 project_root=$(cd -- "$script_dir/.." && pwd -P)
 readonly project_root
-readonly config="$project_root/crates/server/examples/local-alpha/maincopy.toml"
+readonly config="$project_root/crates/server/examples/development/maincopy.toml"
 readonly daemon="$project_root/target/debug/maincopyd"
 if [[ -n ${XDG_DATA_HOME:-} ]]; then
   maincopy_data_root=$XDG_DATA_HOME
@@ -101,11 +101,11 @@ for _ in {1..50}; do
   kill -0 "$gateway_pid" 2>/dev/null || wait "$gateway_pid"
   sleep 0.1
 done
-$ready || die "the local alpha services did not become ready"
+$ready || die "the local development services did not become ready"
 
 cat <<'EOF'
 
-Maincopy local alpha is ready.
+Maincopy development environment is ready.
 
   Public: https://maincopy.localhost:8443
   Admin:  https://admin.localhost:8443/admin/login
@@ -118,6 +118,6 @@ set +e
 wait -n "$daemon_pid" "$gateway_pid"
 child_status=$?
 set -e
-echo "error: a local alpha process exited unexpectedly" >&2
+echo "error: a local development process exited unexpectedly" >&2
 ((child_status != 0)) || child_status=1
 exit "$child_status"

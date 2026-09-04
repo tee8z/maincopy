@@ -177,7 +177,7 @@
                 export MAINCOPY_DEV_TLS_PRIVATE_KEY="$TMPDIR/key.pem"
                 caddy validate --config ${./dev/Caddyfile} --adapter caddyfile
                 shellcheck \
-                  ${./scripts/dev-alpha.sh} \
+                  ${./scripts/dev.sh} \
                   ${./scripts/dev-gateway.sh} \
                   ${./scripts/dev-maincopy.sh} \
                   ${./scripts/test-dev-gateway.sh}

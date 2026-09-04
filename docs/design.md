@@ -5,7 +5,7 @@ Status: target architecture; implementation is incomplete
 Last reviewed: 2026-09-04
 
 Related documents: [project overview](../README.md),
-[implementation plan](implementation.md),
+[remaining implementation work](implementation.md),
 [managed source runbook](managed-source.md), and
 [engineering style guide](quality.md).
 
@@ -19,10 +19,10 @@ Maincopy controls when each approved article revision becomes public on the
 author's domain.
 
 This document defines the accepted V1 behavior and trust boundaries. The
-[implementation plan](implementation.md) defines delivery work and acceptance
-gates.
+[remaining implementation work](implementation.md) defines unfinished delivery
+work and acceptance gates.
 
-The implementation plan must conform to this design. A product decision must
+The remaining work must conform to this design. A product decision must
 update this document before it changes the plan.
 
 > [!WARNING]
@@ -613,8 +613,9 @@ HTML script text node. Ordinary metadata attributes remain Maud-escaped.
 This is deliberately core, non-image Open Graph metadata. The
 [Open Graph protocol](https://ogp.me/) also requires `og:image`, so Maincopy
 does not claim complete Open Graph support yet and does not substitute the
-favicon. Work package 2.5 adds Open Graph and JSON-LD image fields only after
-it can project validated external images and snapshot-scoped local image URLs.
+favicon. The remaining image-metadata work adds Open Graph and JSON-LD image
+fields after it can project validated external images and snapshot-scoped
+local image URLs.
 Feeds use stable post identifiers and absolute canonical URLs.
 
 Request handlers read only the active immutable snapshot. They do not parse
@@ -1042,9 +1043,10 @@ V1 must prove these properties:
   Litestream ordering, restart behavior, and restore behavior.
 - A clean checkout passes the documented Nix and Rust checks.
 
-The [implementation plan](implementation.md) contains the complete work-package
-and failure-injection gates. The [engineering style guide](quality.md) defines
-code conventions and the manual CRAP score budget.
+The [remaining implementation work](implementation.md) contains unfinished
+acceptance and failure-injection gates. The
+[engineering style guide](quality.md) defines code conventions and the manual
+CRAP score budget.
 
 ## Post-v1 roadmap
 

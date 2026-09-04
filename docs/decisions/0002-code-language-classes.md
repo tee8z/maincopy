@@ -7,8 +7,8 @@ Decision date: 2026-09-03
 ## Purpose
 
 This architecture decision record fixes the V1 fenced-code language policy,
-HTML shape, trust boundary, and release evidence. It closes
-[work package 6.1](../implementation.md#work-package-61-code-language-rendering).
+HTML shape, trust boundary, and release evidence. The implementation and
+representative corpus now enforce this decision.
 
 ## Context
 

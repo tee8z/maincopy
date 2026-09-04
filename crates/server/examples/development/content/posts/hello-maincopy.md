@@ -11,7 +11,7 @@ Maincopy is a self-hosted publishing engine for one site and one canonical
 domain. Git owns each article body and its authored metadata. Maincopy controls
 when an approved revision becomes public.
 
-This local-alpha article passes through the same compiler, preview, approval,
+This development article passes through the same compiler, preview, approval,
 and publication path as other content. It is also a compact design document for
 that path.
 
@@ -45,9 +45,9 @@ paths, special files, invalid metadata, and configured limit excesses.
 Compilation produces deterministic owned bytes. Public request handlers read
 the active snapshot instead of reopening Markdown or querying the source tree.
 
-The checked-in local alpha uses external checkout mode. A managed installation
-uses a structured SSH endpoint, one branch, and one selected repository
-subdirectory.
+The checked-in development environment uses external checkout mode. A managed
+installation uses a structured SSH endpoint, one branch, and one selected
+repository subdirectory.
 
 ## Managed synchronization is durable and read-only
 
@@ -188,9 +188,9 @@ the capability to embed accepted SVG.
 Public article reading does not require JavaScript. The built-in shell provides
 server-rendered navigation and content-hashed application assets.
 
-## What the local alpha implements
+## What the development environment demonstrates
 
-The current local alpha provides these foundations:
+The development environment demonstrates these foundations:
 
 - An operator-maintained local checkout with automatic candidate reloads.
 - Generated first-start owner credentials and password browser sign-in.

@@ -1,10 +1,12 @@
 # Configure managed Git synchronization
 
-Status: pre-v1 operator workflow
+Status: supported operator workflow
+
+Last reviewed: 2026-09-04
 
 Related: [system design](design.md),
-[implementation plan](implementation.md),
-[local alpha runbook](local-alpha.md), and
+[remaining implementation work](implementation.md),
+[local development runbook](local-development.md), and
 [engineering style guide](quality.md).
 
 Use this runbook to configure one read-only SSH Git source. Maincopy fetches

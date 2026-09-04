@@ -2,216 +2,219 @@
 
 **Markdown in Git. Live on your domain.**
 
-Maincopy is a self-hosted publishing engine for writers. Git stores
-the canonical Markdown. Maincopy renders and publishes approved revisions on
-the author's domain.
+Maincopy is a self-hosted publishing engine for one website. Git stores each
+article and its authored metadata. Maincopy controls when an approved revision
+becomes public.
 
-Maincopy is in pre-v1 development. It is not ready for a production deployment.
+An author pushes Markdown to one configured branch. Maincopy fetches that
+branch, builds a private candidate, and presents an exact rendered preview.
+Only an explicit release action can change the public website.
 
-## Local browser quick start
+Production deployment tooling is still in development. Use the local workflow
+below to evaluate Maincopy. See the [remaining work](docs/implementation.md)
+before you operate a public instance.
 
-Run each command from the repository root on Linux:
+## How publishing works
+
+```mermaid
+flowchart LR
+    Author[Author] -->|Push Markdown| Git[Git repository]
+    Git -->|Read-only SSH fetch| Sync[Source synchronization]
+    Sync --> Candidate[Immutable candidate]
+    Candidate --> Compiler[Validator and compiler]
+    Compiler --> Preview[Private exact preview]
+    Operator[Administrator] -->|Review and approve| Preview
+    Preview --> Release[Release ledger]
+    Release --> Snapshot[Immutable public snapshot]
+    Snapshot --> Site[Website, RSS, and sitemap]
+```
+
+The synchronization and release paths are separate:
+
+- A sync can add or update a private candidate.
+- A sync cannot publish a new article or replace a live revision.
+- A release binds the selected revision and its exact preview digest.
+- Public requests read one immutable snapshot instead of mutable Markdown.
+- Git access is read-only. Maincopy never commits, merges, or pushes.
+
+Maincopy supports two source modes. Managed Git mode polls a remote repository
+through restricted SSH. External checkout mode reads an operator-maintained
+local tree and performs no Git network operation.
+
+## Try Maincopy locally
+
+Run these commands from the repository root on Linux:
 
 ```console
 nix develop
-scripts/dev-alpha.sh --trust-browser
+scripts/dev.sh --trust-browser
 ```
 
-The launcher installs the development certificate authority (CA) in supported
-browser stores. On fresh state, copy the generated `owner` password from the
-launcher output. Maincopy displays this password only once.
+Keep the launcher open. On fresh state, save the generated `owner` password.
+Maincopy displays it only once and stores only its Argon2id hash.
 
-Keep the launcher open. Then complete this workflow:
+Then publish the included article:
 
 1. Open `https://admin.localhost:8443/admin/login`.
 2. Sign in as `owner` with the generated password.
-3. Choose `Review exact preview` for `Hello, Maincopy` and compare its current
-   and candidate revisions.
-4. Choose `Open exact rendered preview` and review the complete article.
-5. Choose `Continue to publication confirmation`, select `I reviewed and accept
-   this exact preview`, then choose `Publish this exact revision`.
-6. Open `https://maincopy.localhost:8443/posts/hello-maincopy`.
-7. Before resetting local state, return to the post list and choose `Sign out`.
+3. Select **Review exact preview** for **Hello, Maincopy**.
+4. Open and inspect the rendered preview.
+5. Continue to confirmation and accept that exact preview.
+6. Select **Publish this exact revision**.
+7. Open `https://maincopy.localhost:8443/posts/hello-maincopy`.
 
-On a repeat run, `Published` and `This exact revision is already public` mean
-the current candidate needs no publication action. The public URL already
-serves it.
+The included article is also a technical design document. It demonstrates
+code rendering, Mermaid diagrams, previews, and the publication boundary.
 
-The browser workflow does not edit Markdown. See the
-[local alpha runbook](docs/local-alpha.md) for CA removal, CLI diagnostics, and
-safe state reset. This fixture uses the operator-maintained external checkout.
+The launcher preserves its database and candidate artifacts in
+`target/maincopy-dev/`. Follow the
+[local development runbook](docs/local-development.md) for command-line checks,
+certificate removal, troubleshooting, and safe state reset.
 
-See the [managed source runbook](docs/managed-source.md) for read-only SSH
-setup, durable synchronization, and failure diagnosis.
+## Write content
 
-## V1 direction
+A content root contains site metadata and one Markdown file per article:
 
-Maincopy v1 targets one site and canonical domain on one server. That site can
-publish any number of Markdown articles from its Git repository.
+```text
+content/
+|-- publication.toml
+`-- posts/
+    `-- hello-maincopy.md
+```
 
-V1 has these product boundaries:
+`publication.toml` defines the public site:
 
-- Git owns article bodies and authored metadata.
-- Maincopy synchronizes one configured branch through read-only Git access.
-- An administrator previews the exact rendered revision before publication.
-- An administrator can publish now or schedule canonical website visibility.
-- A Git sync cannot silently replace an already published revision.
-- Approved slugs and aliases remain reserved to their stable `PostId`.
-- The canonical website and RSS are the only article outputs.
-- Technical Markdown uses escaped plain code with semantic classes for
-  recognized declared languages, plus Mermaid diagrams and sanitized Scalable
-  Vector Graphics (SVG) output.
-- A user profile can provide a mutable Lightning Address for static tips.
-- Maincopy stores no tip invoice, payment, or settlement state in v1.
-- The remote admin site uses authenticated access on a separate origin.
-- The admin gateway forwards to a loopback-only HTTP listener in `maincopyd`.
-- `maincopyd` exports Prometheus process, Tokio runtime, and database metrics
-  from a dedicated loopback-only `/metrics` endpoint.
-- Owner, Administrator, and Publisher roles map to fixed scopes.
-- Publisher access covers content, status, sync, reload, preview, and release
-  only.
-- Browser sessions are opaque server-side cookies with CSRF protection.
-- Automation uses scoped public-key credentials and fresh NIP-98 proofs.
-- The NixOS module deploys `maincopyd`, the admin gateway, and Litestream.
-- A tested restore combines the database replica and revision artifacts.
-- On fresh state, normal startup generates an instance-unique 256-bit owner
-  password, displays it once, persists only its Argon2id hash, and continues.
-- Explicit bootstrap and repair commands remain finite offline process modes.
-  They bind no listener and create no recovery transport or authentication
-  bypass.
+```toml
+[site]
+title = "Example Site"
+base_url = "https://example.com"
+description = "Notes from Example Author."
 
-Maincopy v1 does not include a browser article editor, Git write-back,
-multi-site hosting, paid articles, subscription capture, email delivery, share
-kits, or social-network publishing. These outbound features are post-v1 work.
-Git write permission remains external to Maincopy roles and credentials.
-V1 uses neither JWT browser sessions nor long-lived bearer API tokens.
+[author]
+name = "Example Author"
+```
 
-## Current status
+Each article starts with strict TOML frontmatter:
 
-The repository contains the content compiler, immutable snapshot model,
-single-writer SQLite core, authenticated admin API, remote CLI, publication
-scheduler, and static tip foundation.
+```markdown
++++
+id = "1dd7559b-90a9-4c5b-a13c-70bf6ec01e92"
+title = "Hello, Maincopy"
+slug = "hello-maincopy"
+aliases = ["welcome"]
+authored_at = 2026-08-29T10:15:00-04:00
+description = "A short description for feeds and page metadata."
++++
 
-Password and Nostr login, generated first-start owner setup, server-side
-sessions, role scopes, NIP-98 agent proofs, exact previews, and immediate or
-scheduled release foundations are present. The admin backend now uses a
-loopback-only HTTP listener. The CLI connects through the configured HTTPS
-admin origin. A first publication UI supports password sign-in, revision
-inspection, exact preview review, and immediate initial or update publication.
+Article Markdown starts here.
+```
 
-A checked, loopback-only HTTPS gateway and explicit local CA trust are present
-for the local-alpha workflow. This development harness is not the production
-gateway or NixOS module.
+Keep `id` stable when you rename or move an article. Maincopy binds approved
+slugs and aliases to that identity. A conflicting article cannot claim them.
 
-The snapshot-backed RSS feed, sitemap, robots policy, HTML autodiscovery,
-canonical links, core non-image Open Graph fields, `BlogPosting` JSON-LD,
-authored-alias redirects, durable route ownership, and snapshot-scoped local
-asset delivery are present. Semantic code-language classes, supervised Mermaid
-rendering, and SVG sanitization are also present. Managed Git synchronization,
-including offline source setup, startup and periodic fetch, manual sync, and
-redacted admin and CLI status, is present as a foundation. Online
-fresh-authenticated source reconfiguration and selected-credential public-key
-visibility remain incomplete, as do favicon and image metadata, page Content
-Security Policy (CSP), the complete admin web interface, the NixOS module,
-Litestream wiring, Prometheus metrics and dashboard, and complete restore
-evidence. V1 rejects authored subscription and outbound-distribution
-configuration. It stores no target-job state.
+The compiler supports CommonMark, declared code-language classes, Mermaid
+diagrams, and sanitized Scalable Vector Graphics (SVG). Public pages remain
+usable without JavaScript.
 
-> [!CAUTION]
-> Do not expose the loopback admin listener directly. Use the reviewed HTTPS
-> gateway and keep the public origin isolated from every admin route. Keep the
-> metrics listener loopback-only.
+## Connect a Git repository
 
-## Post-v1 roadmap
+Managed mode requires one SSH repository, one branch, and a read-only deploy
+key. Maincopy stores repository settings in SQLite and secret file references
+in the host configuration.
 
-Post-v1 mailing-list work starts with first-party double opt-in, unsubscribe,
-export, and deletion. It must store token digests and keep raw addresses out of
-logs, metrics, and audit events. The design must select an email transport,
-address-comparison rule, and retention policy before implementation. Bulk
-newsletter campaigns remain a separate increment.
+Setup has three operator-controlled steps:
 
-Subscriber mutations and transactional email work must commit together. The
-email worker must perform network delivery outside the database transaction.
+1. Register protected SSH credential paths in `maincopy.toml`.
+2. Install the generated public key as a read-only deploy key.
+3. Store the remote, branch, content directory, and poll interval offline.
 
-Assisted X and Substack distribution remains credential-free. A future share
-kit can use only a committed canonical revision and its canonical URL. Copy and
-Open actions cannot claim delivery. X uses its supported Web Intent. Substack
-uses copyable text plus an ordinary link so the user can select `Create` and
-then `Note`; Maincopy does not depend on an undocumented prefilled composer.
-X support must select and pin a weighted-text implementation against official
-fixtures before release.
+Start `maincopyd` after setup. It validates the first fetch and compilation
+before it opens network listeners.
 
-Automatic provider delivery, including Nostr article distribution, requires a
-separate credential and job design. That design must define signer custody,
-idempotency, retries, audit data, and delivery states. No outbound provider can
-block or roll back canonical publication.
+For complete commands and file-permission rules, follow the
+[managed Git runbook](docs/managed-source.md).
 
-Post-v1 authoring can add Obsidian Sync as an optional source. The official
-Obsidian Headless client mirrors a dedicated publishing vault to the server.
-Maincopy then creates an immutable content snapshot before validation and
-preview. A completed sync never publishes an article without the existing
-preview and release approval.
+## Publish an update
 
-The first Obsidian increment includes a Maincopy article template, strict YAML
-Properties support, deterministic wiki links, and local attachment embeds. It
-does not execute community plugins or use Obsidian Publish. Obsidian Sync
-protects remote synchronization, but it does not replace Maincopy database and
-revision-artifact backups.
+After setup, article changes need no server restart:
+
+1. Commit and push Markdown to the configured branch.
+2. Wait for the next poll, or request **Sync now** in `/admin/source`.
+3. Open **Posts** after the sync reports `applied`.
+4. Review the exact rendered candidate.
+5. Publish the selected revision after confirmation.
+
+Use the command-line interface (CLI) for the same source operations:
+
+```console
+maincopy source status
+maincopy source sync --wait
+```
+
+Use `--json` for automation. Add `--idempotency-key UUID` when a caller must
+safely retry one manual sync request.
+
+If a fetch or compile fails, Maincopy keeps the previous private candidate and
+public snapshot. Inspect the stable failure code with:
+
+```console
+maincopy --json source status
+```
+
+## Security boundaries
+
+- Keep the public, administration, and metrics listeners separate.
+- Put the administration listener behind the reviewed HTTPS gateway.
+- Give each SSH deploy key read-only repository access.
+- Store SSH, TLS, and backup secrets in protected host files.
+- Never expose the loopback administration listener directly.
+
+The SSH helper is an outbound client. It binds no listener and requests no
+tunnel. The virtual private cloud and host firewall remain the ingress
+boundary.
+
+The remaining deployment work adds a dedicated loopback metrics listener. It
+will not share the public or administration routers.
 
 ## Documentation
 
-- [System design](docs/design.md) defines the V1 architecture, trust
-  boundaries, and data ownership.
-- [Implementation plan](docs/implementation.md) defines delivery order,
-  dependencies, known transitions, and acceptance gates.
-- [Local alpha runbook](docs/local-alpha.md) starts the development gateway and
-  exercises login, preview, publication, RSS, and authored aliases.
-- [Managed source runbook](docs/managed-source.md) configures read-only SSH,
-  durable source synchronization, and the external-checkout alternative.
-- [Engineering style](docs/quality.md) defines Rust, testing, documentation,
-  and quality conventions. It also explains the manual CRAP report.
-
-The design and implementation documents describe target V1 behavior. They do
-not claim that every feature is implemented.
-
-## Workspace
-
-The root manifest defines one Cargo workspace with five crates:
-
-```text
-crates/
-|-- cli/                 # short-lived maincopy operator client
-|-- diagram-renderer/    # isolated Mermaid renderer subprocess
-|-- markdown-compiler/   # content discovery, validation, and identity
-|-- server/              # maincopyd service and application domains
-`-- shared/              # wire contracts shared by the server and CLI
-```
-
-`maincopyd` owns the public service, loopback admin listener, database, and
-supervised tasks. `maincopy` sends typed HTTPS admin requests and exits.
+- [System design](docs/design.md) defines architecture, data ownership, and
+  trust boundaries.
+- [Managed Git runbook](docs/managed-source.md) covers setup, synchronization,
+  status, and failure recovery.
+- [Local development runbook](docs/local-development.md) covers the included
+  HTTPS environment and browser workflow.
+- [Remaining implementation work](docs/implementation.md) lists unfinished
+  product, operations, and release work.
+- [Engineering style](docs/quality.md) defines code, test, and documentation
+  conventions.
 
 ## Development
 
-The supported development environment uses Nix on Linux.
+The root manifest defines five Rust crates:
+
+```text
+crates/
+|-- cli/                 # short-lived operator client
+|-- diagram-renderer/    # isolated Mermaid renderer
+|-- markdown-compiler/   # content validation and compilation
+|-- server/              # daemon, application domains, and web surfaces
+`-- shared/              # wire contracts shared by server and CLI
+```
+
+Run the workspace tests in the supported Nix environment:
 
 ```console
 nix develop
 cargo test --locked --workspace --all-targets --all-features
 ```
 
-Use the browser quick start above for the shortest publication workflow.
-Follow the [local alpha runbook](docs/local-alpha.md) for the equivalent CLI
-workflow, detailed output checks, trust removal, and safe state reset.
-
-Run the Linux continuous integration checks and build with:
+Run the canonical Linux checks and package build with:
 
 ```console
 nix flake check --print-build-logs
 nix build --print-build-logs
 ```
-
-GitHub Actions also checks the shared contracts, CLI, and server on Windows.
-The manual CRAP report is separate from these CI checks.
 
 The flake supports `x86_64-linux` and `aarch64-linux`. The default branch is
 `master`.
