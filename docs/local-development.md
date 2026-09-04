@@ -70,11 +70,14 @@ Enter the development shell from the repository root:
 nix develop
 ```
 
-Start the local environment and install its CA in supported browser stores:
+Clear disposable state and start the browser workflow:
 
 ```console
-scripts/dev.sh --trust-browser
+just quickstart
 ```
+
+The recipe refuses to run while `maincopyd` or the gateway owns its lock. It
+removes only `target/maincopy-dev/` and keeps the durable development CA.
 
 The launcher builds `maincopyd`, its isolated `maincopy-mermaid` renderer, and
 `maincopy`. It then starts the server and the Caddy gateway. Keep this terminal
@@ -165,13 +168,19 @@ still reports a certificate error.
 To run only CLI diagnostics, start the launcher without changing browser trust:
 
 ```console
-scripts/dev.sh
+just start-cli
+```
+
+To preserve publication state during a browser run, use:
+
+```console
+just start
 ```
 
 To remove browser trust, first stop the launcher. Then run:
 
 ```console
-scripts/dev-gateway.sh --untrust-browser
+just untrust-browser
 ```
 
 This command removes browser trust and keeps the durable CA files. The CLI can
@@ -187,7 +196,7 @@ If the local environment is not running, start it from the repository root:
 
 ```console
 nix develop
-scripts/dev.sh
+just start-cli
 ```
 
 Open a second terminal at the repository root. Enter `nix develop` with the
@@ -395,9 +404,15 @@ launcher with `Ctrl+C` after this command succeeds.
 Normal launcher restarts preserve the database and retained content candidates
 in `target/maincopy-dev/state/`. They also preserve published visibility.
 
-To repeat the first-publication workflow, first revoke the human session. In
-the browser, return to the post list and choose `Sign out`. For a CLI session,
-run `scripts/dev-maincopy.sh logout`. Then stop the launcher and move the state
+Run `just quickstart` after stopping the launcher to discard all disposable
+development state and start the first-publication workflow again. The recipe
+does not delete or untrust the durable development CA.
+
+Run `just reset` to discard the same state without starting the services.
+
+To preserve the old state instead, first revoke the human session. In the
+browser, return to the post list and choose `Sign out`. For a CLI session, run
+`scripts/dev-maincopy.sh logout`. Then stop the launcher and move the state
 directory aside:
 
 ```bash
@@ -454,8 +469,8 @@ the operating system credential manager. Confirm the target before removal.
 ### The generated owner password was not saved
 
 If no human session exists, stop the launcher and move the disposable local
-development state aside with the reset procedure above. Restart the launcher, then
-save the new password before the readiness message appears.
+development state aside with the reset procedure above. Restart the launcher,
+then save the new password before the readiness message appears.
 
 If a session exists, log out before the reset. Maincopy does not redisplay the
 initial password, and the current build does not provide a completed browser
@@ -464,7 +479,7 @@ password-rotation flow.
 ### The development CA is missing
 
 Use the same `XDG_DATA_HOME` value in both terminals. If the CA does not exist,
-restart `scripts/dev.sh` to create it.
+run `just start-cli` to create it.
 
 The launcher creates a fresh disposable leaf certificate from the durable CA
 on each start. A changed `XDG_DATA_HOME` therefore cannot leave the gateway
@@ -474,6 +489,10 @@ serving a leaf from a different development CA.
 
 Read the server and Caddy diagnostics in the launcher terminal. Identify any
 process that owns ports `3000`, `3001`, or `8443`.
+
+If `maincopyd` reports that a retained revision is unavailable, stop the
+launcher. Run `just quickstart` to rebuild disposable state from the current
+example content.
 
 Stop that process only when you own it and no longer need it. Then restart the
 launcher.

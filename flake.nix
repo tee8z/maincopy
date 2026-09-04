@@ -161,9 +161,11 @@
                 nativeBuildInputs = [
                   project.pkgs.caddy
                   project.pkgs.curl
+                  project.pkgs.just
                   project.pkgs.jq
                   project.pkgs.openssl
                   project.pkgs.shellcheck
+                  project.pkgs.util-linux
                 ];
               }
               ''
@@ -176,11 +178,16 @@
                 export MAINCOPY_DEV_TLS_CERTIFICATE="$TMPDIR/certificate.pem"
                 export MAINCOPY_DEV_TLS_PRIVATE_KEY="$TMPDIR/key.pem"
                 caddy validate --config ${./dev/Caddyfile} --adapter caddyfile
+                just --justfile ${./Justfile} --fmt --check
                 shellcheck \
                   ${./scripts/dev.sh} \
                   ${./scripts/dev-gateway.sh} \
                   ${./scripts/dev-maincopy.sh} \
-                  ${./scripts/test-dev-gateway.sh}
+                  ${./scripts/reset-dev.sh} \
+                  ${./scripts/test-dev-gateway.sh} \
+                  ${./scripts/test-reset-dev.sh}
+                ${project.pkgs.bash}/bin/bash \
+                  ${./scripts/test-reset-dev.sh} ${./scripts/reset-dev.sh}
                 ${project.pkgs.bash}/bin/bash \
                   ${./scripts/test-dev-gateway.sh} ${./dev/Caddyfile}
                 touch "$out"
@@ -203,6 +210,7 @@
               project.pkgs.curl
               project.pkgs.git
               project.pkgs.jq
+              project.pkgs.just
               project.pkgs.litestream
               project.pkgs.mkcert
               project.pkgs.nixfmt-tree

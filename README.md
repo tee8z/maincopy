@@ -47,11 +47,15 @@ Run these commands from the repository root on Linux:
 
 ```console
 nix develop
-scripts/dev.sh --trust-browser
+just quickstart
 ```
 
-Keep the launcher open. On fresh state, save the generated `owner` password.
-Maincopy displays it only once and stores only its Argon2id hash.
+`quickstart` removes `target/maincopy-dev/` when it exists. It keeps the
+development certificate authority (CA), then installs browser trust and starts
+a fresh example.
+
+Keep the launcher open. Save the generated `owner` password. Maincopy displays
+it only once and stores only its Argon2id hash.
 
 Then publish the included article:
 
@@ -70,6 +74,9 @@ The launcher preserves its database and candidate artifacts in
 `target/maincopy-dev/`. Follow the
 [local development runbook](docs/local-development.md) for command-line checks,
 certificate removal, troubleshooting, and safe state reset.
+
+After the first run, use `just start` to preserve publication state. Use
+`just start-cli` when you do not want to change browser trust.
 
 ## Write content
 
