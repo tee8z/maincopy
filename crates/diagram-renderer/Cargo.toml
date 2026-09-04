@@ -1,0 +1,21 @@
+[package]
+name = "maincopy-diagram-renderer"
+version.workspace = true
+edition.workspace = true
+autobins = false
+
+[features]
+default = ["client", "helper"]
+client = ["dep:rustix", "dep:tempfile", "rustix/event", "rustix/process"]
+helper = ["dep:mermaid-rs-renderer", "dep:rustix", "rustix/process"]
+
+[[bin]]
+name = "maincopy-mermaid"
+path = "src/main.rs"
+required-features = ["helper"]
+
+[dependencies]
+mermaid-rs-renderer = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+thiserror.workspace = true

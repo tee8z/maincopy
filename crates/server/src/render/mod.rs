@@ -2,12 +2,14 @@
 
 mod asset_path;
 mod catalog;
+mod diagram;
 mod markdown;
 mod metadata;
 mod robots;
 mod rss;
 mod site;
 mod sitemap;
+mod svg;
 
 pub(crate) use asset_path::SnapshotAssetPath;
 pub use catalog::{
@@ -17,8 +19,7 @@ pub(crate) use catalog::{CatalogRetentionError, PreviewAsset};
 pub(crate) use markdown::GeneratedPostAsset;
 pub use markdown::{
     CodeBlockOrdinal, MarkdownRenderError, MarkdownRenderErrorCode, MarkdownRenderLocation,
-    MermaidBlockOrdinal, MermaidPlaceholder, NavigationRejection, RenderDestinationKind,
-    RenderedPost, render_markdown,
+    NavigationRejection, RenderDestinationKind, RenderedPost, render_markdown,
 };
 pub use site::{
     RenderedSiteShell, SiteSnapshot, SiteSnapshotBuildError, SiteSnapshotBuildErrorCode,

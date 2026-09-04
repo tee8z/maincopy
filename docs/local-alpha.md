@@ -70,8 +70,9 @@ scripts/dev-alpha.sh
 On first use, enter and confirm the owner password. Use 15 to 128 Unicode
 characters and no more than 1024 bytes.
 
-The launcher builds `maincopyd` and `maincopy`. It then starts the server and
-the Caddy gateway. Keep this terminal open.
+The launcher builds `maincopyd`, its isolated `maincopy-mermaid` renderer, and
+`maincopy`. It then starts the server and the Caddy gateway. Keep this terminal
+open.
 
 Wait for this output:
 

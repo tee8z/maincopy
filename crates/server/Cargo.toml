@@ -19,6 +19,7 @@ clap.workspace = true
 getrandom.workspace = true
 libsqlite3-sys.workspace = true
 k256.workspace = true
+maincopy-diagram-renderer = { workspace = true, features = ["client"] }
 maincopy-shared = { workspace = true, features = ["schema"] }
 markdown-compiler.workspace = true
 maud.workspace = true
@@ -57,6 +58,7 @@ rustix = { workspace = true, features = ["fs", "std"] }
 
 [dev-dependencies]
 lightningcss.workspace = true
+mermaid-rs-renderer.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

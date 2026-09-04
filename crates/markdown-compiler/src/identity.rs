@@ -28,9 +28,9 @@ const SITE_SNAPSHOT_CONTEXT: &str = "maincopy site snapshot digest v1";
 const COMMONMARK_DIALECT_TAG: u8 = 0;
 const RAW_HTML_DISABLED_TAG: u8 = 0;
 const ESCAPED_PLAIN_CODE_TAG: u8 = 0;
-const MERMAID_PLACEHOLDER_TAG: u8 = 0;
-const POST_RENDERER_VERSION_TAG: u8 = 0;
-const SANITIZER_VERSION_TAG: u8 = 0;
+const MERMAID_SANITIZED_SVG_TAG: u8 = 1;
+const POST_RENDERER_VERSION_TAG: u8 = 1;
+const SANITIZER_VERSION_TAG: u8 = 1;
 const SITE_SHELL_RENDERER_VERSION_TAG: u8 = 0;
 // This tag freezes public content-asset MIME, disposition, and security-header
 // behavior into the snapshot URL. Bump it whenever that delivery policy changes.
@@ -570,7 +570,7 @@ fn encode_baseline_renderer_policy(transcript: &mut Transcript) {
     transcript.tag(COMMONMARK_DIALECT_TAG);
     transcript.tag(RAW_HTML_DISABLED_TAG);
     transcript.tag(ESCAPED_PLAIN_CODE_TAG);
-    transcript.tag(MERMAID_PLACEHOLDER_TAG);
+    transcript.tag(MERMAID_SANITIZED_SVG_TAG);
 }
 
 fn encode_post_renderer(transcript: &mut Transcript, _renderer: &PostRendererIdentity) {
@@ -1056,7 +1056,7 @@ name = "Example Author"
         assert_ne!(baseline, changed);
         assert_eq!(
             baseline.as_str(),
-            "post-b3-v1-5bae9fad34c2c42250d46db8704d38f7f57a804086afa47111b7ffb52c6ade4a"
+            "post-b3-v1-b28db153cfaf94aeac4afc047445e1542ccdeffd2ef2697dc05366f5f2f4cfd6"
         );
 
         let duplicate_refs = [
@@ -1291,7 +1291,7 @@ name = "Example Author"
         assert_eq!(digest(&forward), digest(&reverse));
         assert_eq!(
             digest(&forward).as_str(),
-            "site-b3-v1-8951f1f9fd36abf4e365417ca7e7df972d8db2d847985544dd4779be2e991000"
+            "site-b3-v1-6dd5c5d36a14d0c3c614ec8524e01222abe8691ef9fca722ba2516155a41d451"
         );
 
         let duplicate = [first.clone(), first];
@@ -1406,8 +1406,8 @@ name = "Example Author"
         assert_eq!(
             [disabled.as_str(), enabled.as_str()],
             [
-                "16fe4131db1b25cbf489838b10bb2c9d6383687a910e393ffc78f44b0c93e9b6",
-                "682305887e35b918ab9f685a3c05b50388d339d67c9109e2bd5a7ec50a4ce056",
+                "5cb1b1371d6cd436510db1a4e56e0e04b918c736b4a2f71f4f444d600087412d",
+                "c46e12d4731660d49f3e591bd0d4a7e54876868c57499f473c5c14a103326915",
             ]
         );
     }

@@ -828,7 +828,6 @@ These selections must finish before their owning work starts:
 
 - revision-artifact backup and retention implementation;
 - production HTTPS admin gateway;
-- Mermaid renderer and SVG sanitizer;
 - measured recovery point and recovery time targets.
 
 ## Required release evidence

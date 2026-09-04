@@ -56,6 +56,20 @@ svg {
   max-width: 100%;
 }
 
+.mermaid-diagram {
+  margin-block: 1.5rem;
+  overflow-x: auto;
+}
+
+.mermaid-diagram > svg {
+  display: block;
+  margin-inline: auto;
+}
+
+.mermaid-diagram .mc-mermaid-mix-blend-multiply {
+  mix-blend-mode: multiply;
+}
+
 pre {
   background: var(--surface);
   border: 1px solid var(--border);

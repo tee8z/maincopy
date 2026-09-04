@@ -56,6 +56,7 @@ readonly root_certificate="$maincopy_data_root/maincopy/dev-ca/rootCA.pem"
 cd -- "$project_root"
 cargo build --locked \
   --package maincopy-server --bin maincopyd \
+  --package maincopy-diagram-renderer --bin maincopy-mermaid \
   --package maincopy-cli --bin maincopy
 
 if [[ ! -e $database ]]; then

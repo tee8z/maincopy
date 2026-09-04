@@ -113,6 +113,13 @@
         {
           build = project.maincopy;
 
+          package-binaries = project.pkgs.runCommand "maincopy-package-binaries" { } ''
+            test -x ${project.maincopy}/bin/maincopy
+            test -x ${project.maincopy}/bin/maincopyd
+            test -x ${project.maincopy}/bin/maincopy-mermaid
+            touch "$out"
+          '';
+
           clippy = project.craneLib.cargoClippy {
             inherit (project) cargoArtifacts src;
             cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";

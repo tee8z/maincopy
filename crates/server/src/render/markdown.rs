@@ -12,10 +12,15 @@ use serde::Serialize;
 use thiserror::Error;
 use url::{Position, Url};
 
-use super::SnapshotAssetPath;
+use super::{
+    SnapshotAssetPath,
+    diagram::{DiagramRenderError, DiagramRenderErrorCode, MermaidDiagramRenderer},
+    svg::SanitizedSvg,
+};
 
 const MAX_RENDERED_HTML_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MERMAID_SOURCE_BYTES: usize = 256 * 1024;
+const MAX_MERMAID_SVG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MERMAID_BLOCKS: usize = 64;
 
 /// Render one post with the closed V1 CommonMark pipeline.
@@ -24,17 +29,27 @@ pub fn render_markdown(
     assets: &ResolvedPostAssets,
     site_assets: &ResolvedSiteAssets,
 ) -> Result<RenderedPost, MarkdownRenderError> {
-    render_markdown_with_limits(document, assets, site_assets, RendererLimits::production())
+    let diagrams = MermaidDiagramRenderer::discover()
+        .map_err(|error| mermaid_error(document, MarkdownRenderLocation::Document, error.code()))?;
+    render_markdown_with_renderer(
+        document,
+        assets,
+        site_assets,
+        RendererLimits::production(),
+        &mut |source, ordinal| diagrams.render(source, &document.metadata.id, ordinal),
+    )
 }
 
-fn render_markdown_with_limits(
+fn render_markdown_with_renderer(
     document: &PostDocument,
     assets: &ResolvedPostAssets,
     site_assets: &ResolvedSiteAssets,
     limits: RendererLimits,
+    render_mermaid: &mut dyn FnMut(&str, NonZeroUsize) -> Result<SanitizedSvg, DiagramRenderError>,
 ) -> Result<RenderedPost, MarkdownRenderError> {
     let identity = PostRendererIdentity::baseline();
-    let rendered = MarkdownEventRenderer::new(document, assets, site_assets, limits).render()?;
+    let article = MarkdownEventRenderer::new(document, assets, site_assets, render_mermaid, limits)
+        .render()?;
     let generated_assets: Vec<GeneratedPostAsset> = Vec::new();
     validate_generated_assets(document, assets, &generated_assets)?;
     let generated_identities = generated_assets
@@ -46,7 +61,7 @@ fn render_markdown_with_limits(
         assets,
         site_assets,
         &identity,
-        rendered.article.identity_html.as_bytes(),
+        article.identity_html.as_bytes(),
         &generated_identities,
     )
     .map_err(|error| identity_error(document, error))?;
@@ -55,8 +70,7 @@ fn render_markdown_with_limits(
         document: document.clone(),
         assets: assets.clone(),
         renderer: identity,
-        article: rendered.article,
-        mermaid: rendered.mermaid.into(),
+        article,
         generated_assets: generated_assets.into(),
         revision,
     })
@@ -69,7 +83,6 @@ pub struct RenderedPost {
     pub(crate) assets: ResolvedPostAssets,
     pub(crate) renderer: PostRendererIdentity,
     pub(crate) article: RenderedArticle,
-    pub(crate) mermaid: Arc<[MermaidPlaceholder]>,
     pub(crate) generated_assets: Arc<[GeneratedPostAsset]>,
     pub(crate) revision: PostRevisionDigest,
 }
@@ -156,12 +169,11 @@ impl GeneratedPostAsset {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct MermaidBlockOrdinal(NonZeroUsize);
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MermaidBlockOrdinal(NonZeroUsize);
 
 impl MermaidBlockOrdinal {
-    pub const fn get(self) -> usize {
+    const fn get(self) -> usize {
         self.0.get()
     }
 
@@ -182,13 +194,6 @@ impl CodeBlockOrdinal {
     fn new(value: NonZeroUsize) -> Self {
         Self(value)
     }
-}
-
-/// Escaped inline placeholder input retained for Slice 6 diagram rendering.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MermaidPlaceholder {
-    pub ordinal: MermaidBlockOrdinal,
-    pub source: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -237,6 +242,14 @@ pub enum MarkdownRenderErrorCode {
     NavigationRejected,
     MermaidBlockCountExceeded,
     MermaidBlockTooLarge,
+    MermaidRenderedOutputTooLarge,
+    MermaidInvalid,
+    MermaidRendererUnavailable,
+    MermaidRendererResourceLimit,
+    MermaidRendererTimedOut,
+    MermaidRendererInvalidOutput,
+    MermaidSvgRejected,
+    MermaidRendererInternal,
     RenderedHtmlTooLarge,
     UnsupportedCommonMarkEvent,
     MalformedCommonMarkEvents,
@@ -296,6 +309,7 @@ impl MarkdownRenderError {
 struct RendererLimits {
     rendered_html_bytes: usize,
     mermaid_source_bytes: usize,
+    mermaid_svg_bytes: usize,
     mermaid_blocks: usize,
 }
 
@@ -304,6 +318,7 @@ impl RendererLimits {
         Self {
             rendered_html_bytes: MAX_RENDERED_HTML_BYTES,
             mermaid_source_bytes: MAX_MERMAID_SOURCE_BYTES,
+            mermaid_svg_bytes: MAX_MERMAID_SVG_BYTES,
             mermaid_blocks: MAX_MERMAID_BLOCKS,
         }
     }
@@ -386,12 +401,7 @@ enum ArticleChunk {
     LocalAsset(DigestedAsset),
 }
 
-struct RenderResult {
-    article: RenderedArticle,
-    mermaid: Vec<MermaidPlaceholder>,
-}
-
-struct MarkdownEventRenderer<'input> {
+struct MarkdownEventRenderer<'input, 'renderer> {
     document: &'input PostDocument,
     assets: &'input ResolvedPostAssets,
     site_assets: &'input ResolvedSiteAssets,
@@ -400,16 +410,24 @@ struct MarkdownEventRenderer<'input> {
     destination_count: usize,
     approved_cursor: usize,
     code_block_count: usize,
-    mermaid: Vec<MermaidPlaceholder>,
+    mermaid_count: usize,
+    mermaid_svg_bytes: usize,
+    render_mermaid:
+        &'renderer mut dyn FnMut(&str, NonZeroUsize) -> Result<SanitizedSvg, DiagramRenderError>,
     writer: ArticleWriter,
     limits: RendererLimits,
 }
 
-impl<'input> MarkdownEventRenderer<'input> {
+impl<'input, 'renderer> MarkdownEventRenderer<'input, 'renderer> {
     fn new(
         document: &'input PostDocument,
         assets: &'input ResolvedPostAssets,
         site_assets: &'input ResolvedSiteAssets,
+        render_mermaid: &'renderer mut dyn FnMut(
+            &str,
+            NonZeroUsize,
+        )
+            -> Result<SanitizedSvg, DiagramRenderError>,
         limits: RendererLimits,
     ) -> Self {
         let events = Parser::new_ext(document.markdown.as_str(), Options::empty())
@@ -424,13 +442,15 @@ impl<'input> MarkdownEventRenderer<'input> {
             destination_count: 0,
             approved_cursor: 0,
             code_block_count: 0,
-            mermaid: Vec::new(),
+            mermaid_count: 0,
+            mermaid_svg_bytes: 0,
+            render_mermaid,
             writer: ArticleWriter::new(limits.rendered_html_bytes),
             limits,
         }
     }
 
-    fn render(mut self) -> Result<RenderResult, MarkdownRenderError> {
+    fn render(mut self) -> Result<RenderedArticle, MarkdownRenderError> {
         while self.cursor < self.events.len() {
             let (event, range) = self.events[self.cursor].clone();
             self.cursor += 1;
@@ -444,10 +464,7 @@ impl<'input> MarkdownEventRenderer<'input> {
                 "resolver-approved asset occurrence was not consumed by the renderer",
             ));
         }
-        Ok(RenderResult {
-            article: self.writer.finish(),
-            mermaid: self.mermaid,
-        })
+        Ok(self.writer.finish())
     }
 
     fn render_event(
@@ -574,15 +591,17 @@ impl<'input> MarkdownEventRenderer<'input> {
             .code_block_count
             .checked_add(1)
             .ok_or_else(|| self.malformed())?;
-        let ordinal = CodeBlockOrdinal::new(
+        let code_ordinal = CodeBlockOrdinal::new(
             NonZeroUsize::new(self.code_block_count).ok_or_else(|| self.malformed())?,
         );
         let source = self.collect_code_block()?;
         if matches!(&kind, CodeBlockKind::Fenced(info) if info.as_ref() == "mermaid") {
-            if self.mermaid.len() >= self.limits.mermaid_blocks {
+            if self.mermaid_count >= self.limits.mermaid_blocks {
                 return Err(MarkdownRenderError::new(
                     self.document,
-                    MarkdownRenderLocation::CodeBlock { ordinal },
+                    MarkdownRenderLocation::CodeBlock {
+                        ordinal: code_ordinal,
+                    },
                     MarkdownRenderErrorCode::MermaidBlockCountExceeded,
                     "post contains more Mermaid blocks than the configured limit",
                 ));
@@ -590,25 +609,52 @@ impl<'input> MarkdownEventRenderer<'input> {
             if source.len() > self.limits.mermaid_source_bytes {
                 return Err(MarkdownRenderError::new(
                     self.document,
-                    MarkdownRenderLocation::CodeBlock { ordinal },
+                    MarkdownRenderLocation::CodeBlock {
+                        ordinal: code_ordinal,
+                    },
                     MarkdownRenderErrorCode::MermaidBlockTooLarge,
                     "Mermaid source exceeds the configured byte limit",
                 ));
             }
-            let Some(ordinal) = MermaidBlockOrdinal::from_index(self.mermaid.len()) else {
+            let Some(mermaid_ordinal) = MermaidBlockOrdinal::from_index(self.mermaid_count) else {
                 return Err(self.malformed());
             };
+            let svg = (self.render_mermaid)(&source, mermaid_ordinal.0).map_err(|error| {
+                mermaid_error(
+                    self.document,
+                    MarkdownRenderLocation::CodeBlock {
+                        ordinal: code_ordinal,
+                    },
+                    error.code(),
+                )
+            })?;
+            self.mermaid_svg_bytes = self
+                .mermaid_svg_bytes
+                .checked_add(svg.as_str().len())
+                .filter(|size| *size <= self.limits.mermaid_svg_bytes)
+                .ok_or_else(|| {
+                    MarkdownRenderError::new(
+                        self.document,
+                        MarkdownRenderLocation::CodeBlock {
+                            ordinal: code_ordinal,
+                        },
+                        MarkdownRenderErrorCode::MermaidRenderedOutputTooLarge,
+                        "rendered Mermaid SVG exceeds the per-post byte limit",
+                    )
+                })?;
             self.write_block_start(
-                "<div class=\"mermaid-placeholder\" data-maincopy-mermaid=\"v1\" data-block=\"",
+                "<div class=\"mermaid-diagram\" data-maincopy-mermaid=\"v1\" data-block=\"",
             )?;
-            self.write(&ordinal.get().to_string())?;
-            self.write("\"><pre><code>")?;
-            self.write_escaped_body(&source)?;
-            self.write("</code></pre></div>\n")?;
-            self.mermaid.push(MermaidPlaceholder {
-                ordinal,
-                source: Arc::from(source),
-            });
+            self.write(&mermaid_ordinal.get().to_string())?;
+            self.write("\">")?;
+            self.writer
+                .write_sanitized_svg(&svg)
+                .map_err(|_| rendered_html_limit_error(&self.document.path))?;
+            self.write("</div>\n")?;
+            self.mermaid_count = self
+                .mermaid_count
+                .checked_add(1)
+                .ok_or_else(|| self.malformed())?;
         } else {
             self.write_block_start("<pre><code>")?;
             self.write_escaped_body(&source)?;
@@ -918,6 +964,10 @@ impl ArticleWriter {
             self.end_newline = value.ends_with('\n');
         }
         Ok(())
+    }
+
+    fn write_sanitized_svg(&mut self, svg: &SanitizedSvg) -> Result<(), RenderedHtmlLimit> {
+        self.write(svg.as_str())
     }
 
     fn write_local_asset(&mut self, asset: DigestedAsset) -> Result<(), RenderedHtmlLimit> {
@@ -1251,6 +1301,44 @@ fn rendered_html_limit_error(path: &LogicalContentPath) -> MarkdownRenderError {
     }
 }
 
+fn mermaid_error(
+    document: &PostDocument,
+    location: MarkdownRenderLocation,
+    error: DiagramRenderErrorCode,
+) -> MarkdownRenderError {
+    let (code, message) = match error {
+        DiagramRenderErrorCode::Unavailable => (
+            MarkdownRenderErrorCode::MermaidRendererUnavailable,
+            "the packaged Mermaid renderer is unavailable",
+        ),
+        DiagramRenderErrorCode::InvalidDiagram => (
+            MarkdownRenderErrorCode::MermaidInvalid,
+            "the Mermaid diagram is invalid or unsupported",
+        ),
+        DiagramRenderErrorCode::ResourceLimit => (
+            MarkdownRenderErrorCode::MermaidRendererResourceLimit,
+            "the Mermaid diagram exceeded a renderer resource limit",
+        ),
+        DiagramRenderErrorCode::TimedOut => (
+            MarkdownRenderErrorCode::MermaidRendererTimedOut,
+            "the Mermaid diagram exceeded the renderer deadline",
+        ),
+        DiagramRenderErrorCode::InvalidOutput => (
+            MarkdownRenderErrorCode::MermaidRendererInvalidOutput,
+            "the Mermaid renderer returned invalid output",
+        ),
+        DiagramRenderErrorCode::UnsafeSvg => (
+            MarkdownRenderErrorCode::MermaidSvgRejected,
+            "the Mermaid renderer output failed the SVG security policy",
+        ),
+        DiagramRenderErrorCode::Internal => (
+            MarkdownRenderErrorCode::MermaidRendererInternal,
+            "the Mermaid renderer failed internally",
+        ),
+    };
+    MarkdownRenderError::new(document, location, code, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,8 +1347,42 @@ mod tests {
     };
 
     use crate::content_fixtures::{asset, content_tree, post, publication};
+    use crate::render::svg::{MermaidSvgSanitizer, SvgScope};
 
     const POST_ID: &str = "4f054633-2d09-4b05-97d0-c6f0011a5199";
+    const FIXTURE_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"><text x=\"0\" y=\"1\">diagram</text></svg>";
+
+    fn render_fixture_mermaid(
+        _source: &str,
+        ordinal: NonZeroUsize,
+    ) -> Result<SanitizedSvg, DiagramRenderError> {
+        MermaidSvgSanitizer::sanitize(FIXTURE_SVG, SvgScope::new(POST_ID.as_bytes(), ordinal))
+            .map_err(DiagramRenderError::Sanitizer)
+    }
+
+    fn render_markdown_for_test(
+        document: &PostDocument,
+        assets: &ResolvedPostAssets,
+        site_assets: &ResolvedSiteAssets,
+        limits: RendererLimits,
+    ) -> Result<RenderedPost, MarkdownRenderError> {
+        render_markdown_with_renderer(
+            document,
+            assets,
+            site_assets,
+            limits,
+            &mut render_fixture_mermaid,
+        )
+    }
+
+    fn render_markdown_with_limits(
+        document: &PostDocument,
+        assets: &ResolvedPostAssets,
+        site_assets: &ResolvedSiteAssets,
+        limits: RendererLimits,
+    ) -> Result<RenderedPost, MarkdownRenderError> {
+        render_markdown_for_test(document, assets, site_assets, limits)
+    }
 
     fn publication_source(title: &str, origins: &[&str]) -> String {
         let origins = origins
@@ -1362,20 +1484,22 @@ mod tests {
 
     fn render(origins: &[&str], body: &str, asset_paths: &[&str]) -> RenderedPost {
         let (content, assets) = candidate("Renderer", origins, body, false, asset_paths);
-        render_markdown(
+        render_markdown_for_test(
             &content.posts[0],
             assets.assets_for(&content.posts[0]).unwrap(),
             &assets.site,
+            RendererLimits::production(),
         )
         .expect("fixture must render")
     }
 
     fn render_error(body: &str) -> MarkdownRenderError {
         let (content, assets) = candidate("Renderer", &[], body, false, &[]);
-        render_markdown(
+        render_markdown_for_test(
             &content.posts[0],
             assets.assets_for(&content.posts[0]).unwrap(),
             &assets.site,
+            RendererLimits::production(),
         )
         .expect_err("fixture must be rejected")
     }
@@ -1389,10 +1513,12 @@ mod tests {
     ) -> Result<(String, String), MarkdownRenderError> {
         let (content, assets) = candidate("Renderer", &[], "body", false, &[]);
         let document = &content.posts[0];
+        let mut render_mermaid = render_fixture_mermaid;
         let mut renderer = MarkdownEventRenderer::new(
             document,
             assets.assets_for(document).unwrap(),
             &assets.site,
+            &mut render_mermaid,
             RendererLimits::production(),
         );
         renderer.events = events.into_iter().map(|event| (event, 0..0)).collect();
@@ -1420,12 +1546,12 @@ mod tests {
                         <p><img src=\"assets/images/diagram.png\" alt=\"diagram\" title=\"Diagram\" /></p>\n\
                         <p><a href=\"assets/files/manual.pdf\">manual</a></p>\n\
                         <pre><code>&lt;a&gt;&amp;\n</code></pre>\n\
-                        <div class=\"mermaid-placeholder\" data-maincopy-mermaid=\"v1\" data-block=\"1\"><pre><code>graph TD\nA--&gt;B\n</code></pre></div>\n";
+                        <div class=\"mermaid-diagram\" data-maincopy-mermaid=\"v1\" data-block=\"1\"><svg viewBox=\"0 0 1 1\" xmlns=\"http://www.w3.org/2000/svg\"><text x=\"0\" y=\"1\">diagram</text></svg></div>\n";
         assert_eq!(first.article.identity_html.as_ref(), expected);
         assert_eq!(second.article.identity_html.as_ref(), expected);
         assert_eq!(first.revision, second.revision);
-        assert_eq!(first.mermaid.len(), 1);
-        assert_eq!(first.mermaid[0].source.as_ref(), "graph TD\nA-->B\n");
+        assert!(first.article.identity_html.contains("<svg "));
+        assert!(!first.article.identity_html.contains("graph TD"));
         assert!(first.generated_assets.is_empty());
 
         let (_, projection_assets) = candidate(
@@ -1520,10 +1646,12 @@ mod tests {
 
         let (content, assets) = candidate("Renderer", &[], "body", false, &[]);
         let document = &content.posts[0];
+        let mut render_mermaid = render_fixture_mermaid;
         let renderer = MarkdownEventRenderer::new(
             document,
             assets.assets_for(document).unwrap(),
             &assets.site,
+            &mut render_mermaid,
             RendererLimits::production(),
         );
         let mut depth = usize::MAX;
@@ -1544,11 +1672,16 @@ mod tests {
                 rendered.article.identity_html,
                 expected.article.identity_html
             );
-            assert!(rendered.mermaid.is_empty());
+            assert!(!rendered.article.identity_html.contains("mermaid-diagram"));
             assert!(!rendered.article.identity_html.contains("language-"));
         }
         let commonmark_decoded = render(&[], "```merm&#x61;id\na-->b\n```\n", &[]);
-        assert_eq!(commonmark_decoded.mermaid.len(), 1);
+        assert!(
+            commonmark_decoded
+                .article
+                .identity_html
+                .contains("mermaid-diagram")
+        );
     }
 
     #[test]
@@ -1661,6 +1794,7 @@ mod tests {
         let base = RendererLimits {
             rendered_html_bytes: 1_024,
             mermaid_source_bytes: 4,
+            mermaid_svg_bytes: 1_024,
             mermaid_blocks: 1,
         };
         render_markdown_with_limits(document, post_assets, &assets.site, base).unwrap();
@@ -1675,6 +1809,35 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, MarkdownRenderErrorCode::MermaidBlockTooLarge);
+
+        let svg_bytes = render_fixture_mermaid("abc\n", NonZeroUsize::MIN)
+            .unwrap()
+            .as_str()
+            .len();
+        render_markdown_with_limits(
+            document,
+            post_assets,
+            &assets.site,
+            RendererLimits {
+                mermaid_svg_bytes: svg_bytes,
+                ..base
+            },
+        )
+        .unwrap();
+        let error = render_markdown_with_limits(
+            document,
+            post_assets,
+            &assets.site,
+            RendererLimits {
+                mermaid_svg_bytes: svg_bytes - 1,
+                ..base
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            MarkdownRenderErrorCode::MermaidRenderedOutputTooLarge
+        );
 
         let (two_content, two_assets) = candidate(
             "Renderer",
@@ -1839,10 +2002,8 @@ mod tests {
     fn renderer_wire_types_and_ordinals_have_stable_contracts() {
         let destination_ordinal = MarkdownDestinationOrdinal::new(NonZeroUsize::new(2).unwrap());
         let code_ordinal = CodeBlockOrdinal::new(NonZeroUsize::new(3).unwrap());
-        let mermaid_ordinal = MermaidBlockOrdinal::from_index(3).unwrap();
         assert_eq!(serde_json::to_value(destination_ordinal).unwrap(), 2);
         assert_eq!(serde_json::to_value(code_ordinal).unwrap(), 3);
-        assert_eq!(serde_json::to_value(mermaid_ordinal).unwrap(), 4);
 
         for (value, expected) in [
             (RenderDestinationKind::Link, "link"),
@@ -1925,6 +2086,35 @@ mod tests {
             (
                 MarkdownRenderErrorCode::MermaidBlockTooLarge,
                 "mermaid_block_too_large",
+            ),
+            (
+                MarkdownRenderErrorCode::MermaidRenderedOutputTooLarge,
+                "mermaid_rendered_output_too_large",
+            ),
+            (MarkdownRenderErrorCode::MermaidInvalid, "mermaid_invalid"),
+            (
+                MarkdownRenderErrorCode::MermaidRendererUnavailable,
+                "mermaid_renderer_unavailable",
+            ),
+            (
+                MarkdownRenderErrorCode::MermaidRendererResourceLimit,
+                "mermaid_renderer_resource_limit",
+            ),
+            (
+                MarkdownRenderErrorCode::MermaidRendererTimedOut,
+                "mermaid_renderer_timed_out",
+            ),
+            (
+                MarkdownRenderErrorCode::MermaidRendererInvalidOutput,
+                "mermaid_renderer_invalid_output",
+            ),
+            (
+                MarkdownRenderErrorCode::MermaidSvgRejected,
+                "mermaid_svg_rejected",
+            ),
+            (
+                MarkdownRenderErrorCode::MermaidRendererInternal,
+                "mermaid_renderer_internal",
             ),
             (
                 MarkdownRenderErrorCode::RenderedHtmlTooLarge,
