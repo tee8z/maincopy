@@ -44,6 +44,7 @@ readonly script_dir
 project_root=$(cd -- "$script_dir/.." && pwd -P)
 readonly project_root
 readonly gateway_config="$project_root/dev/Caddyfile"
+readonly browser_trust="$script_dir/dev-browser-trust.sh"
 readonly tls_root="$project_root/target/maincopy-dev/tls"
 readonly certificate="$tls_root/maincopy-localhost.pem"
 readonly private_key="$tls_root/maincopy-localhost-key.pem"
@@ -61,6 +62,7 @@ readonly root_certificate="$ca_root/rootCA.pem"
 readonly root_private_key="$ca_root/rootCA-key.pem"
 readonly caddy_data="$project_root/target/maincopy-dev/gateway/data"
 readonly caddy_config="$project_root/target/maincopy-dev/gateway/config"
+[[ -x $browser_trust ]] || die "the browser trust helper is not executable: $browser_trust"
 
 if $untrust_browser; then
   [[ -f $root_certificate ]] || die "the Maincopy development CA does not exist"
@@ -74,6 +76,7 @@ flock --exclusive --nonblock "$gateway_lock_fd" ||
   die "another Maincopy development gateway owns $ca_root/gateway.lock"
 
 if $untrust_browser; then
+  "$browser_trust" uninstall "$root_certificate"
   CAROOT="$ca_root" TRUST_STORES=nss mkcert -uninstall
   echo "Removed the Maincopy development CA from supported user browser stores."
   exit 0
@@ -107,6 +110,7 @@ trap - EXIT
 if $trust_browser; then
   echo "Installing the isolated Maincopy development CA into supported user browser stores..."
   CAROOT="$ca_root" TRUST_STORES=nss mkcert -install
+  "$browser_trust" install "$root_certificate"
 fi
 
 echo "Maincopy development CA: $root_certificate"

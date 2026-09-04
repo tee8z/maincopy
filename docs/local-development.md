@@ -64,24 +64,22 @@ file, process argument, or environment variable for this credential.
 
 ### 1. Start the services
 
-Enter the development shell from the repository root:
-
-```console
-nix develop
-```
-
-Clear disposable state and start the browser workflow:
+Clear disposable state and start the browser workflow from the repository
+root:
 
 ```console
 just quickstart
 ```
 
-The recipe refuses to run while `maincopyd` or the gateway owns its lock. It
-removes only `target/maincopy-dev/` and keeps the durable development CA.
+The recipe enters the project Nix shell before it changes state. It refuses to
+run while `maincopyd` or the gateway owns its lock. It removes only
+`target/maincopy-dev/` and keeps the durable development CA.
+
+If `just` is not installed outside Nix, run `nix develop -c just quickstart`.
 
 The launcher builds `maincopyd`, its isolated `maincopy-mermaid` renderer, and
-`maincopy`. It then starts the server and the Caddy gateway. Keep this terminal
-open.
+`maincopy`. It starts the server and waits for loopback readiness. It then
+starts Caddy and verifies both HTTPS origins. Keep this terminal open.
 
 On fresh state, `maincopyd` generates the `owner` account with an
 instance-unique password from 256 bits of operating-system randomness. It

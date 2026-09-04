@@ -31,7 +31,7 @@ case ${1:-} in
 esac
 (($# <= 1)) || die "too many arguments"
 
-for command in cargo curl; do
+for command in caddy cargo curl flock mkcert; do
   command -v "$command" >/dev/null || die "$command is required; run this inside nix develop"
 done
 
@@ -60,6 +60,7 @@ cargo build --locked \
 
 daemon_pid=
 gateway_pid=
+readonly readiness_timeout_seconds=30
 # shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap.
 cleanup() {
   local status=$?
@@ -71,16 +72,45 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-trap 'exit 130' INT
+# Ctrl+C is a normal stop for this interactive launcher, not a recipe failure.
+trap 'exit 0' INT
 trap 'exit 143' TERM
+
+die_if_exited() {
+  local name=$1
+  local pid=$2
+  local status=0
+  kill -0 "$pid" 2>/dev/null && return
+  wait "$pid" || status=$?
+  die "$name exited before becoming ready (status $status)"
+}
 
 "$daemon" --config "$config" &
 daemon_pid=$!
+
+daemon_ready=false
+daemon_deadline=$((SECONDS + readiness_timeout_seconds))
+while ((SECONDS < daemon_deadline)); do
+  if curl --fail --silent \
+    --connect-timeout 0.1 \
+    --max-time 0.15 \
+    --noproxy '*' \
+    --header 'Host: maincopy.localhost:8443' \
+    http://127.0.0.1:3000/health/ready >/dev/null; then
+    daemon_ready=true
+    break
+  fi
+  die_if_exited maincopyd "$daemon_pid"
+  sleep 0.1
+done
+$daemon_ready || die "maincopyd did not become ready within $readiness_timeout_seconds seconds"
+
 "$script_dir/dev-gateway.sh" "${gateway_arguments[@]}" &
 gateway_pid=$!
 
-ready=false
-for _ in {1..50}; do
+gateway_ready=false
+gateway_deadline=$((SECONDS + readiness_timeout_seconds))
+while ((SECONDS < gateway_deadline)); do
   if [[ -f $root_certificate ]] && \
     curl --fail --silent \
       --connect-timeout 0.1 \
@@ -94,14 +124,14 @@ for _ in {1..50}; do
       --noproxy '*' \
       --cacert "$root_certificate" \
       https://admin.localhost:8443/admin/login >/dev/null; then
-    ready=true
+    gateway_ready=true
     break
   fi
-  kill -0 "$daemon_pid" 2>/dev/null || wait "$daemon_pid"
-  kill -0 "$gateway_pid" 2>/dev/null || wait "$gateway_pid"
+  die_if_exited maincopyd "$daemon_pid"
+  die_if_exited gateway "$gateway_pid"
   sleep 0.1
 done
-$ready || die "the local development services did not become ready"
+$gateway_ready || die "the development gateway did not become ready within $readiness_timeout_seconds seconds"
 
 cat <<'EOF'
 

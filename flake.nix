@@ -163,6 +163,7 @@
                   project.pkgs.curl
                   project.pkgs.just
                   project.pkgs.jq
+                  project.pkgs.nssTools
                   project.pkgs.openssl
                   project.pkgs.shellcheck
                   project.pkgs.util-linux
@@ -180,12 +181,20 @@
                 caddy validate --config ${./dev/Caddyfile} --adapter caddyfile
                 just --justfile ${./Justfile} --fmt --check
                 shellcheck \
+                  ${./scripts/dev-browser-trust.sh} \
                   ${./scripts/dev.sh} \
                   ${./scripts/dev-gateway.sh} \
                   ${./scripts/dev-maincopy.sh} \
                   ${./scripts/reset-dev.sh} \
+                  ${./scripts/test-dev-browser-trust.sh} \
                   ${./scripts/test-dev-gateway.sh} \
+                  ${./scripts/test-dev.sh} \
                   ${./scripts/test-reset-dev.sh}
+                ${project.pkgs.bash}/bin/bash \
+                  ${./scripts/test-dev-browser-trust.sh} \
+                  ${./scripts/dev-browser-trust.sh}
+                ${project.pkgs.bash}/bin/bash \
+                  ${./scripts/test-dev.sh} ${./scripts/dev.sh}
                 ${project.pkgs.bash}/bin/bash \
                   ${./scripts/test-reset-dev.sh} ${./scripts/reset-dev.sh}
                 ${project.pkgs.bash}/bin/bash \
@@ -222,6 +231,7 @@
               project.rustToolchain
             ];
 
+            MAINCOPY_DEV_SHELL = "1";
             RUST_BACKTRACE = "1";
           };
         }
