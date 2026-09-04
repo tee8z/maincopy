@@ -31,6 +31,10 @@ use crate::domain::publication::store::{
     begin_scheduled_activation, finish_publication, index_content_catalog, install_startup,
     schedule_publication,
 };
+use crate::domain::source::store::{
+    SourceApplyError, SourceStore, advance_sync, apply_catalog, begin_sync, finish_sync,
+    put_configuration,
+};
 
 pub(crate) struct DatabaseWriter {
     connection: SqliteConnection,
@@ -53,7 +57,8 @@ impl BootstrappedDatabase {
             DatabaseStore::new(
                 AuthStore::new(readers.clone(), mutations.clone()),
                 ProfileStore::new(readers.clone(), mutations.clone()),
-                PublicationStore::new(readers.clone(), mutations),
+                PublicationStore::new(readers.clone(), mutations.clone()),
+                SourceStore::new(readers.clone(), mutations),
             ),
             DatabaseWriter {
                 connection,
@@ -363,6 +368,56 @@ async fn apply_mutation(
                 .map_err(ApplyError::publication),
             false,
         ),
+        Mutation::PutSourceConfiguration {
+            command,
+            respond_to,
+        } => database_response(
+            respond_to,
+            put_configuration(transaction, command)
+                .await
+                .map_err(ApplyError::source),
+            true,
+        ),
+        Mutation::BeginSourceSync {
+            command,
+            respond_to,
+        } => database_response(
+            respond_to,
+            begin_sync(transaction, command)
+                .await
+                .map_err(ApplyError::source),
+            true,
+        ),
+        Mutation::AdvanceSourceSync {
+            command,
+            respond_to,
+        } => database_response(
+            respond_to,
+            advance_sync(transaction, command)
+                .await
+                .map_err(ApplyError::source),
+            false,
+        ),
+        Mutation::ApplyManagedSourceCatalog {
+            command,
+            respond_to,
+        } => database_response(
+            respond_to,
+            apply_catalog(transaction, command)
+                .await
+                .map_err(ApplyError::source),
+            true,
+        ),
+        Mutation::FinishSourceSync {
+            command,
+            respond_to,
+        } => database_response(
+            respond_to,
+            finish_sync(transaction, command)
+                .await
+                .map_err(ApplyError::source),
+            true,
+        ),
     }
 }
 
@@ -495,6 +550,14 @@ impl ApplyError {
             PublicationMutationError::Command(error) => Self::Command(error),
             PublicationMutationError::Operation(source) => Self::Operation(source),
             PublicationMutationError::CorruptStoredState => Self::Corrupt("canonical publication"),
+        }
+    }
+
+    fn source(error: SourceApplyError) -> Self {
+        match error {
+            SourceApplyError::Command(error) => Self::Command(error),
+            SourceApplyError::Operation(source) => Self::Operation(source),
+            SourceApplyError::CorruptStoredState => Self::Corrupt("managed source"),
         }
     }
 }

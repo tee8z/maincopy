@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use thiserror::Error;
@@ -21,6 +21,8 @@ const CANDIDATE_SUFFIX: &str = ".candidate";
 const STAGING_PREFIX: &str = ".candidate-stage-";
 const STAGING_SUFFIX: &str = ".tmp";
 const DIGEST_PREFIX: &str = "content-b3-v1-";
+const MAX_STORE_ENTRIES: usize = 4_096;
+const MAX_STORE_BYTES: u64 = 1024 * 1024 * 1024;
 
 const ARCHIVE_MAGIC: &[u8; 17] = b"MAINCOPYCANDIDATE";
 const ARCHIVE_VERSION: u16 = 1;
@@ -106,6 +108,27 @@ fn validate_private_directory(path: &Path) -> io::Result<()> {
 pub struct ContentCandidateStore {
     root: PathBuf,
     limits: ContentTreeLimits,
+    capacity: CandidateStoreCapacity,
+    admission: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CandidateStoreCapacity {
+    entries: usize,
+    bytes: u64,
+}
+
+impl CandidateStoreCapacity {
+    const DEFAULT: Self = Self {
+        entries: MAX_STORE_ENTRIES,
+        bytes: MAX_STORE_BYTES,
+    };
+}
+
+struct CandidateStoreInventory {
+    candidates: Vec<(String, ContentTreeDigest)>,
+    entries: usize,
+    bytes: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -119,41 +142,52 @@ impl ContentCandidateStore {
         state_root: &Path,
         limits: ContentTreeLimits,
     ) -> Result<Self, ContentCandidateStoreError> {
+        Self::open_with_capacity(state_root, limits, CandidateStoreCapacity::DEFAULT)
+    }
+
+    fn open_with_capacity(
+        state_root: &Path,
+        limits: ContentTreeLimits,
+        capacity: CandidateStoreCapacity,
+    ) -> Result<Self, ContentCandidateStoreError> {
+        if capacity.entries == 0 || capacity.bytes == 0 {
+            return Err(ContentCandidateStoreError::CapacityExceeded(
+                "candidate-store capacity must be positive",
+            ));
+        }
         let root = state_root.join(STORE_DIRECTORY);
         prepare_private_directory(&root).map_err(ContentCandidateStoreError::Directory)?;
         sync_directory(state_root).map_err(ContentCandidateStoreError::Directory)?;
-        Ok(Self { root, limits })
+        let store = Self {
+            root,
+            limits,
+            capacity,
+            admission: Arc::new(Mutex::new(())),
+        };
+        store.inventory()?;
+        Ok(store)
     }
 
     pub fn retain(
         &self,
         tree: &DiscoveredContentTree,
     ) -> Result<ContentTreeDigest, ContentCandidateStoreError> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| ContentCandidateStoreError::StoreLockPoisoned)?;
         validate_tree(tree, self.limits)?;
         let digest = tree.digest();
+        let inventory = self.inventory()?;
+        if self.confirm_existing_candidate(&inventory, &digest, tree)? {
+            return Ok(digest);
+        }
+        let archive_bytes = encoded_candidate_bytes(tree)?;
+        require_capacity_for_new_candidate(&inventory, archive_bytes, self.capacity)?;
         let staging_path = self.staging_path();
         let staging = StagingPath::new(staging_path.clone());
-        let mut file = create_staging_file(&staging_path)?;
-        {
-            let mut writer = BufWriter::new(&mut file);
-            encode_candidate(&mut writer, &digest, tree)?;
-            writer.flush().map_err(ContentCandidateStoreError::Io)?;
-        }
-        file.sync_all().map_err(ContentCandidateStoreError::Io)?;
-        drop(file);
-
-        let candidate_path = self.candidate_path(&digest);
-        match publish_no_replace(&staging_path, &candidate_path)? {
-            PublishOutcome::Published => {
-                sync_directory(&self.root).map_err(ContentCandidateStoreError::Io)?;
-            }
-            PublishOutcome::AlreadyExists => {
-                self.load(&digest)?;
-                if !files_equal(&staging_path, &candidate_path)? {
-                    return Err(ContentCandidateStoreError::Collision);
-                }
-            }
-        }
+        write_staging_candidate(&staging_path, &digest, tree, archive_bytes)?;
+        self.publish_staged_candidate(&staging_path, &digest, tree)?;
         staging.cleanup()?;
         Ok(digest)
     }
@@ -174,38 +208,63 @@ impl ContentCandidateStore {
     }
 
     pub fn load_all(&self) -> Result<Vec<RetainedContentCandidate>, ContentCandidateStoreError> {
-        let mut candidates = Vec::new();
-        for entry in fs::read_dir(&self.root).map_err(ContentCandidateStoreError::Io)? {
-            let entry = entry.map_err(ContentCandidateStoreError::Io)?;
-            let file_type = entry.file_type().map_err(ContentCandidateStoreError::Io)?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| ContentCandidateStoreError::UnsafeEntry)?;
-
-            if is_staging_name(&name) {
-                if !file_type.is_file() || file_type.is_symlink() {
-                    return Err(ContentCandidateStoreError::UnsafeEntry);
-                }
-                drop(open_candidate_file(&entry.path())?);
-                continue;
-            }
-            let digest =
-                parse_candidate_name(&name).ok_or(ContentCandidateStoreError::UnexpectedEntry)?;
-            if !file_type.is_file() || file_type.is_symlink() {
-                return Err(ContentCandidateStoreError::UnsafeEntry);
-            }
-            candidates.push((name, digest));
-        }
-        candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-
-        candidates
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| ContentCandidateStoreError::StoreLockPoisoned)?;
+        self.inventory()?
+            .candidates
             .into_iter()
             .map(|(_, digest)| {
                 let tree = self.load(&digest)?;
                 Ok(RetainedContentCandidate { digest, tree })
             })
             .collect()
+    }
+
+    fn inventory(&self) -> Result<CandidateStoreInventory, ContentCandidateStoreError> {
+        inventory(&self.root, self.capacity)
+    }
+
+    fn confirm_existing_candidate(
+        &self,
+        inventory: &CandidateStoreInventory,
+        digest: &ContentTreeDigest,
+        tree: &DiscoveredContentTree,
+    ) -> Result<bool, ContentCandidateStoreError> {
+        if !inventory
+            .candidates
+            .iter()
+            .any(|(_, existing)| existing == digest)
+        {
+            return Ok(false);
+        }
+        let retained = self.load(digest)?;
+        if !canonically_equal(&retained, tree) {
+            return Err(ContentCandidateStoreError::Collision);
+        }
+        Ok(true)
+    }
+
+    fn publish_staged_candidate(
+        &self,
+        staging_path: &Path,
+        digest: &ContentTreeDigest,
+        tree: &DiscoveredContentTree,
+    ) -> Result<(), ContentCandidateStoreError> {
+        match publish_no_replace(staging_path, &self.candidate_path(digest))? {
+            PublishOutcome::Published => {
+                sync_directory(&self.root).map_err(ContentCandidateStoreError::Io)
+            }
+            PublishOutcome::AlreadyExists => {
+                let retained = self.load(digest)?;
+                if canonically_equal(&retained, tree) {
+                    Ok(())
+                } else {
+                    Err(ContentCandidateStoreError::Collision)
+                }
+            }
+        }
     }
 
     fn candidate_path(&self, digest: &ContentTreeDigest) -> PathBuf {
@@ -220,6 +279,32 @@ impl ContentCandidateStore {
     }
 }
 
+fn write_staging_candidate(
+    path: &Path,
+    digest: &ContentTreeDigest,
+    tree: &DiscoveredContentTree,
+    expected_bytes: u64,
+) -> Result<(), ContentCandidateStoreError> {
+    let mut file = create_staging_file(path)?;
+    {
+        let mut writer = BufWriter::new(&mut file);
+        encode_candidate(&mut writer, digest, tree)?;
+        writer.flush().map_err(ContentCandidateStoreError::Io)?;
+    }
+    file.sync_all().map_err(ContentCandidateStoreError::Io)?;
+    if file
+        .metadata()
+        .map_err(ContentCandidateStoreError::Io)?
+        .len()
+        != expected_bytes
+    {
+        return Err(ContentCandidateStoreError::InvalidArchive(
+            "candidate archive size is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum ContentCandidateStoreError {
     #[error("the content candidate directory is unavailable")]
@@ -230,6 +315,10 @@ pub enum ContentCandidateStoreError {
     UnsafeEntry,
     #[error("the content candidate store contains an unexpected entry")]
     UnexpectedEntry,
+    #[error("the content candidate store exceeds its fixed capacity: {0}")]
+    CapacityExceeded(&'static str),
+    #[error("the content candidate store admission lock is poisoned")]
+    StoreLockPoisoned,
     #[error("the content candidate archive is invalid: {0}")]
     InvalidArchive(&'static str),
     #[error("the content candidate exceeds configured limits: {0}")]
@@ -238,6 +327,137 @@ pub enum ContentCandidateStoreError {
     DigestMismatch,
     #[error("the content candidate key is already occupied by different bytes")]
     Collision,
+}
+
+fn inventory(
+    root: &Path,
+    capacity: CandidateStoreCapacity,
+) -> Result<CandidateStoreInventory, ContentCandidateStoreError> {
+    let mut candidates = Vec::new();
+    let mut entries = 0_usize;
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(root).map_err(ContentCandidateStoreError::Io)? {
+        let entry = entry.map_err(ContentCandidateStoreError::Io)?;
+        entries = entries
+            .checked_add(1)
+            .ok_or(ContentCandidateStoreError::CapacityExceeded(
+                "candidate-store entry count overflowed",
+            ))?;
+        if entries > capacity.entries {
+            return Err(ContentCandidateStoreError::CapacityExceeded(
+                "candidate-store entry count is full",
+            ));
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ContentCandidateStoreError::UnsafeEntry)?;
+        let file = open_candidate_file(&entry.path())?;
+        let file_bytes = file
+            .metadata()
+            .map_err(ContentCandidateStoreError::Io)?
+            .len();
+        bytes =
+            bytes
+                .checked_add(file_bytes)
+                .ok_or(ContentCandidateStoreError::CapacityExceeded(
+                    "candidate-store byte count overflowed",
+                ))?;
+        if bytes > capacity.bytes {
+            return Err(ContentCandidateStoreError::CapacityExceeded(
+                "candidate-store byte capacity is full",
+            ));
+        }
+        if is_staging_name(&name) {
+            continue;
+        }
+        let digest =
+            parse_candidate_name(&name).ok_or(ContentCandidateStoreError::UnexpectedEntry)?;
+        candidates.push((name, digest));
+    }
+    candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(CandidateStoreInventory {
+        candidates,
+        entries,
+        bytes,
+    })
+}
+
+fn require_capacity_for_new_candidate(
+    inventory: &CandidateStoreInventory,
+    archive_bytes: u64,
+    capacity: CandidateStoreCapacity,
+) -> Result<(), ContentCandidateStoreError> {
+    let entries =
+        inventory
+            .entries
+            .checked_add(1)
+            .ok_or(ContentCandidateStoreError::CapacityExceeded(
+                "candidate-store entry count overflowed",
+            ))?;
+    if entries > capacity.entries {
+        return Err(ContentCandidateStoreError::CapacityExceeded(
+            "candidate-store entry count is full",
+        ));
+    }
+    let bytes = inventory.bytes.checked_add(archive_bytes).ok_or(
+        ContentCandidateStoreError::CapacityExceeded("candidate-store byte count overflowed"),
+    )?;
+    if bytes > capacity.bytes {
+        return Err(ContentCandidateStoreError::CapacityExceeded(
+            "candidate-store byte capacity is full",
+        ));
+    }
+    Ok(())
+}
+
+fn encoded_candidate_bytes(
+    tree: &DiscoveredContentTree,
+) -> Result<u64, ContentCandidateStoreError> {
+    let post_count = u64::try_from(tree.posts.len()).map_err(|_| {
+        ContentCandidateStoreError::LimitExceeded("candidate archive size cannot be represented")
+    })?;
+    let asset_count = u64::try_from(tree.assets.len()).map_err(|_| {
+        ContentCandidateStoreError::LimitExceeded("candidate archive size cannot be represented")
+    })?;
+    let path_bytes = std::iter::once(tree.publication.path.as_str().len())
+        .chain(tree.posts.iter().map(|post| post.path.as_str().len()))
+        .chain(tree.assets.iter().map(|asset| asset.path.as_str().len()))
+        .try_fold(0_u64, |total, length| {
+            total.checked_add(u64::try_from(length).ok()?)
+        })
+        .ok_or(ContentCandidateStoreError::LimitExceeded(
+            "candidate archive size cannot be represented",
+        ))?;
+    ARCHIVE_HEADER_BYTES
+        .checked_add(SEQUENCE_LENGTH_BYTES * 2)
+        .and_then(|total| total.checked_add(PUBLICATION_RECORD_OVERHEAD))
+        .and_then(|total| total.checked_add(post_count.checked_mul(POST_RECORD_OVERHEAD)?))
+        .and_then(|total| total.checked_add(asset_count.checked_mul(ASSET_RECORD_OVERHEAD)?))
+        .and_then(|total| total.checked_add(path_bytes))
+        .and_then(|total| total.checked_add(tree.total_bytes))
+        .ok_or(ContentCandidateStoreError::LimitExceeded(
+            "candidate archive size cannot be represented",
+        ))
+}
+
+fn canonically_equal(left: &DiscoveredContentTree, right: &DiscoveredContentTree) -> bool {
+    if left.publication != right.publication
+        || left.total_bytes != right.total_bytes
+        || left.posts.len() != right.posts.len()
+        || left.assets.len() != right.assets.len()
+    {
+        return false;
+    }
+    let mut left_posts = left.posts.iter().collect::<Vec<_>>();
+    let mut right_posts = right.posts.iter().collect::<Vec<_>>();
+    left_posts.sort_unstable_by(compare_posts);
+    right_posts.sort_unstable_by(compare_posts);
+    let mut left_assets = left.assets.iter().collect::<Vec<_>>();
+    let mut right_assets = right.assets.iter().collect::<Vec<_>>();
+    left_assets.sort_unstable_by(compare_assets);
+    right_assets.sort_unstable_by(compare_assets);
+    left_posts == right_posts && left_assets == right_assets
 }
 
 fn encode_candidate(
@@ -963,39 +1183,6 @@ fn publish_no_replace(
     }
 }
 
-fn files_equal(left: &Path, right: &Path) -> Result<bool, ContentCandidateStoreError> {
-    let mut left = open_candidate_file(left)?;
-    let mut right = open_candidate_file(right)?;
-    if left
-        .metadata()
-        .map_err(ContentCandidateStoreError::Io)?
-        .len()
-        != right
-            .metadata()
-            .map_err(ContentCandidateStoreError::Io)?
-            .len()
-    {
-        return Ok(false);
-    }
-
-    let mut left_buffer = [0; 64 * 1024];
-    let mut right_buffer = [0; 64 * 1024];
-    loop {
-        let left_read = left
-            .read(&mut left_buffer)
-            .map_err(ContentCandidateStoreError::Io)?;
-        let right_read = right
-            .read(&mut right_buffer)
-            .map_err(ContentCandidateStoreError::Io)?;
-        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
-            return Ok(false);
-        }
-        if left_read == 0 {
-            return Ok(true);
-        }
-    }
-}
-
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sync_directory(path: &Path) -> io::Result<()> {
     let directory: File = rustix::fs::open(
@@ -1204,6 +1391,57 @@ mod tests {
         let mut expected = vec![first.to_string(), second.to_string()];
         expected.sort();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn candidate_store_capacity_bounds_new_archives_and_recovery_scans() {
+        let entry_state = tempfile::tempdir().unwrap();
+        let entry_limited = ContentCandidateStore::open_with_capacity(
+            entry_state.path(),
+            ContentTreeLimits::default(),
+            CandidateStoreCapacity {
+                entries: 1,
+                bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        let first = fixture("capacity-first");
+        let first_digest = entry_limited.retain(&first).unwrap();
+        let mut reordered = first.clone();
+        reordered.posts.reverse();
+        reordered.assets.reverse();
+        assert_eq!(entry_limited.retain(&reordered).unwrap(), first_digest);
+        assert!(matches!(
+            entry_limited.retain(&fixture("capacity-second")),
+            Err(ContentCandidateStoreError::CapacityExceeded(_))
+        ));
+
+        let staging_path = entry_limited.staging_path();
+        let mut staging = create_staging_file(&staging_path).unwrap();
+        staging.write_all(b"bounded interrupted staging").unwrap();
+        staging.sync_all().unwrap();
+        drop(staging);
+        assert!(matches!(
+            entry_limited.load_all(),
+            Err(ContentCandidateStoreError::CapacityExceeded(_))
+        ));
+
+        let byte_state = tempfile::tempdir().unwrap();
+        let first_bytes = encoded_candidate_bytes(&first).unwrap();
+        let byte_limited = ContentCandidateStore::open_with_capacity(
+            byte_state.path(),
+            ContentTreeLimits::default(),
+            CandidateStoreCapacity {
+                entries: 2,
+                bytes: first_bytes,
+            },
+        )
+        .unwrap();
+        byte_limited.retain(&first).unwrap();
+        assert!(matches!(
+            byte_limited.retain(&fixture("capacity-byte-overflow")),
+            Err(ContentCandidateStoreError::CapacityExceeded(_))
+        ));
     }
 
     #[test]

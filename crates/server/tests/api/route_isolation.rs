@@ -5,6 +5,7 @@ use maincopy_shared::{
     posts::POSTS_PATH,
     profile_api::{ACTIVE_TIP_RECIPIENT_PATH, CURRENT_USER_PROFILE_PATH},
     publication::PUBLICATIONS_PATH,
+    source::{SOURCE_PATH, SOURCE_SYNCS_PATH},
 };
 
 use crate::helpers::{get, public_state, request};
@@ -65,6 +66,24 @@ async fn public_router_does_not_expose_profile_or_tip_recipient_resources() {
 
     for path in [CURRENT_USER_PROFILE_PATH, ACTIVE_TIP_RECIPIENT_PATH] {
         let response = get(app.clone(), path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn public_router_does_not_expose_source_resources_or_controls() {
+    let app = public_router(public_state(Readiness::new(true)));
+    for path in [
+        SOURCE_PATH,
+        SOURCE_SYNCS_PATH,
+        "/api/admin/v1/source-syncs/11111111-1111-4111-8111-111111111111",
+        "/admin/source",
+    ] {
+        let response = get(app.clone(), path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    for path in [SOURCE_SYNCS_PATH, "/admin/source/sync"] {
+        let response = request(app.clone(), Method::POST, path).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
 }

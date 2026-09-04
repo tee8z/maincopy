@@ -285,7 +285,11 @@ pub(crate) fn page_response(
                     @if matches!(kind, PageKind::Authenticated) {
                         header {
                             a href="/admin" { strong { "Maincopy" } }
-                            span class="muted" { "Private administration" }
+                            nav class="actions" aria-label="Administration" {
+                                a href="/admin" { "Posts" }
+                                a href="/admin/source" { "Source" }
+                                span class="muted" { "Private administration" }
+                            }
                         }
                     }
                     (content)

@@ -18,6 +18,11 @@ use crate::domain::publication::store::{
     IndexContentCatalog, IndexContentCatalogResult, InstallStartupSnapshot,
     InstallStartupSnapshotResult, PublicationStore, SchedulePublication, SchedulePublicationResult,
 };
+use crate::domain::source::store::{
+    AdvanceSourceSync, ApplyManagedSourceCatalog, BeginSourceSync, BeginSourceSyncResult,
+    FinishSourceSync, PutSourceConfiguration, SourceStore, StoredSourceConfiguration,
+    StoredSourceSync,
+};
 
 /// The server-facing database capability.
 ///
@@ -28,6 +33,7 @@ pub(crate) struct DatabaseStore {
     pub(crate) auth: AuthStore,
     pub(crate) profiles: ProfileStore,
     pub(crate) publications: PublicationStore,
+    pub(crate) source: SourceStore,
 }
 
 impl DatabaseStore {
@@ -35,11 +41,13 @@ impl DatabaseStore {
         auth: AuthStore,
         profiles: ProfileStore,
         publications: PublicationStore,
+        source: SourceStore,
     ) -> Self {
         Self {
             auth,
             profiles,
             publications,
+            source,
         }
     }
 }
@@ -132,6 +140,26 @@ pub(crate) enum Mutation {
     FinishPublication {
         command: FinishPublication,
         respond_to: oneshot::Sender<FinishPublicationResult>,
+    },
+    PutSourceConfiguration {
+        command: PutSourceConfiguration,
+        respond_to: oneshot::Sender<Result<StoredSourceConfiguration, DatabaseCommandError>>,
+    },
+    BeginSourceSync {
+        command: BeginSourceSync,
+        respond_to: oneshot::Sender<Result<BeginSourceSyncResult, DatabaseCommandError>>,
+    },
+    AdvanceSourceSync {
+        command: AdvanceSourceSync,
+        respond_to: oneshot::Sender<Result<StoredSourceSync, DatabaseCommandError>>,
+    },
+    ApplyManagedSourceCatalog {
+        command: ApplyManagedSourceCatalog,
+        respond_to: oneshot::Sender<Result<StoredSourceSync, DatabaseCommandError>>,
+    },
+    FinishSourceSync {
+        command: FinishSourceSync,
+        respond_to: oneshot::Sender<Result<StoredSourceSync, DatabaseCommandError>>,
     },
 }
 

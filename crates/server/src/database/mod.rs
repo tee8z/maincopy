@@ -52,6 +52,9 @@ impl BootstrappedDatabase {
         if result.is_err() {
             tracing::error!("database writer close failed");
         }
+        if let Err(error) = _ownership_lock.unlock() {
+            tracing::error!(%error, "database ownership unlock failed");
+        }
         drop(_ownership_lock);
         result
     }
@@ -96,6 +99,10 @@ pub(crate) async fn bootstrap(
             if writer.close().await.is_err() {
                 tracing::error!("database writer close failed during bootstrap rollback");
             }
+            if let Err(unlock_error) = ownership_lock.unlock() {
+                tracing::error!(error = %unlock_error, "database ownership unlock failed during bootstrap rollback");
+            }
+            drop(ownership_lock);
             return Err(error);
         }
     };

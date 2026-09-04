@@ -6,6 +6,7 @@ pub mod posts;
 pub mod profile;
 pub mod profile_api;
 pub mod publication;
+pub mod source;
 
 use serde::{Deserialize, Serialize};
 

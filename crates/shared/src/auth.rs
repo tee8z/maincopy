@@ -135,8 +135,10 @@ impl UserRole {
 pub enum AdminScope {
     ContentRead,
     StatusRead,
+    SourceSync,
     PreviewRead,
     ReleaseManage,
+    SourceManage,
     ProfileManage,
     LightningManage,
     UserManage,
@@ -146,11 +148,13 @@ pub enum AdminScope {
 }
 
 impl AdminScope {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::ContentRead,
         Self::StatusRead,
+        Self::SourceSync,
         Self::PreviewRead,
         Self::ReleaseManage,
+        Self::SourceManage,
         Self::ProfileManage,
         Self::LightningManage,
         Self::UserManage,
@@ -159,9 +163,10 @@ impl AdminScope {
         Self::AuditRead,
     ];
 
-    pub const ADMINISTRATOR: [Self; 9] = [
+    pub const ADMINISTRATOR: [Self; 10] = [
         Self::ContentRead,
         Self::StatusRead,
+        Self::SourceSync,
         Self::PreviewRead,
         Self::ReleaseManage,
         Self::ProfileManage,
@@ -171,9 +176,10 @@ impl AdminScope {
         Self::AuditRead,
     ];
 
-    pub const PUBLISHER: [Self; 4] = [
+    pub const PUBLISHER: [Self; 5] = [
         Self::ContentRead,
         Self::StatusRead,
+        Self::SourceSync,
         Self::PreviewRead,
         Self::ReleaseManage,
     ];
@@ -182,8 +188,10 @@ impl AdminScope {
         match self {
             Self::ContentRead => "content_read",
             Self::StatusRead => "status_read",
+            Self::SourceSync => "source_sync",
             Self::PreviewRead => "preview_read",
             Self::ReleaseManage => "release_manage",
+            Self::SourceManage => "source_manage",
             Self::ProfileManage => "profile_manage",
             Self::LightningManage => "lightning_manage",
             Self::UserManage => "user_manage",
@@ -197,8 +205,10 @@ impl AdminScope {
         match value {
             "content_read" => Some(Self::ContentRead),
             "status_read" => Some(Self::StatusRead),
+            "source_sync" => Some(Self::SourceSync),
             "preview_read" => Some(Self::PreviewRead),
             "release_manage" => Some(Self::ReleaseManage),
+            "source_manage" => Some(Self::SourceManage),
             "profile_manage" => Some(Self::ProfileManage),
             "lightning_manage" => Some(Self::LightningManage),
             "user_manage" => Some(Self::UserManage),
@@ -283,10 +293,16 @@ mod tests {
                 .scopes()
                 .contains(&AdminScope::RoleAssign)
         );
+        assert!(
+            !UserRole::Administrator
+                .scopes()
+                .contains(&AdminScope::SourceManage)
+        );
 
         for allowed in [
             AdminScope::ContentRead,
             AdminScope::StatusRead,
+            AdminScope::SourceSync,
             AdminScope::PreviewRead,
             AdminScope::ReleaseManage,
         ] {
@@ -299,6 +315,7 @@ mod tests {
             AdminScope::CredentialManage,
             AdminScope::RoleAssign,
             AdminScope::AuditRead,
+            AdminScope::SourceManage,
         ] {
             assert!(!UserRole::Publisher.scopes().contains(&denied), "{denied}");
         }

@@ -7,6 +7,7 @@ use std::{
     io::{self, Write as _},
     path::{Path, PathBuf},
     process::ExitCode,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -15,6 +16,11 @@ use maincopy_shared::{
     auth_api::{AdminSessionResponse, RevokeAdminSessionResponse, SecretString},
     posts::{ListPostsResponse, PostPublicationState, PostSummary},
     publication::{PreviewDigest, PublicationApprovalState, PublishNowRequest, PublishNowResponse},
+    source::{
+        BeginSourceSyncResponse, SourceStatusResponse, SourceSyncAdmission, SourceSyncFailureCode,
+        SourceSyncId, SourceSyncOutcome, SourceSyncResource, valid_source_commit,
+        valid_source_content_digest,
+    },
 };
 use serde::Serialize;
 use serde_json::json;
@@ -23,8 +29,11 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    client::{AdminClient, AdminClientError, PostPreview},
-    models::{AgentKeyCommand, Arguments, Command},
+    client::{AdminClient, AdminClientError, AdminProblem, PostPreview},
+    models::{
+        AgentKeyCommand, Arguments, Command, SourceCommand, SourceSyncDisposition,
+        SourceSyncInvocation,
+    },
     transport::AdditionalRootCertificateError,
 };
 
@@ -38,6 +47,9 @@ const POSTS_PAGE_LIMIT: u16 = 100;
 const MAX_POSTS_PAGES: usize = 10_001;
 const POST_REVISION_PREFIX: &str = "post-b3-v1-";
 const CONTENT_DIGEST_PREFIX: &str = "content-b3-v1-";
+const SOURCE_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const SOURCE_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const MAX_SOURCE_SYNC_POLLS: usize = 600;
 
 enum CommandOutput {
     Login(AdminSessionResponse),
@@ -48,6 +60,12 @@ enum CommandOutput {
     AgentKeyRemoved,
     Capabilities(Capabilities),
     Posts(ListPostsResponse),
+    SourceStatus(Box<SourceStatusResponse>),
+    SourceSync {
+        idempotency_key: Uuid,
+        admission: SourceSyncAdmission,
+        sync: SourceSyncResource,
+    },
     Preview {
         post_id: Uuid,
         output: PathBuf,
@@ -178,6 +196,50 @@ enum CliError {
         source: AdminClientError,
     },
 
+    #[error("source synchronization command {idempotency_key} could not be started: {source}")]
+    SourceSyncStart {
+        idempotency_key: Uuid,
+        #[source]
+        source: AdminClientError,
+    },
+
+    #[error(
+        "source synchronization {source_sync_id} (command {idempotency_key}) could not be followed: {source}"
+    )]
+    SourceSyncFollow {
+        idempotency_key: Uuid,
+        source_sync_id: SourceSyncId,
+        #[source]
+        source: AdminClientError,
+    },
+
+    #[error(
+        "source synchronization {source_sync_id} (command {idempotency_key}) did not finish within the client wait limit"
+    )]
+    SourceSyncTimedOut {
+        idempotency_key: Uuid,
+        source_sync_id: SourceSyncId,
+    },
+
+    #[error(
+        "source synchronization {source_sync_id} (command {idempotency_key}) finished with {outcome}"
+    )]
+    SourceSyncTerminalFailure {
+        idempotency_key: Uuid,
+        source_sync_id: SourceSyncId,
+        outcome: &'static str,
+        failure_code: Option<SourceSyncFailureCode>,
+    },
+
+    #[error(
+        "the admin server returned inconsistent source synchronization {source_sync_id} (command {idempotency_key}): {message}"
+    )]
+    InvalidSourceSyncResponse {
+        idempotency_key: Uuid,
+        source_sync_id: SourceSyncId,
+        message: &'static str,
+    },
+
     #[error("failed to write command output: {0}")]
     Output(#[from] io::Error),
 
@@ -232,6 +294,23 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
             .map(CommandOutput::Capabilities)
             .map_err(CliError::from),
         Command::Posts => list_all_posts(&client).await.map(CommandOutput::Posts),
+        Command::Source {
+            command: SourceCommand::Status,
+        } => client
+            .source_status()
+            .await
+            .map(Box::new)
+            .map(CommandOutput::SourceStatus)
+            .map_err(CliError::from),
+        Command::Source {
+            command: SourceCommand::Sync(arguments),
+        } => {
+            let SourceSyncInvocation {
+                disposition,
+                idempotency_key,
+            } = arguments.into_invocation();
+            source_sync(&client, disposition, idempotency_key).await
+        }
         Command::Preview {
             post_id,
             output,
@@ -271,6 +350,230 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
             )
             .await
         }
+    }
+}
+
+async fn source_sync(
+    client: &AdminClient,
+    disposition: SourceSyncDisposition,
+    idempotency_key: Option<Uuid>,
+) -> Result<CommandOutput, CliError> {
+    let idempotency_key = idempotency_key.unwrap_or_else(Uuid::new_v4);
+    let BeginSourceSyncResponse { admission, sync } = client
+        .begin_source_sync(idempotency_key)
+        .await
+        .map_err(|source| CliError::SourceSyncStart {
+            idempotency_key,
+            source,
+        })?;
+
+    let sync = complete_source_sync(client, disposition, sync, idempotency_key).await?;
+
+    Ok(CommandOutput::SourceSync {
+        idempotency_key,
+        admission,
+        sync,
+    })
+}
+
+async fn complete_source_sync(
+    client: &AdminClient,
+    disposition: SourceSyncDisposition,
+    sync: SourceSyncResource,
+    idempotency_key: Uuid,
+) -> Result<SourceSyncResource, CliError> {
+    match disposition {
+        SourceSyncDisposition::Async => {
+            validate_source_sync(&sync, idempotency_key)?;
+            Ok(sync)
+        }
+        SourceSyncDisposition::Wait => wait_for_source_sync(client, sync, idempotency_key).await,
+    }
+}
+
+async fn wait_for_source_sync(
+    client: &AdminClient,
+    initial: SourceSyncResource,
+    idempotency_key: Uuid,
+) -> Result<SourceSyncResource, CliError> {
+    let source_sync_id = initial.source_sync_id;
+    tokio::time::timeout(
+        SOURCE_SYNC_WAIT_TIMEOUT,
+        poll_source_sync(
+            initial,
+            idempotency_key,
+            |source_sync_id| client.source_sync(source_sync_id),
+            source_sync_poll_pause,
+            MAX_SOURCE_SYNC_POLLS,
+        ),
+    )
+    .await
+    .map_err(|_| CliError::SourceSyncTimedOut {
+        idempotency_key,
+        source_sync_id,
+    })?
+}
+
+async fn source_sync_poll_pause() {
+    tokio::time::sleep(SOURCE_SYNC_POLL_INTERVAL).await;
+}
+
+async fn poll_source_sync<Fetch, FetchFuture, Pause, PauseFuture>(
+    initial: SourceSyncResource,
+    idempotency_key: Uuid,
+    mut fetch: Fetch,
+    mut pause: Pause,
+    maximum_polls: usize,
+) -> Result<SourceSyncResource, CliError>
+where
+    Fetch: FnMut(SourceSyncId) -> FetchFuture,
+    FetchFuture: Future<Output = Result<SourceSyncResource, AdminClientError>>,
+    Pause: FnMut() -> PauseFuture,
+    PauseFuture: Future<Output = ()>,
+{
+    let source_sync_id = initial.source_sync_id;
+    let configuration_version = initial.configuration_version;
+    let request_origin = initial.request_origin;
+    let requested_at = initial.requested_at;
+    let mut previous_version = initial.version;
+    let mut previous_updated_at = initial.updated_at;
+    if validate_source_sync(&initial, idempotency_key)? {
+        return Ok(initial);
+    }
+
+    for _ in 0..maximum_polls {
+        pause().await;
+        let current = fetch(source_sync_id)
+            .await
+            .map_err(|source| CliError::SourceSyncFollow {
+                idempotency_key,
+                source_sync_id,
+                source,
+            })?;
+        if current.source_sync_id != source_sync_id
+            || current.configuration_version != configuration_version
+            || current.request_origin != request_origin
+            || current.requested_at != requested_at
+        {
+            return Err(invalid_source_sync(
+                idempotency_key,
+                source_sync_id,
+                "operation identity changed while polling",
+            ));
+        }
+        if current.version < previous_version || current.updated_at < previous_updated_at {
+            return Err(invalid_source_sync(
+                idempotency_key,
+                source_sync_id,
+                "operation version or update time moved backwards",
+            ));
+        }
+        previous_version = current.version;
+        previous_updated_at = current.updated_at;
+        if validate_source_sync(&current, idempotency_key)? {
+            return Ok(current);
+        }
+    }
+
+    Err(CliError::SourceSyncTimedOut {
+        idempotency_key,
+        source_sync_id,
+    })
+}
+
+fn validate_source_sync(
+    sync: &SourceSyncResource,
+    idempotency_key: Uuid,
+) -> Result<bool, CliError> {
+    let invalid = |message| invalid_source_sync(idempotency_key, sync.source_sync_id, message);
+    if sync.version == 0 {
+        return Err(invalid("operation version must be positive"));
+    }
+    if sync.updated_at < sync.requested_at {
+        return Err(invalid("updated_at precedes requested_at"));
+    }
+    if sync
+        .source_commit
+        .as_deref()
+        .is_some_and(|source_commit| !valid_source_commit(source_commit))
+    {
+        return Err(invalid("source_commit is not a canonical Git object ID"));
+    }
+    if sync
+        .content_digest
+        .as_deref()
+        .is_some_and(|digest| !valid_source_content_digest(digest))
+    {
+        return Err(invalid("content_digest is not a typed content digest"));
+    }
+
+    match (sync.outcome, sync.finished_at) {
+        (None, None) => {
+            if sync.failure_code.is_some() {
+                return Err(invalid(
+                    "non-terminal operation contains a terminal failure code",
+                ));
+            }
+            Ok(false)
+        }
+        (None, Some(_)) | (Some(_), None) => Err(invalid(
+            "outcome and finished_at must either both be present or both be absent",
+        )),
+        (Some(outcome), Some(finished_at)) => {
+            if finished_at < sync.updated_at {
+                return Err(invalid("finished_at precedes updated_at"));
+            }
+            match outcome {
+                SourceSyncOutcome::Applied | SourceSyncOutcome::NoChange => {
+                    if sync.failure_code.is_some() {
+                        return Err(invalid("successful operation contains a failure code"));
+                    }
+                    if sync.source_commit.is_none() || sync.content_digest.is_none() {
+                        return Err(invalid(
+                            "successful operation is missing its commit or content digest",
+                        ));
+                    }
+                    Ok(true)
+                }
+                SourceSyncOutcome::Failed => {
+                    if sync.failure_code.is_none() {
+                        return Err(invalid("failed operation does not contain a failure code"));
+                    }
+                    Err(terminal_source_sync_failure(sync, idempotency_key, outcome))
+                }
+                SourceSyncOutcome::Cancelled => {
+                    if sync.failure_code.is_some() {
+                        return Err(invalid("cancelled operation contains a failure code"));
+                    }
+                    Err(terminal_source_sync_failure(sync, idempotency_key, outcome))
+                }
+            }
+        }
+    }
+}
+
+fn terminal_source_sync_failure(
+    sync: &SourceSyncResource,
+    idempotency_key: Uuid,
+    outcome: SourceSyncOutcome,
+) -> CliError {
+    CliError::SourceSyncTerminalFailure {
+        idempotency_key,
+        source_sync_id: sync.source_sync_id,
+        outcome: outcome.as_str(),
+        failure_code: sync.failure_code,
+    }
+}
+
+const fn invalid_source_sync(
+    idempotency_key: Uuid,
+    source_sync_id: SourceSyncId,
+    message: &'static str,
+) -> CliError {
+    CliError::InvalidSourceSyncResponse {
+        idempotency_key,
+        source_sync_id,
+        message,
     }
 }
 
@@ -479,6 +782,12 @@ fn write_output(
         CommandOutput::AgentKeyRemoved => write_agent_key_removed(output, json),
         CommandOutput::Capabilities(capabilities) => write_capabilities(output, capabilities, json),
         CommandOutput::Posts(posts) => write_posts(output, posts, json),
+        CommandOutput::SourceStatus(status) => write_source_status(output, *status, json),
+        CommandOutput::SourceSync {
+            idempotency_key,
+            admission,
+            sync,
+        } => write_source_sync(output, idempotency_key, admission, sync, json),
         CommandOutput::Preview {
             post_id,
             output: path,
@@ -488,6 +797,168 @@ fn write_output(
             idempotency_key,
             response,
         } => write_publication(output, idempotency_key, response, json),
+    }
+}
+
+fn write_source_status(
+    mut output: impl io::Write,
+    status: SourceStatusResponse,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        serde_json::to_writer(&mut output, &status)?;
+        writeln!(output)?;
+        return Ok(());
+    }
+
+    match status {
+        SourceStatusResponse::ExternalCheckout => {
+            writeln!(output, "Source mode: external_checkout")?;
+        }
+        SourceStatusResponse::ManagedGit {
+            configuration,
+            installed_commit,
+            content_digest,
+            active_sync,
+            latest_sync,
+            next_poll_at,
+        } => {
+            writeln!(output, "Source mode: managed_git")?;
+            writeln!(
+                output,
+                "Remote: {}@{}:{}/{}",
+                configuration.remote.user,
+                configuration.remote.host,
+                configuration.remote.port.get(),
+                configuration.remote.repository_path
+            )?;
+            writeln!(output, "Branch: {}", configuration.branch)?;
+            writeln!(
+                output,
+                "Content subdirectory: {}",
+                configuration.content_subdirectory
+            )?;
+            writeln!(output, "Credential: {}", configuration.credential_name)?;
+            writeln!(
+                output,
+                "Poll interval: {} seconds",
+                configuration.poll_interval_seconds.seconds()
+            )?;
+            writeln!(
+                output,
+                "Configuration version: {}",
+                configuration.version.get()
+            )?;
+            writeln!(
+                output,
+                "Configuration updated at: {}",
+                configuration.updated_at
+            )?;
+            write_optional_line(&mut output, "Installed commit", installed_commit.as_deref())?;
+            write_optional_line(&mut output, "Content", content_digest.as_deref())?;
+            write_optional_line(
+                &mut output,
+                "Active sync",
+                active_sync
+                    .as_ref()
+                    .map(|sync| sync.source_sync_id.to_string())
+                    .as_deref(),
+            )?;
+            write_optional_line(
+                &mut output,
+                "Latest sync",
+                latest_sync
+                    .as_ref()
+                    .map(|sync| sync.source_sync_id.to_string())
+                    .as_deref(),
+            )?;
+            writeln!(
+                output,
+                "Next poll at: {}",
+                next_poll_at
+                    .map(|timestamp| timestamp.to_string())
+                    .as_deref()
+                    .unwrap_or("none")
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn write_source_sync(
+    mut output: impl io::Write,
+    idempotency_key: Uuid,
+    admission: SourceSyncAdmission,
+    sync: SourceSyncResource,
+    json: bool,
+) -> Result<(), CliError> {
+    validate_source_sync(&sync, idempotency_key)?;
+    if json {
+        #[derive(Serialize)]
+        struct SourceSyncOutput<'sync> {
+            idempotency_key: Uuid,
+            admission: SourceSyncAdmission,
+            sync: &'sync SourceSyncResource,
+        }
+
+        serde_json::to_writer(
+            &mut output,
+            &SourceSyncOutput {
+                idempotency_key,
+                admission,
+                sync: &sync,
+            },
+        )?;
+        writeln!(output)?;
+        return Ok(());
+    }
+
+    writeln!(output, "Source sync: {}", sync.source_sync_id)?;
+    writeln!(
+        output,
+        "Admission: {}",
+        source_sync_admission_name(admission)
+    )?;
+    writeln!(
+        output,
+        "Status: {}",
+        sync.outcome
+            .map(SourceSyncOutcome::as_str)
+            .unwrap_or_else(|| sync.stage.as_str())
+    )?;
+    writeln!(
+        output,
+        "Configuration version: {}",
+        sync.configuration_version.get()
+    )?;
+    writeln!(output, "Requested by: {}", sync.request_origin.as_str())?;
+    writeln!(output, "Requested at: {}", sync.requested_at)?;
+    writeln!(output, "Updated at: {}", sync.updated_at)?;
+    if let Some(finished_at) = sync.finished_at {
+        writeln!(output, "Finished at: {finished_at}")?;
+    }
+    write_optional_line(&mut output, "Source commit", sync.source_commit.as_deref())?;
+    write_optional_line(&mut output, "Content", sync.content_digest.as_deref())?;
+    if let Some(code) = sync.failure_code {
+        writeln!(output, "Failure code: {}", code.as_str())?;
+    }
+    writeln!(output, "Idempotency key: {idempotency_key}")?;
+    Ok(())
+}
+
+fn write_optional_line(
+    mut output: impl io::Write,
+    label: &str,
+    value: Option<&str>,
+) -> io::Result<()> {
+    writeln!(output, "{label}: {}", value.unwrap_or("none"))
+}
+
+const fn source_sync_admission_name(admission: SourceSyncAdmission) -> &'static str {
+    match admission {
+        SourceSyncAdmission::Created => "created",
+        SourceSyncAdmission::Coalesced => "coalesced",
+        SourceSyncAdmission::Replayed => "replayed",
     }
 }
 
@@ -760,13 +1231,20 @@ fn error_exit(error: &CliError) -> u8 {
         }
         CliError::InvalidPostsPagination { .. }
         | CliError::InvalidPublicationResponse { .. }
+        | CliError::InvalidSourceSyncResponse { .. }
         | CliError::SecretInput(_)
         | CliError::PreviewOutput { .. }
         | CliError::Output(_)
         | CliError::Encode(_) => {
             return INTERNAL;
         }
-        CliError::Admin(_) | CliError::Publication { .. } => {}
+        CliError::SourceSyncTimedOut { .. } | CliError::SourceSyncTerminalFailure { .. } => {
+            return UNAVAILABLE;
+        }
+        CliError::Admin(_)
+        | CliError::Publication { .. }
+        | CliError::SourceSyncStart { .. }
+        | CliError::SourceSyncFollow { .. } => {}
     }
     let Some(error) = admin_error(error) else {
         return INTERNAL;
@@ -830,7 +1308,8 @@ fn error_exit(error: &CliError) -> u8 {
         | AdminClientError::Nip98Signing(_)
         | AdminClientError::InvalidResponse(_)
         | AdminClientError::InvalidPreviewResponse { .. }
-        | AdminClientError::InvalidPublicationResponse { .. } => INTERNAL,
+        | AdminClientError::InvalidPublicationResponse { .. }
+        | AdminClientError::InvalidSourceSyncResponse { .. } => INTERNAL,
     }
 }
 
@@ -842,8 +1321,21 @@ fn report_error(error: &CliError, exit: u8, json_output: bool) -> io::Result<()>
     write_error(std::io::stderr().lock(), error, exit, false)
 }
 
+#[derive(Clone, Copy)]
+enum ErrorRecovery {
+    None,
+    Publication(Uuid),
+    SourceSyncStart(Uuid),
+    SourceSync {
+        idempotency_key: Uuid,
+        source_sync_id: SourceSyncId,
+        outcome: Option<&'static str>,
+        failure_code: Option<SourceSyncFailureCode>,
+    },
+}
+
 fn write_error(
-    mut output: impl io::Write,
+    output: impl io::Write,
     error: &CliError,
     exit: u8,
     json_output: bool,
@@ -856,26 +1348,82 @@ fn write_error(
         }) => (problem.as_ref(), *request_id),
         _ => (None, None),
     };
-    if !json_output {
-        writeln!(output, "maincopy: {error}")?;
-        if let Some(problem) = problem {
-            writeln!(output, "maincopy: {}: {}", problem.code, problem.message)?;
-        }
-        if let Some(request_id) = request_id {
-            writeln!(output, "maincopy: request ID: {request_id}")?;
-        }
-        return Ok(());
+    let recovery = error_recovery(error);
+    if json_output {
+        return write_json_error(output, error, exit, problem, request_id, recovery);
     }
 
+    write_human_error(output, error, problem, request_id, recovery)
+}
+
+fn write_human_error(
+    mut output: impl io::Write,
+    error: &CliError,
+    problem: Option<&AdminProblem>,
+    request_id: Option<Uuid>,
+    recovery: ErrorRecovery,
+) -> io::Result<()> {
+    writeln!(output, "maincopy: {error}")?;
+    if let Some(problem) = problem {
+        writeln!(output, "maincopy: {}: {}", problem.code, problem.message)?;
+    }
+    if let Some(request_id) = request_id {
+        writeln!(output, "maincopy: request ID: {request_id}")?;
+    }
+    match recovery {
+        ErrorRecovery::None | ErrorRecovery::Publication(_) => {}
+        ErrorRecovery::SourceSyncStart(idempotency_key) => {
+            writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
+        }
+        ErrorRecovery::SourceSync {
+            idempotency_key,
+            source_sync_id,
+            failure_code,
+            ..
+        } => {
+            writeln!(output, "maincopy: source sync: {source_sync_id}")?;
+            writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
+            if let Some(failure_code) = failure_code {
+                writeln!(output, "maincopy: failure code: {}", failure_code.as_str())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_json_error(
+    mut output: impl io::Write,
+    error: &CliError,
+    exit: u8,
+    problem: Option<&AdminProblem>,
+    request_id: Option<Uuid>,
+    recovery: ErrorRecovery,
+) -> io::Result<()> {
     let mut details = serde_json::Map::from_iter([
         ("category".into(), json!(error_category(error, exit))),
         ("message".into(), json!(error.to_string())),
     ]);
-    if let CliError::Publication {
-        idempotency_key, ..
-    } = error
-    {
-        details.insert("idempotency_key".into(), json!(idempotency_key));
+    match recovery {
+        ErrorRecovery::None => {}
+        ErrorRecovery::Publication(idempotency_key)
+        | ErrorRecovery::SourceSyncStart(idempotency_key) => {
+            details.insert("idempotency_key".into(), json!(idempotency_key));
+        }
+        ErrorRecovery::SourceSync {
+            idempotency_key,
+            source_sync_id,
+            outcome,
+            failure_code,
+        } => {
+            details.insert("idempotency_key".into(), json!(idempotency_key));
+            details.insert("source_sync_id".into(), json!(source_sync_id));
+            if let Some(outcome) = outcome {
+                details.insert("outcome".into(), json!(outcome));
+            }
+            if let Some(failure_code) = failure_code {
+                details.insert("failure_code".into(), json!(failure_code.as_str()));
+            }
+        }
     }
     if let Some(problem) = problem {
         details.insert("code".into(), json!(problem.code));
@@ -885,6 +1433,59 @@ fn write_error(
         details.insert("request_id".into(), json!(request_id));
     }
     writeln!(output, "{}", json!({ "error": details }))
+}
+
+const fn error_recovery(error: &CliError) -> ErrorRecovery {
+    match error {
+        CliError::Publication {
+            idempotency_key, ..
+        } => ErrorRecovery::Publication(*idempotency_key),
+        CliError::SourceSyncStart {
+            idempotency_key, ..
+        } => ErrorRecovery::SourceSyncStart(*idempotency_key),
+        CliError::SourceSyncFollow {
+            idempotency_key,
+            source_sync_id,
+            ..
+        }
+        | CliError::SourceSyncTimedOut {
+            idempotency_key,
+            source_sync_id,
+        }
+        | CliError::InvalidSourceSyncResponse {
+            idempotency_key,
+            source_sync_id,
+            ..
+        } => ErrorRecovery::SourceSync {
+            idempotency_key: *idempotency_key,
+            source_sync_id: *source_sync_id,
+            outcome: None,
+            failure_code: None,
+        },
+        CliError::SourceSyncTerminalFailure {
+            idempotency_key,
+            source_sync_id,
+            outcome,
+            failure_code,
+        } => ErrorRecovery::SourceSync {
+            idempotency_key: *idempotency_key,
+            source_sync_id: *source_sync_id,
+            outcome: Some(outcome),
+            failure_code: *failure_code,
+        },
+        CliError::Admin(_)
+        | CliError::SecretInput(_)
+        | CliError::PostsSnapshotChanged { .. }
+        | CliError::InvalidPostsPagination { .. }
+        | CliError::InvalidPublicationResponse { .. }
+        | CliError::InvalidPreviewSelector { .. }
+        | CliError::PreviewRevisionMismatch { .. }
+        | CliError::PreviewContentDigestMismatch { .. }
+        | CliError::PreviewOutputExists { .. }
+        | CliError::PreviewOutput { .. }
+        | CliError::Output(_)
+        | CliError::Encode(_) => ErrorRecovery::None,
+    }
 }
 
 fn error_category(error: &CliError, exit: u8) -> &'static str {
@@ -907,11 +1508,17 @@ fn error_category(error: &CliError, exit: u8) -> &'static str {
 
 fn admin_error(error: &CliError) -> Option<&AdminClientError> {
     match error {
-        CliError::Admin(error) | CliError::Publication { source: error, .. } => Some(error),
+        CliError::Admin(error)
+        | CliError::Publication { source: error, .. }
+        | CliError::SourceSyncStart { source: error, .. }
+        | CliError::SourceSyncFollow { source: error, .. } => Some(error),
         CliError::PostsSnapshotChanged { .. }
         | CliError::SecretInput(_)
         | CliError::InvalidPostsPagination { .. }
         | CliError::InvalidPublicationResponse { .. }
+        | CliError::SourceSyncTimedOut { .. }
+        | CliError::SourceSyncTerminalFailure { .. }
+        | CliError::InvalidSourceSyncResponse { .. }
         | CliError::InvalidPreviewSelector { .. }
         | CliError::PreviewRevisionMismatch { .. }
         | CliError::PreviewContentDigestMismatch { .. }
@@ -924,7 +1531,7 @@ fn admin_error(error: &CliError) -> Option<&AdminClientError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, future::ready};
+    use std::{cell::Cell, collections::VecDeque, future::ready};
 
     use maincopy_shared::FeatureVersions;
     use serde_json::json;
@@ -934,6 +1541,10 @@ mod tests {
 
     const PREVIEW_DIGEST: &str =
         "preview-b3-v1-4444444444444444444444444444444444444444444444444444444444444444";
+    const SOURCE_SYNC_ID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const SOURCE_COMMIT: &str = "git-sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SOURCE_CONTENT_DIGEST: &str =
+        "content-b3-v1-3333333333333333333333333333333333333333333333333333333333333333";
 
     fn capabilities() -> Capabilities {
         Capabilities {
@@ -1033,6 +1644,68 @@ mod tests {
             "scopes": ["content_read"],
             "fresh_until": "2026-09-03T13:00:00Z",
             "expires_at": "2026-09-04T12:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn source_sync_resource(
+        stage: &str,
+        outcome: Option<SourceSyncOutcome>,
+        version: u64,
+    ) -> SourceSyncResource {
+        let (source_commit, content_digest, failure_code) = match outcome {
+            Some(SourceSyncOutcome::Applied) => {
+                (Some(SOURCE_COMMIT), Some(SOURCE_CONTENT_DIGEST), None)
+            }
+            Some(SourceSyncOutcome::NoChange) => {
+                (Some(SOURCE_COMMIT), Some(SOURCE_CONTENT_DIGEST), None)
+            }
+            Some(SourceSyncOutcome::Failed) => (None, None, Some("remote_unavailable")),
+            Some(SourceSyncOutcome::Cancelled) | None => (None, None, None),
+        };
+        serde_json::from_value(json!({
+            "source_sync_id": SOURCE_SYNC_ID,
+            "configuration_version": 3,
+            "request_origin": "manual",
+            "stage": stage,
+            "outcome": outcome,
+            "source_commit": source_commit,
+            "content_digest": content_digest,
+            "failure_code": failure_code,
+            "version": version,
+            "requested_at": "2026-09-04T12:00:00Z",
+            "updated_at": "2026-09-04T12:00:01Z",
+            "finished_at": outcome.map(|_| "2026-09-04T12:00:01Z")
+        }))
+        .unwrap()
+    }
+
+    fn managed_source_status() -> SourceStatusResponse {
+        serde_json::from_value(json!({
+            "mode": "managed_git",
+            "configuration": {
+                "remote": {
+                    "user": "git",
+                    "host": "git.example.test",
+                    "port": 22,
+                    "repository_path": "publisher/site.git"
+                },
+                "branch": "main",
+                "content_subdirectory": "publication",
+                "credential_name": "deploy-key-1",
+                "poll_interval_seconds": 300,
+                "version": 3,
+                "updated_at": "2026-09-04T11:55:00Z"
+            },
+            "installed_commit": SOURCE_COMMIT,
+            "content_digest": SOURCE_CONTENT_DIGEST,
+            "active_sync": null,
+            "latest_sync": source_sync_resource(
+                "reloading",
+                Some(SourceSyncOutcome::Applied),
+                4
+            ),
+            "next_poll_at": "2026-09-04T12:05:00Z"
         }))
         .unwrap()
     }
@@ -1155,6 +1828,399 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "Admin API: v1\nCapabilities contract: v1\n"
         );
+    }
+
+    #[test]
+    fn source_status_has_direct_machine_output_and_bounded_operator_fields() {
+        let status = managed_source_status();
+        let mut json_output = Vec::new();
+        write_source_status(&mut json_output, status.clone(), true).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<SourceStatusResponse>(&json_output).unwrap(),
+            status
+        );
+
+        let mut human_output = Vec::new();
+        write_source_status(&mut human_output, status, false).unwrap();
+        let human_output = String::from_utf8(human_output).unwrap();
+        for expected in [
+            "Source mode: managed_git\n",
+            "Remote: git@git.example.test:22/publisher/site.git\n",
+            "Branch: main\n",
+            "Content subdirectory: publication\n",
+            "Credential: deploy-key-1\n",
+            "Poll interval: 300 seconds\n",
+            "Configuration version: 3\n",
+            "Installed commit: git-sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            "Content: content-b3-v1-3333333333333333333333333333333333333333333333333333333333333333\n",
+            "Latest sync: dddddddd-dddd-4ddd-8ddd-dddddddddddd\n",
+        ] {
+            assert!(human_output.contains(expected), "missing {expected:?}");
+        }
+        assert!(!human_output.contains("private_key"));
+
+        let mut external = Vec::new();
+        write_source_status(&mut external, SourceStatusResponse::ExternalCheckout, false).unwrap();
+        assert_eq!(
+            String::from_utf8(external).unwrap(),
+            "Source mode: external_checkout\n"
+        );
+    }
+
+    #[test]
+    fn asynchronous_source_sync_output_preserves_both_recovery_identities() {
+        let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let queued = source_sync_resource("queued", None, 1);
+
+        let mut json_output = Vec::new();
+        write_source_sync(
+            &mut json_output,
+            idempotency_key,
+            SourceSyncAdmission::Created,
+            queued.clone(),
+            true,
+        )
+        .unwrap();
+        let document = serde_json::from_slice::<serde_json::Value>(&json_output).unwrap();
+        assert_eq!(document["idempotency_key"], idempotency_key.to_string());
+        assert_eq!(document["admission"], "created");
+        assert_eq!(document["sync"]["source_sync_id"], SOURCE_SYNC_ID);
+        assert_eq!(document["sync"]["stage"], "queued");
+
+        let mut human_output = Vec::new();
+        write_source_sync(
+            &mut human_output,
+            idempotency_key,
+            SourceSyncAdmission::Coalesced,
+            queued,
+            false,
+        )
+        .unwrap();
+        let human_output = String::from_utf8(human_output).unwrap();
+        assert!(human_output.contains("Source sync: dddddddd-dddd-4ddd-8ddd-dddddddddddd\n"));
+        assert!(human_output.contains("Admission: coalesced\n"));
+        assert!(human_output.contains("Status: queued\n"));
+        assert!(human_output.contains("Idempotency key: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n"));
+    }
+
+    #[tokio::test]
+    async fn source_sync_wait_is_bounded_and_stops_on_success() {
+        let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let initial = source_sync_resource("queued", None, 1);
+        let fetching = source_sync_resource("fetching", None, 2);
+        let applied = source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 3);
+        let mut responses = VecDeque::from([Ok(fetching), Ok(applied.clone())]);
+        let polls = Cell::new(0);
+        let pauses = Cell::new(0);
+
+        let completed = poll_source_sync(
+            initial,
+            idempotency_key,
+            |source_sync_id| {
+                assert_eq!(source_sync_id.to_string(), SOURCE_SYNC_ID);
+                polls.set(polls.get() + 1);
+                ready(responses.pop_front().unwrap())
+            },
+            || {
+                pauses.set(pauses.get() + 1);
+                ready(())
+            },
+            3,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(completed, applied);
+        assert_eq!(polls.get(), 2);
+        assert_eq!(pauses.get(), 2);
+
+        let polls = Cell::new(0);
+        let no_change =
+            source_sync_resource("resolving_commit", Some(SourceSyncOutcome::NoChange), 2);
+        let completed = poll_source_sync(
+            no_change.clone(),
+            idempotency_key,
+            |_| {
+                polls.set(polls.get() + 1);
+                ready(Ok(no_change.clone()))
+            },
+            || ready(()),
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completed, no_change);
+        assert_eq!(polls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn source_sync_wait_reports_terminal_failure_and_poll_limit() {
+        let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let initial = source_sync_resource("queued", None, 1);
+        let failed = source_sync_resource("fetching", Some(SourceSyncOutcome::Failed), 2);
+        let mut responses = VecDeque::from([Ok(failed)]);
+        let error = poll_source_sync(
+            initial.clone(),
+            idempotency_key,
+            |_| ready(responses.pop_front().unwrap()),
+            || ready(()),
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::SourceSyncTerminalFailure {
+                failure_code: Some(SourceSyncFailureCode::RemoteUnavailable),
+                ..
+            }
+        ));
+        assert_eq!(error_exit(&error), UNAVAILABLE);
+
+        let polls = Cell::new(0);
+        let error = poll_source_sync(
+            initial.clone(),
+            idempotency_key,
+            |_| {
+                polls.set(polls.get() + 1);
+                ready(Ok(initial.clone()))
+            },
+            || ready(()),
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, CliError::SourceSyncTimedOut { .. }));
+        assert_eq!(polls.get(), 2);
+    }
+
+    #[test]
+    fn source_sync_failures_report_safe_details_and_recovery_identities() {
+        let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let failed = source_sync_resource("fetching", Some(SourceSyncOutcome::Failed), 2);
+        let error = validate_source_sync(&failed, idempotency_key).unwrap_err();
+        let exit = error_exit(&error);
+
+        let mut json_output = Vec::new();
+        write_error(&mut json_output, &error, exit, true).unwrap();
+        let document = serde_json::from_slice::<serde_json::Value>(&json_output).unwrap();
+        assert_eq!(document["error"]["source_sync_id"], SOURCE_SYNC_ID);
+        assert_eq!(
+            document["error"]["idempotency_key"],
+            idempotency_key.to_string()
+        );
+        assert_eq!(document["error"]["failure_code"], "remote_unavailable");
+        assert!(document["error"].get("diagnostic").is_none());
+
+        let mut human_output = Vec::new();
+        write_error(&mut human_output, &error, exit, false).unwrap();
+        let human_output = String::from_utf8(human_output).unwrap();
+        assert!(human_output.contains("source sync: dddddddd-dddd-4ddd-8ddd-dddddddddddd\n"));
+        assert!(human_output.contains("idempotency key: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n"));
+        assert!(human_output.contains("failure code: remote_unavailable\n"));
+        assert!(!human_output.contains("diagnostic"));
+    }
+
+    #[test]
+    fn source_sync_validation_rejects_untrusted_or_incomplete_terminal_metadata() {
+        let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+
+        let mut invalid_commit =
+            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
+        invalid_commit.source_commit = Some("not-a-commit\n".into());
+        assert!(matches!(
+            validate_source_sync(&invalid_commit, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse { .. })
+        ));
+
+        let mut missing_digest =
+            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
+        missing_digest.content_digest = None;
+        assert!(matches!(
+            validate_source_sync(&missing_digest, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse { .. })
+        ));
+
+        let mut incomplete_no_change =
+            source_sync_resource("resolving_commit", Some(SourceSyncOutcome::NoChange), 2);
+        incomplete_no_change.content_digest = None;
+        assert!(matches!(
+            validate_source_sync(&incomplete_no_change, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse { .. })
+        ));
+
+        let mut cancelled = source_sync_resource("fetching", Some(SourceSyncOutcome::Cancelled), 2);
+        cancelled.failure_code = Some(SourceSyncFailureCode::Internal);
+        assert!(matches!(
+            validate_source_sync(&cancelled, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn source_sync_validation_rejects_impossible_lifecycle_metadata() {
+        let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+
+        let mut zero_version = source_sync_resource("queued", None, 1);
+        zero_version.version = 0;
+        assert!(matches!(
+            validate_source_sync(&zero_version, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse {
+                message: "operation version must be positive",
+                ..
+            })
+        ));
+
+        let mut backwards_update = source_sync_resource("queued", None, 1);
+        backwards_update.updated_at = backwards_update.requested_at - time::Duration::SECOND;
+        assert!(matches!(
+            validate_source_sync(&backwards_update, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse {
+                message: "updated_at precedes requested_at",
+                ..
+            })
+        ));
+
+        let mut invalid_digest = source_sync_resource("queued", None, 1);
+        invalid_digest.content_digest = Some("content-b3-v1-not-a-digest".into());
+        assert!(matches!(
+            validate_source_sync(&invalid_digest, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse {
+                message: "content_digest is not a typed content digest",
+                ..
+            })
+        ));
+
+        let mut unfinished_with_outcome =
+            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
+        unfinished_with_outcome.finished_at = None;
+        assert!(matches!(
+            validate_source_sync(&unfinished_with_outcome, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse {
+                message: "outcome and finished_at must either both be present or both be absent",
+                ..
+            })
+        ));
+
+        let mut unfinished_with_failure = source_sync_resource("fetching", None, 2);
+        unfinished_with_failure.failure_code = Some(SourceSyncFailureCode::Internal);
+        assert!(matches!(
+            validate_source_sync(&unfinished_with_failure, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse {
+                message: "non-terminal operation contains a terminal failure code",
+                ..
+            })
+        ));
+
+        let mut backwards_finish =
+            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
+        backwards_finish.finished_at = Some(backwards_finish.updated_at - time::Duration::SECOND);
+        assert!(matches!(
+            validate_source_sync(&backwards_finish, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse {
+                message: "finished_at precedes updated_at",
+                ..
+            })
+        ));
+
+        let mut successful_with_failure =
+            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
+        successful_with_failure.failure_code = Some(SourceSyncFailureCode::Internal);
+        assert!(matches!(
+            validate_source_sync(&successful_with_failure, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse {
+                message: "successful operation contains a failure code",
+                ..
+            })
+        ));
+
+        let mut failed_without_code =
+            source_sync_resource("fetching", Some(SourceSyncOutcome::Failed), 2);
+        failed_without_code.failure_code = None;
+        assert!(matches!(
+            validate_source_sync(&failed_without_code, idempotency_key),
+            Err(CliError::InvalidSourceSyncResponse {
+                message: "failed operation does not contain a failure code",
+                ..
+            })
+        ));
+
+        let cancelled = source_sync_resource("fetching", Some(SourceSyncOutcome::Cancelled), 2);
+        assert!(matches!(
+            validate_source_sync(&cancelled, idempotency_key),
+            Err(CliError::SourceSyncTerminalFailure {
+                outcome: "cancelled",
+                failure_code: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn source_sync_errors_preserve_available_recovery_identities() {
+        let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let source_sync_id = SOURCE_SYNC_ID.parse().unwrap();
+        let errors = [
+            (
+                CliError::SourceSyncStart {
+                    idempotency_key,
+                    source: AdminClientError::InvalidAdminOrigin,
+                },
+                false,
+            ),
+            (
+                CliError::SourceSyncFollow {
+                    idempotency_key,
+                    source_sync_id,
+                    source: AdminClientError::InvalidAdminOrigin,
+                },
+                true,
+            ),
+            (
+                CliError::SourceSyncTimedOut {
+                    idempotency_key,
+                    source_sync_id,
+                },
+                true,
+            ),
+            (
+                CliError::InvalidSourceSyncResponse {
+                    idempotency_key,
+                    source_sync_id,
+                    message: "operation identity changed while polling",
+                },
+                true,
+            ),
+        ];
+
+        for (error, has_source_sync_id) in &errors {
+            let exit = error_exit(error);
+            let mut json_output = Vec::new();
+            write_error(&mut json_output, error, exit, true).unwrap();
+            let document = serde_json::from_slice::<serde_json::Value>(&json_output).unwrap();
+            assert_eq!(
+                document["error"]["idempotency_key"],
+                idempotency_key.to_string()
+            );
+            if *has_source_sync_id {
+                assert_eq!(document["error"]["source_sync_id"], SOURCE_SYNC_ID);
+            } else {
+                assert!(document["error"].get("source_sync_id").is_none());
+            }
+
+            let mut human_output = Vec::new();
+            write_error(&mut human_output, error, exit, false).unwrap();
+            let human_output = String::from_utf8(human_output).unwrap();
+            assert!(
+                human_output
+                    .contains("maincopy: idempotency key: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n")
+            );
+            assert_eq!(
+                human_output
+                    .contains("maincopy: source sync: dddddddd-dddd-4ddd-8ddd-dddddddddddd\n"),
+                *has_source_sync_id
+            );
+        }
     }
 
     #[test]

@@ -39,7 +39,10 @@ serves it.
 
 The browser workflow does not edit Markdown. See the
 [local alpha runbook](docs/local-alpha.md) for CA removal, CLI diagnostics, and
-safe state reset.
+safe state reset. This fixture uses the operator-maintained external checkout.
+
+See the [managed source runbook](docs/managed-source.md) for read-only SSH
+setup, durable synchronization, and failure diagnosis.
 
 ## V1 direction
 
@@ -105,11 +108,14 @@ canonical links, core non-image Open Graph fields, `BlogPosting` JSON-LD,
 authored-alias redirects, durable route ownership, and snapshot-scoped local
 asset delivery are present. Semantic code-language classes, supervised Mermaid
 rendering, and SVG sanitization are also present. Managed Git synchronization,
-favicon and image metadata, page Content Security Policy (CSP), the complete
-admin web interface, the NixOS module, Litestream wiring, Prometheus metrics
-and dashboard, and complete restore evidence remain incomplete. V1 rejects
-authored subscription and outbound-distribution configuration. It stores no
-target-job state.
+including offline source setup, startup and periodic fetch, manual sync, and
+redacted admin and CLI status, is present as a foundation. Online
+fresh-authenticated source reconfiguration and selected-credential public-key
+visibility remain incomplete, as do favicon and image metadata, page Content
+Security Policy (CSP), the complete admin web interface, the NixOS module,
+Litestream wiring, Prometheus metrics and dashboard, and complete restore
+evidence. V1 rejects authored subscription and outbound-distribution
+configuration. It stores no target-job state.
 
 > [!CAUTION]
 > Do not expose the loopback admin listener directly. Use the reviewed HTTPS
@@ -160,6 +166,8 @@ revision-artifact backups.
   dependencies, known transitions, and acceptance gates.
 - [Local alpha runbook](docs/local-alpha.md) starts the development gateway and
   exercises login, preview, publication, RSS, and authored aliases.
+- [Managed source runbook](docs/managed-source.md) configures read-only SSH,
+  durable source synchronization, and the external-checkout alternative.
 - [Engineering style](docs/quality.md) defines Rust, testing, documentation,
   and quality conventions. It also explains the manual CRAP report.
 

@@ -47,6 +47,42 @@ async fn insert_site_revision(connection: &mut SqliteConnection, digest: &[u8; 3
     .unwrap();
 }
 
+struct SourceSyncShape<'value> {
+    stage: &'value str,
+    outcome: Option<&'value str>,
+    has_commit: bool,
+    has_digest: bool,
+    failure_code: Option<&'value str>,
+    is_finished: bool,
+}
+
+async fn insert_source_sync_shape(
+    connection: &mut SqliteConnection,
+    identifier_byte: u8,
+    shape: SourceSyncShape<'_>,
+) -> Result<(), sqlx::Error> {
+    let source_sync_id = [identifier_byte; 16];
+    let source_commit = [0x41_u8; 20];
+    let content_digest = [0x42_u8; 32];
+    sqlx::query(
+        "INSERT INTO source_sync_operations (\
+            source_sync_id, configuration_version, request_origin, stage, outcome, \
+            source_commit, content_digest, failure_code, version, requested_at_ns, \
+            updated_at_ns, finished_at_ns\
+         ) VALUES (?, 1, 'startup', ?, ?, ?, ?, ?, 1, 1, 2, ?)",
+    )
+    .bind(source_sync_id.as_slice())
+    .bind(shape.stage)
+    .bind(shape.outcome)
+    .bind(shape.has_commit.then_some(source_commit.as_slice()))
+    .bind(shape.has_digest.then_some(content_digest.as_slice()))
+    .bind(shape.failure_code)
+    .bind(shape.is_finished.then_some(2_i64))
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn empty_directory_bootstraps_the_complete_core_schema() {
     let root = tempfile::tempdir().unwrap();
@@ -82,6 +118,12 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             "site_revisions",
             "site_state",
             "site_tip_recipient",
+            "source_configuration",
+            "source_configuration_mutation_receipts",
+            "source_configuration_revisions",
+            "source_installation",
+            "source_sync_idempotency_aliases",
+            "source_sync_operations",
             "user_nostr_credentials",
             "user_password_credentials",
             "user_profiles",
@@ -145,6 +187,110 @@ async fn bootstrap_is_idempotent_and_completes_each_empty_initial_version() {
     database.close().await.unwrap();
     let reopened = bootstrap(configuration(&path)).await.unwrap();
     reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn managed_source_migration_preserves_existing_agent_scopes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("v5/maincopy.db");
+    prepare_database_file(&path).unwrap();
+    let mut connection = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(false)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA application_id = 1296257113")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    MIGRATOR.run_to(5, &mut connection).await.unwrap();
+
+    let user_id = [0x31_u8; 16];
+    let credential_id = [0x32_u8; 16];
+    sqlx::query(
+        "INSERT INTO users (user_id, status, version, created_at_ns, updated_at_ns) \
+         VALUES (?, 'enabled', 1, 10, 10)",
+    )
+    .bind(user_id.as_slice())
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO agent_credentials (\
+            agent_credential_id, owner_user_id, issuer_user_id, public_key, \
+            label, version, created_at_ns\
+         ) VALUES (?, ?, ?, ?, 'pre-source agent', 1, 10)",
+    )
+    .bind(credential_id.as_slice())
+    .bind(user_id.as_slice())
+    .bind(user_id.as_slice())
+    .bind([0x33_u8; 32].as_slice())
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    for scope in ["content_read", "status_read"] {
+        sqlx::query(
+            "INSERT INTO agent_credential_scopes (agent_credential_id, scope) \
+             VALUES (?, ?)",
+        )
+        .bind(credential_id.as_slice())
+        .bind(scope)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    }
+    connection.close().await.unwrap();
+
+    let mut upgraded = bootstrap(configuration(&path)).await.unwrap();
+    for scope in ["source_sync", "source_manage"] {
+        sqlx::query(
+            "INSERT INTO agent_credential_scopes (agent_credential_id, scope) \
+             VALUES (?, ?)",
+        )
+        .bind(credential_id.as_slice())
+        .bind(scope)
+        .execute(&mut upgraded._writer)
+        .await
+        .unwrap();
+    }
+    let scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT scope FROM agent_credential_scopes \
+         WHERE agent_credential_id = ? ORDER BY scope",
+    )
+    .bind(credential_id.as_slice())
+    .fetch_all(&mut upgraded._writer)
+    .await
+    .unwrap();
+    assert_eq!(
+        scopes,
+        [
+            "content_read",
+            "source_manage",
+            "source_sync",
+            "status_read",
+        ]
+    );
+    let source_tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_schema \
+         WHERE type = 'table' AND name GLOB 'source_*' ORDER BY name",
+    )
+    .fetch_all(&mut upgraded._writer)
+    .await
+    .unwrap();
+    assert_eq!(
+        source_tables,
+        [
+            "source_configuration",
+            "source_configuration_mutation_receipts",
+            "source_configuration_revisions",
+            "source_installation",
+            "source_sync_idempotency_aliases",
+            "source_sync_operations",
+        ]
+    );
+
+    upgraded.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -272,6 +418,232 @@ async fn connection_pragmas_and_foreign_keys_are_verified() {
         .is_err()
     );
     drop(reader);
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn managed_source_configuration_versions_reference_immutable_revisions() {
+    let (_root, mut database) = open_database().await;
+    let references: Vec<String> = sqlx::query_scalar(
+        "SELECT 'source_installation.' || \"from\" || '->' || \"table\" || '.' || \"to\" \
+         FROM pragma_foreign_key_list('source_installation') \
+         UNION ALL \
+         SELECT 'source_sync_operations.' || \"from\" || '->' || \"table\" || '.' || \"to\" \
+         FROM pragma_foreign_key_list('source_sync_operations') \
+         ORDER BY 1",
+    )
+    .fetch_all(&mut database._writer)
+    .await
+    .unwrap();
+    assert_eq!(
+        references,
+        [
+            "source_installation.configuration_version->source_configuration_revisions.version",
+            "source_installation.source_sync_id->source_sync_operations.source_sync_id",
+            "source_sync_operations.configuration_version->source_configuration_revisions.version",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn managed_source_sync_constraints_match_the_validated_lifecycle_shapes() {
+    let (_root, mut database) = open_database().await;
+    sqlx::query(
+        "INSERT INTO source_configuration_revisions (\
+            version, ssh_user, ssh_host, ssh_port, repository_path, branch, \
+            content_subdirectory, credential_name, poll_interval_seconds, updated_at_ns\
+         ) VALUES (1, 'git', 'git.example.test', 22, 'publisher/site.git', 'main', \
+            'publication', 'deploy', 300, 1)",
+    )
+    .execute(&mut database._writer)
+    .await
+    .unwrap();
+
+    let valid_shapes = [
+        SourceSyncShape {
+            stage: "queued",
+            outcome: None,
+            has_commit: false,
+            has_digest: false,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "fetching",
+            outcome: None,
+            has_commit: false,
+            has_digest: false,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "resolving_commit",
+            outcome: None,
+            has_commit: false,
+            has_digest: false,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "preparing_candidate",
+            outcome: None,
+            has_commit: true,
+            has_digest: false,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "compiling",
+            outcome: None,
+            has_commit: true,
+            has_digest: false,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "reloading",
+            outcome: None,
+            has_commit: true,
+            has_digest: true,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "reloading",
+            outcome: Some("applied"),
+            has_commit: true,
+            has_digest: true,
+            failure_code: None,
+            is_finished: true,
+        },
+        SourceSyncShape {
+            stage: "resolving_commit",
+            outcome: Some("no_change"),
+            has_commit: true,
+            has_digest: true,
+            failure_code: None,
+            is_finished: true,
+        },
+        SourceSyncShape {
+            stage: "fetching",
+            outcome: Some("failed"),
+            has_commit: false,
+            has_digest: false,
+            failure_code: Some("fetch_failed"),
+            is_finished: true,
+        },
+        SourceSyncShape {
+            stage: "compiling",
+            outcome: Some("cancelled"),
+            has_commit: true,
+            has_digest: false,
+            failure_code: None,
+            is_finished: true,
+        },
+    ];
+    for (index, shape) in valid_shapes.into_iter().enumerate() {
+        let identifier_byte = u8::try_from(index + 1).unwrap();
+        insert_source_sync_shape(&mut database._writer, identifier_byte, shape)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM source_sync_operations WHERE source_sync_id = ?")
+            .bind([identifier_byte; 16].as_slice())
+            .execute(&mut database._writer)
+            .await
+            .unwrap();
+    }
+
+    let invalid_shapes = [
+        SourceSyncShape {
+            stage: "queued",
+            outcome: None,
+            has_commit: false,
+            has_digest: false,
+            failure_code: Some("fetch_failed"),
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "queued",
+            outcome: Some("applied"),
+            has_commit: true,
+            has_digest: true,
+            failure_code: None,
+            is_finished: true,
+        },
+        SourceSyncShape {
+            stage: "reloading",
+            outcome: Some("applied"),
+            has_commit: true,
+            has_digest: false,
+            failure_code: None,
+            is_finished: true,
+        },
+        SourceSyncShape {
+            stage: "fetching",
+            outcome: Some("no_change"),
+            has_commit: true,
+            has_digest: true,
+            failure_code: None,
+            is_finished: true,
+        },
+        SourceSyncShape {
+            stage: "resolving_commit",
+            outcome: Some("no_change"),
+            has_commit: true,
+            has_digest: false,
+            failure_code: None,
+            is_finished: true,
+        },
+        SourceSyncShape {
+            stage: "queued",
+            outcome: None,
+            has_commit: true,
+            has_digest: false,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "resolving_commit",
+            outcome: None,
+            has_commit: false,
+            has_digest: true,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "preparing_candidate",
+            outcome: None,
+            has_commit: false,
+            has_digest: false,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "compiling",
+            outcome: None,
+            has_commit: true,
+            has_digest: true,
+            failure_code: None,
+            is_finished: false,
+        },
+        SourceSyncShape {
+            stage: "reloading",
+            outcome: None,
+            has_commit: true,
+            has_digest: false,
+            failure_code: None,
+            is_finished: false,
+        },
+    ];
+    for (index, shape) in invalid_shapes.into_iter().enumerate() {
+        let identifier_byte = u8::try_from(index + 0x41).unwrap();
+        assert!(
+            insert_source_sync_shape(&mut database._writer, identifier_byte, shape)
+                .await
+                .is_err()
+        );
+    }
+
     database.close().await.unwrap();
 }
 
@@ -502,6 +874,9 @@ async fn application_schema_has_no_triggers_and_only_expected_explicit_indexes()
             "browser_sessions_user_idx",
             "login_challenges_cleanup_idx",
             "nip98_replay_events_cleanup_idx",
+            "source_sync_history_idx",
+            "source_sync_idempotency_alias_history_idx",
+            "source_sync_one_nonterminal_idx",
             "user_roles_role_idx",
         ]
     );
@@ -583,6 +958,19 @@ async fn identifiers_and_hashes_use_blob_storage() {
             "site_revisions.source_commit:BLOB",
             "site_state.current_site_digest:BLOB",
             "site_tip_recipient.recipient_user_id:BLOB",
+            "source_configuration_mutation_receipts.audit_event_id:BLOB",
+            "source_configuration_mutation_receipts.command_fingerprint:BLOB",
+            "source_configuration_mutation_receipts.idempotency_key:BLOB",
+            "source_installation.content_digest:BLOB",
+            "source_installation.source_commit:BLOB",
+            "source_installation.source_sync_id:BLOB",
+            "source_sync_idempotency_aliases.audit_event_id:BLOB",
+            "source_sync_idempotency_aliases.command_fingerprint:BLOB",
+            "source_sync_idempotency_aliases.idempotency_key:BLOB",
+            "source_sync_idempotency_aliases.source_sync_id:BLOB",
+            "source_sync_operations.content_digest:BLOB",
+            "source_sync_operations.source_commit:BLOB",
+            "source_sync_operations.source_sync_id:BLOB",
             "user_nostr_credentials.public_key:BLOB",
             "user_nostr_credentials.user_id:BLOB",
             "user_password_credentials.user_id:BLOB",
@@ -607,7 +995,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 89);
+    assert_eq!(compact_definitions.matches("check(").count(), 132);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",
@@ -630,6 +1018,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
         "check(length(public_key)=32)",
         "check(length(event_id)=32)",
         "check(length(audit_event_id)=16)",
+        "check(length(source_sync_id)=16)",
     ] {
         assert!(
             compact_definitions.contains(constraint),

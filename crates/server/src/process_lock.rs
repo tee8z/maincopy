@@ -11,7 +11,7 @@ const PROCESS_LOCK_NAME: &str = "maincopy.lock";
 /// The file remains on disk. The operating system releases the lock when this
 /// value drops, including after an abnormal process exit.
 pub(crate) struct ProcessLock {
-    _file: File,
+    file: File,
 }
 
 impl ProcessLock {
@@ -20,9 +20,20 @@ impl ProcessLock {
         let path = runtime_root.join(PROCESS_LOCK_NAME);
         let file = open_private_file(&path).map_err(ProcessLockError::LockFile)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self { file }),
             Err(TryLockError::WouldBlock) => Err(ProcessLockError::AlreadyRunning),
             Err(TryLockError::Error(source)) => Err(ProcessLockError::LockFile(source)),
+        }
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        // `fork` briefly duplicates every descriptor before `exec` applies
+        // close-on-exec. Unlock explicitly so such a child cannot extend
+        // process ownership beyond this value's lifetime.
+        if let Err(error) = self.file.unlock() {
+            tracing::error!(%error, "process lock release failed");
         }
     }
 }
@@ -45,7 +56,8 @@ pub(crate) fn prepare_private_directory(path: &Path) -> io::Result<()> {
     validate_private_directory(path)
 }
 
-fn reject_symlink_components(path: &Path) -> io::Result<()> {
+/// Rejects symbolic links in every existing component of one private path.
+pub(crate) fn reject_symlink_components(path: &Path) -> io::Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
@@ -53,7 +65,7 @@ fn reject_symlink_components(path: &Path) -> io::Result<()> {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "private runtime paths cannot contain symbolic links",
+                    "private paths cannot contain symbolic links",
                 ));
             }
             Ok(_) => {}
@@ -110,6 +122,17 @@ fn validate_private_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 pub(crate) fn open_private_file(path: &Path) -> io::Result<File> {
+    open_private_file_with_creation(path, true)
+}
+
+#[cfg(unix)]
+/// Opens an existing private regular file without creating a missing target.
+pub(crate) fn open_existing_private_file(path: &Path) -> io::Result<File> {
+    open_private_file_with_creation(path, false)
+}
+
+#[cfg(unix)]
+fn open_private_file_with_creation(path: &Path, create: bool) -> io::Result<File> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     if let Ok(metadata) = std::fs::symlink_metadata(path)
@@ -124,7 +147,7 @@ pub(crate) fn open_private_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create(create)
         .truncate(false)
         .mode(0o600)
         .open(path)?;
@@ -150,6 +173,12 @@ pub(crate) fn open_private_file(path: &Path) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .open(path)
+}
+
+#[cfg(not(unix))]
+/// Opens an existing private regular file without creating a missing target.
+pub(crate) fn open_existing_private_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).open(path)
 }
 
 #[cfg(test)]

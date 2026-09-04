@@ -1,10 +1,8 @@
 use std::{fmt, str::FromStr};
 
+use maincopy_shared::source::{GIT_SHA1_SOURCE_COMMIT_PREFIX, GIT_SHA256_SOURCE_COMMIT_PREFIX};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
-
-const SHA1_PREFIX: &str = "git-sha1:";
-const SHA256_PREFIX: &str = "git-sha256:";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,9 +29,10 @@ pub struct SourceCommit {
 
 impl SourceCommit {
     pub fn parse(value: &str) -> Result<Self, SourceCommitParseError> {
-        let (algorithm, hex) = if let Some(hex) = value.strip_prefix(SHA1_PREFIX) {
+        let (algorithm, hex) = if let Some(hex) = value.strip_prefix(GIT_SHA1_SOURCE_COMMIT_PREFIX)
+        {
             (SourceCommitAlgorithm::Sha1, hex)
-        } else if let Some(hex) = value.strip_prefix(SHA256_PREFIX) {
+        } else if let Some(hex) = value.strip_prefix(GIT_SHA256_SOURCE_COMMIT_PREFIX) {
             (SourceCommitAlgorithm::Sha256, hex)
         } else {
             return Err(SourceCommitParseError::InvalidPrefix);
@@ -64,8 +63,8 @@ impl SourceCommit {
 
     pub(crate) fn from_git_hex(value: &str) -> Result<Self, SourceCommitParseError> {
         match value.len() {
-            40 => Self::parse(&format!("{SHA1_PREFIX}{value}")),
-            64 => Self::parse(&format!("{SHA256_PREFIX}{value}")),
+            40 => Self::parse(&format!("{GIT_SHA1_SOURCE_COMMIT_PREFIX}{value}")),
+            64 => Self::parse(&format!("{GIT_SHA256_SOURCE_COMMIT_PREFIX}{value}")),
             _ => Err(SourceCommitParseError::UnsupportedObjectFormat),
         }
     }

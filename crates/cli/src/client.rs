@@ -12,6 +12,10 @@ use maincopy_shared::{
         CONTENT_DIGEST_HEADER, IDEMPOTENCY_KEY_HEADER, POST_REVISION_HEADER, PREVIEW_DIGEST_HEADER,
         PUBLICATIONS_PATH, PreviewDigest, PublishNowRequest, PublishNowResponse,
     },
+    source::{
+        BeginSourceSyncResponse, SOURCE_PATH, SOURCE_SYNCS_PATH, SourceStatusResponse,
+        SourceSyncAdmission, SourceSyncId, SourceSyncResource,
+    },
 };
 use reqwest::{
     Method, StatusCode, Url,
@@ -155,6 +159,42 @@ impl AdminClient {
         limit: u16,
     ) -> Result<ListPostsResponse, AdminClientError> {
         let url = posts_page_url(&self.origin, cursor, limit)?;
+        let response = self
+            .authenticated_request_url(Method::GET, url, Vec::new(), None)
+            .await?;
+        decode_status_json(response, StatusCode::OK)
+    }
+
+    /// Reports the configured source mode and its non-secret runtime state.
+    pub(crate) async fn source_status(&self) -> Result<SourceStatusResponse, AdminClientError> {
+        let response = self
+            .authenticated_request(Method::GET, SOURCE_PATH, Vec::new(), None)
+            .await?;
+        decode_status_json(response, StatusCode::OK)
+    }
+
+    /// Starts or replays one durable managed-source synchronization.
+    pub(crate) async fn begin_source_sync(
+        &self,
+        idempotency_key: Uuid,
+    ) -> Result<BeginSourceSyncResponse, AdminClientError> {
+        let response = self
+            .authenticated_request(
+                Method::POST,
+                SOURCE_SYNCS_PATH,
+                b"{}".to_vec(),
+                Some(idempotency_key),
+            )
+            .await?;
+        decode_begin_source_sync_http_response(response)
+    }
+
+    /// Fetches the latest representation of one durable source synchronization.
+    pub(crate) async fn source_sync(
+        &self,
+        source_sync_id: SourceSyncId,
+    ) -> Result<SourceSyncResource, AdminClientError> {
+        let url = source_sync_url(&self.origin, source_sync_id)?;
         let response = self
             .authenticated_request_url(Method::GET, url, Vec::new(), None)
             .await?;
@@ -331,6 +371,13 @@ fn posts_page_url(
     Ok(url)
 }
 
+fn source_sync_url(
+    origin: &AdminOrigin,
+    source_sync_id: SourceSyncId,
+) -> Result<Url, AdminClientError> {
+    origin.request_url(&format!("{SOURCE_SYNCS_PATH}/{source_sync_id}"))
+}
+
 fn preview_url(
     origin: &AdminOrigin,
     post_id: Uuid,
@@ -364,6 +411,29 @@ fn decode_publication_http_response(
     let response = require_status(response, StatusCode::OK)?;
     require_content_type(&response.headers, "application/json")?;
     decode_publication_response(&response.body, expected_preview)
+}
+
+fn decode_begin_source_sync_http_response(
+    response: HttpResponse,
+) -> Result<BeginSourceSyncResponse, AdminClientError> {
+    let status = response.status;
+    let response = match status {
+        StatusCode::OK | StatusCode::ACCEPTED => response,
+        _ => require_status(response, StatusCode::ACCEPTED)?,
+    };
+    let decoded: BeginSourceSyncResponse = decode_json(&response)?;
+    let admission_matches_status = matches!(
+        (status, decoded.admission),
+        (StatusCode::ACCEPTED, SourceSyncAdmission::Created)
+            | (StatusCode::ACCEPTED, SourceSyncAdmission::Coalesced)
+            | (StatusCode::OK, SourceSyncAdmission::Replayed)
+    );
+    if !admission_matches_status {
+        return Err(AdminClientError::InvalidSourceSyncResponse {
+            message: "admission does not match the HTTP status",
+        });
+    }
+    Ok(decoded)
 }
 
 fn build_authorized_request<LoadCredential>(
@@ -1104,6 +1174,9 @@ pub(crate) enum AdminClientError {
 
     #[error("the admin server returned an inconsistent publication response: {message}")]
     InvalidPublicationResponse { message: &'static str },
+
+    #[error("the admin server returned an inconsistent source-sync response: {message}")]
+    InvalidSourceSyncResponse { message: &'static str },
 }
 
 impl From<CredentialStoreError> for AdminClientError {
@@ -1198,6 +1271,27 @@ mod tests {
         .unwrap()
     }
 
+    fn begin_source_sync_response(admission: SourceSyncAdmission) -> BeginSourceSyncResponse {
+        serde_json::from_value(json!({
+            "admission": admission,
+            "sync": {
+                "source_sync_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "configuration_version": 3,
+                "request_origin": "manual",
+                "stage": "queued",
+                "outcome": null,
+                "source_commit": null,
+                "content_digest": null,
+                "failure_code": null,
+                "version": 1,
+                "requested_at": "2026-09-04T12:00:00Z",
+                "updated_at": "2026-09-04T12:00:00Z",
+                "finished_at": null
+            }
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn request_targets_preserve_the_configured_origin_and_exact_query() {
         let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
@@ -1229,6 +1323,14 @@ mod tests {
         assert_eq!(
             posts_page_url(&origin, Some(cursor), 25).unwrap().as_str(),
             "https://admin.example.test/api/admin/v1/posts?limit=25&cursor=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+
+        let source_sync_id = SourceSyncId::from_uuid(
+            Uuid::parse_str("dddddddd-dddd-4ddd-8ddd-dddddddddddd").unwrap(),
+        );
+        assert_eq!(
+            source_sync_url(&origin, source_sync_id).unwrap().as_str(),
+            "https://admin.example.test/api/admin/v1/source-syncs/dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         );
 
         let post_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
@@ -1481,6 +1583,41 @@ mod tests {
         let response = json_response(StatusCode::CREATED, b"{}".to_vec());
         assert!(matches!(
             decode_publication_http_response(response, &expected),
+            Err(AdminClientError::UnexpectedSuccessStatus { .. })
+        ));
+    }
+
+    #[test]
+    fn source_sync_admission_requires_its_exact_success_status() {
+        for (status, admission) in [
+            (StatusCode::ACCEPTED, SourceSyncAdmission::Created),
+            (StatusCode::ACCEPTED, SourceSyncAdmission::Coalesced),
+            (StatusCode::OK, SourceSyncAdmission::Replayed),
+        ] {
+            let expected = begin_source_sync_response(admission);
+            let response = json_response(status, serde_json::to_vec(&expected).unwrap());
+            assert_eq!(
+                decode_begin_source_sync_http_response(response).unwrap(),
+                expected
+            );
+        }
+
+        for (status, admission) in [
+            (StatusCode::OK, SourceSyncAdmission::Created),
+            (StatusCode::OK, SourceSyncAdmission::Coalesced),
+            (StatusCode::ACCEPTED, SourceSyncAdmission::Replayed),
+        ] {
+            let body = serde_json::to_vec(&begin_source_sync_response(admission)).unwrap();
+            assert!(matches!(
+                decode_begin_source_sync_http_response(json_response(status, body)),
+                Err(AdminClientError::InvalidSourceSyncResponse { .. })
+            ));
+        }
+
+        let body =
+            serde_json::to_vec(&begin_source_sync_response(SourceSyncAdmission::Created)).unwrap();
+        assert!(matches!(
+            decode_begin_source_sync_http_response(json_response(StatusCode::CREATED, body)),
             Err(AdminClientError::UnexpectedSuccessStatus { .. })
         ));
     }

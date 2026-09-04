@@ -64,6 +64,54 @@ fn run_password_bootstrap(root: &tempfile::TempDir, password: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
+fn write_managed_source_host_file(root: &tempfile::TempDir) {
+    fs::write(
+        root.path().join("maincopy.toml"),
+        "[paths]\n\
+         state_root = \"state\"\n\
+         runtime_root = \"run\"\n\
+         [source]\n\
+         mode = \"managed_git\"\n\
+         mirror_root = \"state/source-mirror\"\n\
+         [source.ssh_credentials.deploy]\n\
+         private_key_file = \"keys/source-key\"\n\
+         known_hosts_file = \"keys/known-hosts\"\n",
+    )
+    .unwrap();
+}
+
+fn run_source_configuration(
+    root: &tempfile::TempDir,
+    credential_name: &str,
+    expected_version: Option<&str>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maincopyd"));
+    command.args([
+        "--config",
+        "maincopy.toml",
+        "source",
+        "configure",
+        "--user",
+        "git",
+        "--host",
+        "git.example.test",
+        "--repository-path",
+        "publisher/site.git",
+        "--branch",
+        "main",
+        "--content-subdirectory",
+        "publication",
+        "--credential-name",
+        credential_name,
+        "--poll-interval-seconds",
+        "300",
+    ]);
+    if let Some(expected_version) = expected_version {
+        command.args(["--expected-version", expected_version]);
+    }
+    command.current_dir(root.path()).output().unwrap()
+}
+
 #[test]
 fn help_exits_successfully_from_the_real_binary() {
     let output = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
@@ -206,6 +254,139 @@ fn offline_nostr_owner_bootstrap_accepts_the_typed_public_key() {
     );
     assert!(root.path().join("state/maincopy.db").is_file());
     assert!(!root.path().join("content-that-does-not-exist").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn offline_source_key_generation_is_private_verifiable_and_never_overwrites() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    write_managed_source_host_file(&root);
+    let arguments = [
+        "--config",
+        "maincopy.toml",
+        "source",
+        "generate-key",
+        "--private-key-file",
+        "keys/source-key",
+    ];
+    let first = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
+        .args(arguments)
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        first.status.code(),
+        Some(ProcessExit::Success.code().into())
+    );
+
+    let private_path = root.path().join("keys/source-key");
+    let public_path = root.path().join("keys/source-key.pub");
+    let private_key = fs::read(&private_path).unwrap();
+    let public_key = fs::read_to_string(&public_path).unwrap();
+    assert_eq!(
+        fs::metadata(&private_path).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    assert!(!contains_bytes(&first.stdout, &private_key));
+    assert!(!contains_bytes(&first.stderr, &private_key));
+
+    let derived = Command::new("ssh-keygen")
+        .args(["-y", "-f"])
+        .arg(&private_path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(derived.status.success());
+    let derived = String::from_utf8(derived.stdout).unwrap();
+    let mut derived_fields = derived.split_ascii_whitespace();
+    let derived = format!(
+        "{} {}",
+        derived_fields.next().unwrap(),
+        derived_fields.next().unwrap()
+    );
+    assert!(public_key.starts_with(&derived));
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains(&format!("Public key: {derived}")),
+        "key-generation output did not contain the derived public key: {}",
+        String::from_utf8_lossy(&first.stdout),
+    );
+
+    let fingerprint = Command::new("ssh-keygen")
+        .args(["-l", "-E", "sha256", "-f"])
+        .arg(&public_path)
+        .output()
+        .unwrap();
+    assert!(fingerprint.status.success());
+    let fingerprint = String::from_utf8(fingerprint.stdout)
+        .unwrap()
+        .split_ascii_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains(&format!("Fingerprint: {fingerprint}"))
+    );
+
+    let second = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
+        .args(arguments)
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert_eq!(fs::read(&private_path).unwrap(), private_key);
+    assert_eq!(fs::read_to_string(&public_path).unwrap(), public_key);
+}
+
+#[test]
+fn offline_source_configuration_rejects_an_unregistered_credential_before_database_io() {
+    let root = tempfile::tempdir().unwrap();
+    write_managed_source_host_file(&root);
+
+    let output = run_source_configuration(&root, "missing", None);
+
+    assert_eq!(
+        output.status.code(),
+        Some(ProcessExit::Validation.code().into())
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("selected source credential is not registered")
+    );
+    assert!(!root.path().join("state/maincopy.db").exists());
+}
+
+#[test]
+fn offline_source_repair_reports_conflicts_and_preserves_the_current_version() {
+    const PASSWORD: &str = "correct horse battery staple";
+
+    let root = tempfile::tempdir().unwrap();
+    write_managed_source_host_file(&root);
+    assert!(run_password_bootstrap(&root, PASSWORD).status.success());
+    assert!(
+        run_source_configuration(&root, "deploy", None)
+            .status
+            .success()
+    );
+
+    for expected_version in [None, Some("99")] {
+        let conflict = run_source_configuration(&root, "deploy", expected_version);
+        assert_eq!(
+            conflict.status.code(),
+            Some(ProcessExit::Conflict.code().into())
+        );
+        assert!(
+            String::from_utf8_lossy(&conflict.stderr)
+                .contains("source configuration conflicts with durable state")
+        );
+    }
+
+    assert!(
+        run_source_configuration(&root, "deploy", Some("1"))
+            .status
+            .success()
+    );
 }
 
 #[test]

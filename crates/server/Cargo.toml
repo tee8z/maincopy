@@ -9,6 +9,10 @@ autobins = false
 name = "maincopyd"
 path = "src/main.rs"
 
+[[bin]]
+name = "maincopy-ssh"
+path = "src/bin/maincopy_ssh.rs"
+
 [dependencies]
 arc-swap.workspace = true
 argon2.workspace = true
@@ -33,9 +37,10 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -62,7 +67,6 @@ lightningcss.workspace = true
 mermaid-rs-renderer.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
 

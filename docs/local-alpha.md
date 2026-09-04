@@ -3,6 +3,7 @@
 Status: supported development workflow
 
 Related: [project overview](../README.md),
+[managed source runbook](managed-source.md),
 [implementation plan](implementation.md), and [engineering style](quality.md).
 
 Use this runbook to publish the included Markdown post through the local HTTPS
@@ -23,6 +24,9 @@ production deployment or NixOS acceptance test.
 
 The local-alpha fixture is in `crates/server/examples/local-alpha/`. Runtime
 state persists in `target/maincopy-dev/` between launcher restarts.
+
+This fixture uses `external_checkout`, the default source mode. The launcher
+observes its checked-in content tree and performs no Git network operation.
 
 The launcher runs the Rust daemon and Caddy as separate processes. Caddy
 terminates HTTPS and forwards to the two loopback listeners; `maincopyd` does
@@ -237,6 +241,18 @@ session, user, provider, roles, and expiry time.
 
 ### 2. Select the loaded revision
 
+Confirm that this fixture uses the operator-maintained checkout:
+
+```console
+scripts/dev-maincopy.sh source status
+```
+
+Expected source mode:
+
+```text
+Source mode: external_checkout
+```
+
 List the loaded posts:
 
 ```console
@@ -405,6 +421,9 @@ metrics forwarding.
 
 This evidence applies only to the local-alpha harness. The gateway runs with
 the developer's identity and uses a workstation CA.
+
+The fixture does not test an SSH server, deploy key, or managed mirror. Use the
+[managed source runbook](managed-source.md) for that configuration contract.
 
 [Work package 4.5](implementation.md#work-package-45-https-admin-gateway-contract)
 still requires the complete production gateway contract. It includes remote

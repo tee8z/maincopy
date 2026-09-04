@@ -808,7 +808,7 @@ impl SiteHeadRow {
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(activated_at_ns))
             .map_err(|_| StartupSnapshotLoadError::InvalidSiteTimestamp)?;
         if let Some(commit) = self.source_commit {
-            decode_source_commit(commit).ok_or(StartupSnapshotLoadError::InvalidSourceCommit)?;
+            decode_source_commit(&commit).ok_or(StartupSnapshotLoadError::InvalidSourceCommit)?;
         }
         Ok(Some(SiteHead {
             digest,
@@ -1042,7 +1042,7 @@ fn decode_stored_source_commit(
 ) -> Result<Option<SourceCommit>, StartupSnapshotLoadError> {
     value
         .map(|value| {
-            decode_source_commit(value).ok_or(StartupSnapshotLoadError::InvalidSourceCommit)
+            decode_source_commit(&value).ok_or(StartupSnapshotLoadError::InvalidSourceCommit)
         })
         .transpose()
 }
@@ -1197,7 +1197,7 @@ fn publication_timestamp(value: i64) -> Result<OffsetDateTime, StartupSnapshotLo
         .map_err(|_| StartupSnapshotLoadError::InvalidPublicationTimestamp)
 }
 
-fn decode_source_commit(value: Vec<u8>) -> Option<SourceCommit> {
+fn decode_source_commit(value: &[u8]) -> Option<SourceCommit> {
     let prefix = match value.len() {
         20 => "git-sha1:",
         32 => "git-sha256:",
@@ -1514,7 +1514,7 @@ async fn retain_site_revision(
             .filter(|version| *version > 0)
             .ok_or(StartupSnapshotMutationError::CorruptStoredState)?;
         if !retained_revision_precedes_current(current, retained_version)
-            || source_commit.is_some_and(|commit| decode_source_commit(commit).is_none())
+            || source_commit.is_some_and(|commit| decode_source_commit(&commit).is_none())
         {
             return Err(StartupSnapshotMutationError::CorruptStoredState);
         }
@@ -1601,7 +1601,12 @@ async fn record_observed_posts(
                 stable_post_id, revision_digest, publication_status, first_observed_at_ns, \
                 slug, source_commit\
              ) VALUES (?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(stable_post_id, revision_digest) DO NOTHING",
+             ON CONFLICT(stable_post_id, revision_digest) DO UPDATE SET \
+                source_commit = excluded.source_commit \
+             WHERE post_revisions.source_commit IS NULL \
+               AND excluded.source_commit IS NOT NULL \
+               AND post_revisions.slug = excluded.slug \
+               AND post_revisions.publication_status = excluded.publication_status",
         )
         .bind(stable_post_id.as_slice())
         .bind(post.revision_digest.as_bytes().as_slice())
@@ -1613,8 +1618,8 @@ async fn record_observed_posts(
         .await
         .map_err(StartupSnapshotMutationError::Operation)?;
         if inserted.rows_affected() == 0 {
-            let stored: Option<(String, String)> = sqlx::query_as(
-                "SELECT slug, publication_status FROM post_revisions \
+            let stored: Option<(String, String, Option<Vec<u8>>)> = sqlx::query_as(
+                "SELECT slug, publication_status, source_commit FROM post_revisions \
                  WHERE stable_post_id = ? AND revision_digest = ?",
             )
             .bind(stable_post_id.as_slice())
@@ -1624,8 +1629,14 @@ async fn record_observed_posts(
             .map_err(StartupSnapshotMutationError::Operation)?;
             if stored
                 .as_ref()
-                .map(|(slug, state)| (slug.as_str(), state.as_str()))
+                .map(|(slug, state, _)| (slug.as_str(), state.as_str()))
                 != Some((post.slug.as_str(), status))
+                || stored.as_ref().is_some_and(|(_, _, source_commit)| {
+                    source_commit
+                        .as_deref()
+                        .is_some_and(|commit| decode_source_commit(commit).is_none())
+                        || (command.source_commit.is_some() && source_commit.is_none())
+                })
             {
                 return Err(StartupSnapshotMutationError::CorruptStoredState);
             }
@@ -2802,7 +2813,7 @@ async fn load_retained_site_head(
         .ok_or(PublicationMutationError::CorruptStoredState)?;
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(activated_at_ns))
         .map_err(|_| PublicationMutationError::CorruptStoredState)?;
-    if source_commit.is_some_and(|commit| decode_source_commit(commit).is_none()) {
+    if source_commit.is_some_and(|commit| decode_source_commit(&commit).is_none()) {
         return Err(PublicationMutationError::CorruptStoredState);
     }
     Ok(SiteHead {
@@ -2981,6 +2992,76 @@ mod tests {
         }
         let (mutations, _receiver) = mpsc::channel(1);
         (PublicationStore::new(pool.clone(), mutations), pool)
+    }
+
+    #[tokio::test]
+    async fn first_managed_observation_fills_missing_revision_provenance_once() {
+        let (_store, pool) = startup_store().await;
+        let post = ObservedPostRevision {
+            stable_post_id: PostId::parse(POST_ID).unwrap(),
+            revision_digest: PostRevisionDigest::from_bytes([0x17; 32]),
+            publication_status: DraftStatus::Publishable,
+            slug: PostSlug::parse("managed-provenance").unwrap(),
+        };
+        let observed_at = OffsetDateTime::from_unix_timestamp(10).unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(
+            index_content_catalog(
+                &mut transaction,
+                IndexContentCatalog {
+                    observed_at,
+                    source_commit: None,
+                    posts: vec![post.clone()],
+                },
+            )
+            .await
+            .is_ok()
+        );
+        transaction.commit().await.unwrap();
+
+        let first = SourceCommit::parse(&format!("git-sha1:{}", "12".repeat(20))).unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(
+            index_content_catalog(
+                &mut transaction,
+                IndexContentCatalog {
+                    observed_at: observed_at + time::Duration::SECOND,
+                    source_commit: Some(first.clone()),
+                    posts: vec![post.clone()],
+                },
+            )
+            .await
+            .is_ok()
+        );
+        transaction.commit().await.unwrap();
+
+        let later = SourceCommit::parse(&format!("git-sha1:{}", "34".repeat(20))).unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(
+            index_content_catalog(
+                &mut transaction,
+                IndexContentCatalog {
+                    observed_at: observed_at + time::Duration::seconds(2),
+                    source_commit: Some(later),
+                    posts: vec![post],
+                },
+            )
+            .await
+            .is_ok()
+        );
+        transaction.commit().await.unwrap();
+
+        let stored: Vec<u8> = sqlx::query_scalar(
+            "SELECT source_commit FROM post_revisions \
+             WHERE stable_post_id = ? AND revision_digest = ?",
+        )
+        .bind(uuid_bytes(POST_ID))
+        .bind([0x17_u8; 32].as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_slice(), first.as_bytes());
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -3947,9 +4028,9 @@ mod tests {
             validate_reload_states(&["unknown".into()]),
             Err(StartupSnapshotLoadError::InvalidReloadState)
         ));
-        assert!(decode_source_commit(vec![0xaa; 20]).is_some());
-        assert!(decode_source_commit(vec![0xbb; 32]).is_some());
-        assert!(decode_source_commit(vec![0xcc; 19]).is_none());
+        assert!(decode_source_commit(&[0xaa; 20]).is_some());
+        assert!(decode_source_commit(&[0xbb; 32]).is_some());
+        assert!(decode_source_commit(&[0xcc; 19]).is_none());
 
         let current = SiteHead {
             digest: SiteSnapshotDigest::from_bytes([0xdd; 32]),

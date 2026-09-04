@@ -2,10 +2,11 @@
 
 Status: target architecture; implementation is incomplete
 
-Last reviewed: 2026-09-03
+Last reviewed: 2026-09-04
 
 Related documents: [project overview](../README.md),
-[implementation plan](implementation.md), and
+[implementation plan](implementation.md),
+[managed source runbook](managed-source.md), and
 [engineering style guide](quality.md).
 
 ## Purpose
@@ -222,14 +223,89 @@ non-secret command-line overrides.
 
 ### Managed Git mode
 
-Managed mode uses one provider-neutral SSH remote and one branch. Maincopy owns
-a local mirror and fetches with a read-only deploy key.
+Managed mode uses one provider-neutral SSH remote and one exact branch.
+Maincopy owns one bounded local mirror and uses a read-only deploy key.
 
-A periodic poll and an admin `Sync now` operation trigger fetch and reconcile.
-A future webhook can trigger a fetch, but it cannot supply trusted content.
+Host configuration owns the mode, mirror path, Git process limits, and named
+SSH credential registry. Protected host files contain each private key and
+verified `known_hosts` data.
 
-Managed mode requires the complete source commit. The database stores source
-settings and the last accepted commit.
+SQLite owns the structured remote, branch, content subdirectory, credential
+name, poll interval, and durable synchronization ledger. It contains no SSH
+secret or credential-file path.
+
+```mermaid
+flowchart LR
+    Host[Host config: mode, mirror, limits, credential names] --> Sync[Sync coordinator]
+    Secrets[Protected key and known_hosts files] --> SSH[Restricted SSH helper]
+    DB[(SQLite: source settings and durable operations)] --> Sync
+    Sync --> SSH
+    Remote[SSH Git repository] -->|git-upload-pack only| SSH
+    SSH -->|Shallow exact branch fetch| Mirror[Bounded transport cache]
+    Mirror -->|Full commit and selected subtree| Candidate[Immutable candidate]
+    Candidate --> Compiler[Validator and compiler]
+    Compiler --> Catalog[Private candidate catalog]
+    Catalog --> Preview[Exact preview]
+    Preview -->|Explicit release approval| Public[Public snapshot]
+```
+
+The restricted helper accepts only the configured SSH target, port, and
+`git-upload-pack` command. It clears inherited environment data and requires
+the selected key and verified host-key file. The helper is an outbound client.
+It binds no listener and requests no tunnel; the VPC and host firewall remain
+the ingress boundary.
+
+The fetch follows no tags or submodules. It does not write `FETCH_HEAD` or run
+automatic repository maintenance. When the advertised head changes, Maincopy
+fetches one shallow branch head without negotiating from objects retained for
+an earlier remote, then expires unreachable objects and checks both the mirror
+byte and entry bounds. An operating-system lock gives the mirror one process
+owner. Each Git phase has its own process group; cancellation or a wall-time
+limit terminates the leader and descendants.
+
+The bare mirror is a bounded transport cache, not a revision archive. Maincopy
+retains review and publication continuity in immutable content candidates and
+typed database identities. It does not commit, merge, push, create a remote
+branch, or edit Markdown.
+
+The immutable candidate store admits at most 4,096 archive or staging entries
+and 1 GiB of archive bytes. Reaching either bound rejects a new candidate; it
+never guesses that an older archive is safe to delete. Reachability-aware
+artifact garbage collection remains separate retention work.
+
+Maincopy resolves the complete source commit before content discovery. It
+materializes only the configured subdirectory into an immutable candidate.
+
+Startup, periodic polling, and admin `Sync now` use one coordinator. Concurrent
+requests coalesce onto one durable operation identifier.
+
+Each operation records a typed stage and terminal outcome. A stable failure
+code remains available after process restart. The ledger retains its newest
+4,096 terminal operations, every active operation, the current installation
+operation, and operations behind retained manual aliases. Older list cursors
+can therefore expire. The alias table independently retains the newest 4,096
+manual keys for replay. An expired audit key remains reserved, so reuse
+conflicts instead of starting another synchronization.
+
+A matching installed commit produces `no_change`. A live poll or manual sync
+skips compilation in this case. Startup compiles the retained candidate to
+construct its in-memory serving state.
+
+A new commit reaches the existing reload boundary only after candidate
+validation and compilation succeed.
+
+Post revision provenance records the first managed commit that observed a
+revision. If an identical revision was first observed through external
+checkout, its empty provenance is filled on the first managed observation.
+The revision digest intentionally remains content-derived: identical content
+can occur in more than one commit. The source installation and each release
+therefore pin their exact current commit separately.
+
+The reload indexes private candidate state. It does not approve a revision or
+change the public snapshot.
+
+A future webhook can request the same fetch. It cannot supply trusted content
+or a trusted commit identity.
 
 ### External checkout mode
 
@@ -238,6 +314,9 @@ not fetch, pull, commit, or push.
 
 Source commit metadata is optional in this mode. The content digest remains
 required.
+
+See the [managed source runbook](managed-source.md) for host configuration,
+offline setup, status inspection, and failure recovery.
 
 ### First-run identity and source bootstrap
 
@@ -276,14 +355,14 @@ listener, exposes no network bootstrap route, and accepts no arbitrary SQL.
 V1 does not require the generated password to change on first login. The
 current build has no completed admin UI password-rotation flow.
 
-Managed mode has a separate source bootstrap step. It creates these records in
-one transaction:
+Managed mode has a separate offline source bootstrap step. It creates these
+records in one transaction:
 
 - managed remote and branch;
 - content root and polling policy; and
 - SSH credential reference.
 
-The source step validates the first fetch and compilation before normal
+Normal managed startup validates the first fetch and compilation before
 listener binding. The `maincopy` client never writes SQLite directly.
 
 Offline recovery commands use the same typed invariant checks. They bind no
@@ -733,6 +812,12 @@ cannot meet this gate, remove that path from the V1 product surface.
 
 Maincopy serves the canonical website and RSS in V1. RSS is a pull-based public
 resource, not an outbound delivery operation.
+
+V1 does not run a crawler or archive worker. A future archival integration is
+a downstream distributor of an immutable public snapshot, with its own network
+and storage boundary, rather than part of the publishing daemon. Canonical
+URLs, semantic HTML, article metadata, RSS, sitemap, and stable public routes
+remain the interoperability surface for external archival systems.
 
 Maincopy does not collect subscriber details or send email in V1. It does not
 prepare or submit X, Substack, or Nostr article content.

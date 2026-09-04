@@ -5,7 +5,9 @@ Status: target delivery plan with open design gates
 Last updated: 2026-09-04
 
 Related documents: [project overview](../README.md), [system design](design.md),
-[local alpha runbook](local-alpha.md), and [engineering style guide](quality.md).
+[local alpha runbook](local-alpha.md),
+[managed source runbook](managed-source.md), and
+[engineering style guide](quality.md).
 
 ## Document role
 
@@ -37,7 +39,7 @@ release claim.
 | First useful publication admin UI | Implemented foundation: password sign-in, revision inspection, exact preview review, and immediate initial or update publication |
 | Initial publication, private previews, and local CLI commands | Implemented foundation |
 | Preview-gated update releases and complete release management | In progress |
-| Managed Git synchronization and restricted source bootstrap | Planned |
+| Managed Git synchronization and restricted source bootstrap | Implemented foundation: offline configuration, restricted SSH fetch, startup and periodic synchronization, manual sync, durable status, and admin and CLI inspection; online fresh-authenticated reconfiguration and selected-credential public-key visibility remain open |
 | Snapshot-backed RSS feed, sitemap, robots policy, and HTML autodiscovery | Implemented foundation |
 | Canonical links, core non-image Open Graph fields, and `BlogPosting` JSON-LD | Implemented foundation |
 | Built-in public theme shell, packaged CSS, stable `maincopy-*` hooks, and previous/next navigation | Implemented |
@@ -67,7 +69,8 @@ Managed Git synchronization is the last large article-source feature. After
 orders 1 and 2, V1 still has the bounded product-finish work in order 3; it is
 not accurate to classify all of that work as deployment. Order 4 is
 observability, deployment, recovery, security review, and release engineering.
-X and Substack handoffs, mailing lists, automatic distribution, Obsidian
+X and Substack handoffs, mailing lists, automatic distribution, archival
+snapshot distributors, Obsidian
 authoring, replaceable themes, typed widgets, and article-supplied JavaScript
 remain post-v1 work.
 
@@ -1425,6 +1428,9 @@ Failure tests:
 Add one provider-neutral source synchronization path after reload coordination.
 Keep the compiler input as a local, immutable content-tree candidate.
 
+Status: implemented foundation. Fresh-authenticated online reconfiguration and
+selected-credential public-key visibility remain open.
+
 Deliverables:
 
 - One versioned SQLite source configuration with the SSH remote, exact branch,
@@ -1462,10 +1468,12 @@ Deliverables:
   commit.
 - Retention of each commit candidate required by a non-terminal release or
   current published revision.
-- A required source commit on managed-source post revisions and releases.
+- A first-managed-observation source commit on managed-source post revisions,
+  including revisions first indexed without provenance in external mode, and
+  a separate exact source commit on each managed-source release.
 - The existing optional source commit in external local-checkout mode.
-- Typed sync states, bounded diagnostics, timeouts, cancellation, and ordered
-  shutdown.
+- Typed sync states, stable failure codes, bounded process output, timeouts,
+  cancellation, and ordered shutdown.
 - No automatic merge, local commit, push, branch creation, pull request, or
   conflict-resolution workflow.
 - No webhook listener. A future webhook can request the same fetch operation
@@ -2630,8 +2638,8 @@ Tests:
 - Reject `Sync now` in external local-checkout mode with a typed unsupported
   result.
 - Reject a source sync when the principal lacks source-sync scope.
-- Return no private key, passphrase, credential-file path, or unsafe SSH
-  diagnostic in source resources.
+- Return no private key, passphrase, credential-file path, or SSH process
+  output in source resources.
 - Coalesce concurrent reload calls and return one operation ID.
 - Recover a reload by operation ID or idempotency key after a lost response.
 - Poll a reload operation through a terminal state.

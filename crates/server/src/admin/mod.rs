@@ -9,7 +9,9 @@ use crate::domain::{
     publication::{
         activation::PublicationCoordinatorHandle, admin as publication_admin, ui as publication_ui,
     },
+    source::{admin as source_admin, ui as source_ui},
 };
+use crate::source_sync::SourceSyncHandle;
 use maincopy_shared::auth::AdminScope;
 
 mod assets;
@@ -161,6 +163,26 @@ fn registered_router(security: &AdminSecurityState) -> (Router, utoipa::openapi:
             AdminScope::ReleaseManage,
         ))
         .routes(scoped_routes(
+            source_admin::status_routes(),
+            security,
+            AdminScope::StatusRead,
+        ))
+        .routes(scoped_routes(
+            source_admin::sync_list_routes(),
+            security,
+            AdminScope::StatusRead,
+        ))
+        .routes(scoped_routes(
+            source_admin::sync_item_routes(),
+            security,
+            AdminScope::StatusRead,
+        ))
+        .routes(scoped_routes(
+            source_admin::sync_mutation_routes(),
+            security,
+            AdminScope::SourceSync,
+        ))
+        .routes(scoped_routes(
             routes!(openapi::get_openapi),
             security,
             AdminScope::StatusRead,
@@ -169,7 +191,8 @@ fn registered_router(security: &AdminSecurityState) -> (Router, utoipa::openapi:
     (
         api.merge(ui::public_router())
             .merge(ui::protected_router(security))
-            .merge(publication_ui::router(security)),
+            .merge(publication_ui::router(security))
+            .merge(source_ui::router(security)),
         document,
     )
 }
@@ -187,10 +210,12 @@ pub(crate) fn runtime_admin_router(
     publications: PublicationCoordinatorHandle,
     security: AdminSecurityState,
     profiles: ProfileStore,
+    source: SourceSyncHandle,
 ) -> Router {
     admin_router(security)
         .layer(Extension(publications))
         .layer(Extension(profiles))
+        .layer(Extension(source))
 }
 
 #[cfg(test)]
@@ -210,6 +235,7 @@ mod tests {
         posts::POSTS_PATH,
         profile_api::{ACTIVE_TIP_RECIPIENT_PATH, CURRENT_USER_PROFILE_PATH},
         publication::PUBLICATIONS_PATH,
+        source::{SOURCE_PATH, SOURCE_SYNCS_PATH},
     };
 
     use super::test_support::ProtectedAdminHarness;
@@ -464,6 +490,12 @@ mod tests {
         assert!(document["paths"][CURRENT_USER_PROFILE_PATH]["put"].is_object());
         assert!(document["paths"][ACTIVE_TIP_RECIPIENT_PATH]["get"].is_object());
         assert!(document["paths"][ACTIVE_TIP_RECIPIENT_PATH]["put"].is_object());
+        assert!(document["paths"][SOURCE_PATH]["get"].is_object());
+        assert!(document["paths"][SOURCE_SYNCS_PATH]["get"].is_object());
+        assert!(document["paths"][SOURCE_SYNCS_PATH]["post"].is_object());
+        assert!(
+            document["paths"]["/api/admin/v1/source-syncs/{source_sync_id}"]["get"].is_object()
+        );
         assert!(document["paths"]["/api/admin/v1/auth/sessions"]["post"].is_object());
         assert!(document["paths"]["/health/live"].is_null());
         let posts = &document["paths"][POSTS_PATH]["get"];
@@ -539,6 +571,25 @@ mod tests {
             for status in ["200", "400", "403", "404", "409", "412", "413", "503"] {
                 assert!(mutation["responses"][status]["headers"]["x-request-id"].is_object());
             }
+        }
+        let source_sync = &document["paths"][SOURCE_SYNCS_PATH]["post"];
+        let idempotency_key = source_sync["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "Idempotency-Key")
+            .unwrap();
+        assert_eq!(idempotency_key["required"], true);
+        assert_eq!(idempotency_key["schema"]["format"], "uuid");
+        assert_eq!(
+            source_sync["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BeginSourceSyncRequest"
+        );
+        for status in ["200", "202", "400", "409", "413", "500", "503"] {
+            assert!(
+                source_sync["responses"][status]["headers"]["x-request-id"].is_object(),
+                "source sync response {status} is missing x-request-id"
+            );
         }
         assert_eq!(
             document["components"]["schemas"]["PostPublicationState"]["enum"],

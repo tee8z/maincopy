@@ -36,6 +36,7 @@ use maincopy_shared::{
         SESSION_COOKIE_NAME, SecretString,
     },
     publication::IDEMPOTENCY_KEY_HEADER,
+    source::{SOURCE_PATH, SOURCE_SYNCS_PATH},
 };
 
 const ADMIN_ORIGIN: &str = "https://admin.example.test";
@@ -60,33 +61,6 @@ description = \"A self-contained publication fixture.\"\n\
 name = \"Integration Tester\"\n";
 
 #[test]
-fn admin_readiness_accepts_only_the_configured_ephemeral_loopback_address() {
-    assert_eq!(
-        admin_address_from_ready_line("INFO public listener bound bind=127.0.0.1:1234"),
-        Ok(None)
-    );
-    assert_eq!(
-        admin_address_from_ready_line(
-            "INFO authenticated admin backend listener bound bind=127.0.0.1:43123"
-        ),
-        Ok(Some("127.0.0.1:43123".parse().unwrap()))
-    );
-
-    for invalid in [
-        "INFO authenticated admin backend listener bound",
-        "INFO authenticated admin backend listener bound bind=invalid",
-        "INFO authenticated admin backend listener bound bind=127.0.0.1:0",
-        "INFO authenticated admin backend listener bound bind=127.0.0.2:43123",
-        "INFO authenticated admin backend listener bound bind=[::1]:43123",
-    ] {
-        assert!(
-            admin_address_from_ready_line(invalid).is_err(),
-            "unexpectedly accepted {invalid}"
-        );
-    }
-}
-
-#[test]
 fn response_body_budget_accepts_the_exact_limit_and_rejects_the_next_byte() {
     let mut body = Vec::new();
     assert!(append_response_chunk(&mut body, &vec![0; MAX_RESPONSE_BODY_BYTES - 1]).is_ok());
@@ -94,21 +68,6 @@ fn response_body_budget_accepts_the_exact_limit_and_rejects_the_next_byte() {
     assert_eq!(body.len(), MAX_RESPONSE_BODY_BYTES);
     assert!(append_response_chunk(&mut body, &[0]).is_err());
     assert_eq!(body.len(), MAX_RESPONSE_BODY_BYTES);
-}
-
-#[test]
-fn daemon_stderr_framing_rejects_a_newline_free_line_before_readiness() {
-    let input = vec![b'x'; MAX_DAEMON_LOG_LINE_BYTES + 1];
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-
-    let captured = drain_daemon_stderr(std::io::Cursor::new(input), ready_tx);
-    let error = ready_rx
-        .recv()
-        .expect("stderr framing must report its readiness result")
-        .expect_err("an overlong readiness log line must be rejected");
-
-    assert!(error.contains("exceeded"), "unexpected error: {error}");
-    assert!(captured.len() <= MAX_CAPTURED_OUTPUT_BYTES);
 }
 
 #[tokio::test]
@@ -393,6 +352,84 @@ async fn identity_mutations_reject_ambiguous_paths_and_unsafe_inputs() {
     harness.stop();
 }
 
+#[tokio::test]
+async fn managed_source_endpoints_enforce_their_agent_scopes() {
+    let harness = AdminProcessHarness::start().await;
+    let source_operator =
+        SigningKey::from_bytes(&[4_u8; 32]).expect("the fixed source operator key must be valid");
+    let source_observer =
+        SigningKey::from_bytes(&[5_u8; 32]).expect("the fixed source observer key must be valid");
+
+    for (signing_key, label, scopes) in [
+        (
+            &source_operator,
+            "source sync contract test agent",
+            vec![AdminScope::SourceSync],
+        ),
+        (
+            &source_observer,
+            "source status contract test agent",
+            vec![AdminScope::StatusRead],
+        ),
+    ] {
+        let registered = harness
+            .send_json(
+                Method::POST,
+                ADMIN_AGENT_CREDENTIALS_PATH,
+                json!({
+                    "owner_user_id": harness.owner_user_id,
+                    "public_key": public_key(signing_key),
+                    "label": label,
+                    "scopes": scopes,
+                    "expires_at": null,
+                }),
+            )
+            .await;
+        assert_eq!(registered.status(), StatusCode::CREATED);
+    }
+
+    let status = harness
+        .send_as(
+            &source_observer,
+            Method::GET,
+            SOURCE_PATH,
+            Vec::new(),
+            false,
+        )
+        .await;
+    assert_eq!(status.status(), StatusCode::OK);
+
+    let sync = harness
+        .send_json_as(&source_operator, Method::POST, SOURCE_SYNCS_PATH, json!({}))
+        .await;
+    assert_eq!(sync.status(), StatusCode::CONFLICT);
+    assert_problem(sync, "source_sync_unsupported").await;
+
+    for (signing_key, method, path, body, json_body) in [
+        (
+            &source_operator,
+            Method::GET,
+            SOURCE_PATH,
+            Vec::new(),
+            false,
+        ),
+        (
+            &source_observer,
+            Method::POST,
+            SOURCE_SYNCS_PATH,
+            b"{}".to_vec(),
+            true,
+        ),
+    ] {
+        let denied = harness
+            .send_as(signing_key, method, path, body, json_body)
+            .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_problem(denied, "insufficient_scope").await;
+    }
+    harness.stop();
+}
+
 struct AdminProcessHarness {
     daemon: Daemon,
     _root: tempfile::TempDir,
@@ -432,11 +469,24 @@ impl AdminProcessHarness {
     }
 
     async fn get(&self, path: &str) -> Response {
-        self.send(Method::GET, path, Vec::new(), false).await
+        self.send_as(&self.signing_key, Method::GET, path, Vec::new(), false)
+            .await
     }
 
     async fn send_json(&self, method: Method, path: &str, body: Value) -> Response {
-        self.send(
+        self.send_json_as(&self.signing_key, method, path, body)
+            .await
+    }
+
+    async fn send_json_as(
+        &self,
+        signing_key: &SigningKey,
+        method: Method,
+        path: &str,
+        body: Value,
+    ) -> Response {
+        self.send_as(
+            signing_key,
             method,
             path,
             serde_json::to_vec(&body).expect("admin request fixture must serialize"),
@@ -445,10 +495,17 @@ impl AdminProcessHarness {
         .await
     }
 
-    async fn send(&self, method: Method, path: &str, body: Vec<u8>, json_body: bool) -> Response {
+    async fn send_as(
+        &self,
+        signing_key: &SigningKey,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+        json_body: bool,
+    ) -> Response {
         let idempotency_key = Uuid::new_v4().hyphenated().to_string();
         let authorization =
-            agent_authorization(&self.signing_key, &method, path, &body, &idempotency_key);
+            agent_authorization(signing_key, &method, path, &body, &idempotency_key);
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.admin_url))

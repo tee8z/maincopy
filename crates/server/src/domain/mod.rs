@@ -7,3 +7,4 @@
 pub(crate) mod auth;
 pub(crate) mod profile;
 pub mod publication;
+pub(crate) mod source;

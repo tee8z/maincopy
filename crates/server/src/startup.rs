@@ -27,7 +27,7 @@ use crate::{
         runtime_admin_router,
     },
     cli::{ServerInvocation, parse_process_invocation},
-    config::{HostConfiguration, HostConfigurationLoader},
+    config::{HostConfiguration, HostConfigurationLoader, SourceConfigurationView},
     content_sync::ContentSync,
     database::{self, DatabaseStore},
     domain::{
@@ -37,6 +37,7 @@ use crate::{
             PublicLedgerProjection, PublishedPostRevision, SourceCommit,
             activation::{
                 PublicationCoordinator, PublicationCoordinatorActor, PublicationCoordinatorHandle,
+                observed_post_revisions,
             },
             scheduler::PublicationScheduler,
             store::{
@@ -49,6 +50,7 @@ use crate::{
         ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal, StartupStage,
     },
     frontend_assets::{FrontendAssetManifest, embedded_manifest},
+    git_sync::GitSync,
     identity_bootstrap,
     observability::{initialize_logging, task_span},
     process_lock::{ProcessLock, ProcessLockError},
@@ -56,7 +58,9 @@ use crate::{
         CatalogBuildError, CatalogRetentionError, ContentCatalog, ContentCompiler, SiteSnapshot,
         build_site_snapshot, render_site_shell, snapshot_store,
     },
+    source_bootstrap::{configure_source, generate_source_key},
     source_provenance::{SourceCommitDiscovery, discover_source_commit},
+    source_sync::{ManagedSourceEngine, SourceRuntimeMode, SourceSyncHandle},
     web::{PublicServer, PublicState, Readiness},
 };
 
@@ -75,7 +79,7 @@ const PUBLICATION_COORDINATOR_QUEUE_CAPACITY: usize = 32;
 /// task creation belong in [`Application::build`]. Runtime supervision and
 /// ordered shutdown belong in [`Application::run_until_stop`].
 pub(crate) struct Application {
-    _startup: StartupConfiguration,
+    _startup: StartupResources,
     _database: DatabaseStore,
     publication_coordinator: PublicationCoordinatorHandle,
     runtime: ApplicationRuntime,
@@ -83,6 +87,15 @@ pub(crate) struct Application {
     public_addr: std::net::SocketAddr,
     #[cfg(test)]
     admin_addr: std::net::SocketAddr,
+}
+
+enum StartupResources {
+    External {
+        _resources: Box<StartupConfiguration>,
+    },
+    Managed {
+        _resources: Box<StartupHostConfiguration>,
+    },
 }
 
 struct ApplicationRuntime {
@@ -101,6 +114,16 @@ struct StartupConfiguration {
     _validated_content: ValidatedContent,
 }
 
+/// Host-owned resources acquired before selecting a content source.
+///
+/// Managed mode must open SQLite and finish identity/source bootstrap before
+/// it contacts a remote or compiles content. Keeping this boundary separate
+/// from content discovery makes that startup ordering explicit.
+struct StartupHostConfiguration {
+    process_lock: ProcessLock,
+    host: HostConfiguration,
+}
+
 struct CompiledStartupContent {
     catalog: Arc<ContentCatalog>,
     observed_posts: Vec<ObservedPostRevision>,
@@ -116,7 +139,15 @@ struct ServingState {
     admin_server: AdminServer,
 }
 
+struct StartedDatabase {
+    store: DatabaseStore,
+    shutdown: CancellationToken,
+    task: JoinHandle<(CriticalTaskName, CriticalTaskCompletion)>,
+    security: AdminSecurityState,
+}
+
 impl StartupConfiguration {
+    #[cfg(test)]
     fn load_with_discovery<Discover>(
         config_path: PathBuf,
         discover: Discover,
@@ -127,6 +158,12 @@ impl StartupConfiguration {
             ContentTreeLimits,
         ) -> Result<DiscoveredContentTree, ContentValidationErrors>,
     {
+        StartupHostConfiguration::load(config_path)?.discover_with(discover)
+    }
+}
+
+impl StartupHostConfiguration {
+    fn load(config_path: PathBuf) -> Result<Self, ProcessError> {
         let host = HostConfigurationLoader::from_process_working_directory()?.load(&config_path)?;
         let host_view = host.view();
         let process_lock = match ProcessLock::acquire(host_view.runtime_root) {
@@ -140,12 +177,27 @@ impl StartupConfiguration {
                 ));
             }
         };
+
+        Ok(Self { process_lock, host })
+    }
+
+    fn discover_with<Discover>(
+        self,
+        discover: Discover,
+    ) -> Result<StartupConfiguration, ProcessError>
+    where
+        Discover: FnOnce(
+            &Path,
+            ContentTreeLimits,
+        ) -> Result<DiscoveredContentTree, ContentValidationErrors>,
+    {
+        let host_view = self.host.view();
         let content_tree = discover(host_view.content_root, host_view.content_limits)?;
         let validated_content = content_tree.validate()?;
 
-        Ok(Self {
-            _process_lock: process_lock,
-            _host: host,
+        Ok(StartupConfiguration {
+            _process_lock: self.process_lock,
+            _host: self.host,
             _content_tree: content_tree,
             _validated_content: validated_content,
         })
@@ -162,9 +214,15 @@ pub async fn run_until_stop() -> ProcessExit {
     let result: Result<(), ProcessError> = async {
         match invocation {
             ServerInvocation::Serve { config_path } => {
-                let startup =
-                    StartupConfiguration::load_with_discovery(config_path, discover_content_tree)?;
-                let application = Application::build(startup).await?;
+                let startup = StartupHostConfiguration::load(config_path)?;
+                let application = match startup.host.view().source {
+                    SourceConfigurationView::ExternalCheckout => {
+                        Application::build(startup.discover_with(discover_content_tree)?).await?
+                    }
+                    SourceConfigurationView::ManagedGit { .. } => {
+                        Application::build_managed(startup).await?
+                    }
+                };
                 application
                     .run_until_stop()
                     .await
@@ -174,6 +232,15 @@ pub async fn run_until_stop() -> ProcessExit {
                 config_path,
                 credential,
             } => identity_bootstrap::bootstrap_owner(config_path, credential).await,
+            ServerInvocation::ConfigureSource {
+                config_path,
+                request,
+                idempotency_key,
+            } => configure_source(config_path, request, idempotency_key).await,
+            ServerInvocation::GenerateSourceKey {
+                config_path,
+                private_key_file,
+            } => generate_source_key(config_path, private_key_file).await,
         }
     }
     .await;
@@ -217,7 +284,6 @@ impl Application {
         let content_root = host.content_root.to_path_buf();
         let state_root = host.state_root.to_path_buf();
         let content_limits = host.content_limits;
-        let database_queue_capacity = host.database.writer_queue_capacity.get();
         let frontend = embedded_manifest();
         frontend.validate().map_err(|error| {
             startup_failure(
@@ -253,87 +319,29 @@ impl Application {
         })?;
         let compiled = compile_startup_content(&startup, host.content_root, &content_compiler)?;
         let active_content_digest = compiled.content_digest.clone();
+        let StartedDatabase {
+            store: database_store,
+            shutdown: database_shutdown,
+            task: database_task,
+            security,
+        } = start_database(&startup._host).await?;
+        let source = SourceSyncHandle::new(
+            database_store.source.clone(),
+            SourceRuntimeMode::ExternalCheckout,
+        );
 
-        let database = match database::bootstrap(host.database).await {
-            Ok(database) => database,
-            Err(database::DatabaseStartupError::AlreadyOwned) => {
-                return Err(ProcessError::AlreadyRunning);
-            }
-            Err(error) => {
-                return Err(startup_failure(
-                    StartupStage::Database,
-                    "bootstrap the database",
-                    error,
-                ));
-            }
-        };
-        let (database_store, database_writer) = database.into_store(database_queue_capacity);
-        let database_shutdown = CancellationToken::new();
-        let writer_shutdown = database_shutdown.clone();
-        let database_task = CriticalTask::new(CriticalTaskName::DatabaseWriter, async move {
-            database_writer
-                .run(writer_shutdown)
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
-        let database_task = spawn_critical_task(database_task);
-
-        if let Err(error) =
-            identity_bootstrap::bootstrap_generated_owner(&database_store, std::io::stdout()).await
-        {
-            let error = startup_failure(
-                StartupStage::Identity,
-                "bootstrap a generated initial owner",
-                error,
-            );
-            return Err(close_writer_after_startup_failure(
-                database_store,
-                database_shutdown,
-                database_task,
-                error,
-            )
-            .await);
-        }
-
-        let providers = ConfiguredLoginProviders::new(true, true)
-            .expect("password and Nostr form a valid login-provider set");
-        let security = match AdminSecurityState::new(
-            host.admin_origin.clone(),
-            database_store.auth.clone(),
-            providers,
-            AdminSessionPolicy::default(),
-            Argon2idPolicy::v1(),
-        )
-        .await
-        {
-            Ok(security) => security,
-            Err(error) => {
-                let error = startup_failure(
-                    StartupStage::Identity,
-                    "initialize the admin authentication boundary",
-                    error,
-                );
-                return Err(close_writer_after_startup_failure(
-                    database_store,
-                    database_shutdown,
-                    database_task,
-                    error,
-                )
-                .await);
-            }
-        };
-
-        let serving_state = match prepare_serving_state(
-            &database_store,
+        let serving_state = match prepare_serving_state(ServingStateInput {
+            database: &database_store,
             compiled,
             frontend,
-            host.public_bind,
-            host.admin_bind,
+            public_bind: host.public_bind,
+            admin_bind: host.admin_bind,
             security,
-            cancellation.clone(),
-            &candidate_store,
-            &content_compiler,
-        )
+            cancellation: cancellation.clone(),
+            candidate_store: &candidate_store,
+            content_compiler: &content_compiler,
+            source,
+        })
         .await
         {
             Ok(setup) => setup,
@@ -410,7 +418,9 @@ impl Application {
         });
 
         Ok(Self {
-            _startup: startup,
+            _startup: StartupResources::External {
+                _resources: Box::new(startup),
+            },
             _database: database_store,
             publication_coordinator,
             runtime: ApplicationRuntime::with_database_writer(
@@ -423,6 +433,231 @@ impl Application {
                     public_task,
                     admin_task,
                     content_task,
+                    scheduler_task,
+                ],
+                database_task,
+            ),
+            #[cfg(test)]
+            public_addr,
+            #[cfg(test)]
+            admin_addr,
+        })
+    }
+
+    async fn build_managed(startup: StartupHostConfiguration) -> Result<Self, ProcessError> {
+        let cancellation = CancellationToken::new();
+        let host = startup.host.view();
+        let state_root = host.state_root.to_path_buf();
+        let content_limits = host.content_limits;
+        let (mirror_root, credentials, process_limits) = match host.source {
+            SourceConfigurationView::ManagedGit {
+                mirror_root,
+                credentials,
+                limits,
+            } => (mirror_root, credentials, limits),
+            SourceConfigurationView::ExternalCheckout => {
+                return Err(ProcessError::ManagedSourceDisabled);
+            }
+        };
+        let frontend = embedded_manifest();
+        frontend.validate().map_err(|error| {
+            startup_failure(
+                StartupStage::FrontendAssets,
+                "validate embedded frontend assets",
+                error,
+            )
+        })?;
+        let shutdown = install_termination_signal()?;
+        let database = start_database(&startup.host).await?;
+        let configuration = match database.store.source.configuration().await {
+            Ok(Some(configuration)) => configuration,
+            Ok(None) => {
+                return Err(close_started_database(
+                    database,
+                    ProcessError::SourceConfigurationRequired,
+                )
+                .await);
+            }
+            Err(error) => {
+                let error = startup_failure(
+                    StartupStage::Source,
+                    "load durable managed-source settings",
+                    error,
+                );
+                return Err(close_started_database(database, error).await);
+            }
+        };
+        let git = match GitSync::discover(mirror_root, credentials, process_limits, content_limits)
+        {
+            Ok(git) => git,
+            Err(error) => {
+                let error = startup_failure(
+                    StartupStage::Source,
+                    "initialize the managed Git transport",
+                    error,
+                );
+                return Err(close_started_database(database, error).await);
+            }
+        };
+        let candidate_store = match ContentCandidateStore::open(&state_root, content_limits) {
+            Ok(store) => store,
+            Err(error) => {
+                let error = startup_failure(
+                    StartupStage::Content,
+                    "open the retained content candidate store",
+                    error,
+                );
+                return Err(close_started_database(database, error).await);
+            }
+        };
+        let content_compiler = match ContentCompiler::discover() {
+            Ok(compiler) => compiler,
+            Err(error) => {
+                let error = startup_failure(
+                    StartupStage::Content,
+                    "initialize the content rendering pipeline",
+                    error,
+                );
+                return Err(close_started_database(database, error).await);
+            }
+        };
+        let (source_engine, source) = ManagedSourceEngine::new(
+            database.store.source.clone(),
+            configuration,
+            git,
+            candidate_store.clone(),
+            content_compiler.clone(),
+            cancellation.clone(),
+        );
+        let candidate = match source_engine.prepare_startup().await {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                let error = startup_failure(
+                    StartupStage::Source,
+                    "prepare the managed source head",
+                    error,
+                );
+                return Err(close_started_database(database, error).await);
+            }
+        };
+        let source_commit = match candidate.source_commit.clone() {
+            Some(source_commit) => source_commit,
+            None => {
+                let error = startup_failure(
+                    StartupStage::Source,
+                    "prepare the managed source head",
+                    StartupInvariantError::ManagedSourceCommitMissing,
+                );
+                return Err(close_started_database(database, error).await);
+            }
+        };
+        let compiled = CompiledStartupContent {
+            observed_posts: observed_post_revisions(&candidate.catalog),
+            catalog: candidate.catalog,
+            source_commit: Some(source_commit),
+            content_digest: candidate.content_digest,
+        };
+        let StartedDatabase {
+            store: database_store,
+            shutdown: database_shutdown,
+            task: database_task,
+            security,
+        } = database;
+        let serving_state = match prepare_serving_state(ServingStateInput {
+            database: &database_store,
+            compiled,
+            frontend,
+            public_bind: host.public_bind,
+            admin_bind: host.admin_bind,
+            security,
+            cancellation: cancellation.clone(),
+            candidate_store: &candidate_store,
+            content_compiler: &content_compiler,
+            source,
+        })
+        .await
+        {
+            Ok(setup) => setup,
+            Err(error) => {
+                return Err(close_writer_after_startup_failure(
+                    database_store,
+                    database_shutdown,
+                    database_task,
+                    error,
+                )
+                .await);
+            }
+        };
+        let ServingState {
+            readiness,
+            publication_coordinator,
+            publication_actor,
+            public_server,
+            admin_server,
+        } = serving_state;
+        #[cfg(test)]
+        let public_addr = public_server.local_addr;
+        #[cfg(test)]
+        let admin_addr = admin_server.local_addr;
+        let public_cancellation = cancellation.clone();
+        let public_task = CriticalTask::new(CriticalTaskName::PublicServer, async move {
+            public_server
+                .serve(public_cancellation)
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
+        let admin_cancellation = cancellation.clone();
+        let admin_task = CriticalTask::new(CriticalTaskName::AdminServer, async move {
+            admin_server
+                .serve(admin_cancellation)
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
+        let actor_cancellation = cancellation.clone();
+        let publication_actor_task =
+            CriticalTask::new(CriticalTaskName::PublicationCoordinator, async move {
+                publication_actor
+                    .run(actor_cancellation)
+                    .await
+                    .map_err(|error| Box::new(error) as CriticalTaskFailure)
+            });
+        let source_sync = source_engine.into_live(publication_coordinator.clone());
+        let source_task = CriticalTask::new(CriticalTaskName::SourceSync, async move {
+            source_sync
+                .run()
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
+        let scheduler_wakeup = publication_coordinator.scheduler_wakeup();
+        let scheduler = PublicationScheduler::new(
+            database_store.publications.clone(),
+            publication_coordinator.clone(),
+            scheduler_wakeup,
+            cancellation.clone(),
+        );
+        let scheduler_task = CriticalTask::new(CriticalTaskName::Scheduler, async move {
+            scheduler
+                .run()
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
+
+        Ok(Self {
+            _startup: StartupResources::Managed {
+                _resources: Box::new(startup),
+            },
+            _database: database_store,
+            publication_coordinator,
+            runtime: ApplicationRuntime::with_database_writer(
+                readiness,
+                cancellation,
+                database_shutdown,
+                shutdown,
+                vec![
+                    publication_actor_task,
+                    public_task,
+                    admin_task,
+                    source_task,
                     scheduler_task,
                 ],
                 database_task,
@@ -745,21 +980,32 @@ enum RetainedCatalogError {
     ActivationSnapshotUnavailable { expected: SiteSnapshotDigest },
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "startup composition passes each independently owned runtime resource across this single boundary"
-)]
-async fn prepare_serving_state(
-    database: &DatabaseStore,
+struct ServingStateInput<'resources> {
+    database: &'resources DatabaseStore,
     compiled: CompiledStartupContent,
     frontend: &'static FrontendAssetManifest,
     public_bind: std::net::SocketAddr,
     admin_bind: AdminBind,
     security: AdminSecurityState,
     cancellation: CancellationToken,
-    candidate_store: &ContentCandidateStore,
-    content_compiler: &ContentCompiler,
-) -> Result<ServingState, ProcessError> {
+    candidate_store: &'resources ContentCandidateStore,
+    content_compiler: &'resources ContentCompiler,
+    source: SourceSyncHandle,
+}
+
+async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingState, ProcessError> {
+    let ServingStateInput {
+        database,
+        compiled,
+        frontend,
+        public_bind,
+        admin_bind,
+        security,
+        cancellation,
+        candidate_store,
+        content_compiler,
+        source,
+    } = input;
     let tip_recipient = database
         .profiles
         .effective_tip_recipient()
@@ -882,6 +1128,7 @@ async fn prepare_serving_state(
         publication_coordinator.clone(),
         security,
         database.profiles.clone(),
+        source,
     );
     let public_server = PublicServer::bind(
         public_bind,
@@ -925,12 +1172,96 @@ fn startup_failure(
     .into()
 }
 
+async fn start_database(host: &HostConfiguration) -> Result<StartedDatabase, ProcessError> {
+    let host = host.view();
+    let database = match database::bootstrap(host.database).await {
+        Ok(database) => database,
+        Err(database::DatabaseStartupError::AlreadyOwned) => {
+            return Err(ProcessError::AlreadyRunning);
+        }
+        Err(error) => {
+            return Err(startup_failure(
+                StartupStage::Database,
+                "bootstrap the database",
+                error,
+            ));
+        }
+    };
+    let (store, writer) = database.into_store(host.database.writer_queue_capacity.get());
+    let shutdown = CancellationToken::new();
+    let writer_shutdown = shutdown.clone();
+    let task = spawn_critical_task(CriticalTask::new(
+        CriticalTaskName::DatabaseWriter,
+        async move {
+            writer
+                .run(writer_shutdown)
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        },
+    ));
+
+    if let Err(error) =
+        identity_bootstrap::bootstrap_generated_owner(&store, std::io::stdout()).await
+    {
+        let error = startup_failure(
+            StartupStage::Identity,
+            "bootstrap a generated initial owner",
+            error,
+        );
+        return Err(close_writer_after_startup_failure(store, shutdown, task, error).await);
+    }
+
+    let providers = ConfiguredLoginProviders::new(true, true)
+        .expect("password and Nostr form a valid login-provider set");
+    let security = match AdminSecurityState::new(
+        host.admin_origin.clone(),
+        store.auth.clone(),
+        providers,
+        AdminSessionPolicy::default(),
+        Argon2idPolicy::v1(),
+    )
+    .await
+    {
+        Ok(security) => security,
+        Err(error) => {
+            let error = startup_failure(
+                StartupStage::Identity,
+                "initialize the admin authentication boundary",
+                error,
+            );
+            return Err(close_writer_after_startup_failure(store, shutdown, task, error).await);
+        }
+    };
+
+    Ok(StartedDatabase {
+        store,
+        shutdown,
+        task,
+        security,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 enum StartupInvariantError {
     #[error("the rebuilt base snapshot does not match the durable site head")]
     BaseSnapshotMismatch,
     #[error("the retained public representation does not match the durable site head")]
     PublicSnapshotMismatch,
+    #[error("a managed source candidate has no exact source commit")]
+    ManagedSourceCommitMissing,
+}
+
+async fn close_started_database(
+    database: StartedDatabase,
+    process_error: ProcessError,
+) -> ProcessError {
+    close_writer_after_startup_failure(
+        database.store,
+        database.shutdown,
+        database.task,
+        process_error,
+    )
+    .await
 }
 
 async fn close_writer_after_startup_failure(
@@ -939,8 +1270,8 @@ async fn close_writer_after_startup_failure(
     writer: JoinHandle<(CriticalTaskName, CriticalTaskCompletion)>,
     process_error: ProcessError,
 ) -> ProcessError {
-    drop(database);
     shutdown.cancel();
+    drop(database);
     if let Some(error) = drained_task_failure(writer.await) {
         tracing::error!(error = %error, "database writer failed during startup cleanup");
     }
@@ -1269,6 +1600,7 @@ description = \"Startup configuration test.\"\n\
 name = \"Startup Tester\"\n";
     const DURABLE_POST_ID: &str = "11111111-1111-4111-8111-111111111111";
     const DURABLE_PUBLICATION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const LIVE_RELOAD_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
     const TEST_OWNER_NOSTR_PUBLIC_KEY: &str =
         "63fe6318dc58583cfe16810f86dd09e18bfd76aabc24a0081ce2856f330504ed";
     const TEST_AGENT_SECRET: [u8; 32] = [3_u8; 32];
@@ -1926,7 +2258,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         );
         fs::write(&post_path, &edited).unwrap();
 
-        let edited_summary = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let edited_summary = tokio::time::timeout(LIVE_RELOAD_TEST_TIMEOUT, async {
             loop {
                 let posts: ListPostsResponse =
                     admin_json(admin_get(&admin, POSTS_PATH).await).await;
@@ -2031,7 +2363,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let admin = admin_client(&application);
 
         write_durable_post(&content_root);
-        let summary = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let summary = tokio::time::timeout(LIVE_RELOAD_TEST_TIMEOUT, async {
             loop {
                 let posts: ListPostsResponse =
                     admin_json(admin_get(&admin, POSTS_PATH).await).await;

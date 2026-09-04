@@ -57,6 +57,21 @@ pub enum ProcessError {
     #[error("owner credential input is invalid")]
     IdentityCredentialInvalid,
 
+    #[error("managed Git source mode requires durable source settings")]
+    SourceConfigurationRequired,
+
+    #[error("this source operation requires source.mode = \"managed_git\"")]
+    ManagedSourceDisabled,
+
+    #[error("the selected source credential is not registered by host configuration")]
+    SourceCredentialUnknown,
+
+    #[error("source configuration conflicts with durable state")]
+    SourceConfigurationConflict,
+
+    #[error("source setup requires an existing enabled owner")]
+    SourceOwnerRequired,
+
     #[error(transparent)]
     Application(#[from] ApplicationError),
 }
@@ -64,18 +79,32 @@ pub enum ProcessError {
 impl ProcessError {
     pub const fn exit(&self) -> ProcessExit {
         match self {
-            Self::Configuration(_) => ProcessExit::Configuration,
-            Self::Validation(_) | Self::IdentityCredentialInvalid => ProcessExit::Validation,
-            Self::AlreadyRunning | Self::IdentityAlreadyBootstrapped => ProcessExit::Conflict,
+            Self::Configuration(_)
+            | Self::SourceConfigurationRequired
+            | Self::ManagedSourceDisabled => ProcessExit::Configuration,
+            Self::Validation(_)
+            | Self::IdentityCredentialInvalid
+            | Self::SourceCredentialUnknown => ProcessExit::Validation,
+            Self::AlreadyRunning
+            | Self::IdentityAlreadyBootstrapped
+            | Self::SourceConfigurationConflict
+            | Self::SourceOwnerRequired => ProcessExit::Conflict,
             Self::Application(_) => ProcessExit::Internal,
         }
     }
 
     pub const fn category(&self) -> &'static str {
         match self {
-            Self::Configuration(_) => "configuration",
-            Self::Validation(_) | Self::IdentityCredentialInvalid => "validation",
-            Self::AlreadyRunning | Self::IdentityAlreadyBootstrapped => "conflict",
+            Self::Configuration(_)
+            | Self::SourceConfigurationRequired
+            | Self::ManagedSourceDisabled => "configuration",
+            Self::Validation(_)
+            | Self::IdentityCredentialInvalid
+            | Self::SourceCredentialUnknown => "validation",
+            Self::AlreadyRunning
+            | Self::IdentityAlreadyBootstrapped
+            | Self::SourceConfigurationConflict
+            | Self::SourceOwnerRequired => "conflict",
             Self::Application(_) => "internal",
         }
     }
@@ -151,6 +180,7 @@ pub enum CriticalTaskName {
     PublicationCoordinator,
     DatabaseWriter,
     Scheduler,
+    SourceSync,
     Worker,
 }
 
@@ -161,6 +191,7 @@ impl_display!(CriticalTaskName {
     Self::PublicationCoordinator => "publication coordinator",
     Self::DatabaseWriter => "database writer",
     Self::Scheduler => "scheduler",
+    Self::SourceSync => "source sync",
     Self::Worker => "worker",
 });
 
@@ -171,6 +202,7 @@ pub enum StartupStage {
     Database,
     Identity,
     Content,
+    Source,
     FrontendAssets,
     Listeners,
 }
@@ -181,6 +213,7 @@ impl_display!(StartupStage {
     Self::Database => "database startup",
     Self::Identity => "identity bootstrap",
     Self::Content => "content compilation",
+    Self::Source => "managed source synchronization",
     Self::FrontendAssets => "frontend asset validation",
     Self::Listeners => "listener binding",
 });
@@ -228,6 +261,23 @@ mod tests {
                 ProcessExit::Validation,
             ),
             (
+                ProcessError::SourceConfigurationRequired,
+                ProcessExit::Configuration,
+            ),
+            (
+                ProcessError::ManagedSourceDisabled,
+                ProcessExit::Configuration,
+            ),
+            (
+                ProcessError::SourceCredentialUnknown,
+                ProcessExit::Validation,
+            ),
+            (
+                ProcessError::SourceConfigurationConflict,
+                ProcessExit::Conflict,
+            ),
+            (ProcessError::SourceOwnerRequired, ProcessExit::Conflict),
+            (
                 ProcessError::Application(ApplicationError::Startup {
                     stage: StartupStage::Configuration,
                     operation: "load test configuration",
@@ -263,6 +313,11 @@ mod tests {
             (ProcessError::AlreadyRunning, "conflict"),
             (ProcessError::IdentityAlreadyBootstrapped, "conflict"),
             (ProcessError::IdentityCredentialInvalid, "validation"),
+            (ProcessError::SourceConfigurationRequired, "configuration"),
+            (ProcessError::ManagedSourceDisabled, "configuration"),
+            (ProcessError::SourceCredentialUnknown, "validation"),
+            (ProcessError::SourceConfigurationConflict, "conflict"),
+            (ProcessError::SourceOwnerRequired, "conflict"),
             (
                 ProcessError::Application(ApplicationError::Startup {
                     stage: StartupStage::Configuration,
@@ -293,6 +348,16 @@ mod tests {
                 "identity bootstrap is already complete",
             ProcessError::IdentityCredentialInvalid =>
                 "owner credential input is invalid",
+            ProcessError::SourceConfigurationRequired =>
+                "managed Git source mode requires durable source settings",
+            ProcessError::ManagedSourceDisabled =>
+                "this source operation requires source.mode = \"managed_git\"",
+            ProcessError::SourceCredentialUnknown =>
+                "the selected source credential is not registered by host configuration",
+            ProcessError::SourceConfigurationConflict =>
+                "source configuration conflicts with durable state",
+            ProcessError::SourceOwnerRequired =>
+                "source setup requires an existing enabled owner",
             ShutdownSignal::Interrupt => "interrupt",
             ShutdownSignal::Terminate => "terminate",
             CriticalTaskName::PublicServer => "public server",
@@ -301,12 +366,14 @@ mod tests {
             CriticalTaskName::PublicationCoordinator => "publication coordinator",
             CriticalTaskName::DatabaseWriter => "database writer",
             CriticalTaskName::Scheduler => "scheduler",
+            CriticalTaskName::SourceSync => "source sync",
             CriticalTaskName::Worker => "worker",
             StartupStage::Configuration => "configuration",
             StartupStage::ProcessLock => "process lock",
             StartupStage::Database => "database startup",
             StartupStage::Identity => "identity bootstrap",
             StartupStage::Content => "content compilation",
+            StartupStage::Source => "managed source synchronization",
             StartupStage::FrontendAssets => "frontend asset validation",
             StartupStage::Listeners => "listener binding",
         }

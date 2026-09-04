@@ -1,12 +1,14 @@
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use maincopy_shared::source::SshCredentialName;
 use markdown_compiler::{
     ContentDepthLimit, ContentEntryLimit, ContentFileByteLimit, ContentPathByteLimit,
     ContentTreeByteLimit, ContentTreeLimits,
@@ -19,6 +21,7 @@ use super::diagnostic::{
     ConfigurationDiagnostic, ConfigurationErrors, ConfigurationValidationCode, DiagnosticCollector,
     single_error, toml_location,
 };
+use super::secret::{SecretFileReference, SensitivePath};
 
 const MAX_HOST_DOCUMENT_BYTES: u64 = 1024 * 1024;
 const DEFAULT_CONTENT_ROOT: &str = "content";
@@ -34,6 +37,20 @@ const DEFAULT_READ_POOL_SIZE: usize = 4;
 const MAX_DATABASE_BUSY_TIMEOUT_MILLISECONDS: u64 = 300_000;
 const MAX_DATABASE_WRITER_QUEUE_CAPACITY: usize = 65_536;
 const MAX_DATABASE_READ_POOL_SIZE: usize = 256;
+const DEFAULT_GIT_FETCH_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_GIT_COMMAND_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_GIT_MIRROR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_GIT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_GIT_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_GIT_CPU_SECONDS: u64 = 120;
+const DEFAULT_GIT_OPEN_FILES: u64 = 256;
+const MAX_GIT_FETCH_TIMEOUT_SECONDS: u64 = 3_600;
+const MAX_GIT_COMMAND_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_GIT_MIRROR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_GIT_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_GIT_ADDRESS_SPACE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_GIT_CPU_SECONDS: u64 = 3_600;
+const MAX_GIT_OPEN_FILES: u64 = 4_096;
 
 macro_rules! bounded_usize_setting {
     ($name:ident, $minimum:expr, $maximum:expr) => {
@@ -85,6 +102,111 @@ bounded_usize_setting!(
 );
 bounded_usize_setting!(DatabaseReadPoolSize, 1, MAX_DATABASE_READ_POOL_SIZE);
 
+macro_rules! bounded_u64_setting {
+    ($name:ident, $maximum:expr) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct $name(NonZeroU64);
+
+        impl $name {
+            pub fn new(value: u64) -> Option<Self> {
+                NonZeroU64::new(value)
+                    .filter(|value| value.get() <= $maximum)
+                    .map(Self)
+            }
+
+            pub const fn get(self) -> u64 {
+                self.0.get()
+            }
+        }
+    };
+}
+
+bounded_duration_setting!(
+    GitFetchTimeout,
+    from_seconds,
+    from_secs,
+    MAX_GIT_FETCH_TIMEOUT_SECONDS
+);
+bounded_u64_setting!(GitCommandOutputByteLimit, MAX_GIT_COMMAND_OUTPUT_BYTES);
+bounded_u64_setting!(GitMirrorByteLimit, MAX_GIT_MIRROR_BYTES);
+bounded_u64_setting!(GitFileByteLimit, MAX_GIT_FILE_BYTES);
+bounded_u64_setting!(GitAddressSpaceByteLimit, MAX_GIT_ADDRESS_SPACE_BYTES);
+bounded_u64_setting!(GitCpuSecondLimit, MAX_GIT_CPU_SECONDS);
+bounded_u64_setting!(GitOpenFileLimit, MAX_GIT_OPEN_FILES);
+
+/// Selects the one host-owned content source mechanism.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SourceMode {
+    #[default]
+    ExternalCheckout,
+    ManagedGit,
+}
+
+/// Host paths for one SSH identity. Both paths stay redacted under `Debug`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshCredentialReference {
+    pub private_key: SecretFileReference,
+    pub known_hosts: SecretFileReference,
+}
+
+/// Process and storage ceilings applied to every managed Git phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GitProcessLimits {
+    pub wall_time: GitFetchTimeout,
+    pub command_output_bytes: GitCommandOutputByteLimit,
+    pub mirror_bytes: GitMirrorByteLimit,
+    pub file_bytes: GitFileByteLimit,
+    pub address_space_bytes: GitAddressSpaceByteLimit,
+    pub cpu_seconds: GitCpuSecondLimit,
+    pub open_files: GitOpenFileLimit,
+}
+
+impl Default for GitProcessLimits {
+    fn default() -> Self {
+        Self {
+            wall_time: GitFetchTimeout::from_seconds(DEFAULT_GIT_FETCH_TIMEOUT_SECONDS)
+                .expect("the built-in Git timeout is valid"),
+            command_output_bytes: GitCommandOutputByteLimit::new(DEFAULT_GIT_COMMAND_OUTPUT_BYTES)
+                .expect("the built-in Git output limit is valid"),
+            mirror_bytes: GitMirrorByteLimit::new(DEFAULT_GIT_MIRROR_BYTES)
+                .expect("the built-in Git mirror limit is valid"),
+            file_bytes: GitFileByteLimit::new(DEFAULT_GIT_FILE_BYTES)
+                .expect("the built-in Git file limit is valid"),
+            address_space_bytes: GitAddressSpaceByteLimit::new(DEFAULT_GIT_ADDRESS_SPACE_BYTES)
+                .expect("the built-in Git address-space limit is valid"),
+            cpu_seconds: GitCpuSecondLimit::new(DEFAULT_GIT_CPU_SECONDS)
+                .expect("the built-in Git CPU limit is valid"),
+            open_files: GitOpenFileLimit::new(DEFAULT_GIT_OPEN_FILES)
+                .expect("the built-in Git open-file limit is valid"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedGitHostConfiguration {
+    mirror_root: SensitivePath,
+    credentials: BTreeMap<SshCredentialName, SshCredentialReference>,
+    limits: GitProcessLimits,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceConfiguration {
+    ExternalCheckout,
+    ManagedGit(ManagedGitHostConfiguration),
+}
+
+/// Borrowed host-owned settings for the active source mechanism.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceConfigurationView<'configuration> {
+    ExternalCheckout,
+    ManagedGit {
+        mirror_root: &'configuration SensitivePath,
+        credentials: &'configuration BTreeMap<SshCredentialName, SshCredentialReference>,
+        limits: GitProcessLimits,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DatabaseConfiguration {
     path: PathBuf,
@@ -113,6 +235,7 @@ pub struct HostConfiguration {
     admin_bind: AdminBind,
     admin_origin: AdminOrigin,
     database: DatabaseConfiguration,
+    source: SourceConfiguration,
 }
 
 /// Read-only settings borrowed from validated host configuration.
@@ -126,6 +249,7 @@ pub struct HostConfigurationView<'configuration> {
     pub admin_bind: AdminBind,
     pub admin_origin: &'configuration AdminOrigin,
     pub database: DatabaseConfigurationView<'configuration>,
+    pub source: SourceConfigurationView<'configuration>,
 }
 
 impl HostConfiguration {
@@ -143,6 +267,14 @@ impl HostConfiguration {
                 busy_timeout: self.database.busy_timeout,
                 writer_queue_capacity: self.database.writer_queue_capacity,
                 read_pool_size: self.database.read_pool_size,
+            },
+            source: match &self.source {
+                SourceConfiguration::ExternalCheckout => SourceConfigurationView::ExternalCheckout,
+                SourceConfiguration::ManagedGit(managed) => SourceConfigurationView::ManagedGit {
+                    mirror_root: &managed.mirror_root,
+                    credentials: &managed.credentials,
+                    limits: managed.limits,
+                },
             },
         }
     }
@@ -212,6 +344,7 @@ struct HostCandidate {
     public: PublicCandidate,
     admin: AdminCandidate,
     database: DatabaseCandidate,
+    source: SourceCandidate,
 }
 
 #[derive(Default, Deserialize)]
@@ -254,6 +387,28 @@ struct DatabaseCandidate {
     busy_timeout_ms: Option<u64>,
     writer_queue_capacity: Option<u64>,
     read_pool_size: Option<u64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SourceCandidate {
+    mode: SourceMode,
+    mirror_root: Option<PathBuf>,
+    fetch_timeout_seconds: Option<u64>,
+    command_output_bytes: Option<u64>,
+    mirror_bytes: Option<u64>,
+    file_bytes: Option<u64>,
+    address_space_bytes: Option<u64>,
+    cpu_seconds: Option<u64>,
+    open_files: Option<u64>,
+    ssh_credentials: BTreeMap<String, SshCredentialCandidate>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SshCredentialCandidate {
+    private_key_file: PathBuf,
+    known_hosts_file: PathBuf,
 }
 
 fn read_host_source(path: &Path) -> Result<String, ConfigurationErrors> {
@@ -376,6 +531,15 @@ fn finalize_host(
         DatabaseReadPoolSize::new,
         &mut diagnostics,
     );
+    let source = validate_source_configuration(
+        candidate.source,
+        file_base,
+        state_root.as_deref(),
+        database_path.as_deref(),
+        content_root.as_deref(),
+        runtime_root.as_deref(),
+        &mut diagnostics,
+    );
     diagnostics.into_result()?;
     match (
         content_root,
@@ -388,6 +552,7 @@ fn finalize_host(
         content_limits,
         admin_bind,
         admin_origin,
+        source,
     ) {
         (
             Some(content_root),
@@ -400,6 +565,7 @@ fn finalize_host(
             Some(content),
             Some(admin_bind),
             Some(admin_origin),
+            Some(source),
         ) => Ok(HostConfiguration {
             content_root,
             state_root,
@@ -414,6 +580,7 @@ fn finalize_host(
                 writer_queue_capacity,
                 read_pool_size,
             },
+            source,
         }),
         _ => Err(single_error(host_diagnostic(
             "$document",
@@ -421,6 +588,312 @@ fn finalize_host(
             "effective host settings could not be constructed",
         ))),
     }
+}
+
+fn validate_source_configuration(
+    candidate: SourceCandidate,
+    file_base: &Path,
+    state_root: Option<&Path>,
+    database_path: Option<&Path>,
+    content_root: Option<&Path>,
+    runtime_root: Option<&Path>,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<SourceConfiguration> {
+    let has_managed_settings = candidate.mirror_root.is_some()
+        || candidate.fetch_timeout_seconds.is_some()
+        || candidate.command_output_bytes.is_some()
+        || candidate.mirror_bytes.is_some()
+        || candidate.file_bytes.is_some()
+        || candidate.address_space_bytes.is_some()
+        || candidate.cpu_seconds.is_some()
+        || candidate.open_files.is_some()
+        || !candidate.ssh_credentials.is_empty();
+    let limits = validate_git_process_limits(&candidate, diagnostics);
+    let credentials = validate_ssh_credentials(candidate.ssh_credentials, file_base, diagnostics);
+    match candidate.mode {
+        SourceMode::ExternalCheckout => {
+            if has_managed_settings {
+                diagnostics.push(host_diagnostic(
+                    "source",
+                    ConfigurationValidationCode::SourceModeConflict,
+                    "managed Git settings are available only in managed_git mode",
+                ));
+            }
+            limits.map(|_| SourceConfiguration::ExternalCheckout)
+        }
+        SourceMode::ManagedGit => {
+            let mirror_root = candidate
+                .mirror_root
+                .and_then(|path| resolve_path(file_base, &path))
+                .and_then(|path| {
+                    validate_managed_mirror_root(
+                        path,
+                        state_root,
+                        database_path,
+                        content_root,
+                        runtime_root,
+                        diagnostics,
+                    )
+                });
+            if credentials.is_empty() {
+                diagnostics.push(host_diagnostic(
+                    "source.ssh_credentials",
+                    ConfigurationValidationCode::SecretReferenceInvalid,
+                    "managed_git mode requires at least one named SSH credential",
+                ));
+            }
+            match (mirror_root, limits) {
+                (Some(mirror_root), Some(limits)) if !credentials.is_empty() => Some(
+                    SourceConfiguration::ManagedGit(ManagedGitHostConfiguration {
+                        mirror_root: SensitivePath::new(mirror_root)
+                            .expect("a validated mirror path is nonempty"),
+                        credentials,
+                        limits,
+                    }),
+                ),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn validate_managed_mirror_root(
+    mirror_root: PathBuf,
+    state_root: Option<&Path>,
+    database_path: Option<&Path>,
+    content_root: Option<&Path>,
+    runtime_root: Option<&Path>,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<PathBuf> {
+    let within_state = state_root
+        .and_then(|state_root| mirror_root.strip_prefix(state_root).ok())
+        .is_some_and(|relative| {
+            let mut components = relative.components();
+            matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none()
+        });
+    let overlaps_protected_path = [database_path, content_root, runtime_root]
+        .into_iter()
+        .flatten()
+        .any(|path| path.starts_with(&mirror_root) || mirror_root.starts_with(path));
+    if mirror_root.as_os_str().is_empty() || !within_state || overlaps_protected_path {
+        diagnostics.push(host_diagnostic(
+            "source.mirror_root",
+            ConfigurationValidationCode::PathInvalid,
+            "managed Git mirror root must be one dedicated direct child of paths.state_root",
+        ));
+        None
+    } else {
+        Some(mirror_root)
+    }
+}
+
+fn validate_ssh_credentials(
+    candidates: BTreeMap<String, SshCredentialCandidate>,
+    file_base: &Path,
+    diagnostics: &mut DiagnosticCollector,
+) -> BTreeMap<SshCredentialName, SshCredentialReference> {
+    let mut credentials = BTreeMap::new();
+    for (raw_name, candidate) in candidates {
+        let Ok(name) = SshCredentialName::parse(&raw_name) else {
+            diagnostics.push(host_diagnostic(
+                "source.ssh_credentials",
+                ConfigurationValidationCode::SecretReferenceInvalid,
+                "SSH credential names must use bounded lowercase ASCII identifiers",
+            ));
+            continue;
+        };
+        let private_key = resolve_secret_reference(
+            file_base,
+            candidate.private_key_file,
+            "source.ssh_credentials.private_key_file",
+            diagnostics,
+        );
+        let known_hosts = resolve_secret_reference(
+            file_base,
+            candidate.known_hosts_file,
+            "source.ssh_credentials.known_hosts_file",
+            diagnostics,
+        );
+        if let (Some(private_key), Some(known_hosts)) = (private_key, known_hosts) {
+            credentials.insert(
+                name,
+                SshCredentialReference {
+                    private_key,
+                    known_hosts,
+                },
+            );
+        }
+    }
+    credentials
+}
+
+fn resolve_secret_reference(
+    file_base: &Path,
+    path: PathBuf,
+    field: &'static str,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<SecretFileReference> {
+    let Some(path) = resolve_path(file_base, &path) else {
+        diagnostics.push(host_diagnostic(
+            field,
+            ConfigurationValidationCode::SecretReferenceInvalid,
+            "secret file reference must resolve to a nonempty path",
+        ));
+        return None;
+    };
+    if !ssh_argument_path_is_literal(&path) {
+        diagnostics.push(host_diagnostic(
+            field,
+            ConfigurationValidationCode::SecretReferenceInvalid,
+            "SSH credential paths may contain only ASCII letters, digits, '/', '.', '_', and '-' after resolution",
+        ));
+        return None;
+    }
+    if path_is_in_nix_store(&path)
+        || std::fs::canonicalize(&path).is_ok_and(|canonical| path_is_in_nix_store(&canonical))
+    {
+        diagnostics.push(host_diagnostic(
+            field,
+            ConfigurationValidationCode::SecretReferenceInvalid,
+            "SSH credential files must live outside the immutable Nix store",
+        ));
+        return None;
+    }
+    SecretFileReference::new(path).or_else(|| {
+        diagnostics.push(host_diagnostic(
+            field,
+            ConfigurationValidationCode::SecretReferenceInvalid,
+            "secret file reference must resolve to a nonempty path",
+        ));
+        None
+    })
+}
+
+fn ssh_argument_path_is_literal(path: &Path) -> bool {
+    path.to_str().is_some_and(|value| {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    })
+}
+
+fn path_is_in_nix_store(path: &Path) -> bool {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized.starts_with(Path::new("/nix/store"))
+}
+
+fn validate_git_process_limits(
+    candidate: &SourceCandidate,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<GitProcessLimits> {
+    let defaults = GitProcessLimits::default();
+    let wall_time = validate_duration(
+        candidate
+            .fetch_timeout_seconds
+            .unwrap_or(defaults.wall_time.get().as_secs()),
+        "source.fetch_timeout_seconds",
+        GitFetchTimeout::from_seconds,
+        diagnostics,
+    );
+    let command_output_bytes = validate_u64(
+        candidate
+            .command_output_bytes
+            .unwrap_or(defaults.command_output_bytes.get()),
+        "source.command_output_bytes",
+        GitCommandOutputByteLimit::new,
+        diagnostics,
+    );
+    let mirror_bytes = validate_u64(
+        candidate
+            .mirror_bytes
+            .unwrap_or(defaults.mirror_bytes.get()),
+        "source.mirror_bytes",
+        GitMirrorByteLimit::new,
+        diagnostics,
+    );
+    let file_bytes = validate_u64(
+        candidate.file_bytes.unwrap_or(defaults.file_bytes.get()),
+        "source.file_bytes",
+        GitFileByteLimit::new,
+        diagnostics,
+    );
+    let address_space_bytes = validate_u64(
+        candidate
+            .address_space_bytes
+            .unwrap_or(defaults.address_space_bytes.get()),
+        "source.address_space_bytes",
+        GitAddressSpaceByteLimit::new,
+        diagnostics,
+    );
+    let cpu_seconds = validate_u64(
+        candidate.cpu_seconds.unwrap_or(defaults.cpu_seconds.get()),
+        "source.cpu_seconds",
+        GitCpuSecondLimit::new,
+        diagnostics,
+    );
+    let open_files = validate_u64(
+        candidate.open_files.unwrap_or(defaults.open_files.get()),
+        "source.open_files",
+        GitOpenFileLimit::new,
+        diagnostics,
+    );
+    match (
+        wall_time,
+        command_output_bytes,
+        mirror_bytes,
+        file_bytes,
+        address_space_bytes,
+        cpu_seconds,
+        open_files,
+    ) {
+        (
+            Some(wall_time),
+            Some(command_output_bytes),
+            Some(mirror_bytes),
+            Some(file_bytes),
+            Some(address_space_bytes),
+            Some(cpu_seconds),
+            Some(open_files),
+        ) => Some(GitProcessLimits {
+            wall_time,
+            command_output_bytes,
+            mirror_bytes,
+            file_bytes,
+            address_space_bytes,
+            cpu_seconds,
+            open_files,
+        }),
+        _ => None,
+    }
+}
+
+fn validate_u64<Value>(
+    raw: u64,
+    field: &'static str,
+    constructor: impl FnOnce(u64) -> Option<Value>,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<Value> {
+    let parsed = constructor(raw);
+    if parsed.is_none() {
+        diagnostics.push(host_diagnostic(
+            field,
+            ConfigurationValidationCode::LimitOutOfRange,
+            "configured limit is outside its accepted positive range",
+        ));
+    }
+    parsed
 }
 
 fn validate_content_limits(
@@ -1046,6 +1519,190 @@ mod tests {
     }
 
     #[test]
+    fn source_defaults_to_the_external_checkout_boundary() {
+        let root = tempdir().unwrap();
+        write_config(root.path(), "maincopy.toml", "");
+
+        let config = loader(root.path())
+            .load(Path::new("maincopy.toml"))
+            .unwrap();
+
+        assert_eq!(
+            config.view().source,
+            SourceConfigurationView::ExternalCheckout
+        );
+    }
+
+    #[test]
+    fn managed_git_configuration_keeps_secret_paths_redacted() {
+        let root = tempdir().unwrap();
+        write_config(
+            root.path(),
+            "maincopy.toml",
+            "[paths]\n\
+             state_root = \"state\"\n\
+             [source]\n\
+             mode = \"managed_git\"\n\
+             mirror_root = \"state/git-mirror\"\n\
+             fetch_timeout_seconds = 60\n\
+             command_output_bytes = 1048576\n\
+             mirror_bytes = 1073741824\n\
+             file_bytes = 536870912\n\
+             address_space_bytes = 1073741824\n\
+             cpu_seconds = 60\n\
+             open_files = 128\n\
+             [source.ssh_credentials.deploy]\n\
+             private_key_file = \"secrets/deploy-key\"\n\
+             known_hosts_file = \"secrets/known-hosts\"\n",
+        );
+
+        let config = loader(root.path())
+            .load(Path::new("maincopy.toml"))
+            .unwrap();
+        let SourceConfigurationView::ManagedGit {
+            mirror_root,
+            credentials,
+            limits,
+        } = config.view().source
+        else {
+            panic!("expected managed Git source mode");
+        };
+        assert_eq!(mirror_root.path(), root.path().join("state/git-mirror"));
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(limits.wall_time.get(), Duration::from_secs(60));
+        assert_eq!(limits.command_output_bytes.get(), 1_048_576);
+        let rendered = format!("{credentials:?} {mirror_root:?}");
+        assert!(!rendered.contains("deploy-key"));
+        assert!(!rendered.contains("known-hosts"));
+        assert!(!rendered.contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn managed_git_requires_a_dedicated_state_child_and_named_credential() {
+        let root = tempdir().unwrap();
+        for (index, source) in [
+            "[source]\nmode = \"managed_git\"\nmirror_root = \"elsewhere\"\n",
+            "[source]\nmode = \"managed_git\"\nmirror_root = \"state/git\"\n",
+            "[source]\nmode = \"external_checkout\"\nmirror_root = \"state/git\"\n",
+            "[source]\nmode = \"external_checkout\"\n[source.ssh_credentials.deploy]\nprivate_key_file = \"key\"\nknown_hosts_file = \"hosts\"\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("invalid-source-{index}.toml");
+            write_config(root.path(), &name, source);
+            let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
+            assert!(
+                errors.diagnostics().iter().any(|diagnostic| matches!(
+                    diagnostic.code,
+                    ConfigurationValidationCode::PathInvalid
+                        | ConfigurationValidationCode::SecretReferenceInvalid
+                        | ConfigurationValidationCode::SourceModeConflict
+                )),
+                "unexpected diagnostics: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_git_credentials_cannot_reside_in_the_nix_store() {
+        let root = tempdir().unwrap();
+        write_config(
+            root.path(),
+            "maincopy.toml",
+            "[source]\n\
+             mode = \"managed_git\"\n\
+             mirror_root = \"state/git\"\n\
+             [source.ssh_credentials.deploy]\n\
+             private_key_file = \"/nix/store/example-private-key\"\n\
+             known_hosts_file = \"/var/../nix/store/example-known-hosts\"\n",
+        );
+
+        let errors = loader(root.path())
+            .load(Path::new("maincopy.toml"))
+            .unwrap_err();
+
+        for field in [
+            "source.ssh_credentials.private_key_file",
+            "source.ssh_credentials.known_hosts_file",
+        ] {
+            assert!(errors.diagnostics().iter().any(|diagnostic| {
+                diagnostic.field.as_ref() == field
+                    && diagnostic.code == ConfigurationValidationCode::SecretReferenceInvalid
+            }));
+        }
+        let rendered = format!("{errors:?} {errors}");
+        assert!(!rendered.contains("example-private-key"));
+        assert!(!rendered.contains("example-known-hosts"));
+    }
+
+    #[test]
+    fn managed_git_credential_paths_cannot_reenter_ssh_configuration() {
+        let root = tempdir().unwrap();
+        for (index, field, private_key, known_hosts) in [
+            (
+                0,
+                "source.ssh_credentials.private_key_file",
+                "secrets/deploy%h",
+                "secrets/known-hosts",
+            ),
+            (
+                1,
+                "source.ssh_credentials.known_hosts_file",
+                "secrets/deploy-key",
+                "secrets/known hosts",
+            ),
+            (
+                2,
+                "source.ssh_credentials.private_key_file",
+                "secrets/${HOME}/deploy-key",
+                "secrets/known-hosts",
+            ),
+        ] {
+            let name = format!("unsafe-ssh-path-{index}.toml");
+            write_config(
+                root.path(),
+                &name,
+                &format!(
+                    "[source]\n\
+                     mode = \"managed_git\"\n\
+                     mirror_root = \"state/git\"\n\
+                     [source.ssh_credentials.deploy]\n\
+                     private_key_file = \"{private_key}\"\n\
+                     known_hosts_file = \"{known_hosts}\"\n"
+                ),
+            );
+
+            let errors = loader(root.path()).load(Path::new(&name)).unwrap_err();
+            assert!(errors.diagnostics().iter().any(|diagnostic| {
+                diagnostic.field.as_ref() == field
+                    && diagnostic.code == ConfigurationValidationCode::SecretReferenceInvalid
+            }));
+            let rendered = format!("{errors:?} {errors}");
+            assert!(!rendered.contains(private_key));
+            assert!(!rendered.contains(known_hosts));
+        }
+    }
+
+    #[test]
+    fn every_managed_git_limit_has_a_closed_positive_cap() {
+        assert!(GitFetchTimeout::from_seconds(MAX_GIT_FETCH_TIMEOUT_SECONDS).is_some());
+        assert!(GitFetchTimeout::from_seconds(MAX_GIT_FETCH_TIMEOUT_SECONDS + 1).is_none());
+        assert!(GitCommandOutputByteLimit::new(MAX_GIT_COMMAND_OUTPUT_BYTES).is_some());
+        assert!(GitCommandOutputByteLimit::new(MAX_GIT_COMMAND_OUTPUT_BYTES + 1).is_none());
+        assert!(GitMirrorByteLimit::new(MAX_GIT_MIRROR_BYTES).is_some());
+        assert!(GitMirrorByteLimit::new(MAX_GIT_MIRROR_BYTES + 1).is_none());
+        assert!(GitFileByteLimit::new(MAX_GIT_FILE_BYTES).is_some());
+        assert!(GitFileByteLimit::new(MAX_GIT_FILE_BYTES + 1).is_none());
+        assert!(GitAddressSpaceByteLimit::new(MAX_GIT_ADDRESS_SPACE_BYTES).is_some());
+        assert!(GitAddressSpaceByteLimit::new(MAX_GIT_ADDRESS_SPACE_BYTES + 1).is_none());
+        assert!(GitCpuSecondLimit::new(MAX_GIT_CPU_SECONDS).is_some());
+        assert!(GitCpuSecondLimit::new(MAX_GIT_CPU_SECONDS + 1).is_none());
+        assert!(GitOpenFileLimit::new(MAX_GIT_OPEN_FILES).is_some());
+        assert!(GitOpenFileLimit::new(MAX_GIT_OPEN_FILES + 1).is_none());
+    }
+
+    #[test]
     fn removed_payment_provider_configuration_is_rejected_as_unknown() {
         let root = tempdir().unwrap();
         write_config(
@@ -1136,6 +1793,8 @@ mod tests {
             "[public]\nunknown = true\n",
             "[admin]\nunknown = true\n",
             "[database]\nunknown = true\n",
+            "[source]\nunknown = true\n",
+            "[source.ssh_credentials.deploy]\nprivate_key_file = \"key\"\nknown_hosts_file = \"hosts\"\nunknown = true\n",
             "[lightning]\nprovider = \"lexe\"\nnetwork = \"mainnet\"\ncredentials = { source = \"file\", path = \"secret\" }\nunknown = true\n",
             "[lightning]\nprovider = \"lexe\"\nnetwork = \"mainnet\"\ncredentials = { source = \"file\", path = \"secret\", unknown = true }\n",
         ];

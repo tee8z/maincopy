@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::ArcSwap;
+use maincopy_shared::source::SourceSyncId;
 use markdown_compiler::{
     ContentTreeDigest, DraftStatus, PostAlias, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
     SiteSnapshotDigest,
@@ -22,6 +23,7 @@ use crate::{
             SetTipRecipient, StoredTipRecipientSetting, StoredUserProfile, TipRecipientProjection,
             UpdateProfile,
         },
+        source::store::{ApplyManagedSourceCatalog, SourceStore},
     },
     frontend_assets::FrontendAssetManifest,
     render::{
@@ -177,6 +179,15 @@ enum PublicationCoordinatorCommand {
         source_commit: Option<SourceCommit>,
         respond_to: oneshot::Sender<Result<SiteHead, ContentReloadError>>,
     },
+    ApplyManagedContentCatalog {
+        catalog: Arc<ContentCatalog>,
+        content_digest: ContentTreeDigest,
+        source_commit: SourceCommit,
+        source_store: SourceStore,
+        source_sync_id: SourceSyncId,
+        expected_sync_version: u64,
+        respond_to: oneshot::Sender<Result<SiteHead, ContentReloadError>>,
+    },
     PublishNow {
         command: PublishNow,
         respond_to: oneshot::Sender<Result<PublishedPublication, PublicationActivationError>>,
@@ -270,6 +281,32 @@ impl PublicationCoordinatorHandle {
                 catalog,
                 content_digest,
                 source_commit,
+                respond_to,
+            },
+        )
+        .await
+        .map_err(ContentReloadError::from)?
+    }
+
+    /// Installs one managed candidate and commits its source operation in the
+    /// same database transaction as the private revision index.
+    pub(crate) async fn apply_managed_content_catalog(
+        &self,
+        catalog: Arc<ContentCatalog>,
+        content_digest: ContentTreeDigest,
+        source_commit: SourceCommit,
+        source_store: SourceStore,
+        source_sync_id: SourceSyncId,
+        expected_sync_version: u64,
+    ) -> Result<SiteHead, ContentReloadError> {
+        self.request(
+            |respond_to| PublicationCoordinatorCommand::ApplyManagedContentCatalog {
+                catalog,
+                content_digest,
+                source_commit,
+                source_store,
+                source_sync_id,
+                expected_sync_version,
                 respond_to,
             },
         )
@@ -423,6 +460,31 @@ impl PublicationCoordinatorActor {
                 let result = self
                     .coordinator
                     .apply_content_catalog(catalog, content_digest, source_commit)
+                    .await;
+                if result.is_ok() {
+                    self.publish_read_projection();
+                }
+                let _ = respond_to.send(result);
+            }
+            PublicationCoordinatorCommand::ApplyManagedContentCatalog {
+                catalog,
+                content_digest,
+                source_commit,
+                source_store,
+                source_sync_id,
+                expected_sync_version,
+                respond_to,
+            } => {
+                let result = self
+                    .coordinator
+                    .apply_managed_content_catalog(
+                        catalog,
+                        content_digest,
+                        source_commit,
+                        source_store,
+                        source_sync_id,
+                        expected_sync_version,
+                    )
                     .await;
                 if result.is_ok() {
                     self.publish_read_projection();
@@ -672,6 +734,53 @@ impl PublicationCoordinator {
         source_commit: Option<SourceCommit>,
     ) -> Result<SiteHead, ContentReloadError> {
         let retained_candidate = Arc::clone(&catalog);
+        let catalog = self.retain_pinned_revisions(catalog)?;
+        let observed_posts = observed_post_revisions(&catalog);
+        self.store
+            .index_content_catalog(IndexContentCatalog {
+                observed_at: OffsetDateTime::now_utc(),
+                source_commit: source_commit.clone(),
+                posts: observed_posts,
+            })
+            .await?;
+        self.install_private_catalog(catalog, retained_candidate, content_digest, source_commit);
+        Ok(self.site.clone())
+    }
+
+    async fn apply_managed_content_catalog(
+        &mut self,
+        catalog: Arc<ContentCatalog>,
+        content_digest: ContentTreeDigest,
+        source_commit: SourceCommit,
+        source_store: SourceStore,
+        source_sync_id: SourceSyncId,
+        expected_sync_version: u64,
+    ) -> Result<SiteHead, ContentReloadError> {
+        let retained_candidate = Arc::clone(&catalog);
+        let catalog = self.retain_pinned_revisions(catalog)?;
+        source_store
+            .apply_catalog(ApplyManagedSourceCatalog {
+                source_sync_id,
+                expected_sync_version,
+                source_commit: source_commit.clone(),
+                content_digest: content_digest.clone(),
+                observed_posts: observed_post_revisions(&catalog),
+                completed_at: OffsetDateTime::now_utc(),
+            })
+            .await?;
+        self.install_private_catalog(
+            catalog,
+            retained_candidate,
+            content_digest,
+            Some(source_commit),
+        );
+        Ok(self.site.clone())
+    }
+
+    fn retain_pinned_revisions(
+        &self,
+        catalog: Arc<ContentCatalog>,
+    ) -> Result<Arc<ContentCatalog>, CatalogRetentionError> {
         let mut candidate = catalog.as_ref().clone();
         candidate.retain_revisions_from(&self.catalog, self.ledger.revision_keys())?;
         candidate.retain_revisions_from(
@@ -681,20 +790,20 @@ impl PublicationCoordinator {
                 (view.stable_post_id.clone(), view.pinned_post_digest.clone())
             }),
         )?;
-        let catalog = Arc::new(candidate);
-        let observed_posts = observed_post_revisions(&catalog);
-        self.store
-            .index_content_catalog(IndexContentCatalog {
-                observed_at: OffsetDateTime::now_utc(),
-                source_commit: source_commit.clone(),
-                posts: observed_posts,
-            })
-            .await?;
+        Ok(Arc::new(candidate))
+    }
+
+    fn install_private_catalog(
+        &mut self,
+        catalog: Arc<ContentCatalog>,
+        retained_candidate: Arc<ContentCatalog>,
+        content_digest: ContentTreeDigest,
+        source_commit: Option<SourceCommit>,
+    ) {
         self.catalog = catalog;
         Arc::make_mut(&mut self.candidates).insert(content_digest.clone(), retained_candidate);
         self.content_digest = content_digest;
         self.source_commit = source_commit;
-        Ok(self.site.clone())
     }
 
     /// Publishes one current, publishable catalog revision.

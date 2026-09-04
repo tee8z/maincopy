@@ -7,17 +7,15 @@ authored_at = 2026-08-29T10:15:00-04:00
 description = "How Maincopy separates Git content, private previews, release state, and immutable public snapshots."
 +++
 
-# Hello, Maincopy
-
 Maincopy is a self-hosted publishing engine for one site and one canonical
 domain. Git owns each article body and its authored metadata. Maincopy controls
 when an approved revision becomes public.
 
 This local-alpha article passes through the same compiler, preview, approval,
-and publication path as other content. The sections below separate implemented
-behavior from remaining V1 work.
+and publication path as other content. It is also a compact design document for
+that path.
 
-## One source, two kinds of state
+## One content model, two source modes
 
 Git is the authority for article content. SQLite is the authority for users,
 sessions, release decisions, route ownership, and the current public revision.
@@ -27,9 +25,12 @@ index a new candidate, but it cannot publish that candidate.
 
 ```mermaid
 flowchart LR
-    Source[Operator checkout] --> Compiler[Bounded content compiler]
-    Compiler --> Candidate[Compiled candidate]
-    Candidate --> Preview[Exact private preview]
+    Git[SSH Git repository] -->|Managed Git mode| Sync[Durable source sync]
+    Checkout[Operator checkout] -->|External checkout mode| Candidate[Immutable content candidate]
+    Sync -->|Exact commit and subtree| Candidate
+    Candidate --> Compiler[Bounded validator and compiler]
+    Compiler --> Catalog[Private candidate catalog]
+    Catalog --> Preview[Exact private preview]
     Operator[Authenticated operator] --> Preview
     Preview -->|PreviewDigest| Approval[Explicit approval]
     Approval --> Coordinator[Publication coordinator]
@@ -43,6 +44,67 @@ paths, special files, invalid metadata, and configured limit excesses.
 
 Compilation produces deterministic owned bytes. Public request handlers read
 the active snapshot instead of reopening Markdown or querying the source tree.
+
+The checked-in local alpha uses external checkout mode. A managed installation
+uses a structured SSH endpoint, one branch, and one selected repository
+subdirectory.
+
+## Managed synchronization is durable and read-only
+
+Normal startup, periodic polling, and `Sync now` use one synchronization
+coordinator. Concurrent triggers share one durable operation identifier.
+
+```mermaid
+sequenceDiagram
+    participant T as Startup, poll, or administrator
+    participant S as Sync coordinator
+    participant D as SQLite sync ledger
+    participant G as Git through restricted SSH
+    participant C as Candidate pipeline
+    participant P as Private catalog
+
+    T->>S: Request sync
+    S->>D: Begin or coalesce operation
+    D-->>S: SourceSyncId
+    S-->>T: SourceSyncId
+    S->>G: Fetch configured branch
+    G-->>S: Full commit identity
+    alt Commit already installed
+        opt Startup requires serving state
+            S->>C: Load and compile retained candidate
+        end
+        S->>D: Finish no_change
+    else New commit
+        S->>C: Materialize selected subtree
+        C->>C: Validate and compile
+        S->>D: Install candidate and finish applied
+        S->>P: Swap private catalog
+    end
+```
+
+The SSH helper accepts only the configured target, port, and `git-upload-pack`
+command. Git fetches only the configured branch and follows no tags or
+submodules.
+
+Maincopy shallow-fetches the configured branch head, prunes unreachable Git
+objects, and checks the mirror's byte and entry bounds. It does not commit,
+merge, push, create a remote branch, or edit Markdown.
+
+The mirror is a bounded transport cache, not an archive. Maincopy reads blobs
+from the resolved commit and creates an immutable candidate before compilation;
+those content artifacts and database identities preserve review and release
+continuity after the mirror moves on.
+
+Candidate retention is itself bounded: Maincopy admits at most 4,096 archive
+or staging entries and 1 GiB of archive bytes. Capacity exhaustion rejects a
+new preview without deleting a revision that a current or pending publication
+may still need.
+
+A live unchanged result skips compilation. Startup still compiles the retained
+candidate because the new process needs an in-memory catalog.
+
+A failed fetch or compile keeps the previous candidate and public snapshot.
+An interrupted operation remains diagnosable after restart.
 
 ## Publication is an explicit state change
 
@@ -92,8 +154,11 @@ revision remains public until an approved update activates.
 
 ## Trust boundaries
 
-- The content root contains authored Markdown and metadata. Compilation cannot
-  escape the selected tree.
+- Host configuration owns source mode, process bounds, and named credential
+  file references. Protected host files own key and host-verification bytes.
+- SQLite owns non-secret source settings and the durable sync ledger.
+- The immutable candidate contains authored Markdown and metadata. Compilation
+  cannot escape the selected tree.
 - SQLite contains operational and publication state. Article bodies do not
   become editable database records.
 - The admin origin serves login, previews, and mutations. Authentication and
@@ -136,10 +201,11 @@ The current local alpha provides these foundations:
 - Semantic code classes, supervised Mermaid rendering, and sanitized SVG.
 - A loopback-only HTTPS development gateway with separate origins.
 
-## What remains before V1
+The local fixture intentionally exercises external checkout mode. The managed
+source runbook covers SSH setup, startup synchronization, polling, and
+operator-triggered synchronization.
 
-Managed read-only Git synchronization is not implemented. V1 still needs SSH
-source setup, periodic fetch, `Sync now`, and failure status.
+## What remains before V1
 
 The publication backend has scheduling foundations. The browser still needs the
 complete schedule, edit, cancel, blocked-retry, profile, and account flows.

@@ -11,12 +11,16 @@ mod database;
 pub mod domain;
 pub mod error;
 pub mod frontend_assets;
+mod git_ssh_contract;
+mod git_sync;
 mod identity_bootstrap;
 mod observability;
 mod password_executor;
 mod process_lock;
 pub mod render;
+mod source_bootstrap;
 mod source_provenance;
+mod source_sync;
 pub mod startup;
 pub mod web;
 

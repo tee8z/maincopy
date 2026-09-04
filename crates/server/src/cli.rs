@@ -1,8 +1,19 @@
-use std::path::PathBuf;
+use std::{num::NonZeroU16, path::PathBuf};
+
+#[cfg(test)]
+use std::path::Path;
 
 use clap::{Parser, Subcommand};
+use maincopy_shared::source::{
+    GitBranchName, RepositoryContentSubdirectory, SourceConfigurationVersion, SourcePollInterval,
+    SshCredentialName, SshRemote, SshRemoteHost, SshRemotePort, SshRemoteUser, SshRepositoryPath,
+};
+use uuid::Uuid;
 
-use crate::domain::auth::{CanonicalUsername, NostrPublicKey};
+use crate::domain::{
+    auth::{CanonicalUsername, NostrPublicKey},
+    source::ManagedSourceConfigurationInput,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "maincopyd", version, about = "Run or initialize Maincopy")]
@@ -21,6 +32,50 @@ enum ServerCommand {
     Identity {
         #[command(subcommand)]
         command: IdentityCommand,
+    },
+    /// Perform offline managed-source setup without starting listeners.
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SourceCommand {
+    /// Create or repair the durable non-secret managed-source settings.
+    Configure {
+        #[arg(long, value_name = "USER")]
+        user: SshRemoteUser,
+        #[arg(long, value_name = "HOST")]
+        host: SshRemoteHost,
+        #[arg(long, value_name = "PORT", default_value_t = NonZeroU16::new(22).unwrap())]
+        port: NonZeroU16,
+        #[arg(long, value_name = "PATH")]
+        repository_path: SshRepositoryPath,
+        #[arg(long, value_name = "BRANCH")]
+        branch: GitBranchName,
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        content_subdirectory: RepositoryContentSubdirectory,
+        #[arg(long, value_name = "NAME")]
+        credential_name: SshCredentialName,
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value = "300",
+            value_parser = parse_source_poll_interval
+        )]
+        poll_interval_seconds: SourcePollInterval,
+        /// Require this current source-settings version when repairing settings.
+        #[arg(long, value_name = "POSITIVE_INTEGER", value_parser = parse_source_version)]
+        expected_version: Option<SourceConfigurationVersion>,
+        /// Retry identity for this offline mutation; generated when omitted.
+        #[arg(long, value_name = "UUID")]
+        idempotency_key: Option<Uuid>,
+    },
+    /// Generate a dedicated passwordless Ed25519 deploy key at an explicit path.
+    GenerateKey {
+        #[arg(long, value_name = "PATH")]
+        private_key_file: PathBuf,
     },
 }
 
@@ -58,6 +113,15 @@ pub(crate) enum ServerInvocation {
         config_path: PathBuf,
         credential: BootstrapCredential,
     },
+    ConfigureSource {
+        config_path: PathBuf,
+        request: ManagedSourceConfigurationInput,
+        idempotency_key: Uuid,
+    },
+    GenerateSourceKey {
+        config_path: PathBuf,
+        private_key_file: PathBuf,
+    },
 }
 
 pub(crate) fn parse_process_invocation() -> Result<ServerInvocation, clap::Error> {
@@ -77,8 +141,62 @@ impl From<ServerArguments> for ServerInvocation {
                 config_path: config,
                 credential,
             },
+            Some(ServerCommand::Source {
+                command:
+                    SourceCommand::Configure {
+                        user,
+                        host,
+                        port,
+                        repository_path,
+                        branch,
+                        content_subdirectory,
+                        credential_name,
+                        poll_interval_seconds,
+                        expected_version,
+                        idempotency_key,
+                    },
+            }) => Self::ConfigureSource {
+                config_path: config,
+                request: ManagedSourceConfigurationInput {
+                    remote: SshRemote {
+                        user,
+                        host,
+                        port: SshRemotePort::new(port.get())
+                            .expect("a nonzero CLI port is a valid SSH port"),
+                        repository_path,
+                    },
+                    branch,
+                    content_subdirectory,
+                    credential_name,
+                    poll_interval_seconds,
+                    expected_version,
+                },
+                idempotency_key: idempotency_key.unwrap_or_else(Uuid::new_v4),
+            },
+            Some(ServerCommand::Source {
+                command: SourceCommand::GenerateKey { private_key_file },
+            }) => Self::GenerateSourceKey {
+                config_path: config,
+                private_key_file,
+            },
         }
     }
+}
+
+fn parse_source_poll_interval(value: &str) -> Result<SourcePollInterval, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(SourcePollInterval::from_seconds)
+        .ok_or_else(|| "must be between 30 and 86400 whole seconds".to_owned())
+}
+
+fn parse_source_version(value: &str) -> Result<SourceConfigurationVersion, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(SourceConfigurationVersion::new)
+        .ok_or_else(|| "must be a positive source-configuration version".to_owned())
 }
 
 #[cfg(test)]
@@ -191,6 +309,113 @@ mod tests {
     }
 
     #[test]
+    fn offline_source_configuration_is_fully_typed_and_contains_no_secret() {
+        let arguments = ServerArguments::try_parse_from([
+            "maincopyd",
+            "--config",
+            "host/maincopy.toml",
+            "source",
+            "configure",
+            "--user",
+            "git",
+            "--host",
+            "git.example.test",
+            "--repository-path",
+            "publisher/site.git",
+            "--branch",
+            "main",
+            "--content-subdirectory",
+            "publication",
+            "--credential-name",
+            "deploy",
+            "--poll-interval-seconds",
+            "90",
+            "--expected-version",
+            "2",
+            "--idempotency-key",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        ])
+        .unwrap();
+
+        let ServerInvocation::ConfigureSource {
+            request,
+            idempotency_key,
+            ..
+        } = ServerInvocation::from(arguments)
+        else {
+            panic!("source configure must select the offline source mutation");
+        };
+        assert_eq!(request.remote.user.as_str(), "git");
+        assert_eq!(request.remote.host.as_str(), "git.example.test");
+        assert_eq!(request.remote.port.get(), 22);
+        assert_eq!(
+            request.remote.repository_path.as_str(),
+            "publisher/site.git"
+        );
+        assert_eq!(request.branch.as_str(), "main");
+        assert_eq!(request.content_subdirectory.as_str(), "publication");
+        assert_eq!(request.credential_name.as_str(), "deploy");
+        assert_eq!(request.poll_interval_seconds.seconds(), 90);
+        assert_eq!(request.expected_version.unwrap().get(), 2);
+        assert_eq!(
+            idempotency_key,
+            Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap()
+        );
+
+        for forbidden in [
+            "--private-key",
+            "--private-key-file",
+            "--known-hosts",
+            "--known-hosts-file",
+            "--passphrase",
+            "--password",
+        ] {
+            assert!(
+                ServerArguments::try_parse_from([
+                    "maincopyd",
+                    "--config",
+                    "maincopy.toml",
+                    "source",
+                    "configure",
+                    forbidden,
+                    "secret",
+                ])
+                .is_err(),
+                "source configure accepted {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_source_key_generation_accepts_only_an_explicit_output_path() {
+        let arguments = ServerArguments::try_parse_from([
+            "maincopyd",
+            "--config",
+            "host/maincopy.toml",
+            "source",
+            "generate-key",
+            "--private-key-file",
+            "secrets/maincopy-source",
+        ])
+        .unwrap();
+        assert!(matches!(
+            ServerInvocation::from(arguments),
+            ServerInvocation::GenerateSourceKey { private_key_file, .. }
+                if private_key_file == Path::new("secrets/maincopy-source")
+        ));
+        assert!(
+            ServerArguments::try_parse_from([
+                "maincopyd",
+                "--config",
+                "maincopy.toml",
+                "source",
+                "generate-key",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn per_setting_command_line_overrides_are_rejected() {
         for (flag, value) in [
             ("--content-root", "publication"),
@@ -234,6 +459,7 @@ mod tests {
         assert!(help.contains("identity"));
         for forbidden in [
             "--password",
+            "--passphrase",
             "--content-root",
             "--state-root",
             "--runtime-root",

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use maincopy_shared::publication::PreviewDigest;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -62,6 +62,12 @@ pub(crate) enum Command {
 
     /// List post revisions loaded by the running server.
     Posts,
+
+    /// Inspect and synchronize the configured article source.
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
 
     /// Download one exact private post preview without overwriting a file.
     Preview {
@@ -137,6 +143,60 @@ pub(crate) enum AgentKeyCommand {
     Set,
     /// Delete the protected local agent key.
     Remove,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SourceCommand {
+    /// Report the configured source and its installed state.
+    Status,
+
+    /// Request one durable managed-source synchronization.
+    Sync(SourceSyncArguments),
+}
+
+#[derive(Debug, Args)]
+#[group(skip)]
+pub(crate) struct SourceSyncArguments {
+    /// Wait for the durable synchronization to reach a terminal state.
+    #[arg(
+        long,
+        required_unless_present = "asynchronous",
+        conflicts_with = "asynchronous"
+    )]
+    wait: bool,
+
+    /// Return after the server accepts the durable synchronization.
+    #[arg(long = "async", required_unless_present = "wait")]
+    asynchronous: bool,
+
+    /// Retry identity for this source synchronization; generated when omitted.
+    #[arg(long, value_name = "UUID")]
+    idempotency_key: Option<Uuid>,
+}
+
+impl SourceSyncArguments {
+    pub(crate) fn into_invocation(self) -> SourceSyncInvocation {
+        let disposition = match (self.wait, self.asynchronous) {
+            (true, false) => SourceSyncDisposition::Wait,
+            (false, true) => SourceSyncDisposition::Async,
+            _ => unreachable!("clap enforces exactly one source-sync disposition"),
+        };
+        SourceSyncInvocation {
+            disposition,
+            idempotency_key: self.idempotency_key,
+        }
+    }
+}
+
+pub(crate) struct SourceSyncInvocation {
+    pub(crate) disposition: SourceSyncDisposition,
+    pub(crate) idempotency_key: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceSyncDisposition {
+    Wait,
+    Async,
 }
 
 fn parse_utc_rfc3339(value: &str) -> Result<OffsetDateTime, String> {
@@ -229,6 +289,58 @@ mod tests {
         let arguments = Arguments::try_parse_from(["maincopy", "posts"]).unwrap();
 
         assert!(matches!(arguments.command, Command::Posts));
+    }
+
+    #[test]
+    fn source_status_selects_the_read_only_source_command() {
+        let arguments = Arguments::try_parse_from(["maincopy", "source", "status"]).unwrap();
+
+        assert!(matches!(
+            arguments.command,
+            Command::Source {
+                command: SourceCommand::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn source_sync_requires_exactly_one_wait_disposition() {
+        let key = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let wait = Arguments::try_parse_from([
+            "maincopy",
+            "source",
+            "sync",
+            "--wait",
+            "--idempotency-key",
+            key,
+        ])
+        .unwrap();
+        let Command::Source {
+            command: SourceCommand::Sync(wait),
+        } = wait.command
+        else {
+            panic!("source sync must select the durable source command");
+        };
+        let wait = wait.into_invocation();
+        assert_eq!(wait.disposition, SourceSyncDisposition::Wait);
+        assert_eq!(wait.idempotency_key, Some(Uuid::parse_str(key).unwrap()));
+
+        let asynchronous =
+            Arguments::try_parse_from(["maincopy", "source", "sync", "--async"]).unwrap();
+        let Command::Source {
+            command: SourceCommand::Sync(asynchronous),
+        } = asynchronous.command
+        else {
+            panic!("source sync must select the durable source command");
+        };
+        let asynchronous = asynchronous.into_invocation();
+        assert_eq!(asynchronous.disposition, SourceSyncDisposition::Async);
+        assert!(asynchronous.idempotency_key.is_none());
+
+        assert!(Arguments::try_parse_from(["maincopy", "source", "sync"]).is_err());
+        assert!(
+            Arguments::try_parse_from(["maincopy", "source", "sync", "--wait", "--async"]).is_err()
+        );
     }
 
     #[test]

@@ -68,9 +68,14 @@
             pname = "maincopy-workspace";
             version = "0.1.0";
             cargoExtraArgs = "--locked";
+            nativeBuildInputs = [ pkgs.makeWrapper ];
             strictDeps = true;
+            MAINCOPY_SSH_KEYGEN = "${pkgs.openssh}/bin/ssh-keygen";
             postInstall = ''
               install -Dm444 LICENSE "$out/share/licenses/maincopy/LICENSE"
+              wrapProgram "$out/bin/maincopyd" \
+                --set MAINCOPY_GIT_EXECUTABLE ${pkgs.git}/bin/git \
+                --set MAINCOPY_SSH_EXECUTABLE ${pkgs.openssh}/bin/ssh
             '';
           };
         in
@@ -121,6 +126,7 @@
             test -x ${project.maincopy}/bin/maincopy
             test -x ${project.maincopy}/bin/maincopyd
             test -x ${project.maincopy}/bin/maincopy-mermaid
+            test -x ${project.maincopy}/bin/maincopy-ssh
             test -r ${project.maincopy}/share/licenses/maincopy/LICENSE
             cmp \
               ${project.src}/LICENSE \
@@ -195,11 +201,13 @@
             packages = [
               project.pkgs.caddy
               project.pkgs.curl
+              project.pkgs.git
               project.pkgs.jq
               project.pkgs.litestream
               project.pkgs.mkcert
               project.pkgs.nixfmt-tree
               project.pkgs.nssTools
+              project.pkgs.openssh
               project.pkgs.shellcheck
               project.pkgs.sqlite
               project.pkgs.util-linux

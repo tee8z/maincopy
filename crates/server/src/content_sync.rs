@@ -2,7 +2,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use markdown_compiler::{
     ContentCandidateStore, ContentCandidateStoreError, ContentTreeDigest, ContentTreeLimits,
-    DiscoveredContentTree, discover_content_tree, resolve_content_assets,
+    ContentValidationErrors, DiscoveredContentTree, ResolveContentAssetsError,
+    discover_content_tree, resolve_content_assets,
 };
 use thiserror::Error;
 use tokio::{task::JoinError, time::MissedTickBehavior};
@@ -16,11 +17,78 @@ use crate::{
             ContentReloadError, PublicationCoordinatorHandle, PublicationCoordinatorUnavailable,
         },
     },
-    render::{ContentCatalog, ContentCompiler},
+    render::{CatalogBuildError, ContentCatalog, ContentCompiler},
     source_provenance::{SourceCommitDiscovery, discover_source_commit},
 };
 
 const CONTENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// One immutable content-tree candidate prepared for the publication actor.
+pub(crate) struct PreparedContentCandidate {
+    pub(crate) catalog: Arc<ContentCatalog>,
+    pub(crate) content_digest: ContentTreeDigest,
+    pub(crate) source_commit: Option<SourceCommit>,
+}
+
+/// Validates, compiles, and retains one already stable source candidate.
+///
+/// Managed source synchronization calls this boundary only after it resolves
+/// an exact commit and owns all candidate bytes. External checkout mode keeps
+/// its repeated-observation checks below because that tree can change in place.
+pub(crate) async fn prepare_immutable_candidate(
+    tree: DiscoveredContentTree,
+    source_commit: Option<SourceCommit>,
+    candidate_store: ContentCandidateStore,
+    compiler: ContentCompiler,
+) -> Result<PreparedContentCandidate, ContentCandidatePreparationError> {
+    tokio::task::spawn_blocking(move || {
+        let content_digest = tree.digest();
+        let content = tree
+            .validate()
+            .map_err(ContentCandidatePreparationError::Validate)?;
+        let assets = resolve_content_assets(&tree, &content)
+            .map_err(ContentCandidatePreparationError::ResolveAssets)?;
+        let catalog = compiler
+            .compile(&content, &assets)
+            .map(Arc::new)
+            .map_err(ContentCandidatePreparationError::Compile)?;
+        let retained = candidate_store
+            .retain(&tree)
+            .map_err(ContentCandidatePreparationError::Retention)?;
+        if retained != content_digest {
+            return Err(ContentCandidatePreparationError::RetainedDigestMismatch {
+                expected: content_digest,
+                retained,
+            });
+        }
+        Ok(PreparedContentCandidate {
+            catalog,
+            content_digest,
+            source_commit,
+        })
+    })
+    .await
+    .map_err(ContentCandidatePreparationError::Worker)?
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ContentCandidatePreparationError {
+    #[error("a blocking content-candidate worker failed")]
+    Worker(#[source] JoinError),
+    #[error("the immutable content candidate is invalid")]
+    Validate(#[source] ContentValidationErrors),
+    #[error("the immutable content candidate contains invalid asset references")]
+    ResolveAssets(#[source] ResolveContentAssetsError),
+    #[error("the immutable content candidate could not be compiled")]
+    Compile(#[source] CatalogBuildError),
+    #[error("the immutable content candidate could not be retained durably")]
+    Retention(#[source] ContentCandidateStoreError),
+    #[error("retained content digest {retained} did not match candidate digest {expected}")]
+    RetainedDigestMismatch {
+        expected: ContentTreeDigest,
+        retained: ContentTreeDigest,
+    },
+}
 
 /// Polls the managed content tree and installs stable, valid changes in-process.
 pub(crate) struct ContentSync {
@@ -524,6 +592,51 @@ mod tests {
             .retain_revisions_from(&candidate.catalog, std::iter::once(missing_revision))
             .unwrap_err()
             .into()
+    }
+
+    #[tokio::test]
+    async fn immutable_candidate_preparation_binds_commit_and_retains_exact_tree() {
+        let state = tempfile::tempdir().unwrap();
+        let store =
+            ContentCandidateStore::open(state.path(), ContentTreeLimits::default()).unwrap();
+        let tree = compiled_candidate().observed.tree;
+        let expected_digest = tree.digest();
+        let commit = SourceCommit::parse(&format!("git-sha1:{}", "42".repeat(20))).unwrap();
+
+        let prepared = prepare_immutable_candidate(
+            tree.clone(),
+            Some(commit.clone()),
+            store.clone(),
+            ContentCompiler::discover().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.content_digest, expected_digest);
+        assert_eq!(prepared.source_commit, Some(commit));
+        assert_eq!(store.load(&expected_digest).unwrap(), tree);
+        assert_eq!(prepared.catalog.rendered_posts().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_immutable_candidate_is_not_retained() {
+        let state = tempfile::tempdir().unwrap();
+        let store =
+            ContentCandidateStore::open(state.path(), ContentTreeLimits::default()).unwrap();
+        let mut tree = compiled_candidate().observed.tree;
+        tree.publication.source = "not valid publication TOML".into();
+
+        assert!(matches!(
+            prepare_immutable_candidate(
+                tree,
+                None,
+                store.clone(),
+                ContentCompiler::discover().unwrap(),
+            )
+            .await,
+            Err(ContentCandidatePreparationError::Validate(_))
+        ));
+        assert!(store.load_all().unwrap().is_empty());
     }
 
     #[tokio::test]

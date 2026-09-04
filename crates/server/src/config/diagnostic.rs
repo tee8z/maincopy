@@ -15,6 +15,7 @@ pub enum ConfigurationValidationCode {
     HostTomlInvalid,
     AdminBindInvalid,
     AdminOriginInvalid,
+    SourceModeConflict,
     PathInvalid,
     SecretReferenceInvalid,
     LimitOutOfRange,
@@ -33,6 +34,7 @@ impl ConfigurationValidationCode {
             Self::HostTomlInvalid => "host_toml_invalid",
             Self::AdminBindInvalid => "admin_bind_invalid",
             Self::AdminOriginInvalid => "admin_origin_invalid",
+            Self::SourceModeConflict => "source_mode_conflict",
             Self::PathInvalid => "path_invalid",
             Self::SecretReferenceInvalid => "secret_reference_invalid",
             Self::LimitOutOfRange => "limit_out_of_range",
@@ -195,6 +197,10 @@ mod tests {
             (
                 ConfigurationValidationCode::AdminOriginInvalid,
                 "admin_origin_invalid",
+            ),
+            (
+                ConfigurationValidationCode::SourceModeConflict,
+                "source_mode_conflict",
             ),
             (ConfigurationValidationCode::PathInvalid, "path_invalid"),
             (
