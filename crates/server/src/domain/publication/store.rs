@@ -28,6 +28,30 @@ const MAX_STARTUP_POST_REVISIONS: usize = 10_000;
 const ROUTE_OWNERSHIP_QUERY_BATCH_SIZE: usize = 500;
 const ROUTE_VALIDATION_BATCH_SIZE: i64 = 500;
 
+/// Durable release details shown independently of the current source candidate.
+pub(crate) struct ReleaseView {
+    pub publication_id: Uuid,
+    pub publication: CanonicalPublicationView,
+    pub accepted_preview_digest: PreviewDigest,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ReleaseLoadError {
+    #[error("release query failed")]
+    Database(#[from] sqlx::Error),
+    #[error("stored release failed validation")]
+    InvalidStoredRelease(#[from] StartupSnapshotLoadError),
+}
+
+fn decode_release(row: CanonicalPublicationRow) -> Result<ReleaseView, ReleaseLoadError> {
+    let stored = decode_canonical_publication(row)?;
+    Ok(ReleaseView {
+        publication_id: stored.publication_id,
+        publication: canonical_view(&stored.status).clone(),
+        accepted_preview_digest: stored.accepted_preview_digest,
+    })
+}
+
 /// Publication queries and mutations backed by Maincopy's database.
 #[derive(Clone)]
 pub(crate) struct PublicationStore {
@@ -227,6 +251,40 @@ impl PublicationStore {
         let state = load_replayed_publish_now(&mut transaction, stored).await?;
         transaction.commit().await?;
         Ok(Some(state))
+    }
+
+    /// Loads a durable release, including terminal outcomes, for administration.
+    pub(crate) async fn release(
+        &self,
+        publication_id: Uuid,
+    ) -> Result<Option<ReleaseView>, ReleaseLoadError> {
+        let row = sqlx::query_as::<_, CanonicalPublicationRow>(LOAD_CANONICAL_BY_PUBLICATION_ID)
+            .bind(publication_id.as_bytes().as_slice())
+            .fetch_optional(&self.readers)
+            .await?;
+        row.map(decode_release).transpose()
+    }
+
+    /// Reads one bounded page in stable identifier order.
+    pub(crate) async fn releases(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<Vec<ReleaseView>, ReleaseLoadError> {
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT * FROM (");
+        query.push(LOAD_CANONICAL_PUBLICATIONS).push(")");
+        if let Some(after) = after {
+            query
+                .push(" WHERE publication_id > ")
+                .push_bind(after.as_bytes().to_vec());
+        }
+        query.push(" ORDER BY publication_id LIMIT 101");
+        query
+            .build_query_as::<CanonicalPublicationRow>()
+            .fetch_all(&self.readers)
+            .await?
+            .into_iter()
+            .map(decode_release)
+            .collect()
     }
 
     /// Replays a previously accepted scheduled approval before catalog resolution.

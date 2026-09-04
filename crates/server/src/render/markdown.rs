@@ -1427,6 +1427,8 @@ fn mermaid_error(
 
 #[cfg(test)]
 mod tests {
+    use maincopy_diagram_renderer::client::MermaidRenderError;
+
     use super::*;
     use markdown_compiler::{
         PostCollection, ResolvedContentAssets, ValidatedContent, resolve_content_assets,
@@ -1937,6 +1939,38 @@ mod tests {
         let (removed, _) = candidate("Renderer", &[], "[safe](/safe)\n", false, &[]);
         let error = render_markdown(&removed.posts[0], approved, &assets.site).unwrap_err();
         assert_eq!(error.code, MarkdownRenderErrorCode::AssetOccurrenceUnused);
+    }
+
+    #[test]
+    fn mermaid_timeout_rejects_the_article_with_the_authored_code_block_location() {
+        let (content, assets) = candidate(
+            "Renderer",
+            &[],
+            "```text\nplain\n```\n\n```mermaid\ngraph TD; A-->B\n```\n",
+            false,
+            &[],
+        );
+        let document = &content.posts[0];
+        let error = render_markdown_with_renderer(
+            document,
+            assets.assets_for(document).unwrap(),
+            &assets.site,
+            RendererLimits::production(),
+            &mut |_, _| Err(DiagramRenderError::Renderer(MermaidRenderError::TimedOut)),
+        )
+        .unwrap_err();
+        assert_eq!(error.path, document.path);
+        assert_eq!(error.code, MarkdownRenderErrorCode::MermaidRendererTimedOut);
+        assert_eq!(
+            error.location,
+            MarkdownRenderLocation::CodeBlock {
+                ordinal: CodeBlockOrdinal::new(NonZeroUsize::new(2).unwrap()),
+            }
+        );
+        assert_eq!(
+            error.message.as_ref(),
+            "the Mermaid diagram exceeded the renderer deadline"
+        );
     }
 
     #[test]

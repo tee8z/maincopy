@@ -12,6 +12,7 @@ use markdown_compiler::{
 };
 use maud::html;
 use serde::Deserialize;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
@@ -24,9 +25,10 @@ use crate::{
 };
 
 use super::{
-    PublicPagePath, PublishedPostRevision,
+    CanonicalState, PublicPagePath, PublishedPostRevision,
     activation::{
         PublicationCoordinatorHandle, PublishNow, PublishReviewedNow, ReviewedPublicRevision,
+        Schedule, ScheduleReviewed, ScheduledApprovalOutcome,
     },
     admin::activation_error,
     store::SiteHead,
@@ -79,6 +81,8 @@ struct RawPublicationApproval {
     expected_public_revision: Box<str>,
     idempotency_key: Box<str>,
     accept_preview: Box<str>,
+    #[serde(default)]
+    scheduled_at: Box<str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,7 +96,13 @@ struct RawReviewConfirmation {
     expected_public_revision: Box<str>,
 }
 
+enum PublicationTiming {
+    Now,
+    Scheduled(OffsetDateTime),
+}
+
 struct PublicationApproval {
+    timing: PublicationTiming,
     review: ReviewBinding,
     idempotency_key: Uuid,
 }
@@ -146,7 +156,10 @@ pub(crate) fn router(security_state: &AdminSecurityState) -> Router {
         AdminScope::PreviewRead,
     );
     let confirmation = browser_scoped_router(
-        Router::new().route("/admin/posts/{post_id}/confirm", get(show_confirmation)),
+        Router::new()
+            .route("/admin/posts/{post_id}/confirm", get(show_confirmation))
+            .route("/admin/releases/{release_id}", get(show_release))
+            .route("/admin/releases", get(show_releases)),
         security_state,
         AdminScope::ReleaseManage,
     );
@@ -242,6 +255,9 @@ async fn show_overview(
         html! {
             div class="row" {
                 h1 { "Posts" }
+                @if effective_scopes.contains(&AdminScope::ReleaseManage) {
+                    a class="button" href="/admin/releases" { "Releases" }
+                }
                 form method="post" action="/admin/logout" {
                     input type="hidden" name="_csrf" value=(csrf);
                     button type="submit" { "Sign out" }
@@ -567,7 +583,7 @@ async fn show_confirmation(
                 }
             }
             section class="panel" aria-labelledby="publish-heading" {
-                h2 id="publish-heading" { "Publish now" }
+                h2 id="publish-heading" { "Publish or schedule" }
                 p {
                     "Publication is rejected if the candidate, preview, current public revision, "
                     "or public site head changed after review."
@@ -585,11 +601,18 @@ async fn show_confirmation(
                     input type="hidden" name="expected_public_revision"
                         value=(expected_public_revision);
                     input type="hidden" name="idempotency_key" value=(idempotency_key);
+                    label for="scheduled-at" { "Scheduled publication time (UTC)" }
+                    input id="scheduled-at" type="datetime-local" name="scheduled_at"
+                        aria-describedby="schedule-help";
+                    p id="schedule-help" {
+                        "Leave empty to publish now. To schedule, enter a future date and time in UTC. "
+                        "Scheduling reserves this exact revision; later source changes do not replace it."
+                    }
                     label {
                         input type="checkbox" name="accept_preview" value="accepted" required;
                         " I reviewed and accept this exact preview."
                     }
-                    button type="submit" { "Publish this exact revision" }
+                    button type="submit" { "Approve this exact revision" }
                 }
             }
         },
@@ -631,22 +654,45 @@ async fn publish(
         expected_public_revision,
     } = approval.review;
 
-    let result = coordinator
-        .publish_reviewed_now(PublishReviewedNow {
-            publication: PublishNow {
-                creation_key: approval.idempotency_key,
-                publication_id: Uuid::new_v4(),
-                stable_post_id: post_id.clone(),
-                expected_revision: Some(revision),
-                accepted_preview_digest: preview_digest,
-            },
-            expected_content_digest: content_digest,
-            expected_site,
-            expected_public_revision,
-        })
-        .await;
+    let publication = PublishNow {
+        creation_key: approval.idempotency_key,
+        publication_id: Uuid::new_v4(),
+        stable_post_id: post_id.clone(),
+        expected_revision: Some(revision),
+        accepted_preview_digest: preview_digest,
+    };
+    let result = match approval.timing {
+        PublicationTiming::Now => coordinator
+            .publish_reviewed_now(PublishReviewedNow {
+                publication,
+                expected_content_digest: content_digest,
+                expected_site,
+                expected_public_revision,
+            })
+            .await
+            .map(|published| published.publication_id),
+        PublicationTiming::Scheduled(scheduled_at) => coordinator
+            .schedule_reviewed(ScheduleReviewed {
+                publication: Schedule {
+                    creation_key: publication.creation_key,
+                    publication_id: publication.publication_id,
+                    stable_post_id: publication.stable_post_id,
+                    expected_revision: publication.expected_revision,
+                    accepted_preview_digest: publication.accepted_preview_digest,
+                    scheduled_at,
+                },
+                expected_content_digest: content_digest,
+                expected_site,
+                expected_public_revision,
+            })
+            .await
+            .map(|outcome| match outcome {
+                ScheduledApprovalOutcome::Scheduled(release) => release.publication_id,
+                ScheduledApprovalOutcome::Published(release) => release.publication_id,
+            }),
+    };
     match result {
-        Ok(_) => redirect_to_overview(&post_id),
+        Ok(release_id) => admin_ui::redirect(&format!("/admin/releases/{release_id}")),
         Err(error) => {
             let spec = activation_error(&error);
             if spec.status.is_server_error() {
@@ -659,6 +705,164 @@ async fn publish(
                 request_id,
             )
         }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleasesQuery {
+    after: Option<Uuid>,
+}
+
+async fn show_releases(
+    request_id: RequestId,
+    _browser: RequiredBrowserSession,
+    UiPublication(coordinator): UiPublication,
+    query: Result<Query<ReleasesQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return admin_ui::error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid release page",
+                "The release page cursor was not valid.",
+                request_id,
+            );
+        }
+    };
+    let releases = match coordinator.releases(query.after).await {
+        Ok(releases) => releases,
+        Err(error) => {
+            tracing::error!(%request_id, %error, "admin release list failed");
+            return admin_ui::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Releases unavailable",
+                "The releases could not be loaded. Try this page again.",
+                request_id,
+            );
+        }
+    };
+    admin_ui::page_response(
+        StatusCode::OK,
+        "Releases",
+        PageKind::Authenticated,
+        html! {
+            h1 { "Releases" }
+            a class="button" href="/admin" { "Back to posts" }
+            @if releases.is_empty() {
+                p { "No releases on this page. Review a post to publish or schedule its exact revision." }
+            } @else {
+                table {
+                    thead { tr { th { "Release" } th { "Post" } th { "Status" } th { "Scheduled time (UTC)" } } }
+                    tbody {
+                        @for release in releases.iter().take(100) {
+                            tr {
+                                td { a href=(format!("/admin/releases/{}", release.publication_id)) { (release.publication_id) } }
+                                td { (release.publication.stable_post_id) }
+                                td { (release_status(release.publication.state).0) }
+                                td { (release.publication.scheduled_at) }
+                            }
+                        }
+                    }
+                }
+            }
+            @if releases.len() > 100 {
+                a class="button" href=(format!("/admin/releases?after={}", releases[99].publication_id)) { "Next page" }
+            }
+            @if query.after.is_some() {
+                a class="button" href="/admin/releases" { "First page" }
+            }
+        },
+    )
+}
+
+async fn show_release(
+    request_id: RequestId,
+    _browser: RequiredBrowserSession,
+    UiPublication(coordinator): UiPublication,
+    Path(encoded_release_id): Path<String>,
+) -> Response {
+    let release_id = match Uuid::parse_str(&encoded_release_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return admin_ui::error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid release",
+                "The release identifier was not valid.",
+                request_id,
+            );
+        }
+    };
+    let release = match coordinator.release(release_id).await {
+        Ok(Some(release)) => release,
+        Ok(None) => {
+            return admin_ui::error_response(
+                StatusCode::NOT_FOUND,
+                "Release not found",
+                "No accepted release has this identifier.",
+                request_id,
+            );
+        }
+        Err(error) => {
+            tracing::error!(%request_id, %release_id, %error, "admin release read failed");
+            return admin_ui::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Release unavailable",
+                "The release could not be loaded. Try this page again.",
+                request_id,
+            );
+        }
+    };
+    let view = release.publication;
+    let (status, explanation) = release_status(view.state);
+    admin_ui::page_response(
+        StatusCode::OK,
+        "Release",
+        PageKind::Authenticated,
+        html! {
+            h1 { (status) }
+            p role="status" { (explanation) }
+            section class="panel" {
+                h2 { "Release details" }
+                dl {
+                    dt { "Release identifier" } dd { code { (release.publication_id) } }
+                    dt { "Post" } dd { code { (view.stable_post_id) } }
+                    dt { "Approved revision" } dd { code { (view.pinned_post_digest.as_str()) } }
+                    dt { "Preview digest" } dd { code { (release.accepted_preview_digest.as_str()) } }
+                    dt { "Scheduled time (UTC)" } dd { (view.scheduled_at) }
+                    dt { "Resource version" } dd { (view.version) }
+                }
+                p { "Bookmark this page to check the durable result of this approval." }
+                a class="button" href="/admin" { "Back to posts" }
+            }
+        },
+    )
+}
+
+fn release_status(state: CanonicalState) -> (&'static str, &'static str) {
+    match state {
+        CanonicalState::Scheduled => (
+            "Scheduled",
+            "This exact revision is approved for publication at the time below.",
+        ),
+        CanonicalState::Activating => (
+            "Publishing",
+            "Publication has started. Refresh this page to check its result.",
+        ),
+        CanonicalState::Blocked => (
+            "Blocked",
+            "The approved revision could not be activated. The previous public revision remains available.",
+        ),
+        CanonicalState::Published => (
+            "Published",
+            "Publication completed. This revision is public.",
+        ),
+        CanonicalState::Superseded => (
+            "Superseded",
+            "Publication completed. A later approved revision has replaced this release.",
+        ),
+        CanonicalState::Cancelled => ("Cancelled", "This release will not publish."),
     }
 }
 
@@ -701,10 +905,25 @@ fn parse_approval(raw: RawPublicationApproval) -> Option<PublicationApproval> {
         &raw.expected_site_version,
         &raw.expected_public_revision,
     )?;
+    let timing = parse_publication_timing(&raw.scheduled_at)?;
     Some(PublicationApproval {
+        timing,
         review,
         idempotency_key,
     })
+}
+
+fn parse_publication_timing(value: &str) -> Option<PublicationTiming> {
+    if value.is_empty() {
+        return Some(PublicationTiming::Now);
+    }
+    // The browser control is explicitly labelled UTC and has minute precision.
+    if value.len() != 16 {
+        return None;
+    }
+    let scheduled_at = OffsetDateTime::parse(&format!("{value}:00Z"), &Rfc3339).ok()?;
+    i64::try_from(scheduled_at.unix_timestamp_nanos()).ok()?;
+    Some(PublicationTiming::Scheduled(scheduled_at))
 }
 
 fn parse_review_binding(
@@ -808,10 +1027,6 @@ fn stale_review(request_id: RequestId) -> Response {
     )
 }
 
-fn redirect_to_overview(post_id: &PostId) -> Response {
-    admin_ui::redirect(&format!("/admin?published={post_id}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +1043,7 @@ mod tests {
             expected_public_revision: "unpublished".into(),
             idempotency_key: idempotency_key.into(),
             accept_preview: accept_preview.into(),
+            scheduled_at: "".into(),
         };
         let canonical = "67e55044-10b1-426f-9247-bb680e5fe0c8";
 
@@ -1116,9 +1332,16 @@ mod workflow_tests {
             .await
             .unwrap();
         assert_eq!(published.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            published.headers()[axum::http::header::LOCATION],
-            format!("/admin?published={POST_ID}")
+        let release_path = published.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap();
+        assert!(release_path.starts_with("/admin/releases/"));
+        let release_page = browser_get(&runtime, &browser, release_path).await;
+        assert_eq!(release_page.status(), StatusCode::OK);
+        assert!(
+            response_text(release_page)
+                .await
+                .contains("Publication completed.")
         );
         let first_publication = runtime
             .coordinator
@@ -1243,6 +1466,203 @@ mod workflow_tests {
             "/admin/login"
         );
 
+        runtime.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_schedule_preserves_reviewed_revision_and_recovers_lost_response() {
+        let (initial, digest) = catalog("Scheduled body.");
+        let runtime = workflow_runtime(initial, digest).await;
+        let browser = runtime.auth.password_login(&runtime.router).await;
+        let approval = approval_fixture(&runtime.coordinator, &browser, Uuid::new_v4());
+        let now = OffsetDateTime::now_utc();
+        let scheduled_at = now
+            .replace_second(0)
+            .unwrap()
+            .replace_nanosecond(0)
+            .unwrap()
+            + time::Duration::days(1);
+        let timestamp = scheduled_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let suffix = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("scheduled_at", &timestamp[..16])
+            .finish();
+        let body = Bytes::from(format!(
+            "{}&{suffix}",
+            std::str::from_utf8(&approval.body).unwrap()
+        ));
+        let path = format!("/admin/posts/{POST_ID}/publish");
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &path, body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let release_id =
+            Uuid::parse_str(location.strip_prefix("/admin/releases/").unwrap()).unwrap();
+        assert!(runtime.coordinator.read().ledger.is_empty());
+        assert!(
+            runtime
+                .snapshots
+                .load_full()
+                .post_page(&PostSlug::parse(POST_SLUG).unwrap())
+                .is_none()
+        );
+        let details = response_text(browser_get(&runtime, &browser, &location).await).await;
+        assert!(details.contains("Scheduled"));
+        assert!(details.contains(approval.revision.as_str()));
+        let list = response_text(browser_get(&runtime, &browser, "/admin/releases").await).await;
+        assert!(list.contains(&location));
+
+        for path in [
+            "/admin/releases",
+            location.as_str(),
+            approval.preview_path.as_str(),
+        ] {
+            let response = publication_web::router(runtime.snapshots.clone())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        let private = runtime
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .header(HOST, ADMIN_AUTHORITY)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(private.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            private.headers()[axum::http::header::LOCATION],
+            "/admin/login"
+        );
+
+        let (changed, digest) = catalog("Later unapproved body.");
+        runtime
+            .coordinator
+            .apply_content_catalog(changed, digest, None)
+            .await
+            .unwrap();
+        // Repeat the original form as if the first mutation response was lost.
+        let replay = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &path, body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::SEE_OTHER);
+        assert_eq!(replay.headers()[axum::http::header::LOCATION], location);
+        assert_eq!(runtime.coordinator.releases(None).await.unwrap().len(), 1);
+        let changed_time = Bytes::from(
+            std::str::from_utf8(&body).unwrap().replace(
+                &suffix,
+                &url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair(
+                        "scheduled_at",
+                        &(scheduled_at + time::Duration::days(1))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap()[..16],
+                    )
+                    .finish(),
+            ),
+        );
+        let conflict = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &path, changed_time))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        runtime
+            .coordinator
+            .activate_scheduled(release_id, scheduled_at)
+            .await
+            .unwrap();
+        let page = runtime
+            .snapshots
+            .load_full()
+            .post_page(&PostSlug::parse(POST_SLUG).unwrap())
+            .unwrap();
+        assert!(page.contains("Scheduled body."));
+        assert!(!page.contains("Later unapproved body."));
+        let replay = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &path, body))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::SEE_OTHER);
+        assert_eq!(replay.headers()[axum::http::header::LOCATION], location);
+        let details = response_text(browser_get(&runtime, &browser, &location).await).await;
+        assert!(details.contains("Publication completed."));
+        runtime.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_schedule_rejects_invalid_time_and_stale_review_without_approval() {
+        let (initial, digest) = catalog("Initial body.");
+        let runtime = workflow_runtime(initial, digest).await;
+        let browser = runtime.auth.password_login(&runtime.router).await;
+        let approval = approval_fixture(&runtime.coordinator, &browser, Uuid::new_v4());
+        let path = format!("/admin/posts/{POST_ID}/publish");
+        for (time, expected) in [
+            ("garbage", StatusCode::BAD_REQUEST),
+            ("2000-01-01T12:00", StatusCode::BAD_REQUEST),
+            ("9999-01-01T12:00", StatusCode::BAD_REQUEST),
+        ] {
+            let suffix = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("scheduled_at", time)
+                .finish();
+            let body = Bytes::from(format!(
+                "{}&{suffix}",
+                std::str::from_utf8(&approval.body).unwrap()
+            ));
+            let response = runtime
+                .router
+                .clone()
+                .oneshot(browser.request(Method::POST, &path, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let (changed, digest) = catalog("New body.");
+        runtime
+            .coordinator
+            .apply_content_catalog(changed, digest, None)
+            .await
+            .unwrap();
+        let timestamp = (OffsetDateTime::now_utc() + time::Duration::days(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let suffix = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("scheduled_at", &timestamp[..16])
+            .finish();
+        let body = Bytes::from(format!(
+            "{}&{suffix}",
+            std::str::from_utf8(&approval.body).unwrap()
+        ));
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &path, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert!(runtime.coordinator.releases(None).await.unwrap().is_empty());
+        assert!(runtime.coordinator.read().ledger.is_empty());
         runtime.stop().await;
     }
 

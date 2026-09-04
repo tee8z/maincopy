@@ -39,8 +39,8 @@ use super::store::{
     CompletedPublication, FinishPublication, FinishedPublication, IndexContentCatalog,
     LookupPublishNow, LookupSchedulePublication, ObservedPostRevision,
     PublicationRouteOwnershipError, PublicationStore, PublishNowLookupError, PublishNowState,
-    RecoverablePublicationActivation, SchedulePublication, SchedulePublicationLookupError,
-    SchedulePublicationReplay, ScheduledPublication, SiteHead,
+    RecoverablePublicationActivation, ReleaseLoadError, ReleaseView, SchedulePublication,
+    SchedulePublicationLookupError, SchedulePublicationReplay, ScheduledPublication, SiteHead,
 };
 use super::{PublicLedgerProjection, PublishedPostRevision, SourceCommit};
 
@@ -97,7 +97,7 @@ struct PreparedPublishNow {
     requested: BeginPublishNow,
 }
 
-enum PublishNowReview {
+enum PublicationReview {
     NotRequired,
     Required {
         expected_content_digest: ContentTreeDigest,
@@ -126,6 +126,15 @@ pub(crate) struct Schedule {
     pub expected_revision: Option<PostRevisionDigest>,
     pub accepted_preview_digest: PreviewDigest,
     pub scheduled_at: OffsetDateTime,
+}
+
+/// Browser scheduling approval bound to the candidate and public state shown in review.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScheduleReviewed {
+    pub publication: Schedule,
+    pub expected_content_digest: ContentTreeDigest,
+    pub expected_site: SiteHead,
+    pub expected_public_revision: ReviewedPublicRevision,
 }
 
 /// The durable scheduled approval returned without changing public visibility.
@@ -160,6 +169,7 @@ pub(crate) struct PublicationReadProjection {
 /// Cloneable bounded command capability for the single publication coordinator actor.
 #[derive(Clone)]
 pub(crate) struct PublicationCoordinatorHandle {
+    store: PublicationStore,
     commands: mpsc::Sender<PublicationCoordinatorCommand>,
     read_projection: Arc<ArcSwap<PublicationReadProjection>>,
     scheduler_wakeup: Arc<Notify>,
@@ -200,6 +210,10 @@ enum PublicationCoordinatorCommand {
         command: Schedule,
         respond_to: oneshot::Sender<Result<ScheduledApprovalOutcome, PublicationActivationError>>,
     },
+    ScheduleReviewed {
+        command: ScheduleReviewed,
+        respond_to: oneshot::Sender<Result<ScheduledApprovalOutcome, PublicationActivationError>>,
+    },
     ActivateScheduled {
         publication_id: Uuid,
         now: OffsetDateTime,
@@ -235,6 +249,7 @@ impl PublicationCoordinator {
         let (commands, receiver) = mpsc::channel(queue_capacity);
         (
             PublicationCoordinatorHandle {
+                store: self.store.clone(),
                 commands,
                 read_projection: Arc::clone(&read_projection),
                 scheduler_wakeup,
@@ -261,6 +276,20 @@ impl PublicationCoordinator {
 }
 
 impl PublicationCoordinatorHandle {
+    pub(crate) async fn releases(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<Vec<ReleaseView>, ReleaseLoadError> {
+        self.store.releases(after).await
+    }
+
+    pub(crate) async fn release(
+        &self,
+        publication_id: Uuid,
+    ) -> Result<Option<ReleaseView>, ReleaseLoadError> {
+        self.store.release(publication_id).await
+    }
+
     /// Loads one internally consistent immutable publication read projection.
     pub(crate) fn read(&self) -> Arc<PublicationReadProjection> {
         self.read_projection.load_full()
@@ -348,6 +377,20 @@ impl PublicationCoordinatorHandle {
             command,
             respond_to,
         })
+        .await
+        .map_err(PublicationActivationError::from)?
+    }
+
+    pub(crate) async fn schedule_reviewed(
+        &self,
+        command: ScheduleReviewed,
+    ) -> Result<ScheduledApprovalOutcome, PublicationActivationError> {
+        self.request(
+            |respond_to| PublicationCoordinatorCommand::ScheduleReviewed {
+                command,
+                respond_to,
+            },
+        )
         .await
         .map_err(PublicationActivationError::from)?
     }
@@ -516,6 +559,13 @@ impl PublicationCoordinatorActor {
                 respond_to,
             } => {
                 let result = self.coordinator.schedule(command).await;
+                let _ = respond_to.send(result);
+            }
+            PublicationCoordinatorCommand::ScheduleReviewed {
+                command,
+                respond_to,
+            } => {
+                let result = self.coordinator.schedule_reviewed(command).await;
                 let _ = respond_to.send(result);
             }
             PublicationCoordinatorCommand::ActivateScheduled {
@@ -811,7 +861,7 @@ impl PublicationCoordinator {
         &mut self,
         command: PublishNow,
     ) -> Result<PublishedPublication, PublicationActivationError> {
-        self.publish_now_with_review(command, PublishNowReview::NotRequired)
+        self.publish_now_with_review(command, PublicationReview::NotRequired)
             .await
     }
 
@@ -828,7 +878,7 @@ impl PublicationCoordinator {
         } = command;
         self.publish_now_with_review(
             publication,
-            PublishNowReview::Required {
+            PublicationReview::Required {
                 expected_content_digest,
                 expected_site,
                 expected_public_revision,
@@ -840,22 +890,22 @@ impl PublicationCoordinator {
     async fn publish_now_with_review(
         &mut self,
         command: PublishNow,
-        review: PublishNowReview,
+        review: PublicationReview,
     ) -> Result<PublishedPublication, PublicationActivationError> {
         let Some(replay) = self.publish_now_replay(&command).await? else {
-            self.require_publish_now_review(&command.stable_post_id, &review)?;
+            self.require_publication_review(&command.stable_post_id, &review)?;
             let prepared = self.prepare_publish_now(command)?;
             return self.begin_prepared_publish_now(prepared).await;
         };
         self.resume_publish_now_state(replay).await
     }
 
-    fn require_publish_now_review(
+    fn require_publication_review(
         &self,
         post_id: &PostId,
-        review: &PublishNowReview,
+        review: &PublicationReview,
     ) -> Result<(), PublicationActivationError> {
-        let PublishNowReview::Required {
+        let PublicationReview::Required {
             expected_content_digest,
             expected_site,
             expected_public_revision,
@@ -1071,6 +1121,30 @@ impl PublicationCoordinator {
         &mut self,
         command: Schedule,
     ) -> Result<ScheduledApprovalOutcome, PublicationActivationError> {
+        self.schedule_with_review(command, PublicationReview::NotRequired)
+            .await
+    }
+
+    async fn schedule_reviewed(
+        &mut self,
+        command: ScheduleReviewed,
+    ) -> Result<ScheduledApprovalOutcome, PublicationActivationError> {
+        self.schedule_with_review(
+            command.publication,
+            PublicationReview::Required {
+                expected_content_digest: command.expected_content_digest,
+                expected_site: command.expected_site,
+                expected_public_revision: command.expected_public_revision,
+            },
+        )
+        .await
+    }
+
+    async fn schedule_with_review(
+        &mut self,
+        command: Schedule,
+        review: PublicationReview,
+    ) -> Result<ScheduledApprovalOutcome, PublicationActivationError> {
         let replay = self
             .store
             .schedule_publication_replay(LookupSchedulePublication {
@@ -1104,6 +1178,7 @@ impl PublicationCoordinator {
             };
         }
 
+        self.require_publication_review(&command.stable_post_id, &review)?;
         let now = OffsetDateTime::now_utc();
         if command.scheduled_at <= now {
             return Err(PublicationActivationError::ScheduleNotFuture {

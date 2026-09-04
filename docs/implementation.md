@@ -44,10 +44,10 @@ activation coordinator.
 
 Deliverables:
 
-- List and inspect durable release resources.
+- Expose durable release listing and inspection through the API and CLI.
 - Edit or cancel a scheduled release with an exact resource version.
 - Retry or cancel blocked activation without creating a second release.
-- Add schedule, edit, cancel, and retry flows to the browser interface.
+- Add schedule edit, cancel, and retry flows to the browser interface.
 - Add release inspection, edit, cancel, and retry commands to the CLI.
 - Reject release edits after activation starts.
 - Return stable conflicts for stale resource versions and idempotency reuse.
@@ -241,6 +241,12 @@ Required evidence:
 ## 3. Security and system evidence
 
 ### 3.1 Run the end-to-end matrix
+
+Repair the canonical Nix test environment before release acceptance. The current
+sandbox omits Git and `ssh-keygen` from the test PATH. Its root directory belongs
+to UID 65534, which the credential ancestor policy rejects. Preserve credential
+validation while providing a representative test environment. Local workspace
+tests and CRAP currently pass; the Nix gate remains failing.
 
 Exercise one representative managed Git site through browser, human CLI, and
 agent API workflows.

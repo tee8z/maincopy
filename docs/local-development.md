@@ -133,8 +133,12 @@ semantic `language-rust` class in the rendered HTML.
 ### 4. Publish and verify the article
 
 Choose `Continue to publication confirmation`. On the separate confirmation
-page, select `I reviewed and accept this exact preview`, then choose `Publish
-this exact revision`.
+page, leave `Scheduled publication time (UTC)` empty. Select
+`I reviewed and accept this exact preview`, then choose `Approve this exact
+revision`.
+
+The browser opens the durable release page. Confirm that its status is
+`Published`. Bookmark this page to check the result again.
 
 The confirmation page identifies the candidate revision and exact preview
 digest. If either value changes, open the new preview before publication.
@@ -149,6 +153,21 @@ reviewed article is public.
 On a repeat run, `Published` and `This exact revision is already public` mean
 that no publication action is needed. The public URL already serves the current
 candidate.
+
+To schedule a publication, enter a future UTC date and time on the confirmation
+page before approval. The release page shows `Scheduled`. Scheduling keeps the
+approved revision private until activation. Later source changes do not replace
+that revision.
+
+Choose `Releases` from the post list to inspect accepted approvals. The list
+shows up to 100 releases per page, ordered by release identifier. Choose
+`Next page` to continue. Release details remain available after activation.
+
+If an approval response is lost, submit the original confirmation form again.
+The same approval returns the same release page. Changing its time requires a
+new command; reusing the original form identifier with another time is rejected.
+Schedule editing, cancellation, and blocked-release retry controls remain
+unfinished.
 
 ### 5. Sign out before a state reset
 
