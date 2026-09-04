@@ -71,12 +71,37 @@ pub(crate) struct PublishNow {
     pub accepted_preview_digest: PreviewDigest,
 }
 
+/// One browser approval bound to the complete public state that was reviewed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublishReviewedNow {
+    pub publication: PublishNow,
+    pub expected_content_digest: ContentTreeDigest,
+    pub expected_site: SiteHead,
+    pub expected_public_revision: ReviewedPublicRevision,
+}
+
+/// The exact public revision shown while a browser publication was reviewed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReviewedPublicRevision {
+    Unpublished,
+    Published { revision: PostRevisionDigest },
+}
+
 struct PreparedPublishNow {
     selected: SelectedPost,
     prebuilt: CandidateSnapshot,
     requested_content_digest: ContentTreeDigest,
     accepted_preview_digest: PreviewDigest,
     requested: BeginPublishNow,
+}
+
+enum PublishNowReview {
+    NotRequired,
+    Required {
+        expected_content_digest: ContentTreeDigest,
+        expected_site: SiteHead,
+        expected_public_revision: ReviewedPublicRevision,
+    },
 }
 
 /// The exact durable publication produced by the coordinator.
@@ -154,6 +179,10 @@ enum PublicationCoordinatorCommand {
     },
     PublishNow {
         command: PublishNow,
+        respond_to: oneshot::Sender<Result<PublishedPublication, PublicationActivationError>>,
+    },
+    PublishReviewedNow {
+        command: PublishReviewedNow,
         respond_to: oneshot::Sender<Result<PublishedPublication, PublicationActivationError>>,
     },
     Schedule {
@@ -256,6 +285,20 @@ impl PublicationCoordinatorHandle {
             command,
             respond_to,
         })
+        .await
+        .map_err(PublicationActivationError::from)?
+    }
+
+    pub(crate) async fn publish_reviewed_now(
+        &self,
+        command: PublishReviewedNow,
+    ) -> Result<PublishedPublication, PublicationActivationError> {
+        self.request(
+            |respond_to| PublicationCoordinatorCommand::PublishReviewedNow {
+                command,
+                respond_to,
+            },
+        )
         .await
         .map_err(PublicationActivationError::from)?
     }
@@ -391,6 +434,16 @@ impl PublicationCoordinatorActor {
                 respond_to,
             } => {
                 let result = self.coordinator.publish_now(command).await;
+                if result.is_ok() {
+                    self.publish_read_projection();
+                }
+                let _ = respond_to.send(result);
+            }
+            PublicationCoordinatorCommand::PublishReviewedNow {
+                command,
+                respond_to,
+            } => {
+                let result = self.coordinator.publish_reviewed_now(command).await;
                 if result.is_ok() {
                     self.publish_read_projection();
                 }
@@ -649,11 +702,87 @@ impl PublicationCoordinator {
         &mut self,
         command: PublishNow,
     ) -> Result<PublishedPublication, PublicationActivationError> {
+        self.publish_now_with_review(command, PublishNowReview::NotRequired)
+            .await
+    }
+
+    /// Publishes only if the browser-reviewed candidate and public heads are still current.
+    pub(crate) async fn publish_reviewed_now(
+        &mut self,
+        command: PublishReviewedNow,
+    ) -> Result<PublishedPublication, PublicationActivationError> {
+        let PublishReviewedNow {
+            publication,
+            expected_content_digest,
+            expected_site,
+            expected_public_revision,
+        } = command;
+        self.publish_now_with_review(
+            publication,
+            PublishNowReview::Required {
+                expected_content_digest,
+                expected_site,
+                expected_public_revision,
+            },
+        )
+        .await
+    }
+
+    async fn publish_now_with_review(
+        &mut self,
+        command: PublishNow,
+        review: PublishNowReview,
+    ) -> Result<PublishedPublication, PublicationActivationError> {
         let Some(replay) = self.publish_now_replay(&command).await? else {
+            self.require_publish_now_review(&command.stable_post_id, &review)?;
             let prepared = self.prepare_publish_now(command)?;
             return self.begin_prepared_publish_now(prepared).await;
         };
         self.resume_publish_now_state(replay).await
+    }
+
+    fn require_publish_now_review(
+        &self,
+        post_id: &PostId,
+        review: &PublishNowReview,
+    ) -> Result<(), PublicationActivationError> {
+        let PublishNowReview::Required {
+            expected_content_digest,
+            expected_site,
+            expected_public_revision,
+        } = review
+        else {
+            return Ok(());
+        };
+        if expected_content_digest != &self.content_digest {
+            return Err(PublishReviewError::Content {
+                reviewed: Box::new(expected_content_digest.clone()),
+                current: Box::new(self.content_digest.clone()),
+            }
+            .into());
+        }
+        if expected_site != &self.site {
+            return Err(PublishReviewError::SiteHead {
+                reviewed: Box::new(expected_site.clone()),
+                current: Box::new(self.site.clone()),
+            }
+            .into());
+        }
+        let current_public_revision = match self.ledger.published_post(post_id) {
+            Some(published) => ReviewedPublicRevision::Published {
+                revision: published.revision.clone(),
+            },
+            None => ReviewedPublicRevision::Unpublished,
+        };
+        if expected_public_revision != &current_public_revision {
+            return Err(PublishReviewError::PublicRevision {
+                post_id: post_id.clone(),
+                reviewed: Box::new(expected_public_revision.clone()),
+                current: Box::new(current_public_revision),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     async fn publish_now_replay(
@@ -1544,6 +1673,27 @@ impl Drop for FailClosedGuard {
     }
 }
 
+/// Why a browser-reviewed publication no longer matches coordinator state.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub(crate) enum PublishReviewError {
+    #[error("the content catalog changed after browser publication review")]
+    Content {
+        reviewed: Box<ContentTreeDigest>,
+        current: Box<ContentTreeDigest>,
+    },
+    #[error("the public site head changed after browser publication review")]
+    SiteHead {
+        reviewed: Box<SiteHead>,
+        current: Box<SiteHead>,
+    },
+    #[error("the public revision for post {post_id} changed after browser publication review")]
+    PublicRevision {
+        post_id: PostId,
+        reviewed: Box<ReviewedPublicRevision>,
+        current: Box<ReviewedPublicRevision>,
+    },
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum PublicationActivationError {
     #[error(transparent)]
@@ -1565,6 +1715,8 @@ pub(crate) enum PublicationActivationError {
         accepted: PreviewDigest,
         current: PreviewDigest,
     },
+    #[error(transparent)]
+    StaleReview(#[from] PublishReviewError),
     #[error("post {post_id} is already published")]
     AlreadyPublished { post_id: PostId },
     #[error("scheduled publication {publication_id} is not retained by the coordinator")]
@@ -2217,6 +2369,27 @@ mod tests {
         }
     }
 
+    fn reviewed_publish_command(
+        coordinator: &PublicationCoordinator,
+        publication: PublishNow,
+    ) -> PublishReviewedNow {
+        let expected_public_revision = match coordinator
+            .ledger
+            .published_post(&publication.stable_post_id)
+        {
+            Some(published) => ReviewedPublicRevision::Published {
+                revision: published.revision.clone(),
+            },
+            None => ReviewedPublicRevision::Unpublished,
+        };
+        PublishReviewedNow {
+            publication,
+            expected_content_digest: coordinator.content_digest.clone(),
+            expected_site: coordinator.site.clone(),
+            expected_public_revision,
+        }
+    }
+
     async fn coordinator_fixture(
         catalog: Arc<ContentCatalog>,
     ) -> (
@@ -2392,6 +2565,82 @@ mod tests {
         writer_shutdown.cancel();
         writer_task.await.unwrap();
         drop(writer_keepalive);
+        drop(root);
+    }
+
+    #[tokio::test]
+    async fn actor_rejects_a_review_queued_behind_a_public_head_change() {
+        let catalog = route_ownership_catalog(None, None, "Publication body.");
+        let (root, coordinator, _reader, store, writer_shutdown, writer_task) =
+            coordinator_fixture(catalog).await;
+        let head_change = publish_command_for(
+            &coordinator.catalog,
+            &coordinator.ledger,
+            OTHER_PUBLISHABLE_ID,
+            None,
+            580,
+        );
+        let reviewed = reviewed_publish_command(
+            &coordinator,
+            publish_command_for(
+                &coordinator.catalog,
+                &coordinator.ledger,
+                PUBLISHABLE_ID,
+                None,
+                581,
+            ),
+        );
+        let reviewed_post_id = reviewed.publication.stable_post_id.clone();
+        let changed_post_id = head_change.stable_post_id.clone();
+        let (handle, actor) = coordinator.into_actor(1);
+
+        let change = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.publish_now(head_change).await }
+        });
+        wait_for_full_mailbox(&handle).await;
+        let publication = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.publish_reviewed_now(reviewed).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !publication.is_finished(),
+            "the reviewed publication must remain behind the accepted head change"
+        );
+
+        let actor_cancellation = CancellationToken::new();
+        let actor_task = tokio::spawn(actor.run(actor_cancellation.clone()));
+        change.await.unwrap().unwrap();
+        assert!(matches!(
+            publication.await.unwrap(),
+            Err(PublicationActivationError::StaleReview(
+                PublishReviewError::SiteHead { .. }
+            ))
+        ));
+        let projection = handle.read();
+        assert!(projection.ledger.published_post(&changed_post_id).is_some());
+        assert!(
+            projection
+                .ledger
+                .published_post(&reviewed_post_id)
+                .is_none()
+        );
+        assert!(
+            store
+                .startup_snapshot_state()
+                .await
+                .unwrap()
+                .activating
+                .is_empty()
+        );
+
+        actor_cancellation.cancel();
+        actor_task.await.unwrap().unwrap();
+        drop(handle);
+        writer_shutdown.cancel();
+        writer_task.await.unwrap();
+        drop(store);
         drop(root);
     }
 
@@ -3002,6 +3251,190 @@ mod tests {
         drop(coordinator);
         shutdown.cancel();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reviewed_publish_rejects_each_changed_review_head_before_claiming_intent() {
+        let catalog = catalog();
+        let (root, mut coordinator, _reader, store, shutdown, task) =
+            coordinator_fixture(Arc::clone(&catalog)).await;
+        let reviewed = reviewed_publish_command(&coordinator, command());
+
+        let changed_content_digest = ContentTreeDigest::from_bytes([0x22; 32]);
+        let mut stale_content = reviewed.clone();
+        stale_content.expected_content_digest = changed_content_digest.clone();
+        assert!(matches!(
+            coordinator.publish_reviewed_now(stale_content).await,
+            Err(PublicationActivationError::StaleReview(
+                PublishReviewError::Content { reviewed, current }
+            )) if *reviewed == changed_content_digest && *current == coordinator.content_digest
+        ));
+
+        let mut changed_site = coordinator.site.clone();
+        changed_site.version += 1;
+        let mut stale_site = reviewed.clone();
+        stale_site.expected_site = changed_site.clone();
+        assert!(matches!(
+            coordinator.publish_reviewed_now(stale_site).await,
+            Err(PublicationActivationError::StaleReview(
+                PublishReviewError::SiteHead { reviewed, current }
+            )) if *reviewed == changed_site && *current == coordinator.site
+        ));
+
+        let candidate_revision = catalog
+            .current_post(&reviewed.publication.stable_post_id)
+            .unwrap()
+            .revision
+            .clone();
+        let mut stale_public_revision = reviewed;
+        stale_public_revision.expected_public_revision = ReviewedPublicRevision::Published {
+            revision: candidate_revision.clone(),
+        };
+        assert!(matches!(
+            coordinator
+                .publish_reviewed_now(stale_public_revision)
+                .await,
+            Err(PublicationActivationError::StaleReview(
+                PublishReviewError::PublicRevision {
+                    reviewed,
+                    current,
+                    ..
+                }
+            )) if *reviewed == ReviewedPublicRevision::Published {
+                revision: candidate_revision
+            } && *current == ReviewedPublicRevision::Unpublished
+        ));
+
+        assert!(coordinator.ledger.is_empty());
+        assert!(
+            store
+                .startup_snapshot_state()
+                .await
+                .unwrap()
+                .activating
+                .is_empty()
+        );
+        drop(coordinator);
+        shutdown.cancel();
+        task.await.unwrap();
+        drop(store);
+        drop(root);
+    }
+
+    #[tokio::test]
+    async fn reviewed_update_rejects_an_unseen_public_site_change() {
+        let initial_catalog = route_ownership_catalog(None, None, "Publication body.");
+        let (root, mut coordinator, _reader, store, shutdown, task) =
+            coordinator_fixture(Arc::clone(&initial_catalog)).await;
+        let first = coordinator
+            .publish_now(publish_command_for(
+                &coordinator.catalog,
+                &coordinator.ledger,
+                PUBLISHABLE_ID,
+                None,
+                600,
+            ))
+            .await
+            .unwrap();
+
+        let revised_catalog = route_ownership_catalog(None, None, "Revised publication body.");
+        coordinator
+            .apply_content_catalog(
+                revised_catalog,
+                ContentTreeDigest::from_bytes([0x22; 32]),
+                None,
+            )
+            .await
+            .unwrap();
+        let revised = coordinator
+            .catalog
+            .current_post(&first.stable_post_id)
+            .unwrap()
+            .revision
+            .clone();
+        let update = publish_command_for(
+            &coordinator.catalog,
+            &coordinator.ledger,
+            PUBLISHABLE_ID,
+            Some(revised),
+            601,
+        );
+        let reviewed_update = reviewed_publish_command(&coordinator, update);
+        assert_eq!(
+            reviewed_update.expected_public_revision,
+            ReviewedPublicRevision::Published {
+                revision: first.revision.clone()
+            }
+        );
+
+        coordinator
+            .publish_now(publish_command_for(
+                &coordinator.catalog,
+                &coordinator.ledger,
+                OTHER_PUBLISHABLE_ID,
+                None,
+                602,
+            ))
+            .await
+            .unwrap();
+        assert_ne!(reviewed_update.expected_site, coordinator.site);
+        assert!(matches!(
+            coordinator.publish_reviewed_now(reviewed_update).await,
+            Err(PublicationActivationError::StaleReview(
+                PublishReviewError::SiteHead { .. }
+            ))
+        ));
+        assert_eq!(
+            coordinator
+                .ledger
+                .published_post(&first.stable_post_id)
+                .unwrap()
+                .revision,
+            first.revision
+        );
+
+        drop(coordinator);
+        shutdown.cancel();
+        task.await.unwrap();
+        drop(store);
+        drop(root);
+    }
+
+    #[tokio::test]
+    async fn reviewed_publish_replays_durable_success_before_stale_review_checks() {
+        let catalog = catalog();
+        let (root, mut coordinator, _reader, store, shutdown, task) =
+            coordinator_fixture(catalog).await;
+        let reviewed = reviewed_publish_command(&coordinator, command());
+        let published = coordinator
+            .publish_reviewed_now(reviewed.clone())
+            .await
+            .unwrap();
+        coordinator
+            .apply_content_catalog(
+                revised_catalog(),
+                ContentTreeDigest::from_bytes([0x22; 32]),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(reviewed.expected_content_digest, coordinator.content_digest);
+        assert_ne!(reviewed.expected_site, coordinator.site);
+        assert_ne!(
+            reviewed.expected_public_revision,
+            ReviewedPublicRevision::Published {
+                revision: published.revision.clone()
+            }
+        );
+
+        let replayed = coordinator.publish_reviewed_now(reviewed).await.unwrap();
+        assert_eq!(replayed, published);
+
+        drop(coordinator);
+        shutdown.cancel();
+        task.await.unwrap();
+        drop(store);
+        drop(root);
     }
 
     #[tokio::test]

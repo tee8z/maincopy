@@ -1,7 +1,7 @@
 [site]
 title = "Maincopy Example"
 base_url = "https://maincopy.localhost:8443"
-description = "A minimal publication that demonstrates Maincopy's content contract."
+description = "A technical example that explains Maincopy's publishing architecture."
 
 [author]
 name = "Example Author"

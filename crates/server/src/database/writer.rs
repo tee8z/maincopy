@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::{fs::File, io};
 
 use sqlx::{Connection as _, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use thiserror::Error;
@@ -96,19 +96,30 @@ impl DatabaseWriter {
         } = self;
         readers.close().await;
         let close = connection.close().await;
+        // `fork` briefly duplicates every descriptor before `exec` applies
+        // close-on-exec. Unlock explicitly so such a child cannot extend
+        // ownership beyond the supervised writer's completed shutdown.
+        let unlock = ownership_lock.unlock();
         drop(ownership_lock);
 
-        match (processing, close) {
-            (Err(error), Err(close_source)) => {
-                tracing::error!(
-                    error = %close_source,
-                    "database writer close failed after task failure"
-                );
+        match (processing, close, unlock) {
+            (Err(error), close, unlock) => {
+                if let Err(source) = close {
+                    tracing::error!(error = %source, "database writer close failed after task failure");
+                }
+                if let Err(source) = unlock {
+                    tracing::error!(error = %source, "database ownership unlock failed after task failure");
+                }
                 Err(error)
             }
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(source)) => Err(DatabaseWriterError::Close { source }),
+            (Ok(()), Err(source), unlock) => {
+                if let Err(unlock_source) = unlock {
+                    tracing::error!(error = %unlock_source, "database ownership unlock failed after connection close failure");
+                }
+                Err(DatabaseWriterError::Close { source })
+            }
+            (Ok(()), Ok(()), Err(source)) => Err(DatabaseWriterError::Unlock { source }),
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
         }
     }
 
@@ -575,6 +586,11 @@ pub(crate) enum DatabaseWriterError {
     Close {
         #[source]
         source: sqlx::Error,
+    },
+    #[error("database ownership lock failed to release")]
+    Unlock {
+        #[source]
+        source: io::Error,
     },
 }
 
@@ -1659,6 +1675,23 @@ mod tests {
         .unwrap();
         assert_eq!(key_count, 1);
         reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn writer_shutdown_unlocks_a_descriptor_inherited_before_exec() {
+        let (_root, path, database) = empty_database().await;
+        let inherited_descriptor = database._ownership_lock.try_clone().unwrap();
+        let (handle, writer) = database.into_store(4);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(writer.run(shutdown.clone()));
+
+        stop_writer(shutdown, task).await;
+        drop(handle);
+
+        let reopened = database::bootstrap(configuration(&path)).await.unwrap();
+        reopened.close().await.unwrap();
+        drop(inherited_descriptor);
     }
 
     #[tokio::test]

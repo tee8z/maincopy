@@ -2,7 +2,7 @@
 
 Status: target delivery plan with open design gates
 
-Last updated: 2026-09-03
+Last updated: 2026-09-04
 
 Related documents: [project overview](../README.md), [system design](design.md),
 [local alpha runbook](local-alpha.md), and [engineering style guide](quality.md).
@@ -23,7 +23,7 @@ and quality conventions.
 
 ## Current implementation audit
 
-This table describes the implementation reviewed on 2026-09-03. It is not a
+This table describes the implementation reviewed on 2026-09-04. It is not a
 release claim.
 
 | Area | Reviewed status |
@@ -34,6 +34,7 @@ release claim.
 | Admin discovery, OpenAPI, request IDs, and post reads | Implemented foundation |
 | Users, roles, profiles, password and Nostr login, sessions, CSRF, and NIP-98 authentication | Implemented foundation |
 | Generated first-start owner identity and explicit offline identity bootstrap | Implemented foundation |
+| First useful publication admin UI | Implemented foundation: password sign-in, revision inspection, exact preview review, and immediate initial or update publication |
 | Initial publication, private previews, and local CLI commands | Implemented foundation |
 | Preview-gated update releases and complete release management | In progress |
 | Managed Git synchronization and restricted source bootstrap | Planned |
@@ -43,8 +44,8 @@ release claim.
 | Alias redirects, durable route ownership, snapshot-scoped content assets, and conditional application assets | Implemented |
 | Semantic code language classes, Mermaid rendering, and SVG sanitization | Implemented; Slice 6 gate passed |
 | Favicon and image metadata and page CSP | Planned |
-| Local HTTPS development gateway and explicit CLI CA trust | Implemented development harness; see the [runbook](local-alpha.md) |
-| Production HTTPS admin gateway and admin web interface | Planned; see work packages [4.5](#work-package-45-https-admin-gateway-contract) and [8.2](#work-package-82-nixos-module-and-admin-gateway) |
+| Local HTTPS development gateway with explicit CLI and opt-in browser CA trust | Implemented development harness; see the [runbook](local-alpha.md) |
+| Production HTTPS admin gateway and complete admin web interface | Planned; the local publication UI foundation does not complete work packages [4.5](#work-package-45-https-admin-gateway-contract), [5.4](#work-package-54-canonical-publication-admin-ui), or [8.2](#work-package-82-nixos-module-and-admin-gateway) |
 | Profile-backed static Lightning Address tips | Implemented foundation |
 | Prometheus registry, loopback `/metrics`, and runtime dashboard | Planned |
 | NixOS module, Litestream, artifact backup, and restore | Planned |
@@ -146,7 +147,7 @@ deployments.
 
 ## Delivery rules
 
-- Keep v1 in one Cargo workspace with four Rust crates and one Maincopy daemon.
+- Keep v1 in one Cargo workspace with five Rust crates and one Maincopy daemon.
   The HTTPS gateway and Litestream run as separate processes.
 - Keep each pull request small enough for one focused review.
 - Merge infrastructure only when a product slice needs it.

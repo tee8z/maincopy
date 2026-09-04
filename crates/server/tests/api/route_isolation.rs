@@ -32,6 +32,34 @@ async fn public_router_does_not_expose_admin_routes() {
 }
 
 #[tokio::test]
+async fn public_router_does_not_expose_browser_admin_routes() {
+    const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const ASSET_DIGEST: &str =
+        "admin-b3-v1-4444444444444444444444444444444444444444444444444444444444444444";
+
+    let app = public_router(public_state(Readiness::new(true)));
+    for path in [
+        "/admin".to_owned(),
+        "/admin/login".to_owned(),
+        format!("/admin/posts/{POST_ID}/review"),
+        format!("/admin/posts/{POST_ID}/confirm"),
+        format!("/admin/assets/{ASSET_DIGEST}/site.css"),
+    ] {
+        let response = get(app.clone(), &path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+
+    let publish_path = format!("/admin/posts/{POST_ID}/publish");
+    let response = request(app.clone(), Method::POST, &publish_path).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "{publish_path}");
+
+    for path in ["/admin/login", "/admin/logout"] {
+        let response = request(app.clone(), Method::POST, path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn public_router_does_not_expose_profile_or_tip_recipient_resources() {
     let app = public_router(public_state(Readiness::new(true)));
 

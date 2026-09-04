@@ -8,6 +8,39 @@ the author's domain.
 
 Maincopy is in pre-v1 development. It is not ready for a production deployment.
 
+## Local browser quick start
+
+Run each command from the repository root on Linux:
+
+```console
+nix develop
+scripts/dev-alpha.sh --trust-browser
+```
+
+The launcher installs the development certificate authority (CA) in supported
+browser stores. On fresh state, copy the generated `owner` password from the
+launcher output. Maincopy displays this password only once.
+
+Keep the launcher open. Then complete this workflow:
+
+1. Open `https://admin.localhost:8443/admin/login`.
+2. Sign in as `owner` with the generated password.
+3. Choose `Review exact preview` for `Hello, Maincopy` and compare its current
+   and candidate revisions.
+4. Choose `Open exact rendered preview` and review the complete article.
+5. Choose `Continue to publication confirmation`, select `I reviewed and accept
+   this exact preview`, then choose `Publish this exact revision`.
+6. Open `https://maincopy.localhost:8443/posts/hello-maincopy`.
+7. Before resetting local state, return to the post list and choose `Sign out`.
+
+On a repeat run, `Published` and `This exact revision is already public` mean
+the current candidate needs no publication action. The public URL already
+serves it.
+
+The browser workflow does not edit Markdown. See the
+[local alpha runbook](docs/local-alpha.md) for CA removal, CLI diagnostics, and
+safe state reset.
+
 ## V1 direction
 
 Maincopy v1 targets one site and canonical domain on one server. That site can
@@ -60,7 +93,8 @@ Password and Nostr login, generated first-start owner setup, server-side
 sessions, role scopes, NIP-98 agent proofs, exact previews, and immediate or
 scheduled release foundations are present. The admin backend now uses a
 loopback-only HTTP listener. The CLI connects through the configured HTTPS
-admin origin.
+admin origin. A first publication UI supports password sign-in, revision
+inspection, exact preview review, and immediate initial or update publication.
 
 A checked, loopback-only HTTPS gateway and explicit local CA trust are present
 for the local-alpha workflow. This development harness is not the production
@@ -71,10 +105,10 @@ canonical links, core non-image Open Graph fields, `BlogPosting` JSON-LD,
 authored-alias redirects, durable route ownership, and snapshot-scoped local
 asset delivery are present. Semantic code-language classes, supervised Mermaid
 rendering, and SVG sanitization are also present. Managed Git synchronization,
-favicon and image metadata, page Content Security Policy (CSP), the admin web
-interface, the NixOS module, Litestream wiring, Prometheus metrics and
-dashboard, and complete restore evidence remain incomplete. V1 rejects
-authored subscription and outbound-distribution configuration and stores no
+favicon and image metadata, page Content Security Policy (CSP), the complete
+admin web interface, the NixOS module, Litestream wiring, Prometheus metrics
+and dashboard, and complete restore evidence remain incomplete. V1 rejects
+authored subscription and outbound-distribution configuration. It stores no
 target-job state.
 
 > [!CAUTION]
@@ -134,11 +168,12 @@ not claim that every feature is implemented.
 
 ## Workspace
 
-The root manifest defines one Cargo workspace with four crates:
+The root manifest defines one Cargo workspace with five crates:
 
 ```text
 crates/
 |-- cli/                 # short-lived maincopy operator client
+|-- diagram-renderer/    # isolated Mermaid renderer subprocess
 |-- markdown-compiler/   # content discovery, validation, and identity
 |-- server/              # maincopyd service and application domains
 `-- shared/              # wire contracts shared by the server and CLI
@@ -156,25 +191,9 @@ nix develop
 cargo test --locked --workspace --all-targets --all-features
 ```
 
-Start the local alpha from the repository root:
-
-```console
-scripts/dev-alpha.sh
-```
-
-On fresh state, copy the generated `owner` password from the launcher output.
-Maincopy displays it once and does not use a shared default password. Keep the
-launcher open, then use `scripts/dev-maincopy.sh` from a second Nix shell.
-
-Use explicit browser trust only when the browser demonstration requires it:
-
-```console
-scripts/dev-alpha.sh --trust-browser
-```
-
-Follow the [local alpha runbook](docs/local-alpha.md) for the complete
-login-to-publication flow, trust removal, and safe state reset. Do not expose
-the loopback backends directly.
+Use the browser quick start above for the shortest publication workflow.
+Follow the [local alpha runbook](docs/local-alpha.md) for the equivalent CLI
+workflow, detailed output checks, trust removal, and safe state reset.
 
 Run the Linux continuous integration checks and build with:
 

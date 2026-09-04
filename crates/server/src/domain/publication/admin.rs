@@ -8,7 +8,7 @@ use axum::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
             CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, LINK,
-            X_CONTENT_TYPE_OPTIONS,
+            X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
         },
         request::Parts,
     },
@@ -52,6 +52,9 @@ use super::{
     },
 };
 
+#[cfg(test)]
+use super::activation::PublishReviewError;
+
 const MAX_PUBLICATION_REQUEST_BYTES: usize = 4 * 1024;
 const DEFAULT_POST_PAGE_LIMIT: u16 = 50;
 const MAX_POST_PAGE_LIMIT: u16 = 100;
@@ -59,8 +62,9 @@ const PREVIEW_ASSETS_PATH: &str = "/api/admin/v1/preview-assets";
 const PREVIEW_CACHE_POLICY: HeaderValue = HeaderValue::from_static("private, no-store");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 const PREVIEW_DOCUMENT_SANDBOX: HeaderValue = HeaderValue::from_static(
-    "sandbox; default-src 'none'; script-src 'none'; connect-src 'none'; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; img-src 'self' data:; style-src 'self'; font-src 'self'; media-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; navigate-to 'none'",
+    "sandbox; default-src 'none'; script-src 'none'; connect-src 'none'; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; img-src 'self' data:; style-src 'self'; font-src 'self'; media-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; navigate-to 'none'",
 );
+const SAME_ORIGIN_FRAMING: HeaderValue = HeaderValue::from_static("SAMEORIGIN");
 const ASSET_SANDBOX: HeaderValue = HeaderValue::from_static("sandbox; default-src 'none'");
 const DOWNLOAD_ASSET: HeaderValue =
     HeaderValue::from_static("attachment; filename=\"preview-asset\"");
@@ -605,6 +609,11 @@ async fn get_post_preview(
             response
                 .headers_mut()
                 .insert(CONTENT_SECURITY_POLICY, PREVIEW_DOCUMENT_SANDBOX);
+            // The reviewed document is frameable only by the authenticated
+            // admin origin; its own sandbox still disables scripts and forms.
+            response
+                .headers_mut()
+                .insert(X_FRAME_OPTIONS, SAME_ORIGIN_FRAMING);
             response
         }
         Ok(None) => preview_problem(
@@ -949,7 +958,7 @@ fn idempotency_key(headers: &HeaderMap) -> Result<Uuid, ErrorSpec> {
     }
 }
 
-fn activation_error(error: &PublicationActivationError) -> ErrorSpec {
+pub(super) fn activation_error(error: &PublicationActivationError) -> ErrorSpec {
     match error {
         PublicationActivationError::Coordinator(_) => publication_unavailable(),
         PublicationActivationError::PostNotFound { .. } => ErrorSpec::new(
@@ -975,6 +984,11 @@ fn activation_error(error: &PublicationActivationError) -> ErrorSpec {
             StatusCode::PRECONDITION_FAILED,
             "stale_preview",
             "the current rendered preview does not match preview_digest",
+        ),
+        PublicationActivationError::StaleReview(_) => ErrorSpec::new(
+            StatusCode::PRECONDITION_FAILED,
+            "stale_review",
+            "the reviewed candidate or public site changed before publication",
         ),
         PublicationActivationError::AlreadyPublished { .. } => ErrorSpec::conflict(
             "already_published",
@@ -1773,6 +1787,14 @@ mod tests {
                 },
                 StatusCode::PRECONDITION_FAILED,
                 "stale_preview",
+            ),
+            (
+                PublicationActivationError::StaleReview(PublishReviewError::Content {
+                    reviewed: Box::new(ContentTreeDigest::from_bytes([0x44; 32])),
+                    current: Box::new(ContentTreeDigest::from_bytes([0x55; 32])),
+                }),
+                StatusCode::PRECONDITION_FAILED,
+                "stale_review",
             ),
             (
                 PublicationActivationError::Database(DatabaseMutationError::Admission(

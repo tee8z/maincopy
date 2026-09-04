@@ -7,6 +7,7 @@ mod provenance;
 mod routes;
 pub(crate) mod scheduler;
 pub(crate) mod store;
+pub(crate) mod ui;
 mod visibility;
 pub(crate) mod web;
 

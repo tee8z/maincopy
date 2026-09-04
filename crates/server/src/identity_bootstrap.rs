@@ -1,5 +1,5 @@
 use std::{
-    io::{self, IsTerminal as _, Read as _, Write as _},
+    io::{self, IsTerminal as _, Read as _},
     path::PathBuf,
 };
 

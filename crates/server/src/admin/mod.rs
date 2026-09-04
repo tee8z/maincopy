@@ -6,10 +6,13 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::domain::{
     profile::ProfileStore,
-    publication::{activation::PublicationCoordinatorHandle, admin as publication_admin},
+    publication::{
+        activation::PublicationCoordinatorHandle, admin as publication_admin, ui as publication_ui,
+    },
 };
 use maincopy_shared::auth::AdminScope;
 
+mod assets;
 mod capabilities;
 mod identity;
 mod openapi;
@@ -22,10 +25,13 @@ mod security;
 mod server;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod ui;
 
 use openapi::AdminApi;
-pub(crate) use security::AdminSecurityState;
-pub(crate) use security::{AdminSessionPolicy, BrowserSessionContext};
+pub(crate) use security::{
+    AdminSecurityState, AdminSessionPolicy, BrowserFormSession, BrowserSessionContext,
+    RequiredBrowserSession, browser_scoped_router,
+};
 pub(crate) use server::AdminServer;
 
 /// Builds the protected administration router without binding a listener.
@@ -47,7 +53,7 @@ pub(crate) fn admin_router(security: AdminSecurityState) -> Router {
 }
 
 fn registered_router(security: &AdminSecurityState) -> (Router, utoipa::openapi::OpenApi) {
-    OpenApiRouter::<()>::with_openapi(AdminApi::openapi())
+    let (api, document) = OpenApiRouter::<()>::with_openapi(AdminApi::openapi())
         .routes(scoped_routes(
             routes!(capabilities::get_admin_capabilities),
             security,
@@ -159,7 +165,13 @@ fn registered_router(security: &AdminSecurityState) -> (Router, utoipa::openapi:
             security,
             AdminScope::StatusRead,
         ))
-        .split_for_parts()
+        .split_for_parts();
+    (
+        api.merge(ui::public_router())
+            .merge(ui::protected_router(security))
+            .merge(publication_ui::router(security)),
+        document,
+    )
 }
 
 fn scoped_routes(

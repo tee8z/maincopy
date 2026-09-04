@@ -1,14 +1,14 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration as StdDuration};
 
 use axum::{
-    Extension, Json,
+    Extension, Json, Router,
     body::{Body, to_bytes},
     extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Request},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode, Uri,
         header::{
-            AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, COOKIE, HOST, ORIGIN,
-            REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+            AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST,
+            ORIGIN, REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
         },
         request::Parts,
     },
@@ -63,6 +63,7 @@ use crate::{
 };
 
 const AUTH_REQUEST_BODY_LIMIT: usize = 32 * 1024;
+const BROWSER_FORM_REQUEST_BODY_LIMIT: usize = 32 * 1024;
 const AGENT_REQUEST_BODY_LIMIT: usize = 64 * 1024;
 const ADMIN_REQUEST_CONCURRENCY: usize = 64;
 const ADMIN_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -71,7 +72,7 @@ const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 const DENY_FRAMING: HeaderValue = HeaderValue::from_static("DENY");
 const NO_REFERRER: HeaderValue = HeaderValue::from_static("no-referrer");
 const ADMIN_CSP: HeaderValue = HeaderValue::from_static(
-    "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    "default-src 'self'; script-src 'none'; connect-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
 );
 const RETRY_AFTER_ONE_SECOND: HeaderValue = HeaderValue::from_static("1");
 const MAX_ENCODED_NIP98_EVENT_BYTES: usize = MAX_NIP98_EVENT_BYTES.div_ceil(3) * 4;
@@ -156,9 +157,9 @@ impl BrowserSessionContext {
 ///
 /// Keeping this check in a parts extractor guarantees it runs before the body
 /// extractor while leaving host validation at the outer security boundary.
-struct TrustedLoginRequest {
-    request_id: RequestId,
-    security: AdminSecurityState,
+pub(super) struct TrustedLoginRequest {
+    pub(super) request_id: RequestId,
+    pub(super) security: AdminSecurityState,
 }
 
 impl<S> FromRequestParts<S> for TrustedLoginRequest
@@ -234,10 +235,10 @@ where
 ///
 /// Agent authentication remains valid for shared routes, but routes selecting
 /// this extractor reject agents with the existing browser-only error contract.
-struct RequiredBrowserSession {
-    request_id: RequestId,
-    security: AdminSecurityState,
-    session: StoredBrowserSession,
+pub(crate) struct RequiredBrowserSession {
+    pub(crate) request_id: RequestId,
+    pub(crate) security: AdminSecurityState,
+    pub(crate) session: StoredBrowserSession,
 }
 
 impl<S> FromRequestParts<S> for RequiredBrowserSession
@@ -266,6 +267,43 @@ where
             request_id,
             security,
             session: browser.session.clone(),
+        })
+    }
+}
+
+/// Browser session state suitable for rendering a native mutation form.
+///
+/// The plaintext token comes only from the non-HttpOnly CSRF cookie and is
+/// exposed after its digest is bound to the authenticated server-side session.
+pub(crate) struct BrowserFormSession {
+    pub(crate) session: StoredBrowserSession,
+    pub(crate) csrf_token: CsrfToken,
+}
+
+impl<S> FromRequestParts<S> for BrowserFormSession
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let RequiredBrowserSession {
+            request_id,
+            session,
+            ..
+        } = RequiredBrowserSession::from_request_parts(parts, state).await?;
+        let Ok(Some(encoded_token)) = named_cookie(&parts.headers, CSRF_COOKIE_NAME) else {
+            return Err(auth_problem(AuthErrorSpec::csrf_failed(), request_id));
+        };
+        let Ok(csrf_token) = CsrfToken::parse(encoded_token) else {
+            return Err(auth_problem(AuthErrorSpec::csrf_failed(), request_id));
+        };
+        if !session.csrf_token_digest.ct_eq(&csrf_token.digest()) {
+            return Err(auth_problem(AuthErrorSpec::csrf_failed(), request_id));
+        }
+        Ok(Self {
+            session,
+            csrf_token,
         })
     }
 }
@@ -305,6 +343,51 @@ pub(super) fn scoped_layer(
         ))
 }
 
+/// Applies browser authentication and one scope requirement to HTML routes.
+///
+/// Browser admission runs before authorization so an otherwise capable agent
+/// cannot reach a handler intended to render or process browser-only state.
+pub(crate) fn browser_scoped_router(
+    routes: Router,
+    security: &AdminSecurityState,
+    scope: AdminScope,
+) -> Router {
+    browser_session_router(
+        routes.route_layer(axum::middleware::from_fn_with_state(scope, authorize_scope)),
+        security,
+    )
+}
+
+/// Applies browser authentication without requiring a role-derived scope.
+///
+/// Self-service session revocation must remain available to any valid browser
+/// session, including one whose roles changed after it signed in.
+pub(crate) fn browser_session_router(routes: Router, security: &AdminSecurityState) -> Router {
+    routes
+        .route_layer(axum::middleware::from_fn(require_browser_session))
+        .route_layer(axum::middleware::from_fn_with_state(
+            security.clone(),
+            authenticate,
+        ))
+}
+
+async fn require_browser_session(request: Request, next: Next) -> Response {
+    if request
+        .extensions()
+        .get::<BrowserSessionContext>()
+        .is_none()
+    {
+        return auth_problem(
+            AuthErrorSpec::forbidden(
+                "browser_session_required",
+                "this resource requires a browser session",
+            ),
+            request_id(&request),
+        );
+    }
+    next.run(request).await
+}
+
 pub(super) async fn admit_request(
     axum::extract::State(security): axum::extract::State<AdminSecurityState>,
     request: Request,
@@ -326,7 +409,9 @@ pub(super) async fn harden_private_response(request: Request, next: Next) -> Res
     let headers = response.headers_mut();
     headers.insert(CACHE_CONTROL, PRIVATE_NO_STORE);
     headers.insert(X_CONTENT_TYPE_OPTIONS, NOSNIFF);
-    headers.insert(X_FRAME_OPTIONS, DENY_FRAMING);
+    // Exact previews opt into SAMEORIGIN so the trusted admin review page can
+    // frame them. Every other private response retains the DENY default.
+    headers.entry(X_FRAME_OPTIONS).or_insert(DENY_FRAMING);
     headers.insert(REFERRER_POLICY, NO_REFERRER);
     headers.entry(CONTENT_SECURITY_POLICY).or_insert(ADMIN_CSP);
     response
@@ -383,10 +468,11 @@ async fn authenticate(
             }
         };
 
-        if is_mutation(request.method())
-            && let Err(spec) = validate_cookie_mutation(&request, &security.origin, &session)
-        {
-            return auth_problem(spec, request_id);
+        if is_mutation(request.method()) {
+            request = match validate_cookie_mutation(request, &security.origin, &session).await {
+                Ok(request) => request,
+                Err(spec) => return auth_problem(spec, request_id),
+            };
         }
 
         let principal = AdminPrincipal {
@@ -686,6 +772,14 @@ async fn revoke_current_admin_session(
         session,
     }: RequiredBrowserSession,
 ) -> Response {
+    revoke_browser_session(&security, session, request_id).await
+}
+
+pub(super) async fn revoke_browser_session(
+    security: &AdminSecurityState,
+    session: StoredBrowserSession,
+    request_id: RequestId,
+) -> Response {
     match security
         .store
         .revoke_browser_session(RevokeBrowserSession {
@@ -711,7 +805,7 @@ async fn revoke_current_admin_session(
     }
 }
 
-async fn create_password_session(
+pub(super) async fn create_password_session(
     security: &AdminSecurityState,
     username: &str,
     password: SecretString,
@@ -923,33 +1017,73 @@ fn session_response(session: &StoredBrowserSession) -> AdminSessionResponse {
     }
 }
 
-fn validate_cookie_mutation(
-    request: &Request,
+async fn validate_cookie_mutation(
+    request: Request,
     origin: &AdminOrigin,
     session: &StoredBrowserSession,
-) -> Result<(), AuthErrorSpec> {
+) -> Result<Request, AuthErrorSpec> {
     if !has_exact_origin(request.headers(), origin) {
         return Err(AuthErrorSpec::forbidden(
             "invalid_request_origin",
             "the request origin does not match the configured admin origin",
         ));
     }
-    let encoded = single_optional_header(request.headers(), CSRF_HEADER_NAME)
-        .map_err(|()| AuthErrorSpec::csrf_failed())?
-        .ok_or_else(AuthErrorSpec::csrf_failed)?
-        .to_str()
-        .map_err(|_| AuthErrorSpec::csrf_failed())?;
     let cookie = named_cookie(request.headers(), CSRF_COOKIE_NAME)
         .map_err(|()| AuthErrorSpec::csrf_failed())?
         .ok_or_else(AuthErrorSpec::csrf_failed)?;
-    let header_token = CsrfToken::parse(encoded).map_err(|_| AuthErrorSpec::csrf_failed())?;
     let cookie_token = CsrfToken::parse(cookie).map_err(|_| AuthErrorSpec::csrf_failed())?;
-    let header_digest = header_token.digest();
+    let (request, request_token) = if uses_native_form_csrf(&request) {
+        csrf_token_from_form(request).await?
+    } else {
+        let encoded = single_optional_header(request.headers(), CSRF_HEADER_NAME)
+            .map_err(|()| AuthErrorSpec::csrf_failed())?
+            .ok_or_else(AuthErrorSpec::csrf_failed)?
+            .to_str()
+            .map_err(|_| AuthErrorSpec::csrf_failed())?;
+        let token = CsrfToken::parse(encoded).map_err(|_| AuthErrorSpec::csrf_failed())?;
+        (request, token)
+    };
+    let request_digest = request_token.digest();
     let cookie_digest = cookie_token.digest();
-    if !(header_digest.ct_eq(&cookie_digest) & session.csrf_token_digest.ct_eq(&header_digest)) {
+    if !(request_digest.ct_eq(&cookie_digest) & session.csrf_token_digest.ct_eq(&request_digest)) {
         return Err(AuthErrorSpec::csrf_failed());
     }
-    Ok(())
+    Ok(request)
+}
+
+fn uses_native_form_csrf(request: &Request) -> bool {
+    let path = request.uri().path();
+    let is_browser_ui = path == "/admin" || path.starts_with("/admin/");
+    is_browser_ui
+        && single_optional_header(request.headers(), CONTENT_TYPE)
+            .ok()
+            .flatten()
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media_type| {
+                media_type
+                    .trim()
+                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+            })
+}
+
+async fn csrf_token_from_form(request: Request) -> Result<(Request, CsrfToken), AuthErrorSpec> {
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, BROWSER_FORM_REQUEST_BODY_LIMIT)
+        .await
+        .map_err(|_| AuthErrorSpec::browser_form_too_large())?;
+    let mut encoded_token = None;
+    for (name, value) in url::form_urlencoded::parse(&body) {
+        if name == "_csrf" && encoded_token.replace(value).is_some() {
+            return Err(AuthErrorSpec::csrf_failed());
+        }
+    }
+    let token = encoded_token
+        .ok_or_else(AuthErrorSpec::csrf_failed)
+        .and_then(|encoded| {
+            CsrfToken::parse(encoded.as_ref()).map_err(|_| AuthErrorSpec::csrf_failed())
+        })?;
+    Ok((Request::from_parts(parts, Body::from(body)), token))
 }
 
 fn has_exact_origin(headers: &HeaderMap, origin: &AdminOrigin) -> bool {
@@ -1218,6 +1352,14 @@ impl AuthErrorSpec {
         )
     }
 
+    const fn browser_form_too_large() -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+            "the browser form body exceeds the admin limit",
+        )
+    }
+
     const fn rate_limited() -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -1263,7 +1405,11 @@ impl AuthErrorSpec {
 mod tests {
     use std::path::Path;
 
-    use axum::{Router, body::Bytes, routing::post};
+    use axum::{
+        Router,
+        body::Bytes,
+        routing::{get, post},
+    };
     use k256::schnorr::SigningKey;
     use serde::Serialize;
     use serde_json::json;
@@ -1274,7 +1420,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        admin::{admin_router, origin::AdminOrigin},
+        admin::{admin_router, origin::AdminOrigin, request_id::assign},
         config::{
             DatabaseBusyTimeout, DatabaseConfigurationView, DatabaseReadPoolSize,
             DatabaseWriterQueueCapacity,
@@ -1534,6 +1680,94 @@ mod tests {
             .to_owned()
     }
 
+    struct BrowserCredentials {
+        header: String,
+        session: String,
+        csrf: String,
+    }
+
+    async fn password_browser_credentials(app: &Router) -> BrowserCredentials {
+        let login_body = serde_json::to_vec(&json!({
+            "provider": "password",
+            "username": OWNER_USERNAME,
+            "password": OWNER_PASSWORD,
+        }))
+        .unwrap();
+        let login = request(Method::POST, ADMIN_SESSIONS_PATH, Body::from(login_body));
+        let login = app.clone().oneshot(login).await.unwrap();
+        assert_eq!(login.status(), StatusCode::CREATED);
+        let cookie_pairs = login
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let session = cookie_pairs
+            .iter()
+            .find(|cookie| cookie.starts_with(&format!("{SESSION_COOKIE_NAME}=")))
+            .unwrap()
+            .to_owned();
+        let csrf = cookie_pairs
+            .iter()
+            .find_map(|cookie| cookie.strip_prefix(&format!("{CSRF_COOKIE_NAME}=")))
+            .unwrap()
+            .to_owned();
+        BrowserCredentials {
+            header: cookie_pairs.join("; "),
+            session,
+            csrf,
+        }
+    }
+
+    async fn echo_browser_form(
+        BrowserFormSession {
+            session,
+            csrf_token,
+        }: BrowserFormSession,
+        body: Bytes,
+    ) -> Bytes {
+        assert!(session.csrf_token_digest.ct_eq(&csrf_token.digest()));
+        body
+    }
+
+    async fn accept_browser_form_session(_: BrowserFormSession) -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    fn browser_security_router(security: AdminSecurityState) -> Router {
+        let routes = Router::new()
+            .route("/admin/test/form", post(echo_browser_form))
+            .route("/api/admin/v1/test/form", post(echo_browser_form))
+            .route("/admin/test/form-session", get(accept_browser_form_session));
+        browser_scoped_router(routes, &security, AdminScope::ContentRead)
+            .layer(axum::middleware::from_fn_with_state(
+                security.clone(),
+                validate_host,
+            ))
+            .layer(Extension(security))
+            .layer(axum::middleware::from_fn(assign))
+    }
+
+    fn cookie_mutation_request(cookie: &str, content_type: &str, body: Bytes) -> Request {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/admin/test/form")
+            .header(HOST, ADMIN_AUTHORITY)
+            .header(ORIGIN, ADMIN_ORIGIN)
+            .header(COOKIE, cookie)
+            .header(CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     #[test]
     fn authorization_accepts_only_canonical_padded_or_unpadded_base64() {
         let event = br#"{"id":"test"}"#;
@@ -1627,6 +1861,11 @@ mod tests {
                 "password_verification_busy",
             ),
             (
+                AuthErrorSpec::browser_form_too_large(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_body_too_large",
+            ),
+            (
                 AuthErrorSpec::unavailable(),
                 StatusCode::SERVICE_UNAVAILABLE,
                 "authentication_unavailable",
@@ -1636,6 +1875,229 @@ mod tests {
             assert_eq!(spec.status, status);
             assert_eq!(spec.code, code);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_form_mutations_require_one_bounded_csrf_field_and_restore_exact_bytes() {
+        let harness = SecurityHarness::start().await;
+        let login_app = admin_router(harness.state.clone());
+        let credentials = password_browser_credentials(&login_app).await;
+        let app = browser_security_router(harness.state.clone());
+
+        let valid_body = Bytes::from(format!(
+            "title=Exact+bytes&_csrf={}&path=%2Fadmin%2Fposts",
+            credentials.csrf
+        ));
+        let accepted = app
+            .clone()
+            .oneshot(cookie_mutation_request(
+                &credentials.header,
+                "application/x-www-form-urlencoded; charset=UTF-8",
+                valid_body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(accepted.into_body(), usize::MAX).await.unwrap(),
+            valid_body
+        );
+
+        let mut api_form = cookie_mutation_request(
+            &credentials.header,
+            "application/x-www-form-urlencoded",
+            Bytes::from(format!("_csrf={}", credentials.csrf)),
+        );
+        *api_form.uri_mut() = "/api/admin/v1/test/form".parse().unwrap();
+        let api_form = app.clone().oneshot(api_form).await.unwrap();
+        assert_eq!(api_form.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error_code(api_form).await, "csrf_verification_failed");
+
+        for rejected_body in [
+            Bytes::from_static(b"title=missing"),
+            Bytes::from(format!(
+                "_csrf={}&_csrf={}",
+                credentials.csrf, credentials.csrf
+            )),
+            Bytes::from(format!(
+                "_csrf={}",
+                CsrfToken::generate().unwrap().expose_secret()
+            )),
+        ] {
+            let rejected = app
+                .clone()
+                .oneshot(cookie_mutation_request(
+                    &credentials.header,
+                    "application/x-www-form-urlencoded",
+                    rejected_body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+            assert_eq!(error_code(rejected).await, "csrf_verification_failed");
+        }
+
+        let mut header_cannot_replace_form_field = cookie_mutation_request(
+            &credentials.header,
+            "application/x-www-form-urlencoded",
+            Bytes::from_static(b"title=missing"),
+        );
+        header_cannot_replace_form_field.headers_mut().insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_str(&credentials.csrf).unwrap(),
+        );
+        let header_cannot_replace_form_field = app
+            .clone()
+            .oneshot(header_cannot_replace_form_field)
+            .await
+            .unwrap();
+        assert_eq!(
+            error_code(header_cannot_replace_form_field).await,
+            "csrf_verification_failed"
+        );
+
+        let mut wrong_origin = cookie_mutation_request(
+            &credentials.header,
+            "application/x-www-form-urlencoded",
+            Bytes::from(format!("_csrf={}", credentials.csrf)),
+        );
+        wrong_origin
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("https://evil.example"));
+        let wrong_origin = app.clone().oneshot(wrong_origin).await.unwrap();
+        assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error_code(wrong_origin).await, "invalid_request_origin");
+
+        let json_body = Bytes::from_static(br#"{"exact":"json bytes"}"#);
+        let mut json_request =
+            cookie_mutation_request(&credentials.header, "application/json", json_body.clone());
+        json_request.headers_mut().insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_str(&credentials.csrf).unwrap(),
+        );
+        let json_response = app.clone().oneshot(json_request).await.unwrap();
+        assert_eq!(json_response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(json_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            json_body
+        );
+
+        let json_without_header = cookie_mutation_request(
+            &credentials.header,
+            "application/json",
+            Bytes::from(format!(r#"{{"_csrf":"{}"}}"#, credentials.csrf)),
+        );
+        let json_without_header = app.clone().oneshot(json_without_header).await.unwrap();
+        assert_eq!(json_without_header.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            error_code(json_without_header).await,
+            "csrf_verification_failed"
+        );
+
+        let prefix = format!("_csrf={}&padding=", credentials.csrf);
+        let mut maximum_body = prefix.into_bytes();
+        maximum_body.resize(BROWSER_FORM_REQUEST_BODY_LIMIT, b'x');
+        let maximum_body = Bytes::from(maximum_body);
+        let maximum = app
+            .clone()
+            .oneshot(cookie_mutation_request(
+                &credentials.header,
+                "application/x-www-form-urlencoded",
+                maximum_body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(maximum.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(maximum.into_body(), usize::MAX).await.unwrap(),
+            maximum_body
+        );
+
+        let mut oversized_body = maximum_body.to_vec();
+        oversized_body.push(b'x');
+        let oversized = app
+            .clone()
+            .oneshot(cookie_mutation_request(
+                &credentials.header,
+                "application/x-www-form-urlencoded",
+                Bytes::from(oversized_body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error_code(oversized).await, "request_body_too_large");
+
+        drop(app);
+        drop(login_app);
+        harness.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_routes_reject_agents_and_unbound_csrf_without_capturing_fallbacks() {
+        let harness = SecurityHarness::start().await;
+        let login_app = admin_router(harness.state.clone());
+        let credentials = password_browser_credentials(&login_app).await;
+        let app = browser_security_router(harness.state.clone());
+
+        let accepted = Request::builder()
+            .uri("/admin/test/form-session")
+            .header(HOST, ADMIN_AUTHORITY)
+            .header(COOKIE, &credentials.header)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(accepted).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let unrelated_csrf = CsrfToken::generate().unwrap();
+        let unbound_cookie = format!(
+            "{}; {CSRF_COOKIE_NAME}={}",
+            credentials.session,
+            unrelated_csrf.expose_secret()
+        );
+        let unbound = Request::builder()
+            .uri("/admin/test/form-session")
+            .header(HOST, ADMIN_AUTHORITY)
+            .header(COOKIE, unbound_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let unbound = app.clone().oneshot(unbound).await.unwrap();
+        assert_eq!(unbound.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error_code(unbound).await, "csrf_verification_failed");
+
+        let agent_authorization = agent_authorization(
+            &harness.publisher_agent_key,
+            &Method::GET,
+            "/admin/test/form-session",
+            &[],
+            None,
+        );
+        let agent = Request::builder()
+            .uri("/admin/test/form-session")
+            .header(HOST, ADMIN_AUTHORITY)
+            .header(AUTHORIZATION, agent_authorization)
+            .body(Body::empty())
+            .unwrap();
+        let agent = app.clone().oneshot(agent).await.unwrap();
+        assert_eq!(agent.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error_code(agent).await, "browser_session_required");
+
+        let not_found = Request::builder()
+            .uri("/not-found")
+            .header(HOST, ADMIN_AUTHORITY)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(not_found).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        drop(app);
+        drop(login_app);
+        harness.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1934,7 +2396,7 @@ mod tests {
                 validate_host,
             ))
             .layer(Extension(harness.state.clone()))
-            .layer(axum::middleware::from_fn(super::super::request_id::assign));
+            .layer(axum::middleware::from_fn(assign));
         let profile_request = Request::builder()
             .uri(profile_path)
             .header(HOST, ADMIN_AUTHORITY)
@@ -2010,7 +2472,7 @@ mod tests {
                 harness.state.clone(),
                 validate_host,
             ))
-            .layer(axum::middleware::from_fn(super::super::request_id::assign));
+            .layer(axum::middleware::from_fn(assign));
         let echo_request = Request::builder()
             .method(Method::POST)
             .uri(echo_path)

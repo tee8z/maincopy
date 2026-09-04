@@ -7,7 +7,7 @@ usage() {
 Usage: scripts/dev-alpha.sh [--trust-browser]
 
 Build and run the example Maincopy server plus its loopback HTTPS gateway.
-On first use, the daemon prints a generated owner password exactly once.
+On fresh state, the daemon prints a generated owner password exactly once.
 EOF
 }
 
@@ -87,7 +87,13 @@ for _ in {1..50}; do
       --max-time 0.15 \
       --noproxy '*' \
       --cacert "$root_certificate" \
-      https://maincopy.localhost:8443/health/ready >/dev/null; then
+      https://maincopy.localhost:8443/health/ready >/dev/null && \
+    curl --fail --silent \
+      --connect-timeout 0.1 \
+      --max-time 0.15 \
+      --noproxy '*' \
+      --cacert "$root_certificate" \
+      https://admin.localhost:8443/admin/login >/dev/null; then
     ready=true
     break
   fi
@@ -95,15 +101,15 @@ for _ in {1..50}; do
   kill -0 "$gateway_pid" 2>/dev/null || wait "$gateway_pid"
   sleep 0.1
 done
-$ready || die "the local alpha did not become ready within 15 seconds"
+$ready || die "the local alpha services did not become ready"
 
 cat <<'EOF'
 
 Maincopy local alpha is ready.
 
   Public: https://maincopy.localhost:8443
-  Login:  scripts/dev-maincopy.sh login --username owner
-  Posts:  scripts/dev-maincopy.sh posts
+  Admin:  https://admin.localhost:8443/admin/login
+  CLI:    scripts/dev-maincopy.sh login --username owner
 
 Use Ctrl+C here to stop the server and gateway.
 EOF

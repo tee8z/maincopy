@@ -1,0 +1,143 @@
+:root {
+  color-scheme: light dark;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  background: Canvas;
+  color: CanvasText;
+}
+
+main {
+  width: min(72rem, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 3rem 0 5rem;
+}
+
+header,
+.row,
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+header,
+.row {
+  justify-content: space-between;
+}
+
+header {
+  margin-bottom: 2.5rem;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+a {
+  color: LinkText;
+}
+
+.panel,
+.notice,
+.error {
+  border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+  border-radius: 0.6rem;
+  padding: 1.25rem;
+}
+
+.panel + .panel,
+.notice + .panel,
+.error + .actions {
+  margin-top: 1rem;
+}
+
+.notice {
+  border-color: #17823b;
+}
+
+.error {
+  border-color: #b42318;
+}
+
+.muted,
+dt {
+  color: color-mix(in srgb, CanvasText 65%, Canvas);
+}
+
+dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.35rem 1rem;
+  margin: 1rem 0;
+}
+
+dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+label {
+  display: block;
+  margin-top: 1rem;
+  font-weight: 600;
+}
+
+input[type="text"],
+input[type="password"] {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 34rem;
+  margin-top: 0.35rem;
+  padding: 0.65rem;
+  border: 1px solid color-mix(in srgb, CanvasText 35%, Canvas);
+  border-radius: 0.35rem;
+  font: inherit;
+}
+
+button,
+.button {
+  display: inline-block;
+  margin-top: 1.25rem;
+  padding: 0.65rem 1rem;
+  border: 0;
+  border-radius: 0.35rem;
+  background: ButtonText;
+  color: ButtonFace;
+  font: inherit;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+code {
+  overflow-wrap: anywhere;
+}
+
+.preview-frame {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 60vh;
+  border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+  background: white;
+}
+
+@media (max-width: 42rem) {
+  header,
+  .row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  dl {
+    grid-template-columns: 1fr;
+  }
+}

@@ -871,6 +871,7 @@ The root `Cargo.toml` defines one workspace:
 ```text
 crates/
 |-- cli/                 # maincopy operator client
+|-- diagram-renderer/    # isolated Mermaid renderer subprocess
 |-- markdown-compiler/   # content discovery, validation, and identity
 |-- server/              # maincopyd and application domains
 `-- shared/              # wire contracts and shared defaults

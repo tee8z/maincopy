@@ -23,7 +23,9 @@ use super::{
     assets::AssetDelivery,
 };
 use crate::{
-    frontend_assets::{FrontendAssetName, FrontendBundleDigest, IMMUTABLE_CACHE_CONTROL},
+    frontend_assets::{
+        FrontendAssetManifest, FrontendAssetName, FrontendBundleDigest, IMMUTABLE_CACHE_CONTROL,
+    },
     render::{SiteSnapshot, SiteSnapshotReader, SnapshotAssetPath, SnapshotPublicAsset},
 };
 
@@ -294,21 +296,30 @@ async fn application_asset(
         value: (digest, name),
     }: PublicPath<(String, String)>,
 ) -> Response {
-    let Ok(digest) = FrontendBundleDigest::from_str(&digest) else {
-        return not_found_response(&snapshot, &headers);
-    };
-    let Ok(name) = FrontendAssetName::parse(&name) else {
-        return not_found_response(&snapshot, &headers);
-    };
-    let manifest = snapshot.frontend;
-    let Some(asset) = manifest.lookup(&digest, name) else {
-        return not_found_response(&snapshot, &headers);
-    };
+    application_asset_response(snapshot.frontend, &headers, &digest, &name)
+        .unwrap_or_else(|| not_found_response(&snapshot, &headers))
+}
 
-    let Ok(etag) = HeaderValue::from_str(&asset.etag()) else {
-        return internal_error_response();
+/// Resolves one exact embedded application asset for either HTTP origin.
+///
+/// The caller owns the surrounding origin's authentication and fallback page.
+pub(crate) fn application_asset_response(
+    manifest: &'static FrontendAssetManifest,
+    headers: &HeaderMap,
+    digest: &str,
+    name: &str,
+) -> Option<Response> {
+    let Ok(digest) = FrontendBundleDigest::from_str(digest) else {
+        return None;
     };
-    if if_none_match(&headers, &etag) {
+    let Ok(name) = FrontendAssetName::parse(name) else {
+        return None;
+    };
+    let asset = manifest.lookup(&digest, name)?;
+
+    let etag = HeaderValue::from_str(&asset.etag())
+        .expect("a typed frontend asset digest always forms a valid ETag");
+    if if_none_match(headers, &etag) {
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::NOT_MODIFIED;
         let response_headers = response.headers_mut();
@@ -318,12 +329,11 @@ async fn application_asset(
         );
         response_headers.insert(ETAG, etag);
         response_headers.insert(X_CONTENT_TYPE_OPTIONS, NOSNIFF);
-        return response;
+        return Some(response);
     }
 
-    let Ok(content_length) = HeaderValue::from_str(&asset.bytes.len().to_string()) else {
-        return internal_error_response();
-    };
+    let content_length = HeaderValue::from_str(&asset.bytes.len().to_string())
+        .expect("a bounded embedded asset length always forms a valid header value");
     let mut response = Response::new(Body::from(asset.bytes));
     *response.status_mut() = StatusCode::OK;
     let response_headers = response.headers_mut();
@@ -335,7 +345,7 @@ async fn application_asset(
     );
     response_headers.insert(ETAG, etag);
     response_headers.insert(X_CONTENT_TYPE_OPTIONS, NOSNIFF);
-    response
+    Some(response)
 }
 
 async fn not_found(PublicRequest { snapshot, headers }: PublicRequest) -> Response {

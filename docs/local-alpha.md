@@ -6,8 +6,8 @@ Related: [project overview](../README.md),
 [implementation plan](implementation.md), and [engineering style](quality.md).
 
 Use this runbook to publish the included Markdown post through the local HTTPS
-gateway. The command-line interface (CLI) operates through the administration
-origin. The workflow keeps the public and administration origins separate.
+gateway. Start with the browser walkthrough. Use the command-line interface
+(CLI) reference for detailed checks and diagnostics.
 
 This workflow is for development on one Linux workstation. It is not a
 production deployment or NixOS acceptance test.
@@ -17,7 +17,7 @@ production deployment or NixOS acceptance test.
 | Surface | Address | Purpose |
 | --- | --- | --- |
 | Public HTTPS origin | `https://maincopy.localhost:8443` | Canonical pages, RSS, and public assets |
-| Administration HTTPS origin | `https://admin.localhost:8443` | Authenticated CLI requests |
+| Administration HTTPS origin | `https://admin.localhost:8443` | Authenticated browser and CLI requests |
 | Public loopback upstream | `127.0.0.1:3000` | Caddy access only |
 | Administration loopback upstream | `127.0.0.1:3001` | Caddy access only |
 
@@ -48,12 +48,14 @@ The CA certificate is `rootCA.pem`. The CA private key is `rootCA-key.pem`.
 1. Start from a Linux user session that can run Nix.
 2. Use the same `XDG_DATA_HOME` value in each terminal.
 3. Ensure that ports `3000`, `3001`, and `8443` are available.
-4. Ensure that the user session provides an unlocked Secret Service store.
+4. For the CLI workflow, provide an unlocked Secret Service store.
 
 The human CLI stores its session in Secret Service. It does not use a plaintext
 file, process argument, or environment variable for this credential.
 
-## Start the services
+## Browser walkthrough
+
+### 1. Start the services
 
 Enter the development shell from the repository root:
 
@@ -61,10 +63,10 @@ Enter the development shell from the repository root:
 nix develop
 ```
 
-Start the local alpha without changing browser trust:
+Start the local alpha and install its CA in supported browser stores:
 
 ```console
-scripts/dev-alpha.sh
+scripts/dev-alpha.sh --trust-browser
 ```
 
 The launcher builds `maincopyd`, its isolated `maincopy-mermaid` renderer, and
@@ -76,10 +78,9 @@ instance-unique password from 256 bits of operating-system randomness. It
 prints the username and password once before it persists the identity
 transaction. Copy the password from the launcher output immediately.
 
-Maincopy stores only the Argon2id password hash. It does not have a shared
-default password, and it does not display this password on later starts. The
-current alpha does not force a password change or provide a completed admin UI
-for first-login rotation.
+Maincopy stores only the Argon2id password hash. It has no shared default
+password, and it does not display this password on later starts. The first
+publication UI does not include password rotation.
 
 The credential output appears before the readiness output:
 
@@ -102,22 +103,65 @@ Wait for this output:
 Maincopy local alpha is ready.
 
   Public: https://maincopy.localhost:8443
+  Admin:  https://admin.localhost:8443/admin/login
+  CLI:    scripts/dev-maincopy.sh login --username owner
 ```
 
-## Configure browser trust
+### 2. Sign in and inspect the revision
 
-If a browser must open the public origin without a certificate warning, stop
-the launcher and restart it with explicit trust:
+Open `https://admin.localhost:8443/admin/login`. Sign in as `owner` with the
+generated password.
+
+For `Hello, Maincopy`, choose `Review exact preview`. Compare the current public
+revision with the candidate revision. New state displays `Not published`.
+
+### 3. Review the exact preview
+
+Choose `Open exact rendered preview`. Review the complete article before you
+continue. Confirm that the Rust source is escaped plain code and that the
+Mermaid source appears as a diagram. The CLI diagnostics below verify the
+semantic `language-rust` class in the rendered HTML.
+
+### 4. Publish and verify the article
+
+Choose `Continue to publication confirmation`. On the separate confirmation
+page, select `I reviewed and accept this exact preview`, then choose `Publish
+this exact revision`.
+
+The confirmation page identifies the candidate revision and exact preview
+digest. If either value changes, open the new preview before publication.
+
+New state publishes the initial article. If the live post has a newer candidate,
+the same workflow publishes an update. A reload cannot publish that update by
+itself.
+
+Open `https://maincopy.localhost:8443/posts/hello-maincopy`. Confirm that the
+reviewed article is public.
+
+On a repeat run, `Published` and `This exact revision is already public` mean
+that no publication action is needed. The public URL already serves the current
+candidate.
+
+### 5. Sign out before a state reset
+
+Return to the post list and choose `Sign out` before resetting local state.
+The browser returns to the sign-in page and clears the session and CSRF cookies.
+You may keep the session for an ordinary launcher restart because restarts
+preserve the same state.
+
+## Browser trust lifecycle
+
+The browser walkthrough installs the durable development CA in supported user
+Network Security Services (NSS) browser stores. Restart an open browser if it
+still reports a certificate error.
+
+To run only CLI diagnostics, start the launcher without changing browser trust:
 
 ```console
-scripts/dev-alpha.sh --trust-browser
+scripts/dev-alpha.sh
 ```
 
-This option installs the durable development CA into supported user Network
-Security Services (NSS) browser stores. Restart an open browser after the trust
-change.
-
-To remove that browser trust, first stop the launcher. Then run:
+To remove browser trust, first stop the launcher. Then run:
 
 ```console
 scripts/dev-gateway.sh --untrust-browser
@@ -126,7 +170,18 @@ scripts/dev-gateway.sh --untrust-browser
 This command removes browser trust and keeps the durable CA files. The CLI can
 continue to trust `rootCA.pem` explicitly on later runs.
 
-## Publish the example post
+## CLI reference and diagnostics
+
+This section preserves the detailed API checks for development and fault
+diagnosis. Browser trust is not required because the CLI uses the CA file
+directly.
+
+If the local alpha is not running, start it from the repository root:
+
+```console
+nix develop
+scripts/dev-alpha.sh
+```
 
 Open a second terminal at the repository root. Enter `nix develop` with the
 same `XDG_DATA_HOME` value.
@@ -321,8 +376,10 @@ launcher with `Ctrl+C` after this command succeeds.
 Normal launcher restarts preserve the database and retained content candidates
 in `target/maincopy-dev/state/`. They also preserve published visibility.
 
-To repeat the first-publication workflow, first revoke the human session. Then
-stop the launcher and move the state directory aside:
+To repeat the first-publication workflow, first revoke the human session. In
+the browser, return to the post list and choose `Sign out`. For a CLI session,
+run `scripts/dev-maincopy.sh logout`. Then stop the launcher and move the state
+directory aside:
 
 ```bash
 STATE_ARCHIVE="target/maincopy-dev/state.before-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -334,8 +391,10 @@ The next launcher run creates new state and prints a new owner password once.
 This reset does not replace the durable development CA.
 
 > [!WARNING]
-> Do not reset state before logout. The operating system can retain a session
-> that the new database cannot revoke, which can block a later login.
+> Sign out of the browser and log out of the CLI before resetting state. A
+> successful browser login replaces stale cookies, but an operating-system
+> credential can retain a CLI session for a database that no longer exists and
+> block a later CLI login.
 
 ## Development evidence and production boundary
 
