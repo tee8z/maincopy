@@ -51,6 +51,25 @@ release claim.
 | Outbound distribution, subscription, and email delivery | Deferred until after v1 |
 | Distribution frontmatter and target-job schema | Removed from v1 |
 
+## Immediate execution order
+
+The successful local end-to-end alpha fixes the next implementation order:
+
+| Order | Outcome | Included work |
+| --- | --- | --- |
+| 1 | Make the existing local workflow obvious from a browser and a clean checkout | Land the first useful [publication admin UI](#work-package-54-canonical-publication-admin-ui): sign in, inspect the current and candidate revisions, open the exact rendered preview, and publish the initial article or an update. Simplify the supported CLI path where it reduces operator steps. Put the root-level quick start and preview-to-publish walkthrough ahead of the exhaustive reference documentation, and test every documented command from the repository root. This UI does not edit Markdown. |
+| 2 | Replace manual checkout management with one safe article-source workflow | Implement [managed read-only Git synchronization](#work-package-17-managed-read-only-git-source), including SSH source setup, startup and periodic fetch, `Sync now`, immutable candidate preparation, failure status, and the source-facing admin and CLI surfaces. Keep external local-checkout mode available. Maincopy never commits, merges, or pushes. |
+| 3 | Close the remaining product gaps | Complete the [publication commands, coordinator, API, and full admin surface](#slice-5-canonical-publication-and-required-previews), including update, schedule, cancel, blocked-retry, profile, and account flows. Finish the [public-listener lifecycle](#work-package-24-public-listener-lifecycle), [favicon, image metadata, and CSP](#work-package-25-favicon-asset-output-and-csp), and the [Lightning-tip gate](#slice-7-profile-backed-lightning-address-tips). |
+| 4 | Close the operational V1 release gates | Add [metrics and health](#work-package-35-prometheus-metrics-database-health-and-fault-reporting); complete the production admin gateway and [NixOS, Caddy, Litestream, backup, and restore](#slice-8-litestream-nixos-and-restore); then complete the [security, documentation, system-test, and release evidence](#slice-9-release-hardening). |
+
+Managed Git synchronization is the last large article-source feature. After
+orders 1 and 2, V1 still has the bounded product-finish work in order 3; it is
+not accurate to classify all of that work as deployment. Order 4 is
+observability, deployment, recovery, security review, and release engineering.
+X and Substack handoffs, mailing lists, automatic distribution, Obsidian
+authoring, replaceable themes, typed widgets, and article-supplied JavaScript
+remain post-v1 work.
+
 The `development-gateway` flake check validates the development Caddy
 configuration and launcher scripts. This evidence does not complete the
 production gateway or NixOS work packages.
