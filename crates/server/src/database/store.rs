@@ -14,9 +14,10 @@ use crate::domain::profile::store::{
 };
 use crate::domain::publication::store::{
     BeginPublishNow, BeginPublishNowResult, BeginScheduledActivation,
-    BeginScheduledActivationResult, FinishPublication, FinishPublicationResult,
-    IndexContentCatalog, IndexContentCatalogResult, InstallStartupSnapshot,
-    InstallStartupSnapshotResult, PublicationStore, SchedulePublication, SchedulePublicationResult,
+    BeginScheduledActivationResult, BlockScheduled, ChangeRelease, FinishPublication,
+    FinishPublicationResult, IndexContentCatalog, IndexContentCatalogResult,
+    InstallStartupSnapshot, InstallStartupSnapshotResult, PublicationStore, ReleaseChangeReceipt,
+    ReleaseCommandError, SchedulePublication, SchedulePublicationResult,
 };
 use crate::domain::source::store::{
     AdvanceSourceSync, ApplyManagedSourceCatalog, BeginSourceSync, BeginSourceSyncResult,
@@ -53,6 +54,14 @@ impl DatabaseStore {
 }
 
 pub(crate) enum Mutation {
+    BlockScheduled {
+        command: BlockScheduled,
+        respond_to: oneshot::Sender<Result<(), DatabaseCommandError>>,
+    },
+    ChangeRelease {
+        command: ChangeRelease,
+        respond_to: oneshot::Sender<Result<ReleaseChangeReceipt, ReleaseCommandError>>,
+    },
     RecordAdminAuditFailure {
         command: RecordAdminAuditFailure,
         respond_to: oneshot::Sender<Result<(), AuthCommandError>>,

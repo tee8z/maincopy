@@ -45,13 +45,13 @@ activation coordinator.
 Deliverables:
 
 - Expose durable release listing and inspection through the API and CLI.
-- Edit or cancel a scheduled release with an exact resource version.
-- Retry or cancel blocked activation without creating a second release.
-- Add schedule edit, cancel, and retry flows to the browser interface.
+- Expose schedule edits and cancellation through the API and CLI with exact
+  resource versions.
+- Expose blocked-release retry and cancellation through the API and CLI without
+  creating a second release.
 - Add release inspection, edit, cancel, and retry commands to the CLI.
-- Reject release edits after activation starts.
 - Return stable conflicts for stale resource versions and idempotency reuse.
-- Show a clear terminal result after a lost or repeated request.
+- Expose durable release-operation inspection through the API and CLI.
 
 Required evidence:
 

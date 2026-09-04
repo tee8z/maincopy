@@ -35,14 +35,35 @@ use crate::{
 };
 
 use super::store::{
-    BeginPublishNow, BeginScheduledActivation, BegunPublication, CommandIdempotencyKey,
-    CompletedPublication, FinishPublication, FinishedPublication, IndexContentCatalog,
-    LookupPublishNow, LookupSchedulePublication, ObservedPostRevision,
-    PublicationRouteOwnershipError, PublicationStore, PublishNowLookupError, PublishNowState,
-    RecoverablePublicationActivation, ReleaseLoadError, ReleaseView, SchedulePublication,
+    ActivationIntent, BeginPublishNow, BeginScheduledActivation, BegunPublication, BlockScheduled,
+    ChangeRelease, CommandIdempotencyKey, CompletedPublication, FinishPublication,
+    FinishedPublication, IndexContentCatalog, LookupPublishNow, LookupSchedulePublication,
+    ObservedPostRevision, PublicationRouteOwnershipError, PublicationStore, PublishNowLookupError,
+    PublishNowState, RecoverablePublicationActivation, ReleaseChangeReceipt, ReleaseCommandError,
+    ReleaseLoadError, ReleaseMutationError, ReleaseView, SchedulePublication,
     SchedulePublicationLookupError, SchedulePublicationReplay, ScheduledPublication, SiteHead,
 };
-use super::{PublicLedgerProjection, PublishedPostRevision, SourceCommit};
+use super::{
+    ActivationBlockReason, CanonicalPublicationView, CanonicalState, PublicLedgerProjection,
+    PublishedPostRevision, SourceCommit,
+};
+
+/// One explicit retry of the original approved release.
+#[derive(Clone)]
+pub(crate) struct RetryRelease {
+    pub operation_id: Uuid,
+    pub publication_id: Uuid,
+    pub expected_version: u64,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone)]
+struct ActivationApproval {
+    publication_id: Uuid,
+    publication: CanonicalPublicationView,
+    content_digest: ContentTreeDigest,
+    accepted_preview_digest: PreviewDigest,
+}
 
 /// Owns the serialized transition from durable publication intent to public visibility.
 pub(crate) struct PublicationCoordinator {
@@ -183,6 +204,14 @@ pub(crate) struct PublicationCoordinatorActor {
 }
 
 enum PublicationCoordinatorCommand {
+    RetryRelease {
+        command: RetryRelease,
+        respond_to: oneshot::Sender<Result<ReleaseChangeReceipt, ReleaseTransitionError>>,
+    },
+    ChangeRelease {
+        command: ChangeRelease,
+        respond_to: oneshot::Sender<Result<ReleaseChangeReceipt, ReleaseTransitionError>>,
+    },
     ApplyContentCatalog {
         catalog: Arc<ContentCatalog>,
         content_digest: ContentTreeDigest,
@@ -276,6 +305,37 @@ impl PublicationCoordinator {
 }
 
 impl PublicationCoordinatorHandle {
+    pub(crate) async fn retry_release(
+        &self,
+        command: RetryRelease,
+    ) -> Result<ReleaseChangeReceipt, ReleaseTransitionError> {
+        self.request(|respond_to| PublicationCoordinatorCommand::RetryRelease {
+            command,
+            respond_to,
+        })
+        .await
+        .map_err(ReleaseTransitionError::from)?
+    }
+
+    pub(crate) async fn change_release(
+        &self,
+        command: ChangeRelease,
+    ) -> Result<ReleaseChangeReceipt, ReleaseTransitionError> {
+        self.request(|respond_to| PublicationCoordinatorCommand::ChangeRelease {
+            command,
+            respond_to,
+        })
+        .await
+        .map_err(ReleaseTransitionError::from)?
+    }
+
+    pub(crate) async fn release_operation(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<Option<ReleaseChangeReceipt>, ReleaseLoadError> {
+        self.store.release_operation(operation_id).await
+    }
+
     pub(crate) async fn releases(
         &self,
         after: Option<Uuid>,
@@ -552,6 +612,23 @@ impl PublicationCoordinatorActor {
                 if result.is_ok() {
                     self.publish_read_projection();
                 }
+                let _ = respond_to.send(result);
+            }
+            PublicationCoordinatorCommand::RetryRelease {
+                command,
+                respond_to,
+            } => {
+                let result = self.coordinator.retry_release(command).await;
+                if result.is_ok() {
+                    self.publish_read_projection();
+                }
+                let _ = respond_to.send(result);
+            }
+            PublicationCoordinatorCommand::ChangeRelease {
+                command,
+                respond_to,
+            } => {
+                let result = self.coordinator.change_release(command).await;
                 let _ = respond_to.send(result);
             }
             PublicationCoordinatorCommand::Schedule {
@@ -1267,7 +1344,6 @@ impl PublicationCoordinator {
                 .expected_revision
                 .as_ref()
                 .is_some_and(|expected| expected != &view.pinned_post_digest)
-            || view.scheduled_at != command.scheduled_at.to_offset(time::UtcOffset::UTC)
         {
             return Err(PublicationActivationError::DurableStateMismatch);
         }
@@ -1290,14 +1366,73 @@ impl PublicationCoordinator {
         publication_id: Uuid,
         now: OffsetDateTime,
     ) -> Result<PublishedPublication, PublicationActivationError> {
-        let scheduled = self.scheduled.get(&publication_id).cloned().ok_or(
-            PublicationActivationError::ScheduledPublicationUnavailable { publication_id },
-        )?;
-        let view = scheduled.publication.view();
+        let scheduled = match self.scheduled.get(&publication_id).cloned() {
+            Some(scheduled) => scheduled,
+            None => {
+                if self
+                    .store
+                    .scheduled_release(publication_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(
+                        DatabaseMutationError::Command(DatabaseCommandError::Rejected).into(),
+                    );
+                }
+                return Err(PublicationActivationError::DurableStateMismatch);
+            }
+        };
+        let approval = ActivationApproval {
+            publication_id,
+            publication: scheduled.publication.into_view(),
+            content_digest: scheduled.content_digest,
+            accepted_preview_digest: scheduled.accepted_preview_digest,
+        };
+        let result = self
+            .activate_approval(approval.clone(), ActivationIntent::Due, now)
+            .await;
+        let reason = match &result {
+            Err(PublicationActivationError::ApprovedRevisionUnavailable) => {
+                ActivationBlockReason::RevisionUnavailable
+            }
+            Err(PublicationActivationError::StalePreview { .. }) => {
+                ActivationBlockReason::PreviewChanged
+            }
+            _ => return result,
+        };
+        let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
+        if let Err(error) = self
+            .store
+            .block_scheduled(BlockScheduled {
+                publication_id,
+                expected_version: approval.publication.version,
+                now,
+                reason,
+            })
+            .await
+        {
+            if definitely_unclaimed(&error) {
+                safety.disarm();
+            }
+            return Err(error.into());
+        }
+        self.scheduled.remove(&publication_id);
+        safety.disarm();
+        Err(PublicationActivationError::ReleaseBlocked { publication_id })
+    }
+
+    async fn activate_approval(
+        &mut self,
+        approval: ActivationApproval,
+        intent: ActivationIntent,
+        now: OffsetDateTime,
+    ) -> Result<PublishedPublication, PublicationActivationError> {
+        let publication_id = approval.publication_id;
+        let view = &approval.publication;
         let retained = self
             .candidates
-            .get(&scheduled.content_digest)
-            .ok_or(PublicationActivationError::DurableStateMismatch)?;
+            .get(&approval.content_digest)
+            .ok_or(PublicationActivationError::ApprovedRevisionUnavailable)?;
         let mut catalog = retained.as_ref().clone();
         catalog
             .retain_revisions_from(&self.catalog, self.ledger.revision_keys())
@@ -1312,7 +1447,7 @@ impl PublicationCoordinator {
                 self.tip_recipient.as_ref(),
                 &selected,
             )?,
-            &scheduled.accepted_preview_digest,
+            &approval.accepted_preview_digest,
         )?;
         self.ensure_routes_available(&selected).await?;
         let prebuilt = build_candidate(
@@ -1330,6 +1465,7 @@ impl PublicationCoordinator {
         let begun = match self
             .store
             .begin_scheduled_activation(BeginScheduledActivation {
+                intent,
                 publication_id,
                 expected_publication_version: view.version,
                 expected_site: self.site.clone(),
@@ -1346,8 +1482,8 @@ impl PublicationCoordinator {
                 return Err(PublicationActivationError::Database(error));
             }
         };
-        if begun.content_digest != scheduled.content_digest
-            || begun.accepted_preview_digest != scheduled.accepted_preview_digest
+        if begun.content_digest != approval.content_digest
+            || begun.accepted_preview_digest != approval.accepted_preview_digest
         {
             return Err(PublicationActivationError::DurableStateMismatch);
         }
@@ -1880,6 +2016,12 @@ pub(crate) enum PublishReviewError {
 
 #[derive(Debug, Error)]
 pub(crate) enum PublicationActivationError {
+    #[error("the approved revision is unavailable")]
+    ApprovedRevisionUnavailable,
+    #[error("release {publication_id} is blocked")]
+    ReleaseBlocked { publication_id: Uuid },
+    #[error(transparent)]
+    ReleaseLoad(#[from] ReleaseLoadError),
     #[error(transparent)]
     Coordinator(#[from] PublicationCoordinatorUnavailable),
     #[error("post {post_id} is not present in the current content catalog")]
@@ -1903,8 +2045,6 @@ pub(crate) enum PublicationActivationError {
     StaleReview(#[from] PublishReviewError),
     #[error("post {post_id} is already published")]
     AlreadyPublished { post_id: PostId },
-    #[error("scheduled publication {publication_id} is not retained by the coordinator")]
-    ScheduledPublicationUnavailable { publication_id: Uuid },
     #[error("scheduled publication time {scheduled_at} is not later than {now}")]
     ScheduleNotFuture {
         scheduled_at: OffsetDateTime,
@@ -1939,6 +2079,111 @@ pub(crate) enum ContentReloadError {
     Retention(#[from] CatalogRetentionError),
     #[error("the database rejected the candidate preview catalog")]
     Database(#[from] DatabaseMutationError),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ReleaseTransitionError {
+    #[error(transparent)]
+    Activation(#[from] PublicationActivationError),
+    #[error(transparent)]
+    Mutation(#[from] ReleaseMutationError),
+    #[error(transparent)]
+    Load(#[from] ReleaseLoadError),
+    #[error(transparent)]
+    Unavailable(#[from] PublicationCoordinatorUnavailable),
+}
+
+impl PublicationCoordinator {
+    async fn retry_release(
+        &mut self,
+        command: RetryRelease,
+    ) -> Result<ReleaseChangeReceipt, ReleaseTransitionError> {
+        let version =
+            command
+                .expected_version
+                .checked_add(1)
+                .ok_or(ReleaseMutationError::Command(
+                    ReleaseCommandError::InvalidValue,
+                ))?;
+        if let Some(receipt) = self.store.release_operation(command.operation_id).await? {
+            if receipt.publication_id != command.publication_id
+                || receipt.version != version
+                || receipt.state != CanonicalState::Activating
+            {
+                return Err(ReleaseMutationError::Command(
+                    ReleaseCommandError::IdempotencyConflict,
+                )
+                .into());
+            }
+            return Ok(receipt);
+        }
+        let blocked = self.store.blocked_release(command.publication_id).await?;
+        let Some(blocked) = blocked else {
+            let current = self.store.release(command.publication_id).await?;
+            let error = match current {
+                None => ReleaseCommandError::NotFound,
+                Some(current) if current.publication.version != command.expected_version => {
+                    ReleaseCommandError::StaleVersion
+                }
+                Some(_) => ReleaseCommandError::InvalidState,
+            };
+            return Err(ReleaseMutationError::Command(error).into());
+        };
+        if blocked.publication.view().version != command.expected_version {
+            return Err(ReleaseMutationError::Command(ReleaseCommandError::StaleVersion).into());
+        }
+        self.activate_approval(
+            ActivationApproval {
+                publication_id: command.publication_id,
+                publication: blocked.publication.into_view(),
+                content_digest: blocked.content_digest,
+                accepted_preview_digest: blocked.accepted_preview_digest,
+            },
+            ActivationIntent::Retry {
+                operation_id: command.operation_id,
+            },
+            command.now,
+        )
+        .await?;
+        Ok(ReleaseChangeReceipt {
+            operation_id: command.operation_id,
+            publication_id: command.publication_id,
+            version,
+            state: CanonicalState::Activating,
+        })
+    }
+
+    async fn change_release(
+        &mut self,
+        command: ChangeRelease,
+    ) -> Result<ReleaseChangeReceipt, ReleaseTransitionError> {
+        let publication_id = command.publication_id;
+        let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
+        let receipt = match self.store.change_release(command).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if !matches!(
+                    error,
+                    ReleaseMutationError::Command(ReleaseCommandError::OutcomeUnknown)
+                ) {
+                    safety.disarm();
+                }
+                return Err(error.into());
+            }
+        };
+        // Reconcile from durable state, not a possibly older replayed receipt.
+        match self.store.scheduled_release(publication_id).await? {
+            Some(scheduled) => {
+                self.scheduled.insert(publication_id, scheduled);
+            }
+            None => {
+                self.scheduled.remove(&publication_id);
+            }
+        }
+        self.scheduler_wakeup.notify_one();
+        safety.disarm();
+        Ok(receipt)
+    }
 }
 
 #[cfg(test)]
@@ -3435,6 +3680,101 @@ mod tests {
         drop(coordinator);
         shutdown.cancel();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_approval_blocks_without_shutdown_and_retries_the_same_release() {
+        let catalog = catalog();
+        let (root, mut coordinator, reader, store, shutdown, task) =
+            coordinator_fixture(Arc::clone(&catalog)).await;
+        let due = OffsetDateTime::now_utc() + time::Duration::days(1);
+        let command = schedule_command_for(&catalog, &coordinator.ledger, due);
+        let publication_id = command.publication_id;
+        coordinator.schedule(command.clone()).await.unwrap();
+        let candidates = std::mem::replace(&mut coordinator.candidates, Arc::new(BTreeMap::new()));
+        assert!(
+            matches!(coordinator.activate_scheduled(publication_id, due).await, Err(PublicationActivationError::ReleaseBlocked { publication_id: id }) if id == publication_id)
+        );
+        assert!(coordinator.readiness.is_ready());
+        assert!(!coordinator.cancellation.is_cancelled());
+        assert!(coordinator.ledger.is_empty());
+        let blocked = store.release(publication_id).await.unwrap().unwrap();
+        assert_eq!(blocked.publication.state, CanonicalState::Blocked);
+        assert_eq!(
+            blocked.publication.block_reason,
+            Some(ActivationBlockReason::RevisionUnavailable)
+        );
+        assert!(matches!(
+            coordinator.schedule(command).await,
+            Err(PublicationActivationError::ScheduleLookup(
+                SchedulePublicationLookupError::Blocked { .. }
+            ))
+        ));
+        let retry = RetryRelease {
+            operation_id: Uuid::new_v4(),
+            publication_id,
+            expected_version: blocked.publication.version,
+            now: due,
+        };
+        assert!(matches!(
+            coordinator
+                .retry_release(RetryRelease {
+                    expected_version: 1,
+                    ..retry.clone()
+                })
+                .await,
+            Err(ReleaseTransitionError::Mutation(
+                ReleaseMutationError::Command(ReleaseCommandError::StaleVersion)
+            ))
+        ));
+        assert!(matches!(
+            coordinator.retry_release(retry.clone()).await,
+            Err(ReleaseTransitionError::Activation(
+                PublicationActivationError::ApprovedRevisionUnavailable
+            ))
+        ));
+        assert!(
+            store
+                .release_operation(retry.operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .release(publication_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .publication
+                .version,
+            blocked.publication.version
+        );
+        coordinator.candidates = candidates;
+        let receipt = coordinator.retry_release(retry.clone()).await.unwrap();
+        assert_eq!(coordinator.retry_release(retry).await.unwrap(), receipt);
+        let published = store.release(publication_id).await.unwrap().unwrap();
+        assert_eq!(published.publication.state, CanonicalState::Published);
+        assert_eq!(
+            published.publication.pinned_post_digest,
+            blocked.publication.pinned_post_digest
+        );
+        assert_eq!(
+            published.accepted_preview_digest,
+            blocked.accepted_preview_digest
+        );
+        assert!(
+            reader
+                .load_full()
+                .post_page(&PostSlug::parse("publishable").unwrap())
+                .is_some()
+        );
+        assert!(coordinator.readiness.is_ready());
+        drop(coordinator);
+        shutdown.cancel();
+        task.await.unwrap();
+        drop(store);
+        drop(root);
     }
 
     #[tokio::test]

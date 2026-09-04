@@ -93,7 +93,9 @@ impl PublicationScheduler {
             return Ok(LoopControl::Stop);
         }
         match result {
-            Ok(_) => Ok(LoopControl::Continue),
+            Ok(_) | Err(PublicationActivationError::ReleaseBlocked { .. }) => {
+                Ok(LoopControl::Continue)
+            }
             Err(error) if retryable(&error) => Ok(self.wait(Some(RETRY_DELAY)).await),
             Err(source) => Err(PublicationSchedulerError::Activation {
                 publication_id,

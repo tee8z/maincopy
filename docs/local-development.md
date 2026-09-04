@@ -164,10 +164,27 @@ shows up to 100 releases per page, ordered by release identifier. Choose
 `Next page` to continue. Release details remain available after activation.
 
 If an approval response is lost, submit the original confirmation form again.
-The same approval returns the same release page. Changing its time requires a
-new command; reusing the original form identifier with another time is rejected.
-Schedule editing, cancellation, and blocked-release retry controls remain
-unfinished.
+The same approval returns the same release page. Reusing an operation identifier
+with different inputs is rejected.
+
+On a scheduled release page, enter a future UTC time and choose
+`Change scheduled time` to reschedule. Choose `Cancel this release` to cancel.
+Both operations require the displayed resource version. Refresh the page after
+a version conflict. Changes preserve the original approved revision and preview.
+
+A release becomes `Blocked` if its approved revision is unavailable or its
+rendered preview differs from the approved preview. The previous public snapshot remains available.
+After resolving the cause, choose `Retry this release`. Retry uses the original
+approval. A blocked release can also be cancelled.
+
+Each accepted edit, cancellation, or retry has a durable operation receipt.
+The receipt identifies the accepted version; the page also shows the current
+release state. Repeating the original form recovers that receipt after later
+changes or a restart.
+
+Cancelled releases remain in history. A fresh preview approval can release
+the same cancelled revision again. Cancellation retains route reservations
+and does not remove an existing public revision.
 
 ### 5. Sign out before a state reset
 

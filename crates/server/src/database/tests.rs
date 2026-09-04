@@ -113,6 +113,7 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             "nip98_replay_events",
             "post_revisions",
             "publication_routes",
+            "release_operations",
             "reload_operations",
             "reload_post_changes",
             "site_revisions",
@@ -872,6 +873,7 @@ async fn application_schema_has_no_triggers_and_only_expected_explicit_indexes()
             "admin_audit_events_occurred_idx",
             "agent_credentials_owner_idx",
             "browser_sessions_user_idx",
+            "canonical_active_revision_idx",
             "login_challenges_cleanup_idx",
             "nip98_replay_events_cleanup_idx",
             "source_sync_history_idx",
@@ -947,6 +949,8 @@ async fn identifiers_and_hashes_use_blob_storage() {
             "post_revisions.stable_post_id:BLOB",
             "publication_routes.revision_digest:BLOB",
             "publication_routes.stable_post_id:BLOB",
+            "release_operations.operation_id:BLOB",
+            "release_operations.publication_id:BLOB",
             "reload_operations.candidate_site_digest:BLOB",
             "reload_operations.expected_site_digest:BLOB",
             "reload_operations.reload_operation_id:BLOB",
@@ -995,13 +999,14 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 132);
+    assert_eq!(compact_definitions.matches("check(").count(), 138);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",
         "check(length(revision_digest)=32)",
         "check(length(candidate_site_digest)=32)",
         "check(length(publication_id)=16)",
+        "check(length(operation_id)=16)",
         "check(length(stable_post_id)=16)",
         "check(length(idempotency_key)=16)",
         "check(length(reload_operation_id)=16)",

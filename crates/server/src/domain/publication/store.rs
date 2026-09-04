@@ -37,6 +37,8 @@ pub(crate) struct ReleaseView {
 
 #[derive(Debug, Error)]
 pub(crate) enum ReleaseLoadError {
+    #[error("stored release operation failed validation")]
+    InvalidOperation,
     #[error("release query failed")]
     Database(#[from] sqlx::Error),
     #[error("stored release failed validation")]
@@ -50,6 +52,217 @@ fn decode_release(row: CanonicalPublicationRow) -> Result<ReleaseView, ReleaseLo
         publication: canonical_view(&stored.status).clone(),
         accepted_preview_digest: stored.accepted_preview_digest,
     })
+}
+
+/// An exact-version change to an already approved release.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChangeRelease {
+    pub operation_id: Uuid,
+    pub publication_id: Uuid,
+    pub expected_version: u64,
+    pub change: ReleaseChange,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReleaseChange {
+    Reschedule { scheduled_at: OffsetDateTime },
+    Cancel,
+}
+
+/// Receipt of one committed change; later changes cannot rewrite this result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReleaseChangeReceipt {
+    pub operation_id: Uuid,
+    pub publication_id: Uuid,
+    pub version: u64,
+    pub state: CanonicalState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub(crate) enum ReleaseCommandError {
+    #[error("the release does not exist")]
+    NotFound,
+    #[error("the release version is stale")]
+    StaleVersion,
+    #[error("the release cannot be changed in its current state")]
+    InvalidState,
+    #[error("the operation identifier belongs to another command")]
+    IdempotencyConflict,
+    #[error("the release command contains an invalid value")]
+    InvalidValue,
+    #[error("the release change outcome is unknown")]
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ReleaseApplyError {
+    #[error(transparent)]
+    Command(#[from] ReleaseCommandError),
+    #[error("release persistence operation failed")]
+    Operation(#[from] sqlx::Error),
+    #[error("stored release state is invalid")]
+    CorruptStoredState,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ReleaseMutationError {
+    #[error(transparent)]
+    Admission(#[from] DatabaseAdmissionError),
+    #[error(transparent)]
+    Command(#[from] ReleaseCommandError),
+}
+
+#[derive(FromRow)]
+struct ReleaseOperationRow {
+    publication_id: Vec<u8>,
+    expected_version: i64,
+    kind: String,
+    scheduled_at_ns: Option<i64>,
+    result_version: i64,
+}
+
+impl ReleaseOperationRow {
+    fn receipt(self, operation_id: Uuid) -> Result<ReleaseChangeReceipt, ReleaseApplyError> {
+        let state = match (self.kind.as_str(), self.scheduled_at_ns) {
+            ("reschedule", Some(_)) => CanonicalState::Scheduled,
+            ("cancel", None) => CanonicalState::Cancelled,
+            ("retry", None) => CanonicalState::Activating,
+            _ => return Err(ReleaseApplyError::CorruptStoredState),
+        };
+        if self.expected_version < 1
+            || self.expected_version.checked_add(1) != Some(self.result_version)
+        {
+            return Err(ReleaseApplyError::CorruptStoredState);
+        }
+        Ok(ReleaseChangeReceipt {
+            operation_id,
+            publication_id: Uuid::from_slice(&self.publication_id)
+                .map_err(|_| ReleaseApplyError::CorruptStoredState)?,
+            version: u64::try_from(self.result_version)
+                .map_err(|_| ReleaseApplyError::CorruptStoredState)?,
+            state,
+        })
+    }
+}
+
+pub(crate) async fn change_release(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: ChangeRelease,
+) -> Result<ReleaseChangeReceipt, ReleaseApplyError> {
+    let expected_version =
+        i64::try_from(command.expected_version).map_err(|_| ReleaseCommandError::InvalidValue)?;
+    let result_version = expected_version
+        .checked_add(1)
+        .filter(|_| expected_version > 0)
+        .ok_or(ReleaseCommandError::InvalidValue)?;
+    let (kind, scheduled_at_ns) = match command.change {
+        ReleaseChange::Reschedule { scheduled_at } => (
+            "reschedule",
+            Some(
+                i64::try_from(scheduled_at.unix_timestamp_nanos())
+                    .map_err(|_| ReleaseCommandError::InvalidValue)?,
+            ),
+        ),
+        ReleaseChange::Cancel => ("cancel", None),
+    };
+    if let Some(receipt) = replay_release_change(
+        transaction,
+        &command,
+        expected_version,
+        kind,
+        scheduled_at_ns,
+    )
+    .await?
+    {
+        return Ok(receipt);
+    }
+    let stored = load_canonical_by_id(transaction, command.publication_id)
+        .await
+        .map_err(release_apply_load_error)?
+        .ok_or(ReleaseCommandError::NotFound)?;
+    if canonical_view(&stored.status).version != command.expected_version {
+        return Err(ReleaseCommandError::StaleVersion.into());
+    }
+    let changed = apply_release_change(stored.status, &command)?;
+    let now_ns = i64::try_from(command.now.unix_timestamp_nanos())
+        .map_err(|_| ReleaseCommandError::InvalidValue)?;
+    sqlx::query("UPDATE canonical_publications SET approved_scheduled_at_ns = COALESCE(approved_scheduled_at_ns, scheduled_at_ns), state = ?, version = ?, scheduled_at_ns = ? WHERE publication_id = ? AND version = ?")
+        .bind(match changed.state { CanonicalState::Scheduled => "scheduled", CanonicalState::Cancelled => "cancelled", _ => return Err(ReleaseApplyError::CorruptStoredState) })
+        .bind(result_version).bind(i64::try_from(changed.scheduled_at.unix_timestamp_nanos()).map_err(|_| ReleaseApplyError::CorruptStoredState)?)
+        .bind(command.publication_id.as_bytes().as_slice()).bind(expected_version).execute(&mut **transaction).await?;
+    sqlx::query("INSERT INTO release_operations (operation_id, publication_id, expected_version, kind, scheduled_at_ns, result_version, created_at_ns) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(command.operation_id.as_bytes().as_slice()).bind(command.publication_id.as_bytes().as_slice()).bind(expected_version)
+        .bind(kind).bind(scheduled_at_ns).bind(result_version).bind(now_ns).execute(&mut **transaction).await?;
+    Ok(ReleaseChangeReceipt {
+        operation_id: command.operation_id,
+        publication_id: command.publication_id,
+        version: changed.version,
+        state: changed.state,
+    })
+}
+
+/// Resolve a repeated operation before checking the release's current version.
+async fn replay_release_change(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: &ChangeRelease,
+    expected_version: i64,
+    kind: &str,
+    scheduled_at_ns: Option<i64>,
+) -> Result<Option<ReleaseChangeReceipt>, ReleaseApplyError> {
+    let previous = sqlx::query_as::<_, ReleaseOperationRow>(
+        "SELECT publication_id, expected_version, kind, scheduled_at_ns, result_version FROM release_operations WHERE operation_id = ?"
+    ).bind(command.operation_id.as_bytes().as_slice()).fetch_optional(&mut **transaction).await?;
+    if let Some(previous) = previous {
+        if previous.publication_id != command.publication_id.as_bytes()
+            || previous.expected_version != expected_version
+            || previous.kind != kind
+            || previous.scheduled_at_ns != scheduled_at_ns
+        {
+            return Err(ReleaseCommandError::IdempotencyConflict.into());
+        }
+        return previous.receipt(command.operation_id).map(Some);
+    }
+    Ok(None)
+}
+
+fn apply_release_change(
+    status: CanonicalPublicationStatus,
+    command: &ChangeRelease,
+) -> Result<CanonicalPublicationView, ReleaseApplyError> {
+    let changed = match (status, &command.change) {
+        (
+            CanonicalPublicationStatus::Scheduled(publication),
+            ReleaseChange::Reschedule { scheduled_at },
+        ) => {
+            if *scheduled_at <= command.now {
+                return Err(ReleaseCommandError::InvalidValue.into());
+            }
+            publication
+                .reschedule(command.expected_version, *scheduled_at)
+                .map_err(|_| ReleaseApplyError::CorruptStoredState)?
+                .into_view()
+        }
+        (CanonicalPublicationStatus::Scheduled(publication), ReleaseChange::Cancel) => publication
+            .cancel(command.expected_version)
+            .map_err(|_| ReleaseApplyError::CorruptStoredState)?
+            .into_view(),
+        (CanonicalPublicationStatus::Blocked(publication), ReleaseChange::Cancel) => publication
+            .cancel(command.expected_version)
+            .map_err(|_| ReleaseApplyError::CorruptStoredState)?
+            .into_view(),
+        _ => return Err(ReleaseCommandError::InvalidState.into()),
+    };
+    Ok(changed)
+}
+
+fn release_apply_load_error(error: PublicationMutationError) -> ReleaseApplyError {
+    match error {
+        PublicationMutationError::Operation(source) => ReleaseApplyError::Operation(source),
+        PublicationMutationError::Command(_) | PublicationMutationError::CorruptStoredState => {
+            ReleaseApplyError::CorruptStoredState
+        }
+    }
 }
 
 /// Publication queries and mutations backed by Maincopy's database.
@@ -285,6 +498,110 @@ impl PublicationStore {
             .into_iter()
             .map(decode_release)
             .collect()
+    }
+
+    pub(crate) async fn change_release(
+        &self,
+        command: ChangeRelease,
+    ) -> Result<ReleaseChangeReceipt, ReleaseMutationError> {
+        let (respond_to, response) = oneshot::channel();
+        self.mutations
+            .try_send(Mutation::ChangeRelease {
+                command,
+                respond_to,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
+            })?;
+        response
+            .await
+            .map_err(|_| ReleaseCommandError::OutcomeUnknown)?
+            .map_err(ReleaseMutationError::Command)
+    }
+
+    pub(crate) async fn scheduled_release(
+        &self,
+        publication_id: Uuid,
+    ) -> Result<Option<ScheduledPublication>, ReleaseLoadError> {
+        let row = sqlx::query_as::<_, CanonicalPublicationRow>(LOAD_CANONICAL_BY_PUBLICATION_ID)
+            .bind(publication_id.as_bytes().as_slice())
+            .fetch_optional(&self.readers)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let stored = decode_canonical_publication(row)?;
+        Ok(match stored.status {
+            CanonicalPublicationStatus::Scheduled(publication) => Some(ScheduledPublication {
+                publication_id,
+                publication,
+                creation_key: stored.creation_key,
+                content_digest: stored.content_digest,
+                accepted_preview_digest: stored.accepted_preview_digest,
+            }),
+            _ => None,
+        })
+    }
+
+    pub(crate) async fn blocked_release(
+        &self,
+        publication_id: Uuid,
+    ) -> Result<Option<BlockedPublication>, ReleaseLoadError> {
+        let row = sqlx::query_as::<_, CanonicalPublicationRow>(LOAD_CANONICAL_BY_PUBLICATION_ID)
+            .bind(publication_id.as_bytes().as_slice())
+            .fetch_optional(&self.readers)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let stored = decode_canonical_publication(row)?;
+        Ok(match stored.status {
+            CanonicalPublicationStatus::Blocked(publication) => Some(BlockedPublication {
+                publication,
+                content_digest: stored.content_digest,
+                accepted_preview_digest: stored.accepted_preview_digest,
+            }),
+            CanonicalPublicationStatus::Scheduled(_)
+            | CanonicalPublicationStatus::Activating(_)
+            | CanonicalPublicationStatus::Published(_)
+            | CanonicalPublicationStatus::Superseded(_)
+            | CanonicalPublicationStatus::Cancelled(_) => None,
+        })
+    }
+
+    pub(crate) async fn block_scheduled(
+        &self,
+        command: BlockScheduled,
+    ) -> Result<(), DatabaseMutationError> {
+        let (respond_to, response) = oneshot::channel();
+        self.mutations
+            .try_send(Mutation::BlockScheduled {
+                command,
+                respond_to,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
+            })?;
+        response
+            .await
+            .map_err(|_| DatabaseCommandError::OutcomeUnknown)?
+            .map_err(DatabaseMutationError::Command)
+    }
+
+    pub(crate) async fn release_operation(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<Option<ReleaseChangeReceipt>, ReleaseLoadError> {
+        let row = sqlx::query_as::<_, ReleaseOperationRow>(
+            "SELECT publication_id, expected_version, kind, scheduled_at_ns, result_version FROM release_operations WHERE operation_id = ?"
+        ).bind(operation_id.as_bytes().as_slice()).fetch_optional(&self.readers).await?;
+        row.map(|row| {
+            row.receipt(operation_id)
+                .map_err(|_| ReleaseLoadError::InvalidOperation)
+        })
+        .transpose()
     }
 
     /// Replays a previously accepted scheduled approval before catalog resolution.
@@ -523,6 +840,26 @@ pub(crate) struct ScheduledPublication {
     pub accepted_preview_digest: PreviewDigest,
 }
 
+/// A retained approval that requires an explicit retry.
+pub(crate) struct BlockedPublication {
+    pub publication: CanonicalPublication<canonical::Blocked>,
+    pub content_digest: ContentTreeDigest,
+    pub accepted_preview_digest: PreviewDigest,
+}
+
+pub(crate) struct BlockScheduled {
+    pub publication_id: Uuid,
+    pub expected_version: u64,
+    pub now: OffsetDateTime,
+    pub reason: ActivationBlockReason,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ActivationIntent {
+    Due,
+    Retry { operation_id: Uuid },
+}
+
 /// A prior scheduled-approval command resolved before current-catalog selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SchedulePublicationReplay {
@@ -532,6 +869,7 @@ pub(crate) enum SchedulePublicationReplay {
 
 /// One due scheduled approval to claim against the current public site head.
 pub(crate) struct BeginScheduledActivation {
+    pub intent: ActivationIntent,
     pub publication_id: Uuid,
     pub expected_publication_version: u64,
     pub expected_site: SiteHead,
@@ -632,6 +970,7 @@ const LOAD_CANONICAL_PUBLICATIONS: &str = "SELECT \
     canonical.pinned_post_digest AS pinned_post_digest, \
     canonical.state AS state, \
     canonical.version AS version, \
+    COALESCE(canonical.approved_scheduled_at_ns, canonical.scheduled_at_ns) AS approved_scheduled_at_ns, \
     canonical.scheduled_at_ns AS scheduled_at_ns, \
     canonical.activation_at_ns AS activation_at_ns, \
     canonical.published_at_ns AS published_at_ns, \
@@ -666,6 +1005,7 @@ const LOAD_CANONICAL_BY_CREATION_KEY: &str = "SELECT \
     canonical.pinned_post_digest AS pinned_post_digest, \
     canonical.state AS state, \
     canonical.version AS version, \
+    COALESCE(canonical.approved_scheduled_at_ns, canonical.scheduled_at_ns) AS approved_scheduled_at_ns, \
     canonical.scheduled_at_ns AS scheduled_at_ns, \
     canonical.activation_at_ns AS activation_at_ns, \
     canonical.published_at_ns AS published_at_ns, \
@@ -700,6 +1040,7 @@ const LOAD_CANONICAL_BY_PUBLICATION_ID: &str = "SELECT \
     canonical.pinned_post_digest AS pinned_post_digest, \
     canonical.state AS state, \
     canonical.version AS version, \
+    COALESCE(canonical.approved_scheduled_at_ns, canonical.scheduled_at_ns) AS approved_scheduled_at_ns, \
     canonical.scheduled_at_ns AS scheduled_at_ns, \
     canonical.activation_at_ns AS activation_at_ns, \
     canonical.published_at_ns AS published_at_ns, \
@@ -741,6 +1082,7 @@ struct SiteHeadRow {
 
 #[derive(FromRow)]
 struct CanonicalPublicationRow {
+    approved_scheduled_at_ns: i64,
     publication_id: Vec<u8>,
     stable_post_id: Vec<u8>,
     pinned_post_digest: Vec<u8>,
@@ -903,6 +1245,7 @@ impl PublicationCommandKind {
 }
 
 struct StoredCanonicalPublication {
+    approved_scheduled_at: OffsetDateTime,
     publication_id: Uuid,
     creation_key: Option<CommandIdempotencyKey>,
     command_kind: PublicationCommandKind,
@@ -1045,6 +1388,7 @@ fn decode_canonical_publication(
     let status = CanonicalPublicationStatus::try_from(view)
         .map_err(StartupSnapshotLoadError::InvalidCanonicalPublication)?;
     Ok(StoredCanonicalPublication {
+        approved_scheduled_at: publication_timestamp(row.approved_scheduled_at_ns)?,
         publication_id,
         creation_key,
         command_kind,
@@ -1111,6 +1455,7 @@ fn decode_block_reason(
     reason
         .map(|reason| match reason.as_str() {
             "revision_unavailable" => Ok(ActivationBlockReason::RevisionUnavailable),
+            "preview_changed" => Ok(ActivationBlockReason::PreviewChanged),
             _ => Err(StartupSnapshotLoadError::InvalidBlockReason),
         })
         .transpose()
@@ -1397,6 +1742,10 @@ impl PublishNowLookupError {
 
 #[derive(Debug, Error)]
 pub(crate) enum SchedulePublicationLookupError {
+    #[error("release {publication_id} is blocked")]
+    Blocked { publication_id: Uuid },
+    #[error("release {publication_id} was cancelled")]
+    Cancelled { publication_id: Uuid },
     #[error("could not read a prior scheduled-publication request")]
     Query(#[from] sqlx::Error),
     #[error("the idempotency key is already bound to a different command")]
@@ -1737,8 +2086,7 @@ pub(crate) async fn schedule_publication(
                 command.expected_revision.as_ref(),
                 &command.accepted_preview_digest,
             )
-            || canonical_view(&stored.status).scheduled_at
-                != command.scheduled_at.to_offset(UtcOffset::UTC)
+            || stored.approved_scheduled_at != command.scheduled_at.to_offset(UtcOffset::UTC)
         {
             return Err(PublicationMutationError::Command(
                 DatabaseCommandError::IdempotencyConflict,
@@ -1832,6 +2180,39 @@ pub(crate) async fn schedule_publication(
     })
 }
 
+pub(crate) async fn block_scheduled(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: BlockScheduled,
+) -> Result<(), PublicationMutationError> {
+    let stored = load_canonical_by_id(transaction, command.publication_id)
+        .await?
+        .ok_or(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ))?;
+    let CanonicalPublicationStatus::Scheduled(publication) = stored.status else {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    };
+    let blocked = publication
+        .begin_activation(command.expected_version, command.now)
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::Rejected))?
+        .block_activation(command.expected_version + 1, command.reason)
+        .map_err(|_| PublicationMutationError::CorruptStoredState)?;
+    let view = blocked.view();
+    let version = i64::try_from(view.version)
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    let now = i64::try_from(command.now.unix_timestamp_nanos())
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    let reason = match command.reason {
+        ActivationBlockReason::RevisionUnavailable => "revision_unavailable",
+        ActivationBlockReason::PreviewChanged => "preview_changed",
+    };
+    sqlx::query("UPDATE canonical_publications SET state = 'blocked', version = ?, activation_at_ns = ?, block_reason = ? WHERE publication_id = ?")
+        .bind(version).bind(now).bind(reason).bind(command.publication_id.as_bytes().as_slice()).execute(&mut **transaction).await.map_err(PublicationMutationError::Operation)?;
+    Ok(())
+}
+
 pub(crate) async fn begin_scheduled_activation(
     transaction: &mut Transaction<'_, Sqlite>,
     command: BeginScheduledActivation,
@@ -1843,12 +2224,16 @@ pub(crate) async fn begin_scheduled_activation(
         ))?;
     let content_digest = stored.content_digest;
     let accepted_preview_digest = stored.accepted_preview_digest;
-    let CanonicalPublicationStatus::Scheduled(publication) = stored.status else {
-        return Err(PublicationMutationError::Command(
-            DatabaseCommandError::Rejected,
-        ));
+    let prior_state = match &stored.status {
+        CanonicalPublicationStatus::Scheduled(_) => "scheduled",
+        CanonicalPublicationStatus::Blocked(_) => "blocked",
+        _ => {
+            return Err(PublicationMutationError::Command(
+                DatabaseCommandError::Rejected,
+            ));
+        }
     };
-    if publication.view().version != command.expected_publication_version {
+    if canonical_view(&stored.status).version != command.expected_publication_version {
         return Err(PublicationMutationError::Command(
             DatabaseCommandError::Rejected,
         ));
@@ -1878,9 +2263,12 @@ pub(crate) async fn begin_scheduled_activation(
             DatabaseCommandError::Rejected,
         ));
     }
-    let activating = publication
-        .begin_activation(command.expected_publication_version, command.now)
-        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::Rejected))?;
+    let activating = claim_release_activation(
+        stored.status,
+        command.intent,
+        command.expected_publication_version,
+        command.now,
+    )?;
     let view = activating.view();
     let activation_at_ns = i64::try_from(
         view.activation_started_at
@@ -1895,14 +2283,15 @@ pub(crate) async fn begin_scheduled_activation(
     let updated = sqlx::query(
         "UPDATE canonical_publications \
          SET state = 'activating', version = ?, activation_at_ns = ?, \
-             activation_site_digest = ? \
-         WHERE publication_id = ? AND state = 'scheduled' AND version = ? \
-           AND scheduled_at_ns <= ?",
+             activation_site_digest = ?, block_reason = NULL \
+         WHERE publication_id = ? AND state = ? AND version = ? \
+           AND (state = 'blocked' OR scheduled_at_ns <= ?)",
     )
     .bind(version)
     .bind(activation_at_ns)
     .bind(command.candidate_site_digest.as_bytes().as_slice())
     .bind(command.publication_id.as_bytes().as_slice())
+    .bind(prior_state)
     .bind(expected_version)
     .bind(activation_at_ns)
     .execute(&mut **transaction)
@@ -1914,6 +2303,12 @@ pub(crate) async fn begin_scheduled_activation(
         ));
     }
 
+    if let ActivationIntent::Retry { operation_id } = command.intent {
+        sqlx::query("INSERT INTO release_operations (operation_id, publication_id, expected_version, kind, scheduled_at_ns, result_version, created_at_ns) VALUES (?, ?, ?, 'retry', NULL, ?, ?)")
+            .bind(operation_id.as_bytes().as_slice()).bind(command.publication_id.as_bytes().as_slice())
+            .bind(expected_version).bind(version).bind(activation_at_ns).execute(&mut **transaction).await.map_err(PublicationMutationError::insert_sql)?;
+    }
+
     Ok(BegunPublication {
         publication_id: command.publication_id,
         publication: activating,
@@ -1922,6 +2317,33 @@ pub(crate) async fn begin_scheduled_activation(
         accepted_preview_digest,
         candidate_site_digest: command.candidate_site_digest,
     })
+}
+
+fn claim_release_activation(
+    status: CanonicalPublicationStatus,
+    intent: ActivationIntent,
+    expected_version: u64,
+    now: OffsetDateTime,
+) -> Result<CanonicalPublication<canonical::Activating>, PublicationMutationError> {
+    let rejected = || PublicationMutationError::Command(DatabaseCommandError::Rejected);
+    match status {
+        CanonicalPublicationStatus::Scheduled(publication) => match intent {
+            ActivationIntent::Due => publication
+                .begin_activation(expected_version, now)
+                .map_err(|_| rejected()),
+            ActivationIntent::Retry { .. } => Err(rejected()),
+        },
+        CanonicalPublicationStatus::Blocked(publication) => match intent {
+            ActivationIntent::Retry { .. } => publication
+                .retry_blocked(expected_version, now)
+                .map_err(|_| rejected()),
+            ActivationIntent::Due => Err(rejected()),
+        },
+        CanonicalPublicationStatus::Activating(_)
+        | CanonicalPublicationStatus::Published(_)
+        | CanonicalPublicationStatus::Superseded(_)
+        | CanonicalPublicationStatus::Cancelled(_) => Err(rejected()),
+    }
 }
 
 pub(crate) async fn begin_publish_now(
@@ -2133,8 +2555,7 @@ fn validate_schedule_publication_fingerprint(
             command.expected_revision.as_ref(),
             &command.accepted_preview_digest,
         )
-        && canonical_view(&stored.status).scheduled_at
-            == command.scheduled_at.to_offset(UtcOffset::UTC)
+        && stored.approved_scheduled_at == command.scheduled_at.to_offset(UtcOffset::UTC)
     {
         Ok(())
     } else {
@@ -2179,9 +2600,14 @@ async fn load_replayed_schedule_publication(
         .await
         .map(SchedulePublicationReplay::Published)
         .map_err(SchedulePublicationLookupError::from_publication),
-        CanonicalPublicationStatus::Blocked(_) | CanonicalPublicationStatus::Cancelled(_) => {
-            Err(SchedulePublicationLookupError::InvalidStoredState)
+        CanonicalPublicationStatus::Cancelled(_) => {
+            Err(SchedulePublicationLookupError::Cancelled {
+                publication_id: stored.publication_id,
+            })
         }
+        CanonicalPublicationStatus::Blocked(_) => Err(SchedulePublicationLookupError::Blocked {
+            publication_id: stored.publication_id,
+        }),
     }
 }
 
@@ -3034,6 +3460,7 @@ mod tests {
                 stable_post_id BLOB NOT NULL, \
                 requested_revision_digest BLOB, \
                 pinned_post_digest BLOB NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL, \
+                approved_scheduled_at_ns INTEGER, \
                 scheduled_at_ns INTEGER NOT NULL, activation_at_ns INTEGER, \
                 activation_site_digest BLOB, \
                 published_at_ns INTEGER, current_published_digest BLOB, source_commit BLOB, \

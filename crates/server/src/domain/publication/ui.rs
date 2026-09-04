@@ -25,13 +25,17 @@ use crate::{
 };
 
 use super::{
-    CanonicalState, PublicPagePath, PublishedPostRevision,
+    ActivationBlockReason, CanonicalState, PublicPagePath, PublishedPostRevision,
     activation::{
-        PublicationCoordinatorHandle, PublishNow, PublishReviewedNow, ReviewedPublicRevision,
-        Schedule, ScheduleReviewed, ScheduledApprovalOutcome,
+        PublicationActivationError, PublicationCoordinatorHandle, PublishNow, PublishReviewedNow,
+        ReleaseTransitionError, RetryRelease, ReviewedPublicRevision, Schedule, ScheduleReviewed,
+        ScheduledApprovalOutcome,
     },
     admin::activation_error,
-    store::SiteHead,
+    store::{
+        ChangeRelease, ReleaseChange, ReleaseCommandError, ReleaseMutationError,
+        SchedulePublicationLookupError, SiteHead,
+    },
     web::application_asset_response,
 };
 
@@ -166,6 +170,7 @@ pub(crate) fn router(security_state: &AdminSecurityState) -> Router {
     let publication = browser_scoped_router(
         Router::new()
             .route("/admin/posts/{post_id}/publish", post(publish))
+            .route("/admin/releases/{release_id}", post(change_release))
             .layer(DefaultBodyLimit::max(MAX_PUBLICATION_FORM_BYTES)),
         security_state,
         AdminScope::ReleaseManage,
@@ -692,6 +697,10 @@ async fn publish(
             }),
     };
     match result {
+        Err(PublicationActivationError::ScheduleLookup(
+            SchedulePublicationLookupError::Cancelled { publication_id }
+            | SchedulePublicationLookupError::Blocked { publication_id },
+        )) => admin_ui::redirect(&format!("/admin/releases/{publication_id}")),
         Ok(release_id) => admin_ui::redirect(&format!("/admin/releases/{release_id}")),
         Err(error) => {
             let spec = activation_error(&error);
@@ -705,6 +714,198 @@ async fn publish(
                 request_id,
             )
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum RawReleaseChange {
+    Retry {
+        #[serde(rename = "_csrf")]
+        csrf: SecretString,
+        operation_id: Uuid,
+        expected_version: Box<str>,
+    },
+    Reschedule {
+        #[serde(rename = "_csrf")]
+        csrf: SecretString,
+        operation_id: Uuid,
+        expected_version: Box<str>,
+        scheduled_at: Box<str>,
+    },
+    Cancel {
+        #[serde(rename = "_csrf")]
+        csrf: SecretString,
+        operation_id: Uuid,
+        expected_version: Box<str>,
+    },
+}
+
+enum ReleaseControl {
+    Change(ChangeRelease),
+    Retry(RetryRelease),
+}
+
+impl RawReleaseChange {
+    fn into_command(self, publication_id: Uuid) -> Option<ReleaseControl> {
+        let (csrf, operation_id, expected_version, change) = match self {
+            Self::Retry {
+                csrf,
+                operation_id,
+                expected_version,
+            } => {
+                let expected_version = expected_version.parse::<u64>().ok()?;
+                if csrf.expose_secret().is_empty() || expected_version == 0 {
+                    return None;
+                }
+                return Some(ReleaseControl::Retry(RetryRelease {
+                    operation_id,
+                    publication_id,
+                    expected_version,
+                    now: OffsetDateTime::now_utc(),
+                }));
+            }
+            Self::Reschedule {
+                csrf,
+                operation_id,
+                expected_version,
+                scheduled_at,
+            } => {
+                let PublicationTiming::Scheduled(scheduled_at) =
+                    parse_publication_timing(&scheduled_at)?
+                else {
+                    return None;
+                };
+                (
+                    csrf,
+                    operation_id,
+                    expected_version,
+                    ReleaseChange::Reschedule { scheduled_at },
+                )
+            }
+            Self::Cancel {
+                csrf,
+                operation_id,
+                expected_version,
+            } => (csrf, operation_id, expected_version, ReleaseChange::Cancel),
+        };
+        let expected_version = expected_version.parse::<u64>().ok()?;
+        if csrf.expose_secret().is_empty() || expected_version == 0 {
+            return None;
+        }
+        Some(ReleaseControl::Change(ChangeRelease {
+            operation_id,
+            publication_id,
+            expected_version,
+            change,
+            now: OffsetDateTime::now_utc(),
+        }))
+    }
+}
+
+async fn change_release(
+    request_id: RequestId,
+    _browser: RequiredBrowserSession,
+    UiPublication(coordinator): UiPublication,
+    Path(encoded_release_id): Path<String>,
+    form: Result<Form<RawReleaseChange>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let release_id = match Uuid::parse_str(&encoded_release_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_release_change(request_id),
+    };
+    let raw = match form {
+        Ok(Form(raw)) => raw,
+        Err(error) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return admin_ui::error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Release change is too large",
+                "Open the release page and try again.",
+                request_id,
+            );
+        }
+        Err(_) => return invalid_release_change(request_id),
+    };
+    let Some(command) = raw.into_command(release_id) else {
+        return invalid_release_change(request_id);
+    };
+    let result = match command {
+        ReleaseControl::Change(command) => coordinator.change_release(command).await,
+        ReleaseControl::Retry(command) => coordinator.retry_release(command).await,
+    };
+    match result {
+        Ok(receipt) => admin_ui::redirect(&format!(
+            "/admin/releases/{release_id}?operation={}",
+            receipt.operation_id
+        )),
+        Err(error) => {
+            let (status, message) = release_change_error(&error);
+            if status.is_server_error() {
+                tracing::error!(%request_id, %release_id, %error, "admin release change failed");
+            }
+            admin_ui::error_response(
+                status,
+                "Release change did not complete",
+                message,
+                request_id,
+            )
+        }
+    }
+}
+
+fn invalid_release_change(request_id: RequestId) -> Response {
+    admin_ui::error_response(
+        StatusCode::BAD_REQUEST,
+        "Invalid release change",
+        "Use the current release page. Schedule edits require a future UTC date and time.",
+        request_id,
+    )
+}
+
+fn release_change_error(error: &ReleaseTransitionError) -> (StatusCode, &'static str) {
+    match error {
+        ReleaseTransitionError::Activation(PublicationActivationError::StalePreview { .. }) => (
+            StatusCode::CONFLICT,
+            "The approved preview cannot be reproduced. This release remains blocked.",
+        ),
+        ReleaseTransitionError::Activation(error) => {
+            let spec = activation_error(error);
+            (spec.status, spec.message)
+        }
+        ReleaseTransitionError::Mutation(ReleaseMutationError::Command(error)) => match error {
+            ReleaseCommandError::NotFound => {
+                (StatusCode::NOT_FOUND, "The release no longer exists.")
+            }
+            ReleaseCommandError::StaleVersion => (
+                StatusCode::PRECONDITION_FAILED,
+                "The release changed. Open its current page before trying again.",
+            ),
+            ReleaseCommandError::InvalidState => (
+                StatusCode::CONFLICT,
+                "This release cannot be changed in its current state. Publication may already have started.",
+            ),
+            ReleaseCommandError::IdempotencyConflict => (
+                StatusCode::CONFLICT,
+                "This operation identifier belongs to a different change. Open the release page to start a new change.",
+            ),
+            ReleaseCommandError::InvalidValue => (
+                StatusCode::BAD_REQUEST,
+                "The schedule must be a future UTC date and time.",
+            ),
+            ReleaseCommandError::OutcomeUnknown => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The result is not yet known. Repeat the original form to recover the same operation.",
+            ),
+        },
+        ReleaseTransitionError::Mutation(ReleaseMutationError::Admission(_))
+        | ReleaseTransitionError::Unavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Release management is unavailable. Try again from the release page.",
+        ),
+        ReleaseTransitionError::Load(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The release state could not be loaded safely. Check the release page before trying again.",
+        ),
     }
 }
 
@@ -777,12 +978,26 @@ async fn show_releases(
     )
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseDetailQuery {
+    operation: Option<Uuid>,
+}
+
 async fn show_release(
     request_id: RequestId,
-    _browser: RequiredBrowserSession,
+    BrowserFormSession {
+        csrf_token,
+        session: _,
+    }: BrowserFormSession,
     UiPublication(coordinator): UiPublication,
     Path(encoded_release_id): Path<String>,
+    query: Result<Query<ReleaseDetailQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_release_change(request_id),
+    };
     let release_id = match Uuid::parse_str(&encoded_release_id) {
         Ok(id) => id,
         Err(_) => {
@@ -814,6 +1029,29 @@ async fn show_release(
             );
         }
     };
+    let receipt = match query.operation {
+        Some(operation_id) => match coordinator.release_operation(operation_id).await {
+            Ok(Some(receipt)) if receipt.publication_id == release_id => Some(receipt),
+            Ok(_) => {
+                return admin_ui::error_response(
+                    StatusCode::NOT_FOUND,
+                    "Operation not found",
+                    "This release has no accepted operation with that identifier.",
+                    request_id,
+                );
+            }
+            Err(error) => {
+                tracing::error!(%request_id, %operation_id, %error, "admin release receipt read failed");
+                return admin_ui::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Operation unavailable",
+                    "The operation receipt could not be loaded. Try this page again.",
+                    request_id,
+                );
+            }
+        },
+        None => None,
+    };
     let view = release.publication;
     let (status, explanation) = release_status(view.state);
     admin_ui::page_response(
@@ -822,6 +1060,10 @@ async fn show_release(
         PageKind::Authenticated,
         html! {
             h1 { (status) }
+        @if let Some(receipt) = receipt {
+            p role="status" { "Operation " code { (receipt.operation_id) }
+                " accepted at release version " (receipt.version) ": " (release_status(receipt.state).0) ". Current release details appear below." }
+        }
             p role="status" { (explanation) }
             section class="panel" {
                 h2 { "Release details" }
@@ -832,8 +1074,47 @@ async fn show_release(
                     dt { "Preview digest" } dd { code { (release.accepted_preview_digest.as_str()) } }
                     dt { "Scheduled time (UTC)" } dd { (view.scheduled_at) }
                     dt { "Resource version" } dd { (view.version) }
+                @if let Some(reason) = view.block_reason {
+                    dt { "Blocked reason" }
+                    dd { @match reason {
+                        ActivationBlockReason::RevisionUnavailable => { "The approved revision is unavailable." }
+                        ActivationBlockReason::PreviewChanged => { "The approved preview cannot currently be reproduced." }
+                    } }
                 }
-                p { "Bookmark this page to check the durable result of this approval." }
+                }
+                @if view.state == CanonicalState::Scheduled {
+                form method="post" action=(format!("/admin/releases/{release_id}")) {
+                    input type="hidden" name="_csrf" value=(csrf_token.expose_secret());
+                    input type="hidden" name="action" value="reschedule";
+                    input type="hidden" name="operation_id" value=(Uuid::new_v4());
+                    input type="hidden" name="expected_version" value=(view.version);
+                    label for="reschedule-at" { "New scheduled time (UTC)" }
+                    input id="reschedule-at" type="datetime-local" name="scheduled_at" required;
+                    p { "This changes only the time. The approved revision stays the same." }
+                    button type="submit" { "Change scheduled time" }
+                }
+            }
+            @if view.state == CanonicalState::Blocked {
+                form method="post" action=(format!("/admin/releases/{release_id}")) {
+                    input type="hidden" name="_csrf" value=(csrf_token.expose_secret());
+                    input type="hidden" name="action" value="retry";
+                    input type="hidden" name="operation_id" value=(Uuid::new_v4());
+                    input type="hidden" name="expected_version" value=(view.version);
+                    p { "Retry uses the original approved revision and preview." }
+                    button type="submit" { "Retry this release" }
+                }
+            }
+            @if matches!(view.state, CanonicalState::Scheduled | CanonicalState::Blocked) {
+                form method="post" action=(format!("/admin/releases/{release_id}")) {
+                    input type="hidden" name="_csrf" value=(csrf_token.expose_secret());
+                    input type="hidden" name="action" value="cancel";
+                    input type="hidden" name="operation_id" value=(Uuid::new_v4());
+                    input type="hidden" name="expected_version" value=(view.version);
+                    p { "Cancellation keeps the current public revision available and retains this release in history." }
+                    button type="submit" { "Cancel this release" }
+                }
+            }
+            p { "Bookmark this page to check the durable result of this approval." }
                 a class="button" href="/admin" { "Back to posts" }
             }
         },
@@ -1103,8 +1384,9 @@ mod workflow_tests {
     };
 
     use super::{
-        PREVIEW_ASSETS_PATH, ReviewBinding, confirmation_path, reviewed_public_revision,
-        reviewed_public_revision_value,
+        CanonicalState, ChangeRelease, PREVIEW_ASSETS_PATH, PublicationActivationError,
+        ReleaseChange, ReviewBinding, Schedule, ScheduledApprovalOutcome, confirmation_path,
+        reviewed_public_revision, reviewed_public_revision_value,
     };
 
     const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -1124,6 +1406,10 @@ mod workflow_tests {
 
     impl WorkflowRuntime {
         async fn stop(self) {
+            drop(self.close().await);
+        }
+
+        async fn close(self) -> tempfile::TempDir {
             let Self {
                 _root,
                 router,
@@ -1146,7 +1432,7 @@ mod workflow_tests {
                 .await
                 .expect("the publication writer task must join");
             auth.stop().await;
-            drop(_root);
+            _root
         }
     }
 
@@ -1343,6 +1629,19 @@ mod workflow_tests {
                 .await
                 .contains("Publication completed.")
         );
+        for scheduled_at in [
+            None,
+            Some(OffsetDateTime::now_utc() + time::Duration::days(1)),
+        ] {
+            let body = release_change_form(&browser, Uuid::new_v4(), 3, scheduled_at);
+            let rejected = runtime
+                .router
+                .clone()
+                .oneshot(browser.request(Method::POST, release_path, body))
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        }
         let first_publication = runtime
             .coordinator
             .read()
@@ -1666,6 +1965,345 @@ mod workflow_tests {
         runtime.stop().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_retries_the_original_blocked_release_and_replays_its_receipt() {
+        let (initial, digest) = catalog("Originally approved body.");
+        let runtime = workflow_runtime_with_blocked(initial, digest, true).await;
+        let browser = runtime.auth.password_login(&runtime.router).await;
+        let blocked = runtime.coordinator.releases(None).await.unwrap().remove(0);
+        assert_eq!(blocked.publication.state, CanonicalState::Blocked);
+        let path = format!("/admin/releases/{}", blocked.publication_id);
+        let page = response_text(browser_get(&runtime, &browser, &path).await).await;
+        assert!(page.contains("Retry this release"));
+        assert!(page.contains("The approved revision is unavailable."));
+        let operation_id = Uuid::new_v4();
+        let retry = Bytes::from(
+            std::str::from_utf8(&release_change_form(
+                &browser,
+                operation_id,
+                blocked.publication.version,
+                None,
+            ))
+            .unwrap()
+            .replace("action=cancel", "action=retry"),
+        );
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &path, retry.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let receipt_path = response.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let published = runtime
+            .coordinator
+            .release(blocked.publication_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(published.publication.state, CanonicalState::Published);
+        assert_eq!(
+            published.publication.pinned_post_digest,
+            blocked.publication.pinned_post_digest
+        );
+        assert_eq!(
+            published.accepted_preview_digest,
+            blocked.accepted_preview_digest
+        );
+        assert_eq!(runtime.coordinator.releases(None).await.unwrap().len(), 1);
+        let replay = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &path, retry))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::SEE_OTHER);
+        assert_eq!(replay.headers()[axum::http::header::LOCATION], receipt_path);
+        let page = response_text(browser_get(&runtime, &browser, &receipt_path).await).await;
+        assert!(page.contains("Publication completed."));
+        assert!(!page.contains("Retry this release"));
+        let conflict =
+            release_change_form(&browser, operation_id, blocked.publication.version, None);
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &path, conflict))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        runtime.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_cancels_a_blocked_release_without_publishing_it() {
+        let (initial, digest) = catalog("Private body.");
+        let runtime = workflow_runtime_with_blocked(initial, digest, true).await;
+        let browser = runtime.auth.password_login(&runtime.router).await;
+        let blocked = runtime.coordinator.releases(None).await.unwrap().remove(0);
+        let path = format!("/admin/releases/{}", blocked.publication_id);
+        let cancel =
+            release_change_form(&browser, Uuid::new_v4(), blocked.publication.version, None);
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &path, cancel))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            runtime
+                .coordinator
+                .release(blocked.publication_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .publication
+                .state,
+            CanonicalState::Cancelled
+        );
+        assert!(runtime.coordinator.read().ledger.is_empty());
+        runtime.stop().await;
+    }
+
+    fn schedule_form(approval: &ApprovalFixture, scheduled_at: OffsetDateTime) -> Bytes {
+        let timestamp = scheduled_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let suffix = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("scheduled_at", &timestamp[..16])
+            .finish();
+        Bytes::from(format!(
+            "{}&{suffix}",
+            std::str::from_utf8(&approval.body).unwrap()
+        ))
+    }
+
+    fn release_change_form(
+        browser: &BrowserSession,
+        operation_id: Uuid,
+        version: u64,
+        scheduled_at: Option<OffsetDateTime>,
+    ) -> Bytes {
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.append_pair("_csrf", browser.as_csrf_token())
+            .append_pair("operation_id", &operation_id.to_string())
+            .append_pair("expected_version", &version.to_string());
+        if let Some(scheduled_at) = scheduled_at {
+            let timestamp = scheduled_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            form.append_pair("action", "reschedule")
+                .append_pair("scheduled_at", &timestamp[..16]);
+        } else {
+            form.append_pair("action", "cancel");
+        }
+        Bytes::from(form.finish())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_edits_and_cancels_exact_release_versions_with_durable_replay() {
+        let (initial, digest) = catalog("Approved body.");
+        let runtime = workflow_runtime(initial, digest).await;
+        let browser = runtime.auth.password_login(&runtime.router).await;
+        let approval = approval_fixture(&runtime.coordinator, &browser, Uuid::new_v4());
+        let scheduled_at = OffsetDateTime::now_utc()
+            .replace_second(0)
+            .unwrap()
+            .replace_nanosecond(0)
+            .unwrap()
+            + time::Duration::days(1);
+        let original = schedule_form(&approval, scheduled_at);
+        let publish_path = format!("/admin/posts/{POST_ID}/publish");
+        let created = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &publish_path, original.clone()))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::SEE_OTHER);
+        let location = created.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let release_id =
+            Uuid::parse_str(location.strip_prefix("/admin/releases/").unwrap()).unwrap();
+        let page = response_text(browser_get(&runtime, &browser, &location).await).await;
+        assert!(page.contains("Change scheduled time"));
+        assert!(page.contains("Cancel this release"));
+
+        let operation_id = Uuid::new_v4();
+        let changed_time = scheduled_at + time::Duration::days(1);
+        let edit = release_change_form(&browser, operation_id, 1, Some(changed_time));
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &location, edit.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let receipt_path = response.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(receipt_path.contains(&operation_id.to_string()));
+        let edited = runtime
+            .coordinator
+            .release(release_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edited.publication.version, 2);
+        assert_eq!(edited.publication.scheduled_at, changed_time);
+        assert_eq!(edited.publication.pinned_post_digest, approval.revision);
+        assert_eq!(edited.accepted_preview_digest, approval.preview_digest);
+
+        let replay = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &publish_path, original.clone()))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::SEE_OTHER);
+        assert_eq!(replay.headers()[axum::http::header::LOCATION], location);
+        let conflict = release_change_form(
+            &browser,
+            operation_id,
+            1,
+            Some(changed_time + time::Duration::days(1)),
+        );
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &location, conflict))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let stale = release_change_form(&browser, Uuid::new_v4(), 1, None);
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &location, stale))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+        let cancel = release_change_form(&browser, Uuid::new_v4(), 2, None);
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &location, cancel.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cancelled = runtime
+            .coordinator
+            .release(release_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.publication.state, CanonicalState::Cancelled);
+        assert_eq!(cancelled.publication.version, 3);
+        assert!(runtime.coordinator.read().ledger.is_empty());
+        // The scheduler may already have selected this release before cancellation.
+        assert!(matches!(
+            runtime
+                .coordinator
+                .activate_scheduled(release_id, changed_time)
+                .await,
+            Err(PublicationActivationError::Database(_))
+        ));
+        for body in [edit, cancel] {
+            let replay = runtime
+                .router
+                .clone()
+                .oneshot(browser.request(Method::POST, &location, body))
+                .await
+                .unwrap();
+            assert_eq!(replay.status(), StatusCode::SEE_OTHER);
+        }
+        let receipt = response_text(browser_get(&runtime, &browser, &receipt_path).await).await;
+        assert!(receipt.contains("accepted at release version 2: Scheduled"));
+        assert!(receipt.contains("Cancelled"));
+        assert!(!receipt.contains("Cancel this release"));
+        let replay = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(Method::POST, &publish_path, original))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::SEE_OTHER);
+        assert_eq!(replay.headers()[axum::http::header::LOCATION], location);
+
+        // Cancellation keeps history but permits a fresh approval of the same revision.
+        let next = approval_fixture(&runtime.coordinator, &browser, Uuid::new_v4());
+        let response = runtime
+            .router
+            .clone()
+            .oneshot(browser.request(
+                Method::POST,
+                &publish_path,
+                schedule_form(&next, changed_time),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_ne!(response.headers()[axum::http::header::LOCATION], location);
+        assert_eq!(runtime.coordinator.releases(None).await.unwrap().len(), 2);
+        let root = runtime.close().await;
+        let database_path = root.path().join("state/maincopy.db");
+        let database = database::bootstrap(database_configuration(&database_path))
+            .await
+            .unwrap();
+        let (store, writer) = database.into_store(8);
+        let shutdown = CancellationToken::new();
+        let writer_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            writer.run(writer_shutdown).await.unwrap();
+        });
+        let restored = store.publications.startup_snapshot_state().await.unwrap();
+        assert!(restored.ledger.is_empty());
+        assert_eq!(restored.scheduled.len(), 1);
+        assert_eq!(
+            store
+                .publications
+                .release(release_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .publication
+                .state,
+            CanonicalState::Cancelled
+        );
+        let receipt = store
+            .publications
+            .release_operation(operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.version, 2);
+        let replay = store
+            .publications
+            .change_release(ChangeRelease {
+                operation_id,
+                publication_id: release_id,
+                expected_version: 1,
+                change: ReleaseChange::Reschedule {
+                    scheduled_at: changed_time,
+                },
+                now: OffsetDateTime::now_utc(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt, replay);
+        shutdown.cancel();
+        task.await.unwrap();
+        drop(store);
+        drop(root);
+    }
+
     fn catalog(body: &str) -> (Arc<ContentCatalog>, ContentTreeDigest) {
         let tree = content_tree(
             publication(
@@ -1708,6 +2346,14 @@ mod workflow_tests {
         catalog: Arc<ContentCatalog>,
         content_digest: ContentTreeDigest,
     ) -> WorkflowRuntime {
+        workflow_runtime_with_blocked(catalog, content_digest, false).await
+    }
+
+    async fn workflow_runtime_with_blocked(
+        catalog: Arc<ContentCatalog>,
+        content_digest: ContentTreeDigest,
+        seed_blocked: bool,
+    ) -> WorkflowRuntime {
         let ledger = PublicLedgerProjection::empty();
         let shell = render_site_shell(Arc::clone(&catalog), embedded_manifest(), &ledger).unwrap();
         let initial_snapshot = build_site_snapshot(shell, &ledger).unwrap();
@@ -1742,7 +2388,7 @@ mod workflow_tests {
             .unwrap();
         drop(store);
 
-        let coordinator = PublicationCoordinator {
+        let mut coordinator = PublicationCoordinator {
             catalog: Arc::clone(&catalog),
             content_digest: content_digest.clone(),
             candidates: Arc::new(BTreeMap::from([(content_digest, catalog)])),
@@ -1759,6 +2405,43 @@ mod workflow_tests {
             readiness: Readiness::new(true),
             cancellation: CancellationToken::new(),
         };
+        if seed_blocked {
+            let post_id = PostId::parse(POST_ID).unwrap();
+            let preview = render_bound_post_preview(
+                &coordinator.catalog,
+                coordinator.frontend,
+                &post_id,
+                None,
+                PREVIEW_ASSETS_PATH,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let scheduled_at = OffsetDateTime::now_utc() + time::Duration::days(1);
+            let scheduled = coordinator
+                .schedule(Schedule {
+                    creation_key: Uuid::new_v4(),
+                    publication_id: Uuid::new_v4(),
+                    stable_post_id: post_id,
+                    expected_revision: Some(preview.revision),
+                    accepted_preview_digest: preview.digest,
+                    scheduled_at,
+                })
+                .await
+                .unwrap();
+            let ScheduledApprovalOutcome::Scheduled(scheduled) = scheduled else {
+                panic!("expected scheduled approval");
+            };
+            let retained =
+                std::mem::replace(&mut coordinator.candidates, Arc::new(BTreeMap::new()));
+            assert!(matches!(
+                coordinator
+                    .activate_scheduled(scheduled.publication_id, scheduled_at)
+                    .await,
+                Err(PublicationActivationError::ReleaseBlocked { .. })
+            ));
+            coordinator.candidates = retained;
+        }
         let (coordinator, actor) = coordinator.into_actor(8);
         let actor_shutdown = CancellationToken::new();
         let actor_cancellation = actor_shutdown.clone();

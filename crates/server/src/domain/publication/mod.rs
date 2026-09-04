@@ -39,6 +39,7 @@ pub enum CanonicalState {
 #[serde(rename_all = "snake_case")]
 pub enum ActivationBlockReason {
     RevisionUnavailable,
+    PreviewChanged,
 }
 
 macro_rules! state_markers {
@@ -195,6 +196,17 @@ impl CanonicalPublicationView {
 }
 
 impl CanonicalPublication<canonical::Scheduled> {
+    /// Changes the activation time without replacing the approved revision.
+    pub(crate) fn reschedule(
+        self,
+        expected_version: u64,
+        scheduled_at: OffsetDateTime,
+    ) -> Result<Self, TransitionFailure<Self>> {
+        let mut publication = self.require_version(expected_version)?;
+        publication.entity.scheduled_at = scheduled_at.to_offset(UtcOffset::UTC);
+        Ok(publication.transition(CanonicalState::Scheduled))
+    }
+
     pub fn schedule(
         stable_post_id: PostId,
         pinned_post_digest: PostRevisionDigest,
@@ -533,6 +545,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ActivationBlockReason::RevisionUnavailable).unwrap(),
             serde_json::json!("revision_unavailable")
+        );
+        assert_eq!(
+            serde_json::to_value(ActivationBlockReason::PreviewChanged).unwrap(),
+            serde_json::json!("preview_changed")
         );
     }
 

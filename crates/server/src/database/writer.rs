@@ -27,8 +27,9 @@ use crate::domain::profile::store::{
 #[cfg(test)]
 use crate::domain::publication::store::CommandIdempotencyKey;
 use crate::domain::publication::store::{
-    PublicationMutationError, PublicationStore, StartupSnapshotMutationError, begin_publish_now,
-    begin_scheduled_activation, finish_publication, index_content_catalog, install_startup,
+    PublicationMutationError, PublicationStore, ReleaseApplyError, ReleaseCommandError,
+    StartupSnapshotMutationError, begin_publish_now, begin_scheduled_activation, block_scheduled,
+    change_release, finish_publication, index_content_catalog, install_startup,
     schedule_publication,
 };
 use crate::domain::source::store::{
@@ -338,6 +339,20 @@ async fn apply_mutation(
                 .map_err(ApplyError::publication),
             true,
         ),
+        Mutation::BlockScheduled {
+            command,
+            respond_to,
+        } => database_response(
+            respond_to,
+            block_scheduled(transaction, command)
+                .await
+                .map_err(ApplyError::publication),
+            false,
+        ),
+        Mutation::ChangeRelease {
+            command,
+            respond_to,
+        } => release_response(respond_to, change_release(transaction, command).await),
         Mutation::SchedulePublication {
             command,
             respond_to,
@@ -477,6 +492,23 @@ where
         Err(AuthApplyError::Command(error)) => Err(command_failure(respond_to, error)),
         Err(AuthApplyError::Operation(source)) => Err(FailedMutation::Operation(source)),
         Err(AuthApplyError::CorruptStoredState) => Err(FailedMutation::Corrupt("admin identity")),
+    }
+}
+
+fn release_response<Output: Send + 'static>(
+    respond_to: oneshot::Sender<Result<Output, ReleaseCommandError>>,
+    result: Result<Output, ReleaseApplyError>,
+) -> Result<AppliedMutation, FailedMutation> {
+    match result {
+        Ok(output) => Ok(AppliedMutation::new(
+            respond_to,
+            output,
+            ReleaseCommandError::OutcomeUnknown,
+            true,
+        )),
+        Err(ReleaseApplyError::Command(error)) => Err(command_failure(respond_to, error)),
+        Err(ReleaseApplyError::Operation(source)) => Err(FailedMutation::Operation(source)),
+        Err(ReleaseApplyError::CorruptStoredState) => Err(FailedMutation::Corrupt("release")),
     }
 }
 
@@ -675,9 +707,9 @@ mod tests {
         config::{DatabaseBusyTimeout, DatabaseReadPoolSize, DatabaseWriterQueueCapacity},
         database,
         domain::publication::store::{
-            BeginPublishNow, BeginScheduledActivation, FinishPublication, InstallStartupSnapshot,
-            ObservedPostRevision, PublicationRoute, PublicationRouteOwnershipError,
-            PublishNowState, SchedulePublication, SiteHead,
+            ActivationIntent, BeginPublishNow, BeginScheduledActivation, FinishPublication,
+            InstallStartupSnapshot, ObservedPostRevision, PublicationRoute,
+            PublicationRouteOwnershipError, PublishNowState, SchedulePublication, SiteHead,
         },
     };
     use markdown_compiler::{
@@ -1386,6 +1418,7 @@ mod tests {
         let begun = store
             .publications
             .begin_scheduled_activation(BeginScheduledActivation {
+                intent: ActivationIntent::Due,
                 publication_id: uuid(PUBLICATION_ID),
                 expected_publication_version: 1,
                 expected_site: initial,

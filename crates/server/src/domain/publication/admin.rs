@@ -996,13 +996,28 @@ pub(super) fn activation_error(error: &PublicationActivationError) -> ErrorSpec 
             "already_published",
             "the selected post is already published",
         ),
+        PublicationActivationError::ApprovedRevisionUnavailable => ErrorSpec::conflict(
+            "approved_revision_unavailable",
+            "The approved revision is unavailable; this release remains blocked",
+        ),
+        PublicationActivationError::ReleaseBlocked { .. }
+        | PublicationActivationError::ScheduleLookup(SchedulePublicationLookupError::Blocked {
+            ..
+        }) => ErrorSpec::conflict(
+            "release_blocked",
+            "This release is blocked and requires an explicit retry or cancellation",
+        ),
+        PublicationActivationError::ReleaseLoad(_) => publication_unavailable(),
+        PublicationActivationError::ScheduleLookup(SchedulePublicationLookupError::Cancelled {
+            ..
+        }) => ErrorSpec::conflict(
+            "release_cancelled",
+            "This release was cancelled and will not publish",
+        ),
         PublicationActivationError::ScheduleNotFuture { .. } => ErrorSpec::bad_request(
             "schedule_not_future",
             "scheduled_for must be later than the current server time",
         ),
-        PublicationActivationError::ScheduledPublicationUnavailable { .. } => {
-            publication_unavailable()
-        }
         PublicationActivationError::Database(DatabaseMutationError::Admission(
             DatabaseAdmissionError::QueueFull | DatabaseAdmissionError::WriterClosed,
         ))
