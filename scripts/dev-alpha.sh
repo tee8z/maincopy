@@ -7,7 +7,7 @@ usage() {
 Usage: scripts/dev-alpha.sh [--trust-browser]
 
 Build and run the example Maincopy server plus its loopback HTTPS gateway.
-On first use, bootstrap prompts twice for the owner password.
+On first use, the daemon prints a generated owner password exactly once.
 EOF
 }
 
@@ -41,7 +41,6 @@ project_root=$(cd -- "$script_dir/.." && pwd -P)
 readonly project_root
 readonly config="$project_root/crates/server/examples/local-alpha/maincopy.toml"
 readonly daemon="$project_root/target/debug/maincopyd"
-readonly database="$project_root/target/maincopy-dev/state/maincopy.db"
 if [[ -n ${XDG_DATA_HOME:-} ]]; then
   maincopy_data_root=$XDG_DATA_HOME
 elif [[ -n ${HOME:-} ]]; then
@@ -58,10 +57,6 @@ cargo build --locked \
   --package maincopy-server --bin maincopyd \
   --package maincopy-diagram-renderer --bin maincopy-mermaid \
   --package maincopy-cli --bin maincopy
-
-if [[ ! -e $database ]]; then
-  "$daemon" --config "$config" identity bootstrap password --username owner
-fi
 
 daemon_pid=
 gateway_pid=

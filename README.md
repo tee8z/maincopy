@@ -38,8 +38,10 @@ V1 has these product boundaries:
 - Automation uses scoped public-key credentials and fresh NIP-98 proofs.
 - The NixOS module deploys `maincopyd`, the admin gateway, and Litestream.
 - A tested restore combines the database replica and revision artifacts.
-- Offline bootstrap and repair are finite process modes that bind no listener.
-- These modes create no recovery transport, recovery API, or authentication
+- On fresh state, normal startup generates an instance-unique 256-bit owner
+  password, displays it once, persists only its Argon2id hash, and continues.
+- Explicit bootstrap and repair commands remain finite offline process modes.
+  They bind no listener and create no recovery transport or authentication
   bypass.
 
 Maincopy v1 does not include a browser article editor, Git write-back,
@@ -54,10 +56,11 @@ The repository contains the content compiler, immutable snapshot model,
 single-writer SQLite core, authenticated admin API, remote CLI, publication
 scheduler, and static tip foundation.
 
-Password and Nostr login, server-side sessions, role scopes, NIP-98 agent
-proofs, exact previews, and immediate or scheduled release foundations are
-present. The admin backend now uses a loopback-only HTTP listener. The CLI
-connects through the configured HTTPS admin origin.
+Password and Nostr login, generated first-start owner setup, server-side
+sessions, role scopes, NIP-98 agent proofs, exact previews, and immediate or
+scheduled release foundations are present. The admin backend now uses a
+loopback-only HTTP listener. The CLI connects through the configured HTTPS
+admin origin.
 
 A checked, loopback-only HTTPS gateway and explicit local CA trust are present
 for the local-alpha workflow. This development harness is not the production
@@ -159,8 +162,9 @@ Start the local alpha from the repository root:
 scripts/dev-alpha.sh
 ```
 
-The first run reads the owner password from the terminal. Keep the launcher
-open, then use `scripts/dev-maincopy.sh` from a second Nix shell.
+On fresh state, copy the generated `owner` password from the launcher output.
+Maincopy displays it once and does not use a shared default password. Keep the
+launcher open, then use `scripts/dev-maincopy.sh` from a second Nix shell.
 
 Use explicit browser trust only when the browser demonstration requires it:
 

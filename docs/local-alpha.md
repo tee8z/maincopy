@@ -67,12 +67,34 @@ Start the local alpha without changing browser trust:
 scripts/dev-alpha.sh
 ```
 
-On first use, enter and confirm the owner password. Use 15 to 128 Unicode
-characters and no more than 1024 bytes.
-
 The launcher builds `maincopyd`, its isolated `maincopy-mermaid` renderer, and
 `maincopy`. It then starts the server and the Caddy gateway. Keep this terminal
 open.
+
+On fresh state, `maincopyd` generates the `owner` account with an
+instance-unique password from 256 bits of operating-system randomness. It
+prints the username and password once before it persists the identity
+transaction. Copy the password from the launcher output immediately.
+
+Maincopy stores only the Argon2id password hash. It does not have a shared
+default password, and it does not display this password on later starts. The
+current alpha does not force a password change or provide a completed admin UI
+for first-login rotation.
+
+The credential output appears before the readiness output:
+
+```text
+Maincopy generated the initial owner credential.
+
+  Username: owner
+  Password: COPY_THIS_GENERATED_VALUE
+
+Save this password now. Maincopy will not display it after identity setup.
+```
+
+> [!WARNING]
+> Treat first-start standard output as credential material. Do not copy the
+> generated password into shared terminal logs, issue reports, or shell files.
 
 Wait for this output:
 
@@ -155,8 +177,8 @@ Run the human login command:
 scripts/dev-maincopy.sh login --username owner
 ```
 
-Enter the bootstrap password. A successful command reports the session, user,
-provider, roles, and expiry time.
+Enter the generated initial owner password. A successful command reports the
+session, user, provider, roles, and expiry time.
 
 ### 2. Select the loaded revision
 
@@ -308,7 +330,7 @@ mv -- target/maincopy-dev/state "$STATE_ARCHIVE"
 printf 'Preserved prior state at %s\n' "$STATE_ARCHIVE"
 ```
 
-The next launcher run creates new state and prompts for a new owner password.
+The next launcher run creates new state and prints a new owner password once.
 This reset does not replace the durable development CA.
 
 > [!WARNING]
@@ -347,6 +369,16 @@ Use the stored session or restore its original server state. Run
 
 If the original state no longer exists, remove only the Maincopy entry through
 the operating system credential manager. Confirm the target before removal.
+
+### The generated owner password was not saved
+
+If no human session exists, stop the launcher and move the disposable local
+alpha state aside with the reset procedure above. Restart the launcher, then
+save the new password before the readiness message appears.
+
+If a session exists, log out before the reset. Maincopy does not redisplay the
+initial password, and the current alpha does not provide a completed browser
+password-rotation flow.
 
 ### The development CA is missing
 

@@ -106,7 +106,7 @@ pub(crate) struct AdminSecurityState {
 }
 
 impl AdminSecurityState {
-    /// Initializes the security boundary only after offline identity bootstrap.
+    /// Initializes the security boundary only after identity bootstrap.
     pub(crate) async fn new(
         origin: AdminOrigin,
         store: AuthStore,

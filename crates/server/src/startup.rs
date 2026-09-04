@@ -49,8 +49,8 @@ use crate::{
         ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal, StartupStage,
     },
     frontend_assets::{FrontendAssetManifest, embedded_manifest},
+    identity_bootstrap,
     observability::{initialize_logging, task_span},
-    offline_identity,
     process_lock::{ProcessLock, ProcessLockError},
     render::{
         CatalogBuildError, CatalogRetentionError, ContentCatalog, ContentCompiler, SiteSnapshot,
@@ -173,7 +173,7 @@ pub async fn run_until_stop() -> ProcessExit {
             ServerInvocation::BootstrapIdentity {
                 config_path,
                 credential,
-            } => offline_identity::bootstrap_owner(config_path, credential).await,
+            } => identity_bootstrap::bootstrap_owner(config_path, credential).await,
         }
     }
     .await;
@@ -277,6 +277,23 @@ impl Application {
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
         let database_task = spawn_critical_task(database_task);
+
+        if let Err(error) =
+            identity_bootstrap::bootstrap_generated_owner(&database_store, std::io::stdout()).await
+        {
+            let error = startup_failure(
+                StartupStage::Identity,
+                "bootstrap a generated initial owner",
+                error,
+            );
+            return Err(close_writer_after_startup_failure(
+                database_store,
+                database_shutdown,
+                database_task,
+                error,
+            )
+            .await);
+        }
 
         let providers = ConfiguredLoginProviders::new(true, true)
             .expect("password and Nostr form a valid login-provider set");
@@ -1656,7 +1673,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
-    async fn unbootstrapped_identity_prevents_both_network_listeners() {
+    async fn unbootstrapped_identity_generates_owner_and_starts_the_application() {
         let (root, _, _) = startup_fixture("", VALID_PUBLICATION);
         let config_path = root.path().join("maincopy.toml");
         let public_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1670,22 +1687,47 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let arguments = config_path;
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
-        let admin_addr = startup._host.view().admin_bind.into_socket_addr();
+        let application = Application::build(startup).await.unwrap();
 
-        let error = match Application::build(startup).await {
-            Ok(_) => panic!("an unbootstrapped identity must prevent listener binding"),
-            Err(error) => error,
-        };
+        let identity = application._database.auth.identity_state().await.unwrap();
+        assert!(!identity.bootstrap_required);
+        assert!(identity.instance.is_some());
+        let users = application
+            ._database
+            .auth
+            .users_page(None, 2)
+            .await
+            .unwrap();
+        assert_eq!(users.items.len(), 1);
+        let owner = &users.items[0];
+        assert!(owner.has_password);
+        assert!(!owner.has_nostr);
+        assert!(
+            owner
+                .roles
+                .contains(&maincopy_shared::auth::UserRole::Owner)
+        );
+        let credentials = application
+            ._database
+            .auth
+            .user_credentials(owner.user_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            error,
-            ProcessError::Application(ApplicationError::Startup {
-                stage: StartupStage::Identity,
+            credentials.as_slice(),
+            [crate::domain::auth::store::StoredHumanCredential::Password {
+                username,
                 ..
-            })
+            }] if username.as_str() == "owner"
         ));
-        let rebound_public = tokio::net::TcpListener::bind(public_addr).await.unwrap();
-        let rebound_admin = tokio::net::TcpListener::bind(admin_addr).await.unwrap();
-        drop((rebound_public, rebound_admin));
+        assert!(
+            !identity_bootstrap::bootstrap_generated_owner(&application._database, std::io::sink())
+                .await
+                .unwrap()
+        );
+
+        stop_built_application(application).await;
     }
 
     #[tokio::test]

@@ -790,11 +790,15 @@ mod tests {
         );
         assert_eq!(
             config.view().state_root,
-            crate_root.join("examples/../../../target/maincopy-dev/state")
+            crate_root.join("examples/../../../target/maincopy-example/state")
         );
         assert_eq!(
             config.view().runtime_root,
-            crate_root.join("examples/../../../target/maincopy-dev/run")
+            crate_root.join("examples/../../../target/maincopy-example/run")
+        );
+        assert_eq!(
+            config.view().admin_origin.as_str(),
+            "https://admin.localhost:8443"
         );
     }
 

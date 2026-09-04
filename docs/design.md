@@ -128,6 +128,7 @@ flowchart LR
     Gateway -->|loopback HTTP| Listener[Admin listener]
     Listener --> Auth[Authentication and scopes]
     Auth --> Admin[Admin API and UI]
+    FreshStart[Fresh normal daemon startup] -->|generated owner identity| Operations[Typed admin operations]
     Recovery[Offline bootstrap or recovery] --> Operations[Typed admin operations]
 
     Admin --> Preview[Private preview builder]
@@ -171,8 +172,10 @@ The public and admin routers do not mount `/metrics`.
 The metrics listener does not use admin authentication. V1 relies on the
 loopback bind and host access controls and provides no remote metrics gateway.
 
-Offline bootstrap and repair are finite process invocations. They create no
-recovery transport, recovery API, or continuing authentication bypass.
+Fresh-state identity creation runs inside normal startup before any listener
+binds. Explicit bootstrap and repair are finite offline process invocations.
+They create no recovery transport, recovery API, or continuing authentication
+bypass.
 
 ## Source-of-truth boundaries
 
@@ -236,29 +239,52 @@ not fetch, pull, commit, or push.
 Source commit metadata is optional in this mode. The content digest remains
 required.
 
-### First-run bootstrap
+### First-run identity and source bootstrap
 
-An empty managed installation starts in a restricted bootstrap state. It binds
-no network listener.
+An empty installation starts with identity bootstrap required. On normal
+`maincopyd` startup, the daemon acquires process ownership and opens SQLite
+before it creates the first identity. No network listener binds during this
+operation.
 
-An operator runs typed, offline `maincopyd` bootstrap commands on the host.
-Each command acquires exclusive process ownership and uses domain transactions.
-The commands do not provide a raw SQLite console or accept arbitrary SQL.
+The daemon obtains 256 random bits from the operating system and encodes them
+as one copyable, instance-unique password for the fixed `owner` username. It
+writes the username and password to standard output once and flushes that
+output. Only then does it persist these records in one atomic transaction:
 
-The identity step creates these records in one transaction:
-
-- stable `InstanceId`;
-- first owner and login credential; and
+- stable random `InstanceId`;
+- first owner and Argon2id password credential; and
 - initial audit event.
 
-The source step then creates these records in one transaction:
+SQLite stores only the password hash. Maincopy does not use a shared default
+password, send the raw password through tracing, or display it after a
+successful identity transaction. The process supervisor must restrict access
+to first-start standard output because that one credential block is secret.
+
+If credential output fails, startup performs no identity transaction. If the
+transaction fails after output, that displayed password is not committed. A
+retry generates and displays a different password.
+
+After the transaction commits, normal startup continues through content and
+snapshot construction before it binds the listeners. A later normal restart
+detects the existing identity and generates no owner credential.
+
+An operator can run a typed offline identity command before normal startup for
+automation, controlled provisioning, or recovery. The command acquires
+exclusive process ownership and uses the same domain transaction. It binds no
+listener, exposes no network bootstrap route, and accepts no arbitrary SQL.
+
+V1 does not require the generated password to change on first login. The
+current build has no completed admin UI password-rotation flow.
+
+Managed mode has a separate source bootstrap step. It creates these records in
+one transaction:
 
 - managed remote and branch;
 - content root and polling policy; and
 - SSH credential reference.
 
-The source step validates the first fetch and compilation before it closes the
-bootstrap state. The `maincopy` client never writes SQLite directly.
+The source step validates the first fetch and compilation before normal
+listener binding. The `maincopy` client never writes SQLite directly.
 
 Offline recovery commands use the same typed invariant checks. They bind no
 listener and refuse to run while the daemon owns the process lock. These
@@ -266,8 +292,9 @@ commands create no recovery transport or recovery API.
 
 ## Instance identity and discovery
 
-Bootstrap generates one random `InstanceId` and stores it in SQLite. A restore
-preserves the identifier. A new database receives a new identifier.
+The identity transaction generates one random `InstanceId` and stores it in
+SQLite. A restore preserves the identifier. A new database receives a new
+identifier.
 
 Unauthenticated admin discovery returns these bounded fields:
 
@@ -688,6 +715,8 @@ Network reachability alone grants no authority.
 V1 requires a release-blocking review of the complete authentication boundary.
 The review includes these areas:
 
+- one-time first-start credential generation, output handling, and atomic
+  persistence;
 - password hashing, verification, rate limits, and account enumeration;
 - session creation, fixation resistance, expiry, rotation, and revocation;
 - cookie flags, CSRF verification, and exact host and origin checks;
@@ -796,15 +825,18 @@ Normal startup follows this order:
 1. Validate host configuration and acquire process ownership.
 2. Construct the Prometheus registry and registered metric instruments.
 3. Open and verify SQLite through its instrumented single-writer bootstrap.
-4. Verify instance identity and authentication compatibility.
-5. Reconcile incomplete reloads and releases.
-6. Verify required revision artifacts.
-7. Build and install the canonical immutable snapshot.
-8. Bind the public, loopback admin, and loopback metrics listeners.
-9. Start the supervised Tokio collector, source polling, and release scheduler.
+4. If identity is absent, generate and display the owner credential once.
+5. Atomically persist the generated identity, or fail before listener binding.
+6. Verify instance identity and authentication compatibility.
+7. Reconcile incomplete reloads and releases.
+8. Verify required revision artifacts.
+9. Build and install the canonical immutable snapshot.
+10. Bind the public, loopback admin, and loopback metrics listeners.
+11. Start the supervised collector, source polling, and release scheduler.
 
-Bootstrap and recovery commands are offline process modes. They bind no network
-listener.
+Explicit bootstrap and recovery commands are offline process modes. They bind
+no network listener. Automatic identity bootstrap is part of normal startup,
+but it also completes before a listener binds.
 
 Shutdown stops intake before workers. It drains accepted database work before
 it closes SQLite and releases all listener addresses.
@@ -905,8 +937,11 @@ V1 must prove these properties:
   audit records, or instance configuration.
 - The authentication security review has no unresolved critical or high-risk
   finding.
-- Bootstrap and recovery create no recovery transport, bind no listener, and
-  accept no arbitrary SQL.
+- Fresh-state normal startup outputs one instance-unique 256-bit owner password
+  before its atomic identity transaction. It binds no listener until that
+  transaction and the remaining startup checks succeed.
+- Explicit bootstrap and recovery commands create no recovery transport, bind
+  no listener, and accept no arbitrary SQL.
 - Known code fences use only static canonical language classes; every code path
   escapes source and unknown fences use the plain-code fallback.
 - Mermaid uses a deterministic local renderer with bounded resources.

@@ -1,0 +1,19 @@
+# Local daemon configuration for runs launched from the repository root.
+#
+# cargo run --locked --package maincopy-server --bin maincopyd -- \
+#   --config maincopy.example.toml
+
+[paths]
+content_root = "crates/server/examples/content"
+# This pre-release sample state is disposable across breaking renderer changes.
+state_root = "target/maincopy-example/state"
+runtime_root = "target/maincopy-example/run"
+
+[public]
+bind = "127.0.0.1:3000"
+
+[admin]
+bind = "127.0.0.1:3001"
+# The daemon exposes plain loopback HTTP here. A separate local gateway owns
+# this HTTPS origin for administration requests.
+origin = "https://admin.localhost:8443"

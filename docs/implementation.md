@@ -33,9 +33,10 @@ release claim.
 | SQLite bootstrap, single writer, and query pool | Implemented foundation |
 | Admin discovery, OpenAPI, request IDs, and post reads | Implemented foundation |
 | Users, roles, profiles, password and Nostr login, sessions, CSRF, and NIP-98 authentication | Implemented foundation |
+| Generated first-start owner identity and explicit offline identity bootstrap | Implemented foundation |
 | Initial publication, private previews, and local CLI commands | Implemented foundation |
 | Preview-gated update releases and complete release management | In progress |
-| Managed Git synchronization and restricted bootstrap | Planned |
+| Managed Git synchronization and restricted source bootstrap | Planned |
 | Snapshot-backed RSS feed, sitemap, robots policy, and HTML autodiscovery | Implemented foundation |
 | Canonical links, core non-image Open Graph fields, and `BlogPosting` JSON-LD | Implemented foundation |
 | Built-in public theme shell, packaged CSS, stable `maincopy-*` hooks, and previous/next navigation | Implemented |
@@ -136,7 +137,9 @@ deployments.
 - Run continuous integration on pull requests and pushes to `master`.
 - Keep the repository private until the owner approves public release.
 - Treat remote administration as the normal production workflow.
-- Keep bootstrap and recovery as offline, no-listener process modes.
+- Complete automatic first-owner creation before listener binding.
+- Keep explicit bootstrap and recovery commands as offline, no-listener process
+  modes.
 - Keep `/metrics` on its dedicated loopback-only listener.
 - Keep Git write permission outside every Maincopy role and credential.
 - Do not add a browser content editor in v1.
@@ -277,6 +280,8 @@ browser, human CLI, or agent ---> HTTPS admin gateway
 
 offline bootstrap or recovery ---> typed domain operations ---> SQLite writer
 
+fresh normal startup ---> generated owner identity ---> SQLite writer
+
 Prometheus scraper ---> loopback TCP metrics listener ---> GET /metrics
 ```
 
@@ -367,8 +372,10 @@ Every slice must preserve these invariants:
 40. Maincopy roles and agent scopes grant no Git write permission.
 41. Mermaid rendering runs during compilation. Only sanitized SVG can enter a
     candidate, and a rendering or sanitization failure rejects that candidate.
-42. Bootstrap and recovery are offline typed commands. They bind no listener,
-    accept no arbitrary SQL, and require exclusive process ownership.
+42. Fresh-state normal startup creates the generated owner through one typed
+    transaction before listener binding. Explicit bootstrap and recovery
+    commands remain offline, bind no listener, accept no arbitrary SQL, and
+    require exclusive process ownership.
 43. `maincopyd` serves `/metrics` only from a dedicated loopback listener. The
     public and admin routers do not mount this route.
 44. An accepted scheduled release or successful immediate release permanently
@@ -448,9 +455,10 @@ flowchart LR
 The pre-v1 transition must finish before another persistent contract lands.
 The content compiler foundation and SQLite core can then run in parallel.
 WP1.5 runs after the canonical web and SQLite core.
-The Slice 4 foundation adds the first owner through an offline bootstrap mode
-after reload coordination. WP1.7 then adds the offline source-settings
-bootstrap transaction and managed Git synchronization.
+The Slice 4 foundation adds automatic first-owner creation during fresh-state
+normal startup and retains an explicit offline identity command. WP1.7 then
+adds the offline source-settings bootstrap transaction and managed Git
+synchronization.
 WP4.2 builds a fail-closed router without binding a listener. WP4.6 supplies
 the identity and session state. WP4.1 is the first package that can bind the
 protected loopback listener.
@@ -604,8 +612,9 @@ A fixed row is binding. Resolve each selection row before its due work starts.
 | --- | --- | --- | --- |
 | Pre-v1 state | Discard all pre-release databases and bootstrap fresh state. Rewrite baseline migrations in place. Keep `/api/admin/v1` and `*-b3-v1-*` as the first intended product contracts. Add no migration, converter, fallback, or legacy reader. | Fixed | 0.5 |
 | Git metadata | Require the full commit in managed mode. Keep it optional in external checkout mode. Always require the content digest. | Fixed | 1.7 |
-| Managed-source bootstrap | Use offline typed commands that bind no listener. Create the first owner and source settings before the first accepted fetch, compile, public listener, or admin listener. | Fixed | 1.7 and 4.1 |
-| Instance identity | Generate a stable random `InstanceId` during bootstrap. Store it in SQLite and advertise it with the expected public origin through unauthenticated bounded discovery. A restore preserves it. | Fixed | 4.2 |
+| First-owner bootstrap | On fresh-state normal startup, generate an instance-unique 256-bit password for `owner`, write it once to standard output before atomic persistence, and continue startup. Retain the typed offline identity command for automation and recovery. Neither path binds a listener before the identity transaction commits. | Fixed | 4.1 and 4.6 |
+| Managed-source bootstrap | Use an offline typed source-settings command that binds no listener. Create source settings before the first accepted managed fetch, compile, public listener, or admin listener. | Fixed | 1.7 and 4.1 |
+| Instance identity | Generate a stable random `InstanceId` during the atomic identity transaction. Store it in SQLite and advertise it with the expected public origin through unauthenticated bounded discovery. A restore preserves it. | Fixed | 4.2 |
 | Pinned revision retention | Store a content-addressed immutable artifact package for each current or non-terminal release revision. Treat unexpected loss as `revision_unavailable`. | Fixed | 1.8 and 5.1 |
 | Revision-artifact backup | Select a backup and retention implementation that restores artifact packages at a recovery point compatible with SQLite. Litestream alone is insufficient. | Select | 8.4 |
 | Preview precondition | Require an accepted preview digest plus the expected post and site revision for every first-publication or update schedule and publish-now action. | Fixed | 5.1 and 5.3 |
@@ -1400,9 +1409,10 @@ Deliverables:
 
 - One versioned SQLite source configuration with the SSH remote, exact branch,
   content subdirectory, named SSH credential reference, and poll interval.
-- A bootstrap-only source-settings command after the identity bootstrap has
-  created the first owner. This offline `maincopyd` mode binds no listener and
-  uses the same typed writer operations. The CLI never writes SQLite directly.
+- A bootstrap-only source-settings command after automatic or explicit
+  identity bootstrap has created the first owner. This offline `maincopyd`
+  mode binds no listener and uses the same typed writer operations. The CLI
+  never writes SQLite directly.
 - No public, admin, or metrics listener, source fetch, or normal content compile
   before the first owner and source settings commit.
 - A first successful fetch and compile that closes bootstrap state before
@@ -2421,7 +2431,8 @@ Deliverables:
   security state.
 - Graceful listener shutdown and address release.
 - No gateway access to the database, content, state, or secret directories.
-- A `BootstrapRequired` process state that binds no network listener.
+- A `BootstrapRequired` identity state that normal startup resolves through the
+  WP4.6 generated-owner transaction before it binds a network listener.
 - Typed offline bootstrap and recovery modes that acquire the process lock,
   use invariant-preserving domain operations, and accept no arbitrary SQL.
 - Offline modes create no recovery transport, recovery API, or continuing
@@ -2450,8 +2461,9 @@ Failure tests:
 - Deny the gateway service access to daemon state and secret files.
 - Send an authenticated `GET /metrics` request to the admin router and receive
   `404 Not Found`.
-- Prove that `BootstrapRequired` and recovery modes create no recovery
-  transport and bind no listener.
+- Prove that automatic identity bootstrap completes before listener binding
+  and creates no recovery transport.
+- Prove that explicit bootstrap and recovery modes bind no listener.
 - Refuse an offline command while the daemon owns the process lock.
 - Reject arbitrary SQL, raw database paths, and unknown recovery operations.
 - Prove that the public router returns `404 Not Found` for every admin path.
@@ -2478,8 +2490,8 @@ Deliverables:
   HTML, and login challenge or session creation.
 - Authentication on the versioned capabilities document, OpenAPI document,
   preview HTML, preview assets, resource reads, and every mutation.
-- A stable random `InstanceId` generated by the restricted bootstrap
-  transaction and stored in SQLite.
+- A stable random `InstanceId` generated by the identity transaction and stored
+  in SQLite.
 - Supported API versions, feature-contract versions, `InstanceId`, and the
   expected public origin in bounded discovery output.
 - A discovery contract that remains forward-compatible when a server
@@ -2825,9 +2837,24 @@ Deliverables:
   fragments, whitespace, control characters, trailing dots, and empty labels.
 - Clearnet HTTPS addresses only. Reject LUD-16 default-identifier shorthand and
   Onion identifiers in v1.
-- An offline `maincopyd` bootstrap command that creates the first owner with a
-  Nostr or password credential accepted by the configured provider set. It
-  binds no listener, and the CLI never writes SQLite directly.
+- A normal `maincopyd` startup path that detects fresh identity state before
+  listener binding and creates the first owner with username `owner`.
+- An instance-unique initial owner password generated from exactly 32 bytes of
+  operating-system cryptographic randomness. Encode it as a copyable value
+  that satisfies the password-input bounds without reducing its 256-bit source
+  entropy.
+- One dedicated standard-output credential block containing the initial
+  username and password. Write and flush it exactly once before the atomic
+  identity transaction begins. Never send it through tracing or diagnostics.
+- Fail before identity persistence when credential output or flushing fails.
+  If persistence fails after output, leave identity bootstrap required. The
+  next attempt must generate and display a different credential.
+- No shared default owner password and no automatic redisplay on restart. V1
+  does not require a password change on first login.
+- An explicit offline `maincopyd` identity command for automation, controlled
+  provisioning, and recovery. It can create the first owner with a Nostr or
+  password credential accepted by its selected provider set. It binds no
+  listener, and the CLI never writes SQLite directly.
 - Protected terminal input for an offline bootstrap or recovery password. Do
   not accept the password in arguments, environment variables, or diagnostics.
 - One atomic identity-bootstrap transaction that creates the `InstanceId`,
@@ -2925,6 +2952,8 @@ Deliverables:
   profile changes, and agent credential lifecycle operations.
 - Owner or typed offline-recovery password rotation. V1 has no public or
   self-service password-reset flow.
+- Do not make initial startup depend on a completed admin UI or a forced
+  first-login rotation gate.
 - No raw password, browser session token, CSRF token, Nostr private key, or
   encrypted `nsec` field in v1 SQLite, logs, metrics, errors, traces, or audit
   events. PHC strings stay in the password credential table and never enter
@@ -2940,7 +2969,18 @@ Tests:
 - Prevent an enabled user from losing its last credential accepted by an
   enabled provider. Reject startup when a provider change strands one.
 - Preserve global uniqueness for canonical usernames and Nostr public keys.
-- Create the first owner only through the offline bootstrap process mode.
+- Start against fresh state and capture exactly one generated `owner`
+  credential block before the identity transaction commits.
+- Verify that the generated password derives from 32 random bytes, satisfies
+  the password policy, and persists only as its Argon2id PHC string.
+- Restart the initialized instance and produce no credential block, no second
+  owner, and no new `InstanceId`.
+- Inject standard-output write and flush failures. Persist no identity and bind
+  no listener.
+- Inject an identity-transaction failure after successful output. Preserve
+  bootstrap-required state and generate a different password on retry.
+- Complete explicit offline identity bootstrap before normal startup. Produce
+  no automatic credential and preserve the offline-selected owner identity.
 - Refuse open registration and remote first-owner bootstrap.
 - Verify a valid NIP-98 login proof against the configured admin origin.
 - Reject the wrong kind, method, URL, payload hash, signature, or public key.
@@ -3019,8 +3059,11 @@ Tests:
   is ready.
 - The legacy Unix-socket and Windows named-pipe deletion set lands atomically
   with the protected loopback listener.
-- Bootstrap and recovery modes create no recovery transport, bind no listener,
-  and accept no arbitrary SQL.
+- Fresh-state normal startup displays one instance-unique 256-bit `owner`
+  password before atomic identity persistence and listener binding. Restart
+  displays no credential.
+- Explicit bootstrap and recovery modes create no recovery transport, bind no
+  listener, and accept no arbitrary SQL.
 - A laptop user can manage a remote instance without an interactive host login.
 - Every remote operation has an authenticated principal and typed scopes.
 - Every human principal resolves to a stable `UserId`.
@@ -5259,8 +5302,11 @@ V1 is ready for owner approval when all of these statements are true:
 - Remote clients use an HTTPS gateway on a separate admin origin.
 - The public origin has no route or upstream to the admin service.
 - The gateway forwards only to a loopback-only admin listener.
-- Offline bootstrap and recovery create no recovery transport, bind no
-  listener, and accept no arbitrary SQL.
+- Fresh-state normal startup generates and displays one instance-unique
+  256-bit owner password before atomic identity persistence. It continues only
+  after the transaction commits and never displays that password again.
+- Explicit offline bootstrap and recovery create no recovery transport, bind
+  no listener, and accept no arbitrary SQL.
 - Browser, human CLI, and agent clients receive the same typed resources and
   errors after authentication.
 - Durable operations remain inspectable after a client disconnect or timeout.

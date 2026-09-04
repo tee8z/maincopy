@@ -1,8 +1,9 @@
 use std::{
-    io::{self, IsTerminal as _, Read as _},
+    io::{self, IsTerminal as _, Read as _, Write as _},
     path::PathBuf,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use maincopy_shared::{
     auth::{AdminAuditEventId, InstanceId, UserId},
     auth_api::SecretString,
@@ -12,16 +13,17 @@ use time::OffsetDateTime;
 use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use zeroize::Zeroize as _;
 
 use crate::{
     cli::BootstrapCredential,
     config::HostConfigurationLoader,
     database::{self, DatabaseStore},
     domain::auth::{
-        Argon2idPolicy, MAX_PASSWORD_BYTES, PasswordHashingError,
+        Argon2idPolicy, CanonicalUsername, MAX_PASSWORD_BYTES, PasswordHashingError,
         store::{
-            AuthCommandError, AuthMutationError, BootstrapIdentity, ConfiguredLoginProviders,
-            NewHumanCredential,
+            AuthCommandError, AuthLoadError, AuthMutationError, BootstrapIdentity,
+            BootstrapIdentityResult, ConfiguredLoginProviders, NewHumanCredential,
         },
     },
     error::{ApplicationError, ProcessError, StartupStage},
@@ -30,6 +32,114 @@ use crate::{
 };
 
 const INITIAL_PASSWORD_POLICY_VERSION: u32 = 1;
+const GENERATED_OWNER_USERNAME: &str = "owner";
+const GENERATED_OWNER_PASSWORD_PREFIX: &str = "mcp1_";
+const GENERATED_OWNER_PASSWORD_ENTROPY_BYTES: usize = 32;
+
+struct GeneratedOwnerPassword(SecretString);
+
+impl GeneratedOwnerPassword {
+    fn generate() -> Result<Self, GeneratedOwnerBootstrapError> {
+        let mut entropy = [0_u8; GENERATED_OWNER_PASSWORD_ENTROPY_BYTES];
+        if getrandom::fill(&mut entropy).is_err() {
+            entropy.zeroize();
+            return Err(GeneratedOwnerBootstrapError::PasswordGeneration);
+        }
+        Ok(Self::from_entropy(entropy))
+    }
+
+    fn from_entropy(mut entropy: [u8; GENERATED_OWNER_PASSWORD_ENTROPY_BYTES]) -> Self {
+        let mut password = String::with_capacity(48);
+        password.push_str(GENERATED_OWNER_PASSWORD_PREFIX);
+        URL_SAFE_NO_PAD.encode_string(entropy, &mut password);
+        entropy.zeroize();
+        Self(SecretString::new(password.into_boxed_str()))
+    }
+
+    fn copy_for_hashing(&self) -> SecretString {
+        SecretString::new(self.0.expose_secret())
+    }
+}
+
+/// Creates the first owner from an instance-unique password when a daemon is
+/// started against fresh state.
+pub(crate) async fn bootstrap_generated_owner<Output>(
+    store: &DatabaseStore,
+    mut output: Output,
+) -> Result<bool, GeneratedOwnerBootstrapError>
+where
+    Output: io::Write + Send,
+{
+    let identity = store
+        .auth
+        .identity_state()
+        .await
+        .map_err(GeneratedOwnerBootstrapError::IdentityState)?;
+    if !identity.bootstrap_required {
+        return Ok(false);
+    }
+
+    let password = GeneratedOwnerPassword::generate()?;
+    let password_executor = PasswordExecutor::new(Argon2idPolicy::v1())
+        .await
+        .map_err(GeneratedOwnerBootstrapError::Password)?;
+    let password_hash = password_executor
+        .hash_password(password.copy_for_hashing())
+        .await
+        .map_err(GeneratedOwnerBootstrapError::Password)?;
+
+    write_generated_owner_credential(&mut output, &password)
+        .map_err(GeneratedOwnerBootstrapError::Output)?;
+    output
+        .flush()
+        .map_err(GeneratedOwnerBootstrapError::Output)?;
+
+    let result = persist_owner_identity(
+        store,
+        NewHumanCredential::Password {
+            username: CanonicalUsername::parse(GENERATED_OWNER_USERNAME)
+                .expect("the generated owner username is canonical"),
+            password_hash,
+            policy_version: INITIAL_PASSWORD_POLICY_VERSION,
+        },
+        ConfiguredLoginProviders::new(true, true)
+            .expect("password and Nostr form a valid login-provider set"),
+    )
+    .await
+    .map_err(GeneratedOwnerBootstrapError::Mutation)?;
+
+    tracing::info!(
+        instance_id = %result.instance.instance_id,
+        owner_user_id = %result.owner_user_id,
+        "generated the initial owner identity"
+    );
+    Ok(true)
+}
+
+fn write_generated_owner_credential(
+    output: &mut impl io::Write,
+    password: &GeneratedOwnerPassword,
+) -> io::Result<()> {
+    writeln!(
+        output,
+        "\nMaincopy generated the initial owner credential.\n\n  Username: {GENERATED_OWNER_USERNAME}\n  Password: {}\n\nSave this password now. Maincopy will not display it after identity setup.\n",
+        password.0.expose_secret()
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GeneratedOwnerBootstrapError {
+    #[error("the durable identity state could not be read")]
+    IdentityState(#[source] AuthLoadError),
+    #[error("a secure initial owner password could not be generated")]
+    PasswordGeneration,
+    #[error("the initial owner password could not be prepared")]
+    Password(#[source] PasswordExecutorError),
+    #[error("the generated owner credential could not be displayed")]
+    Output(#[source] io::Error),
+    #[error("the generated owner identity could not be persisted")]
+    Mutation(#[source] AuthMutationError),
+}
 
 /// Creates the instance identity and first owner without starting any server runtime.
 pub(crate) async fn bootstrap_owner(
@@ -141,7 +251,24 @@ async fn bootstrap_with_store(
         }
     };
 
-    let result = store
+    let result = persist_owner_identity(store, credential, configured_providers)
+        .await
+        .map_err(map_bootstrap_mutation_error)?;
+
+    tracing::info!(
+        instance_id = %result.instance.instance_id,
+        owner_user_id = %result.owner_user_id,
+        "identity bootstrap completed"
+    );
+    Ok(())
+}
+
+async fn persist_owner_identity(
+    store: &DatabaseStore,
+    credential: NewHumanCredential,
+    configured_providers: ConfiguredLoginProviders,
+) -> Result<BootstrapIdentityResult, AuthMutationError> {
+    store
         .auth
         .bootstrap_identity(BootstrapIdentity {
             instance_id: InstanceId::from_uuid(Uuid::new_v4()),
@@ -152,14 +279,6 @@ async fn bootstrap_with_store(
             audit_event_id: AdminAuditEventId::from_uuid(Uuid::new_v4()),
         })
         .await
-        .map_err(map_bootstrap_mutation_error)?;
-
-    tracing::info!(
-        instance_id = %result.instance.instance_id,
-        owner_user_id = %result.owner_user_id,
-        "identity bootstrap completed"
-    );
-    Ok(())
 }
 
 fn read_password_secret() -> Result<SecretString, PasswordReadError> {
@@ -298,5 +417,26 @@ mod tests {
             map_password_hashing_error(error),
             ProcessError::IdentityCredentialInvalid
         ));
+    }
+
+    #[test]
+    fn generated_owner_password_is_strong_copyable_and_shown_once() {
+        let password =
+            GeneratedOwnerPassword::from_entropy([0x5a_u8; GENERATED_OWNER_PASSWORD_ENTROPY_BYTES]);
+        let exposed = password.0.expose_secret();
+
+        assert!(exposed.starts_with(GENERATED_OWNER_PASSWORD_PREFIX));
+        assert_eq!(exposed.chars().count(), 48);
+        assert!(exposed.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+        }));
+        Argon2idPolicy::v1().hash_password(exposed).unwrap();
+
+        let mut output = Vec::new();
+        write_generated_owner_credential(&mut output, &password).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Username: owner"));
+        assert_eq!(output.matches(exposed).count(), 1);
+        assert!(output.contains("will not display it after identity setup"));
     }
 }
