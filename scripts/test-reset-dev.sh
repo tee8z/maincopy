@@ -46,6 +46,8 @@ trap 'exit 143' TERM
 mkdir -p "$project_root/scripts" "$ca_root"
 cp -- "$reset_script" "$fixture_script"
 printf 'durable CA\n' >"$ca_root/rootCA.pem"
+mkdir -p "$project_root/target/sibling"
+printf 'keep\n' >"$project_root/target/sibling/marker"
 
 run_reset() {
   XDG_DATA_HOME="$data_root" bash "$fixture_script" >"$output" 2>&1
@@ -100,6 +102,7 @@ run_reset
 grep -F "Removed disposable development state at $development_root" "$output" >/dev/null ||
   die "reset did not report the removed development state"
 [[ -f $ca_root/rootCA.pem ]] || die "reset removed the durable development CA"
+[[ -f $project_root/target/sibling/marker ]] || die "reset removed sibling target state"
 
 run_reset
 grep -F "No disposable development state exists at $development_root" "$output" >/dev/null ||
