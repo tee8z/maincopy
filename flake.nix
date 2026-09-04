@@ -51,6 +51,7 @@
               || (builtins.match ".*/examples/content(/.*)?" path != null)
               || (builtins.match ".*/tests/fixtures(/.*)?" path != null)
               || (builtins.match ".*/migrations(/.*)?" path != null)
+              || (builtins.match ".*/LICENSE" path != null)
               || (builtins.match ".*/templates(/.*)?" path != null);
           };
 
@@ -68,6 +69,9 @@
             version = "0.1.0";
             cargoExtraArgs = "--locked";
             strictDeps = true;
+            postInstall = ''
+              install -Dm444 LICENSE "$out/share/licenses/maincopy/LICENSE"
+            '';
           };
         in
         {
@@ -117,6 +121,10 @@
             test -x ${project.maincopy}/bin/maincopy
             test -x ${project.maincopy}/bin/maincopyd
             test -x ${project.maincopy}/bin/maincopy-mermaid
+            test -r ${project.maincopy}/share/licenses/maincopy/LICENSE
+            cmp \
+              ${project.src}/LICENSE \
+              ${project.maincopy}/share/licenses/maincopy/LICENSE
             touch "$out"
           '';
 

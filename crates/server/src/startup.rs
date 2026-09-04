@@ -53,12 +53,15 @@ use crate::{
     offline_identity,
     process_lock::{ProcessLock, ProcessLockError},
     render::{
-        CatalogBuildError, CatalogRetentionError, ContentCatalog, SiteSnapshot,
-        build_site_snapshot, compile_content_catalog, render_site_shell, snapshot_store,
+        CatalogBuildError, CatalogRetentionError, ContentCatalog, ContentCompiler, SiteSnapshot,
+        build_site_snapshot, render_site_shell, snapshot_store,
     },
     source_provenance::{SourceCommitDiscovery, discover_source_commit},
     web::{PublicServer, PublicState, Readiness},
 };
+
+#[cfg(test)]
+use crate::render::compile_content_catalog;
 
 type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), ApplicationError>> + Send>>;
 type CriticalTaskFuture = Pin<Box<dyn Future<Output = CriticalTaskResult> + Send>>;
@@ -241,7 +244,14 @@ impl Application {
                     error,
                 )
             })?;
-        let compiled = compile_startup_content(&startup, host.content_root)?;
+        let content_compiler = ContentCompiler::discover().map_err(|error| {
+            startup_failure(
+                StartupStage::Content,
+                "initialize the content rendering pipeline",
+                error,
+            )
+        })?;
+        let compiled = compile_startup_content(&startup, host.content_root, &content_compiler)?;
         let active_content_digest = compiled.content_digest.clone();
 
         let database = match database::bootstrap(host.database).await {
@@ -305,6 +315,7 @@ impl Application {
             security,
             cancellation.clone(),
             &candidate_store,
+            &content_compiler,
         )
         .await
         {
@@ -359,6 +370,7 @@ impl Application {
             active_content_digest,
             publication_coordinator.clone(),
             cancellation.clone(),
+            content_compiler,
         );
         let content_task = CriticalTask::new(CriticalTaskName::ContentSync, async move {
             content_sync
@@ -427,6 +439,7 @@ impl Application {
 fn compile_startup_content(
     startup: &StartupConfiguration,
     content_root: &Path,
+    compiler: &ContentCompiler,
 ) -> Result<CompiledStartupContent, ProcessError> {
     let content_digest = startup._content_tree.digest();
     let resolved_assets =
@@ -434,9 +447,11 @@ fn compile_startup_content(
             |error| startup_failure(StartupStage::Content, "resolve content assets", error),
         )?;
     let catalog = Arc::new(
-        compile_content_catalog(&startup._validated_content, &resolved_assets).map_err(
-            |error| startup_failure(StartupStage::Content, "compile the content catalog", error),
-        )?,
+        compiler
+            .compile(&startup._validated_content, &resolved_assets)
+            .map_err(|error| {
+                startup_failure(StartupStage::Content, "compile the content catalog", error)
+            })?,
     );
     let observed_posts = catalog
         .rendered_posts()
@@ -464,6 +479,7 @@ fn compile_startup_content(
 
 fn compile_retained_catalogs(
     store: &ContentCandidateStore,
+    compiler: &ContentCompiler,
 ) -> Result<BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>, RetainedCatalogError> {
     store
         .load_all()
@@ -485,7 +501,7 @@ fn compile_retained_catalogs(
                     source,
                 }
             })?;
-            match compile_content_catalog(&content, &assets) {
+            match compiler.compile(&content, &assets) {
                 Ok(catalog) => Ok((digest, Arc::new(catalog))),
                 Err(source) => Err(RetainedCatalogError::Compile { digest, source }),
             }
@@ -725,6 +741,7 @@ async fn prepare_serving_state(
     security: AdminSecurityState,
     cancellation: CancellationToken,
     candidate_store: &ContentCandidateStore,
+    content_compiler: &ContentCompiler,
 ) -> Result<ServingState, ProcessError> {
     let tip_recipient = database
         .profiles
@@ -749,13 +766,14 @@ async fn prepare_serving_state(
             )
         })?;
     let ledger = startup_state.ledger.clone();
-    let retained_catalogs = compile_retained_catalogs(candidate_store).map_err(|error| {
-        startup_failure(
-            StartupStage::Content,
-            "compile retained content candidates",
-            error,
-        )
-    })?;
+    let retained_catalogs =
+        compile_retained_catalogs(candidate_store, content_compiler).map_err(|error| {
+            startup_failure(
+                StartupStage::Content,
+                "compile retained content candidates",
+                error,
+            )
+        })?;
     let preview_pins = ledger
         .published_posts()
         .map(|published| (published.post_id.clone(), published.revision.clone()))

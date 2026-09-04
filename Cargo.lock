@@ -1681,6 +1681,7 @@ dependencies = [
 name = "maincopy-diagram-renderer"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "mermaid-rs-renderer",
  "rustix",
  "tempfile",

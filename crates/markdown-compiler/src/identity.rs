@@ -27,11 +27,11 @@ const SITE_SNAPSHOT_CONTEXT: &str = "maincopy site snapshot digest v1";
 // policy. Change the relevant tag when a policy or implementation changes.
 const COMMONMARK_DIALECT_TAG: u8 = 0;
 const RAW_HTML_DISABLED_TAG: u8 = 0;
-const ESCAPED_PLAIN_CODE_TAG: u8 = 0;
+const CODE_LANGUAGE_CLASS_POLICY_TAG: u8 = 1;
 const MERMAID_SANITIZED_SVG_TAG: u8 = 1;
-const POST_RENDERER_VERSION_TAG: u8 = 1;
+const POST_RENDERER_VERSION_TAG: u8 = 2;
 const SANITIZER_VERSION_TAG: u8 = 1;
-const SITE_SHELL_RENDERER_VERSION_TAG: u8 = 0;
+const SITE_SHELL_RENDERER_VERSION_TAG: u8 = 1;
 // This tag freezes public content-asset MIME, disposition, and security-header
 // behavior into the snapshot URL. Bump it whenever that delivery policy changes.
 const PUBLIC_ASSET_DELIVERY_POLICY_TAG: u8 = 0;
@@ -58,7 +58,14 @@ pub(super) struct PublicationAssetSourceBinding([u8; 32]);
 pub(super) struct AssetResolutionPolicyBinding([u8; 32]);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PostRendererIdentity(());
+pub struct PostRendererIdentity {
+    commonmark_dialect: u8,
+    raw_html_disabled: u8,
+    code_language_classes: u8,
+    mermaid_sanitized_svg: u8,
+    renderer_version: u8,
+    sanitizer_version: u8,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreInjectionRenderedArticle<'bytes>(&'bytes [u8]);
@@ -75,7 +82,14 @@ impl<'bytes> PreInjectionRenderedArticle<'bytes> {
 
 impl PostRendererIdentity {
     pub const fn baseline() -> Self {
-        Self(())
+        Self {
+            commonmark_dialect: COMMONMARK_DIALECT_TAG,
+            raw_html_disabled: RAW_HTML_DISABLED_TAG,
+            code_language_classes: CODE_LANGUAGE_CLASS_POLICY_TAG,
+            mermaid_sanitized_svg: MERMAID_SANITIZED_SVG_TAG,
+            renderer_version: POST_RENDERER_VERSION_TAG,
+            sanitizer_version: SANITIZER_VERSION_TAG,
+        }
     }
 }
 
@@ -569,14 +583,17 @@ fn encode_post_document(transcript: &mut Transcript, document: &PostDocument) {
 fn encode_baseline_renderer_policy(transcript: &mut Transcript) {
     transcript.tag(COMMONMARK_DIALECT_TAG);
     transcript.tag(RAW_HTML_DISABLED_TAG);
-    transcript.tag(ESCAPED_PLAIN_CODE_TAG);
+    transcript.tag(CODE_LANGUAGE_CLASS_POLICY_TAG);
     transcript.tag(MERMAID_SANITIZED_SVG_TAG);
 }
 
-fn encode_post_renderer(transcript: &mut Transcript, _renderer: &PostRendererIdentity) {
-    encode_baseline_renderer_policy(transcript);
-    transcript.tag(POST_RENDERER_VERSION_TAG);
-    transcript.tag(SANITIZER_VERSION_TAG);
+fn encode_post_renderer(transcript: &mut Transcript, renderer: &PostRendererIdentity) {
+    transcript.tag(renderer.commonmark_dialect);
+    transcript.tag(renderer.raw_html_disabled);
+    transcript.tag(renderer.code_language_classes);
+    transcript.tag(renderer.mermaid_sanitized_svg);
+    transcript.tag(renderer.renderer_version);
+    transcript.tag(renderer.sanitizer_version);
 }
 
 fn encode_site_renderer(transcript: &mut Transcript, renderer: &SiteShellRendererIdentity) {
@@ -783,6 +800,55 @@ name = "Example Author"
         PostRendererIdentity::baseline()
     }
 
+    fn changed_renderer_policies(
+        baseline: &PostRendererIdentity,
+    ) -> [(&'static str, PostRendererIdentity); 6] {
+        [
+            (
+                "CommonMark dialect",
+                PostRendererIdentity {
+                    commonmark_dialect: baseline.commonmark_dialect ^ 1,
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "raw HTML policy",
+                PostRendererIdentity {
+                    raw_html_disabled: baseline.raw_html_disabled ^ 1,
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "code-language class policy",
+                PostRendererIdentity {
+                    code_language_classes: baseline.code_language_classes ^ 1,
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "Mermaid policy",
+                PostRendererIdentity {
+                    mermaid_sanitized_svg: baseline.mermaid_sanitized_svg ^ 1,
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "post-renderer version",
+                PostRendererIdentity {
+                    renderer_version: baseline.renderer_version ^ 1,
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "SVG-sanitizer version",
+                PostRendererIdentity {
+                    sanitizer_version: baseline.sanitizer_version ^ 1,
+                    ..baseline.clone()
+                },
+            ),
+        ]
+    }
+
     const fn frontend_bundle(byte: u8) -> [u8; 32] {
         [byte; 32]
     }
@@ -957,6 +1023,78 @@ name = "Example Author"
     }
 
     #[test]
+    fn every_post_renderer_policy_field_is_identity_bearing() {
+        let (publication, post) = validate_post(&frontmatter("2026-08-29T12:00:00Z"), "# Body\n");
+        let post_assets = ResolvedPostAssets::new(&post, None, Vec::new());
+        let site_assets = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
+        let baseline_renderer = renderer();
+        let revision = |renderer: &PostRendererIdentity| {
+            finalize_post_revision(
+                &post,
+                &post_assets,
+                &site_assets,
+                renderer,
+                b"<h1>Body</h1>",
+                &[],
+            )
+            .unwrap()
+        };
+        let baseline_revision = revision(&baseline_renderer);
+        let site_renderer = SiteShellRendererIdentity::new(frontend_bundle(0x22));
+        let preview = |renderer: &PostRendererIdentity| {
+            finalize_preview_digest(PreviewDigestInput {
+                publication: &publication,
+                site_assets: &site_assets,
+                post_id: &post.metadata.id,
+                post_revision: &baseline_revision,
+                post_renderer: renderer,
+                article_identity_html: b"<h1>Body</h1>",
+                site_renderer: &site_renderer,
+                pre_injection_post_shell: b"<html>Production shell</html>",
+                profile_projection: b"",
+                canonical_url: "https://example.com/posts/example-post",
+            })
+            .unwrap()
+        };
+        let baseline_preview = preview(&baseline_renderer);
+        let published_at = OffsetDateTime::from_unix_timestamp(1_777_734_400).unwrap();
+        let snapshot = |revision: &PostRevisionDigest| {
+            let published = [PublishedPostIdentityInput::new(
+                &post.metadata.id,
+                revision,
+                published_at,
+            )];
+            finalize_site_snapshot(
+                &publication,
+                &site_assets,
+                &site_renderer,
+                &shell_output(b"shell"),
+                &published,
+            )
+            .unwrap()
+        };
+        let baseline_snapshot = snapshot(&baseline_revision);
+
+        for (field, changed_renderer) in changed_renderer_policies(&baseline_renderer) {
+            let changed_revision = revision(&changed_renderer);
+            assert_ne!(
+                baseline_revision, changed_revision,
+                "{field} was omitted from post revision identity"
+            );
+            assert_ne!(
+                baseline_preview,
+                preview(&changed_renderer),
+                "{field} was omitted from preview identity"
+            );
+            assert_ne!(
+                baseline_snapshot,
+                snapshot(&changed_revision),
+                "{field} did not reach site identity through the post revision"
+            );
+        }
+    }
+
+    #[test]
     fn every_canonical_post_field_and_authored_order_is_identity_bearing() {
         let baseline_frontmatter = frontmatter("2026-08-29T12:00:00Z");
         let (_, baseline_post) = validate_post(&baseline_frontmatter, "# Body\n");
@@ -1056,7 +1194,7 @@ name = "Example Author"
         assert_ne!(baseline, changed);
         assert_eq!(
             baseline.as_str(),
-            "post-b3-v1-b28db153cfaf94aeac4afc047445e1542ccdeffd2ef2697dc05366f5f2f4cfd6"
+            "post-b3-v1-19825bff7919a4338aa4cef37de8e2a1f6a0e42aaf786f3a8094cc42e4843178"
         );
 
         let duplicate_refs = [
@@ -1291,7 +1429,7 @@ name = "Example Author"
         assert_eq!(digest(&forward), digest(&reverse));
         assert_eq!(
             digest(&forward).as_str(),
-            "site-b3-v1-6dd5c5d36a14d0c3c614ec8524e01222abe8691ef9fca722ba2516155a41d451"
+            "site-b3-v1-c57b86a24be37013fe3aaf70231cf98ad6a4ea6eee7ef47603d31ecd8fdcfb6d"
         );
 
         let duplicate = [first.clone(), first];
@@ -1406,8 +1544,8 @@ name = "Example Author"
         assert_eq!(
             [disabled.as_str(), enabled.as_str()],
             [
-                "5cb1b1371d6cd436510db1a4e56e0e04b918c736b4a2f71f4f444d600087412d",
-                "c46e12d4731660d49f3e591bd0d4a7e54876868c57499f473c5c14a103326915",
+                "5fc545f41d08ee9fdcd91297ea58a7c9323d3bc90c2ac29bf7d1feed71bd6196",
+                "fad5dcb2a50c69e1ff85de0de17a697d7578e3243648b875cac27ffcb169c497",
             ]
         );
     }

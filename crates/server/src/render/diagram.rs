@@ -53,7 +53,7 @@ pub(super) enum DiagramRenderErrorCode {
 }
 
 #[derive(Debug, Error)]
-pub(super) enum DiagramRenderError {
+pub(crate) enum DiagramRenderError {
     #[error("Mermaid rendering failed")]
     Renderer(#[source] MermaidRenderError),
     #[error("Mermaid renderer output failed the SVG security policy")]

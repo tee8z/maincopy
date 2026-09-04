@@ -10,3 +10,20 @@ description = "A minimal post in the example publication."
 # Hello, Maincopy
 
 This repository is the canonical source for this article.
+
+Known fenced languages become deterministic, theme-aware code:
+
+```rust
+fn publish(markdown: &str) -> &'static str {
+    "preview, approve, publish"
+}
+```
+
+Mermaid uses the same compile-time renderer in private preview and public HTML:
+
+```mermaid
+flowchart LR
+    Markdown --> Preview
+    Preview --> Approval
+    Approval --> Public
+```

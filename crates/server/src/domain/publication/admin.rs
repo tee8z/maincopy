@@ -1514,7 +1514,7 @@ mod tests {
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let html = std::str::from_utf8(&body).unwrap();
             assert!(html.starts_with("<!DOCTYPE html>"), "{post_id}");
-            assert!(html.contains("class=\"site-header\""), "{post_id}");
+            assert!(html.contains("maincopy-site-header"), "{post_id}");
             assert!(html.contains(&format!("<h1>{title}</h1>")), "{post_id}");
             assert!(
                 html.contains(&format!(

@@ -1,6 +1,6 @@
 # ADR 0001: Use mermaid-rs-renderer 0.3.1 in a supervised helper
 
-Status: accepted and implemented; release verification is in progress
+Status: accepted and implemented
 
 Decision date: 2026-09-03
 
@@ -11,7 +11,8 @@ Maincopy v1. It also fixes the process boundary and initial resource targets.
 
 The decision resolves the renderer selection in
 [work package 6.2](../implementation.md#work-package-62-mermaid-implementation-spike).
-It does not complete the wider Slice 6 rendering corpus and release gate.
+The supervised and sanitized corpus evidence is completed by work packages
+6.3 and 6.4.
 
 ## Context
 
@@ -166,18 +167,24 @@ part of WP6.4.
 | Mermaid source | 256 KiB per block | Markdown compiler and helper |
 | Mermaid block count | 64 blocks per post | Markdown compiler |
 | Accepted raw SVG bytes | 2 MiB | Helper result check and parent reader |
+| Sanitized SVG bytes | 2 MiB per block and 16 MiB per post | Sanitizer and Markdown compiler |
+| SVG structure | 20,000 elements, depth 64, 200,000 total attributes, 32 attributes per element | Sanitizer |
+| SVG identity graph | 20,000 IDs and 100,000 local references | Sanitizer |
+| SVG text | 1 MiB total and 256 KiB per text node | Sanitizer |
+| Individual SVG values | 256-byte IDs, 256 KiB paths, 16 KiB embedded PNGs, 2 KiB navigation URLs, and absolute coordinates at most 10,000,000 | Sanitizer |
 | Output file size | 2 MiB through `RLIMIT_FSIZE` | Helper |
 | Address space | 512 MiB through `RLIMIT_AS` | Helper |
 | Stack | 16 MiB through `RLIMIT_STACK` | Helper |
 | CPU time | 5 seconds through `RLIMIT_CPU` | Helper |
 | Core dump | 0 bytes through `RLIMIT_CORE` | Helper |
-| Wall time | 6 seconds | Parent supervisor |
-| Concurrent helpers | 1 within each renderer instance; the current catalog loop is serial | Parent supervisor |
+| Wall time | 10 seconds | Parent supervisor |
+| Concurrent helpers | 1 for the application-owned content compiler | Parent supervisor |
 
 The 512 MiB address-space limit, not the 2 MiB accepted-output limit, bounds
-memory while the engine constructs its result. The concurrency row describes
-the current serial catalog path; a process-wide bound under simultaneous
-compiler calls remains a WP6.4 release gate.
+memory while the engine constructs its result. Startup constructs one concrete
+`ContentCompiler`; startup compilation, retained recovery, and live content
+synchronization share its renderer admission slot. Concurrent compiler clones
+therefore cannot start a second helper job.
 
 The helper uses a fixed, versioned file protocol. It must return bounded,
 machine-readable failure classes. The parent classifies timeout, signal,
@@ -191,8 +198,10 @@ and a versioned `maincopy-fontless-v1` environment marker. With
 deterministic no-font fallback. A non-UTF-8 environment path is rejected before
 startup so the renderer cannot silently fall back to host Fontconfig data.
 
-Tests must cover ASCII and Unicode labels in fresh processes. They must also
-cover empty, populated, and hostile ambient cache directories.
+Tests cover ASCII and Unicode labels in fresh processes. The parent clears the
+complete inherited environment and supplies a new private cache and Fontconfig
+file for every render, so populated or hostile ambient cache paths never enter
+the helper environment.
 
 ### Init directives
 
@@ -232,10 +241,12 @@ source and ship under the package's MIT license. The 0.3.1 crate declares no
 separate asset license for those byte strings; their exact digests remain part
 of Maincopy's renderer-version-specific sanitizer policy.
 
-WP6.2 remains in progress until the full corpus and every limit test pass.
-WP6.3 now provides the distinct sanitized-inline-SVG capability and removes
-the known inline-style CSP mismatch. Its remaining release work is the full
-preview/public equivalence and hostile-candidate retention evidence in WP6.4.
+WP6.2 runs all ten selected diagrams through the supervised helper and fixes
+their raw-output digests. WP6.3 provides the distinct sanitized-inline-SVG
+capability, removes the known inline-style CSP mismatch, and fixes separately
+scoped sanitizer-output digests. WP6.4 binds the application-wide admission
+capability, preview/public equivalence, structural limits, identity mutation,
+and Nix license closure into the release gate.
 
 Reconsider `merman` when it publishes a stable release with the evaluated
 resource, cancellation, sanitizer, and diagram-family contracts.

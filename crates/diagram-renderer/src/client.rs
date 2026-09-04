@@ -73,10 +73,21 @@ impl MermaidRenderer {
         if source.len() > MAX_SOURCE_BYTES {
             return Err(MermaidRenderError::SourceTooLarge);
         }
+        self.with_admission(|| self.render_admitted(source))
+    }
+
+    fn with_admission<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, MermaidRenderError>,
+    ) -> Result<T, MermaidRenderError> {
         let _slot = self
             .slot
             .lock()
             .map_err(|_| MermaidRenderError::ConcurrencyStatePoisoned)?;
+        operation()
+    }
+
+    fn render_admitted(&self, source: &str) -> Result<RawMermaidSvg, MermaidRenderError> {
         self.verify_protocol()?;
 
         let workspace = tempfile::Builder::new()
@@ -543,6 +554,94 @@ mod tests {
             error,
             MermaidRenderError::ExecutablePathNotAbsolute
         ));
+    }
+
+    #[test]
+    fn output_reader_enforces_byte_and_utf8_boundaries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exact = workspace.path().join("exact.svg");
+        let oversized = workspace.path().join("oversized.svg");
+        let invalid_utf8 = workspace.path().join("invalid-utf8.svg");
+        fs::write(&exact, vec![b'x'; MAX_RAW_SVG_BYTES]).unwrap();
+        fs::write(&oversized, vec![b'x'; MAX_RAW_SVG_BYTES + 1]).unwrap();
+        fs::write(&invalid_utf8, [0xff]).unwrap();
+
+        assert_eq!(
+            read_raw_svg(&exact).unwrap().as_str().len(),
+            MAX_RAW_SVG_BYTES
+        );
+        assert!(matches!(
+            read_raw_svg(&oversized),
+            Err(MermaidRenderError::OutputTooLarge)
+        ));
+        assert!(matches!(
+            read_raw_svg(&invalid_utf8),
+            Err(MermaidRenderError::OutputIsNotUtf8)
+        ));
+    }
+
+    #[test]
+    fn renderer_admission_runs_only_one_helper_job_at_a_time() {
+        use std::{
+            sync::{Arc, Barrier, mpsc},
+            thread,
+            time::Duration,
+        };
+
+        let executable = env::current_exe().expect("test executable must be discoverable");
+        let renderer = Arc::new(MermaidRenderer::from_executable(executable).unwrap());
+        let ready = Arc::new(Barrier::new(3));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (release_second_tx, release_second_rx) = mpsc::channel();
+
+        let spawn_job = |id, release: mpsc::Receiver<()>| {
+            let renderer = Arc::clone(&renderer);
+            let ready = Arc::clone(&ready);
+            let entered = entered_tx.clone();
+            thread::spawn(move || {
+                ready.wait();
+                renderer
+                    .with_admission(|| {
+                        entered.send(id).unwrap();
+                        release.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+        let first_job = spawn_job(1_u8, release_first_rx);
+        let second_job = spawn_job(2_u8, release_second_rx);
+        ready.wait();
+
+        let first = entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("one helper job must enter admission");
+        assert!(
+            matches!(
+                entered_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a second helper job entered the supervised section concurrently"
+        );
+        if first == 1 {
+            release_first_tx.send(()).unwrap();
+        } else {
+            release_second_tx.send(()).unwrap();
+        }
+
+        let second = entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the waiting helper job must enter after release");
+        assert_ne!(first, second);
+        if second == 1 {
+            release_first_tx.send(()).unwrap();
+        } else {
+            release_second_tx.send(()).unwrap();
+        }
+
+        first_job.join().unwrap();
+        second_job.join().unwrap();
     }
 
     #[test]

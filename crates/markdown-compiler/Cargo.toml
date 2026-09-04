@@ -2,6 +2,7 @@
 name = "markdown-compiler"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 autobins = false
 
 [lib]

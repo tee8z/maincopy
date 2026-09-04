@@ -121,6 +121,7 @@ pub struct RenderedSiteShell {
     renderer: SiteShellRendererIdentity,
     posts: Arc<[PublicPostView]>,
     chronology: Arc<[usize]>,
+    post_navigation: Arc<[ChronologicalNeighbors]>,
     tags: BTreeMap<PostTag, Arc<[usize]>>,
     redirects: BTreeMap<PostAlias, Arc<CanonicalSiteUrl>>,
     feed: RenderedRssFeed,
@@ -155,6 +156,7 @@ pub fn render_site_shell(
         .map_err(|error| SiteSnapshotBuildError::frontend(error.to_string()))?;
     let posts = select_public_posts(&catalog, ledger)?;
     let chronology = chronology(&posts);
+    let post_navigation = chronological_neighbors(posts.len(), &chronology);
     let tags = tag_index(&posts, &chronology);
     let alias_count = posts
         .iter()
@@ -170,10 +172,13 @@ pub fn render_site_shell(
     let pre_injection_output = render_pre_injection_shell(
         &catalog.publication,
         frontend,
-        &posts,
-        &chronology,
-        &tags,
-        &redirects,
+        PublicPagePlan {
+            posts: &posts,
+            chronology: &chronology,
+            post_navigation: &post_navigation,
+            tags: &tags,
+            redirects: &redirects,
+        },
         DiscoveryDocuments {
             feed: &feed,
             robots: &robots,
@@ -188,6 +193,7 @@ pub fn render_site_shell(
         renderer,
         posts: posts.into(),
         chronology: chronology.into(),
+        post_navigation: post_navigation.into(),
         tags,
         redirects,
         feed,
@@ -302,6 +308,7 @@ fn render_bound_preview(
         page,
         &canonical_url,
         ArticleBody::Projected(&article),
+        PostNavigation::default(),
         tip_handoff.as_ref(),
     )?
     .into_string();
@@ -312,6 +319,7 @@ fn render_bound_preview(
         PostPageView::from_rendered(rendered, None),
         &canonical_url,
         ArticleBody::Omitted,
+        PostNavigation::default(),
         None,
     )?
     .into_string();
@@ -389,6 +397,25 @@ fn chronology(posts: &[PublicPostView]) -> Vec<usize> {
             .then_with(|| posts[*left].post_id.cmp(&posts[*right].post_id))
     });
     chronology
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ChronologicalNeighbors {
+    previous: Option<usize>,
+    next: Option<usize>,
+}
+
+fn chronological_neighbors(post_count: usize, chronology: &[usize]) -> Vec<ChronologicalNeighbors> {
+    let mut neighbors = vec![ChronologicalNeighbors::default(); post_count];
+    for (position, post_index) in chronology.iter().copied().enumerate() {
+        neighbors[post_index] = ChronologicalNeighbors {
+            next: position
+                .checked_sub(1)
+                .and_then(|next| chronology.get(next).copied()),
+            previous: chronology.get(position + 1).copied(),
+        };
+    }
+    neighbors
 }
 
 fn tag_index(posts: &[PublicPostView], chronology: &[usize]) -> BTreeMap<PostTag, Arc<[usize]>> {
@@ -490,13 +517,19 @@ fn validate_route_count(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct PublicPagePlan<'plan> {
+    posts: &'plan [PublicPostView],
+    chronology: &'plan [usize],
+    post_navigation: &'plan [ChronologicalNeighbors],
+    tags: &'plan BTreeMap<PostTag, Arc<[usize]>>,
+    redirects: &'plan BTreeMap<PostAlias, Arc<CanonicalSiteUrl>>,
+}
+
 fn render_pre_injection_shell(
     publication: &PublicationSettings,
     frontend: &'static FrontendAssetManifest,
-    posts: &[PublicPostView],
-    chronology: &[usize],
-    tags: &BTreeMap<PostTag, Arc<[usize]>>,
-    redirects: &BTreeMap<PostAlias, Arc<CanonicalSiteUrl>>,
+    plan: PublicPagePlan<'_>,
     discovery: DiscoveryDocuments<'_>,
 ) -> Result<SiteShellOutputDigest, SiteSnapshotBuildError> {
     let mut pages = BTreeMap::new();
@@ -505,13 +538,13 @@ fn render_pre_injection_shell(
     pages.insert(PublicPagePath::feed(), PreInjectionPage::Feed);
     pages.insert(PublicPagePath::robots(), PreInjectionPage::Robots);
     pages.insert(PublicPagePath::sitemap(), PreInjectionPage::Sitemap);
-    for (index, post) in posts.iter().enumerate() {
+    for (index, post) in plan.posts.iter().enumerate() {
         pages.insert(post.public_path(), PreInjectionPage::Post(index));
     }
-    for tag in tags.keys() {
+    for tag in plan.tags.keys() {
         pages.insert(PublicPagePath::tag(tag), PreInjectionPage::Tag(tag));
     }
-    for (alias, target) in redirects {
+    for (alias, target) in plan.redirects {
         pages.insert(
             PublicPagePath::post_alias(alias),
             PreInjectionPage::Redirect(target.as_ref()),
@@ -534,13 +567,13 @@ fn render_pre_injection_shell(
                 &mut hasher,
                 &mut retained,
                 &path,
-                render_index(publication, frontend, posts, chronology).into_string(),
+                render_index(publication, frontend, plan.posts, plan.chronology).into_string(),
             ),
             PreInjectionPage::Archive => hash_pre_injection_html(
                 &mut hasher,
                 &mut retained,
                 &path,
-                render_archive(publication, frontend, posts, chronology).into_string(),
+                render_archive(publication, frontend, plan.posts, plan.chronology).into_string(),
             ),
             PreInjectionPage::Feed => {
                 hasher.page(path.as_str(), discovery.feed.body.as_bytes());
@@ -561,9 +594,10 @@ fn render_pre_injection_shell(
                 render_post(
                     publication,
                     frontend,
-                    PostPageView::from_public(&posts[index]),
-                    &posts[index].canonical_url,
+                    PostPageView::from_public(&plan.posts[index]),
+                    &plan.posts[index].canonical_url,
                     ArticleBody::Omitted,
+                    PostNavigation::from_indexes(plan.posts, plan.post_navigation[index]),
                     None,
                 )?
                 .into_string(),
@@ -576,8 +610,8 @@ fn render_pre_injection_shell(
                     publication,
                     frontend,
                     tag,
-                    posts,
-                    tags.get(tag).map_or(&[], Arc::as_ref),
+                    plan.posts,
+                    plan.tags.get(tag).map_or(&[], Arc::as_ref),
                 )
                 .into_string(),
             ),
@@ -761,7 +795,7 @@ fn render_snapshot_pages(
         retained,
     )?;
 
-    for post in &*shell.posts {
+    for (post_index, post) in shell.posts.iter().enumerate() {
         let (rendered, local_assets) = shell
             .catalog
             .get_with_local_assets(&post.post_id, &post.revision)
@@ -791,6 +825,7 @@ fn render_snapshot_pages(
                 PostPageView::from_public(post),
                 &post.canonical_url,
                 ArticleBody::Projected(&article),
+                PostNavigation::from_indexes(&shell.posts, shell.post_navigation[post_index]),
                 tip_handoff,
             )?
             .into_string(),
@@ -1495,7 +1530,7 @@ fn render_index(
     let canonical_url =
         CanonicalSiteUrl::for_path(&publication.site.base_url, &PublicPagePath::index());
     let content = html! {
-        section aria-labelledby="recent-posts-heading" {
+        section class="maincopy-index" aria-labelledby="recent-posts-heading" {
             h1 id="recent-posts-heading" { "Recent posts" }
             @if chronology.is_empty() {
                 p { "No posts have been published yet." }
@@ -1508,6 +1543,7 @@ fn render_index(
         publication,
         frontend,
         PageHead {
+            context: PageContext::Index,
             title: publication.site.title.as_str(),
             description: publication.site.description.as_str(),
             canonical: Some(CanonicalPageHead {
@@ -1532,7 +1568,7 @@ fn render_archive(
         publication.site.title.as_str()
     );
     let content = html! {
-        section aria-labelledby="archive-heading" {
+        section class="maincopy-archive" aria-labelledby="archive-heading" {
             h1 id="archive-heading" { "Archive" }
             @if chronology.is_empty() {
                 p { "No posts have been published yet." }
@@ -1545,6 +1581,7 @@ fn render_archive(
         publication,
         frontend,
         PageHead {
+            context: PageContext::Archive,
             title: "Archive",
             description: &description,
             canonical: Some(CanonicalPageHead {
@@ -1572,7 +1609,7 @@ fn render_tag(
     let canonical_url =
         CanonicalSiteUrl::for_path(&publication.site.base_url, &PublicPagePath::tag(tag));
     let content = html! {
-        section aria-labelledby="tag-heading" {
+        section class="maincopy-tag" aria-labelledby="tag-heading" {
             h1 id="tag-heading" { "Posts tagged “" (tag.as_str()) "”" }
             (render_post_list(posts, indexes))
         }
@@ -1581,6 +1618,7 @@ fn render_tag(
         publication,
         frontend,
         PageHead {
+            context: PageContext::Tag,
             title: &title,
             description: &description,
             canonical: Some(CanonicalPageHead {
@@ -1647,6 +1685,25 @@ impl<'post> PostPageView<'post> {
                 DefaultPostTipPolicy::Disabled => false,
             },
         }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PostNavigation<'post> {
+    previous: Option<&'post PublicPostView>,
+    next: Option<&'post PublicPostView>,
+}
+
+impl<'post> PostNavigation<'post> {
+    fn from_indexes(posts: &'post [PublicPostView], indexes: ChronologicalNeighbors) -> Self {
+        Self {
+            previous: indexes.previous.map(|index| &posts[index]),
+            next: indexes.next.map(|index| &posts[index]),
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.previous.is_none() && self.next.is_none()
     }
 }
 
@@ -1718,12 +1775,36 @@ fn render_tip_cta(handoff: &TipHandoff<'_>) -> Markup {
     }
 }
 
+fn render_post_navigation(navigation: PostNavigation<'_>) -> Markup {
+    html! {
+        @if !navigation.is_empty() {
+            nav class="maincopy-post-navigation" aria-label="Post navigation" {
+                @if let Some(previous) = navigation.previous {
+                    a class="maincopy-post-navigation-link maincopy-post-navigation-previous"
+                        href=(previous.public_path().as_str()) rel="prev" {
+                        span class="maincopy-post-navigation-label" { "Previous post" }
+                        span class="maincopy-post-navigation-title" { (previous.title.as_str()) }
+                    }
+                }
+                @if let Some(next) = navigation.next {
+                    a class="maincopy-post-navigation-link maincopy-post-navigation-next"
+                        href=(next.public_path().as_str()) rel="next" {
+                        span class="maincopy-post-navigation-label" { "Next post" }
+                        span class="maincopy-post-navigation-title" { (next.title.as_str()) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn render_post(
     publication: &PublicationSettings,
     frontend: &'static FrontendAssetManifest,
     post: PostPageView<'_>,
     canonical_url: &CanonicalSiteUrl,
     article: ArticleBody<'_>,
+    navigation: PostNavigation<'_>,
     tip_handoff: Option<&TipHandoff<'_>>,
 ) -> Result<Markup, SiteSnapshotBuildError> {
     let metadata = render_post_head_metadata(PostHeadMetadataInput {
@@ -1739,8 +1820,9 @@ fn render_post(
     .map_err(|error| SiteSnapshotBuildError::metadata(post.post_id, error))?;
     let tips_enabled = post.tips_enabled(publication);
     let content = html! {
-        article {
-            header {
+        div class="maincopy-post-page" {
+            article class="maincopy-post" {
+                header class="maincopy-post-header" {
                 h1 { (post.title.as_str()) }
                 p { (post.description.as_str()) }
                 @if let Some(published_at) = post.published_at {
@@ -1761,32 +1843,35 @@ fn render_post(
                         time datetime=(updated_at.to_string()) { (updated_at.to_string()) }
                     }
                 }
-                @if !post.tags.is_empty() {
-                    ul class="post-tags" aria-label="Tags" {
-                        @for tag in post.tags {
-                            li {
-                                a href=(format!("/tags/{}", tag.as_str())) { (tag.as_str()) }
+                    @if !post.tags.is_empty() {
+                        ul class="maincopy-post-tags" aria-label="Tags" {
+                            @for tag in post.tags {
+                                li {
+                                    a href=(format!("/tags/{}", tag.as_str())) { (tag.as_str()) }
+                                }
                             }
                         }
                     }
                 }
-            }
-            section class="post-content" {
-                @if let ArticleBody::Projected(article) = article {
-                    (trusted_article_markup(article))
+                section class="maincopy-post-content" {
+                    @if let ArticleBody::Projected(article) = article {
+                        (trusted_article_markup(article))
+                    }
+                }
+                @if tips_enabled {
+                    @if let Some(tip_handoff) = tip_handoff {
+                        (render_tip_cta(tip_handoff))
+                    }
                 }
             }
-            @if tips_enabled {
-                @if let Some(tip_handoff) = tip_handoff {
-                    (render_tip_cta(tip_handoff))
-                }
-            }
+            (render_post_navigation(navigation))
         }
     };
     Ok(render_layout(
         publication,
         frontend,
         PageHead {
+            context: PageContext::Post,
             title: post.title.as_str(),
             description: post.description.as_str(),
             canonical: Some(CanonicalPageHead {
@@ -1803,7 +1888,7 @@ fn render_post(
 
 fn render_post_list(posts: &[PublicPostView], indexes: &[usize]) -> Markup {
     html! {
-        ol class="post-list" {
+        ol class="maincopy-post-list" {
             @for index in indexes {
                 @let post = &posts[*index];
                 li {
@@ -1844,12 +1929,13 @@ fn render_error(
         publication,
         frontend,
         PageHead {
+            context: PageContext::Error,
             title,
             description: explanation,
             canonical: None,
         },
         html! {
-            section class="error-page" {
+            section class="maincopy-error-page" {
                 h1 { (title) }
                 p { (explanation) }
                 p { a href="/" { "Return to the publication index" } }
@@ -1860,9 +1946,31 @@ fn render_error(
 
 #[derive(Clone, Copy)]
 struct PageHead<'head> {
+    context: PageContext,
     title: &'head str,
     description: &'head str,
     canonical: Option<CanonicalPageHead<'head>>,
+}
+
+#[derive(Clone, Copy)]
+enum PageContext {
+    Index,
+    Archive,
+    Tag,
+    Post,
+    Error,
+}
+
+impl PageContext {
+    const fn body_class(self) -> &'static str {
+        match self {
+            Self::Index => "maincopy-site maincopy-page-index",
+            Self::Archive => "maincopy-site maincopy-page-archive",
+            Self::Tag => "maincopy-site maincopy-page-tag",
+            Self::Post => "maincopy-site maincopy-page-post",
+            Self::Error => "maincopy-site maincopy-page-error",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1932,18 +2040,18 @@ fn render_layout(
                     script src=(javascript.public_path) defer {}
                 }
             }
-            body {
-                header class="site-header" {
-                    a class="site-title" href="/" { (site.title.as_str()) }
-                    nav aria-label="Primary navigation" {
+            body class=(head.context.body_class()) {
+                header class="maincopy-site-header" {
+                    a class="maincopy-site-title" href="/" { (site.title.as_str()) }
+                    nav class="maincopy-site-navigation" aria-label="Primary navigation" {
                         ul {
                             li { a href="/" { "Home" } }
                             li { a href="/archive" { "Archive" } }
                         }
                     }
                 }
-                main { (content) }
-                footer {
+                main class="maincopy-site-main" { (content) }
+                footer class="maincopy-site-footer" {
                     p { "Written by " (publication.author.name.as_str()) }
                 }
             }
@@ -2361,7 +2469,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(draft.starts_with("<!DOCTYPE html>"));
-        assert!(draft.contains("class=\"site-header\""));
+        assert!(draft.contains("maincopy-site-header"));
         assert!(draft.contains("<h1>Draft post</h1>"));
         assert!(draft.contains("<h1>Draft</h1>"));
         assert!(draft.contains(&format!("{asset_endpoint}?path=assets/draft.png")));
@@ -2543,6 +2651,7 @@ mod tests {
             page,
             &canonical_url,
             ArticleBody::Omitted,
+            PostNavigation::default(),
             Some(&handoff),
         )
         .unwrap()
@@ -2556,6 +2665,7 @@ mod tests {
             page,
             &canonical_url,
             ArticleBody::Omitted,
+            PostNavigation::default(),
             Some(&handoff),
         )
         .unwrap()
@@ -2570,6 +2680,7 @@ mod tests {
             page,
             &canonical_url,
             ArticleBody::Omitted,
+            PostNavigation::default(),
             Some(&handoff),
         )
         .unwrap()
@@ -3132,11 +3243,84 @@ mod tests {
     }
 
     #[test]
+    fn chronological_neighbors_cover_both_boundaries_and_the_middle() {
+        assert_eq!(
+            chronological_neighbors(3, &[2, 0, 1]),
+            vec![
+                ChronologicalNeighbors {
+                    previous: Some(1),
+                    next: Some(2),
+                },
+                ChronologicalNeighbors {
+                    previous: None,
+                    next: Some(0),
+                },
+                ChronologicalNeighbors {
+                    previous: Some(0),
+                    next: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn public_post_navigation_uses_only_canonical_chronological_neighbors() {
+        let fixture = fixture();
+        let ledger = projection([
+            entry(&fixture, FIRST_ID, 1_000),
+            entry(&fixture, SECOND_ID, 2_000),
+        ]);
+        let snapshot = build_snapshot(&fixture, &ledger).unwrap();
+        let first = snapshot
+            .post_page(&PostSlug::parse("first-post").unwrap())
+            .unwrap();
+        let second = snapshot
+            .post_page(&PostSlug::parse("second-post").unwrap())
+            .unwrap();
+
+        assert!(first.contains("class=\"maincopy-post-page\""));
+        assert!(first.contains("maincopy-post-navigation-next"));
+        assert!(first.contains("href=\"/posts/second-post\" rel=\"next\""));
+        assert!(!first.contains("maincopy-post-navigation-previous"));
+        assert!(!first.contains("draft-post"));
+
+        assert!(second.contains("maincopy-post-navigation-previous"));
+        assert!(second.contains("href=\"/posts/first-post\" rel=\"prev\""));
+        assert!(second.contains("First &lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!second.contains("maincopy-post-navigation-next"));
+        assert!(!second.contains("draft-post"));
+
+        let preview = render_post_preview(
+            &fixture.catalog,
+            embedded_manifest(),
+            &PostId::parse(DRAFT_ID).unwrap(),
+            "/api/admin/v1/preview-assets/navigation",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(preview.contains("class=\"maincopy-post-page\""));
+        assert!(!preview.contains("maincopy-post-navigation"));
+    }
+
+    #[test]
+    fn one_public_post_omits_empty_navigation() {
+        let fixture = fixture();
+        let ledger = projection([entry(&fixture, FIRST_ID, 2_000)]);
+        let snapshot = build_snapshot(&fixture, &ledger).unwrap();
+        let page = snapshot
+            .post_page(&PostSlug::parse("first-post").unwrap())
+            .unwrap();
+        assert!(!page.contains("maincopy-post-navigation"));
+    }
+
+    #[test]
     fn site_shell_identity_binds_exact_discovery_document_representations() {
         let fixture = fixture();
         let ledger = projection([entry(&fixture, FIRST_ID, 2_000)]);
         let posts = select_public_posts(&fixture.catalog, &ledger).unwrap();
         let chronology = chronology(&posts);
+        let post_navigation = chronological_neighbors(posts.len(), &chronology);
         let tags = tag_index(&posts, &chronology);
         let redirects = alias_redirect_index(&posts).unwrap();
         let feed = render_public_feed(&fixture.catalog.publication, &posts, &chronology).unwrap();
@@ -3145,10 +3329,13 @@ mod tests {
         let original = render_pre_injection_shell(
             &fixture.catalog.publication,
             embedded_manifest(),
-            &posts,
-            &chronology,
-            &tags,
-            &redirects,
+            PublicPagePlan {
+                posts: &posts,
+                chronology: &chronology,
+                post_navigation: &post_navigation,
+                tags: &tags,
+                redirects: &redirects,
+            },
             DiscoveryDocuments {
                 feed: &feed,
                 robots: &robots,
@@ -3161,10 +3348,13 @@ mod tests {
         let feed_changed = render_pre_injection_shell(
             &fixture.catalog.publication,
             embedded_manifest(),
-            &posts,
-            &chronology,
-            &tags,
-            &redirects,
+            PublicPagePlan {
+                posts: &posts,
+                chronology: &chronology,
+                post_navigation: &post_navigation,
+                tags: &tags,
+                redirects: &redirects,
+            },
             DiscoveryDocuments {
                 feed: &changed_feed,
                 robots: &robots,
@@ -3177,10 +3367,13 @@ mod tests {
         let robots_changed = render_pre_injection_shell(
             &fixture.catalog.publication,
             embedded_manifest(),
-            &posts,
-            &chronology,
-            &tags,
-            &redirects,
+            PublicPagePlan {
+                posts: &posts,
+                chronology: &chronology,
+                post_navigation: &post_navigation,
+                tags: &tags,
+                redirects: &redirects,
+            },
             DiscoveryDocuments {
                 feed: &feed,
                 robots: &changed_robots,
@@ -3193,10 +3386,13 @@ mod tests {
         let sitemap_changed = render_pre_injection_shell(
             &fixture.catalog.publication,
             embedded_manifest(),
-            &posts,
-            &chronology,
-            &tags,
-            &redirects,
+            PublicPagePlan {
+                posts: &posts,
+                chronology: &chronology,
+                post_navigation: &post_navigation,
+                tags: &tags,
+                redirects: &redirects,
+            },
             DiscoveryDocuments {
                 feed: &feed,
                 robots: &robots,
@@ -3215,10 +3411,13 @@ mod tests {
         let redirects_changed = render_pre_injection_shell(
             &fixture.catalog.publication,
             embedded_manifest(),
-            &posts,
-            &chronology,
-            &tags,
-            &changed_redirects,
+            PublicPagePlan {
+                posts: &posts,
+                chronology: &chronology,
+                post_navigation: &post_navigation,
+                tags: &tags,
+                redirects: &changed_redirects,
+            },
             DiscoveryDocuments {
                 feed: &feed,
                 robots: &robots,

@@ -22,8 +22,9 @@ V1 has these product boundaries:
 - A Git sync cannot silently replace an already published revision.
 - Approved slugs and aliases remain reserved to their stable `PostId`.
 - The canonical website and RSS are the only article outputs.
-- Technical Markdown includes syntax highlighting, Mermaid diagrams, and
-  sanitized Scalable Vector Graphics (SVG) output.
+- Technical Markdown uses escaped plain code with semantic classes for
+  recognized declared languages, plus Mermaid diagrams and sanitized Scalable
+  Vector Graphics (SVG) output.
 - A user profile can provide a mutable Lightning Address for static tips.
 - Maincopy stores no tip invoice, payment, or settlement state in v1.
 - The remote admin site uses authenticated access on a separate origin.
@@ -65,12 +66,13 @@ gateway or NixOS module.
 The snapshot-backed RSS feed, sitemap, robots policy, HTML autodiscovery,
 canonical links, core non-image Open Graph fields, `BlogPosting` JSON-LD,
 authored-alias redirects, durable route ownership, and snapshot-scoped local
-asset delivery are present. Managed Git synchronization, favicon and image
-metadata, page Content Security Policy (CSP), the admin web interface,
-release-quality technical rendering, the NixOS module, Litestream wiring,
-Prometheus metrics and dashboard, and complete restore evidence remain
-incomplete. V1 rejects authored subscription and outbound-distribution
-configuration and stores no target-job state.
+asset delivery are present. Semantic code-language classes, supervised Mermaid
+rendering, and SVG sanitization are also present. Managed Git synchronization,
+favicon and image metadata, page Content Security Policy (CSP), the admin web
+interface, the NixOS module, Litestream wiring, Prometheus metrics and
+dashboard, and complete restore evidence remain incomplete. V1 rejects
+authored subscription and outbound-distribution configuration and stores no
+target-job state.
 
 > [!CAUTION]
 > Do not expose the loopback admin listener directly. Use the reviewed HTTPS

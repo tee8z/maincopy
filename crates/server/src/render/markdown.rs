@@ -14,6 +14,7 @@ use url::{Position, Url};
 
 use super::{
     SnapshotAssetPath,
+    code::CodeLanguage,
     diagram::{DiagramRenderError, DiagramRenderErrorCode, MermaidDiagramRenderer},
     svg::SanitizedSvg,
 };
@@ -22,6 +23,7 @@ const MAX_RENDERED_HTML_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MERMAID_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_MERMAID_SVG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MERMAID_BLOCKS: usize = 64;
+const MAX_CODE_BLOCKS: usize = 256;
 
 /// Render one post with the closed V1 CommonMark pipeline.
 pub fn render_markdown(
@@ -31,6 +33,21 @@ pub fn render_markdown(
 ) -> Result<RenderedPost, MarkdownRenderError> {
     let diagrams = MermaidDiagramRenderer::discover()
         .map_err(|error| mermaid_error(document, MarkdownRenderLocation::Document, error.code()))?;
+    render_markdown_with_renderer(
+        document,
+        assets,
+        site_assets,
+        RendererLimits::production(),
+        &mut |source, ordinal| diagrams.render(source, &document.metadata.id, ordinal),
+    )
+}
+
+pub(super) fn render_markdown_with_diagrams(
+    document: &PostDocument,
+    assets: &ResolvedPostAssets,
+    site_assets: &ResolvedSiteAssets,
+    diagrams: &MermaidDiagramRenderer,
+) -> Result<RenderedPost, MarkdownRenderError> {
     render_markdown_with_renderer(
         document,
         assets,
@@ -250,6 +267,7 @@ pub enum MarkdownRenderErrorCode {
     MermaidRendererInvalidOutput,
     MermaidSvgRejected,
     MermaidRendererInternal,
+    CodeBlockCountExceeded,
     RenderedHtmlTooLarge,
     UnsupportedCommonMarkEvent,
     MalformedCommonMarkEvents,
@@ -311,6 +329,7 @@ struct RendererLimits {
     mermaid_source_bytes: usize,
     mermaid_svg_bytes: usize,
     mermaid_blocks: usize,
+    code_blocks: usize,
 }
 
 impl RendererLimits {
@@ -320,6 +339,7 @@ impl RendererLimits {
             mermaid_source_bytes: MAX_MERMAID_SOURCE_BYTES,
             mermaid_svg_bytes: MAX_MERMAID_SVG_BYTES,
             mermaid_blocks: MAX_MERMAID_BLOCKS,
+            code_blocks: MAX_CODE_BLOCKS,
         }
     }
 }
@@ -587,80 +607,134 @@ impl<'input, 'renderer> MarkdownEventRenderer<'input, 'renderer> {
         &mut self,
         kind: CodeBlockKind<'input>,
     ) -> Result<(), MarkdownRenderError> {
-        self.code_block_count = self
+        let next_count = self
             .code_block_count
             .checked_add(1)
             .ok_or_else(|| self.malformed())?;
-        let code_ordinal = CodeBlockOrdinal::new(
-            NonZeroUsize::new(self.code_block_count).ok_or_else(|| self.malformed())?,
-        );
+        let code_ordinal =
+            CodeBlockOrdinal::new(NonZeroUsize::new(next_count).ok_or_else(|| self.malformed())?);
+        if next_count > self.limits.code_blocks {
+            return Err(MarkdownRenderError::new(
+                self.document,
+                MarkdownRenderLocation::CodeBlock {
+                    ordinal: code_ordinal,
+                },
+                MarkdownRenderErrorCode::CodeBlockCountExceeded,
+                "post contains more code blocks than the configured limit",
+            ));
+        }
+        self.code_block_count = next_count;
+        let mermaid = matches!(&kind, CodeBlockKind::Fenced(info) if info.as_ref() == "mermaid");
+        let language = match &kind {
+            CodeBlockKind::Fenced(info) => CodeLanguage::from_fence_info(info.as_ref()),
+            CodeBlockKind::Indented => None,
+        };
         let source = self.collect_code_block()?;
-        if matches!(&kind, CodeBlockKind::Fenced(info) if info.as_ref() == "mermaid") {
-            if self.mermaid_count >= self.limits.mermaid_blocks {
-                return Err(MarkdownRenderError::new(
-                    self.document,
-                    MarkdownRenderLocation::CodeBlock {
-                        ordinal: code_ordinal,
-                    },
-                    MarkdownRenderErrorCode::MermaidBlockCountExceeded,
-                    "post contains more Mermaid blocks than the configured limit",
-                ));
-            }
-            if source.len() > self.limits.mermaid_source_bytes {
-                return Err(MarkdownRenderError::new(
-                    self.document,
-                    MarkdownRenderLocation::CodeBlock {
-                        ordinal: code_ordinal,
-                    },
-                    MarkdownRenderErrorCode::MermaidBlockTooLarge,
-                    "Mermaid source exceeds the configured byte limit",
-                ));
-            }
-            let Some(mermaid_ordinal) = MermaidBlockOrdinal::from_index(self.mermaid_count) else {
-                return Err(self.malformed());
-            };
-            let svg = (self.render_mermaid)(&source, mermaid_ordinal.0).map_err(|error| {
-                mermaid_error(
-                    self.document,
-                    MarkdownRenderLocation::CodeBlock {
-                        ordinal: code_ordinal,
-                    },
-                    error.code(),
-                )
-            })?;
-            self.mermaid_svg_bytes = self
-                .mermaid_svg_bytes
-                .checked_add(svg.as_str().len())
-                .filter(|size| *size <= self.limits.mermaid_svg_bytes)
-                .ok_or_else(|| {
-                    MarkdownRenderError::new(
-                        self.document,
-                        MarkdownRenderLocation::CodeBlock {
-                            ordinal: code_ordinal,
-                        },
-                        MarkdownRenderErrorCode::MermaidRenderedOutputTooLarge,
-                        "rendered Mermaid SVG exceeds the per-post byte limit",
-                    )
-                })?;
-            self.write_block_start(
-                "<div class=\"mermaid-diagram\" data-maincopy-mermaid=\"v1\" data-block=\"",
-            )?;
-            self.write(&mermaid_ordinal.get().to_string())?;
-            self.write("\">")?;
-            self.writer
-                .write_sanitized_svg(&svg)
-                .map_err(|_| rendered_html_limit_error(&self.document.path))?;
-            self.write("</div>\n")?;
-            self.mermaid_count = self
-                .mermaid_count
-                .checked_add(1)
-                .ok_or_else(|| self.malformed())?;
-        } else {
-            self.write_block_start("<pre><code>")?;
-            self.write_escaped_body(&source)?;
-            self.write("</code></pre>\n")?;
+        if mermaid {
+            return self.render_mermaid_block(&source, code_ordinal);
+        }
+        self.render_plain_code_block(&source, language)?;
+        Ok(())
+    }
+
+    fn render_mermaid_block(
+        &mut self,
+        source: &str,
+        code_ordinal: CodeBlockOrdinal,
+    ) -> Result<(), MarkdownRenderError> {
+        self.validate_mermaid_source(source, code_ordinal)?;
+        let Some(mermaid_ordinal) = MermaidBlockOrdinal::from_index(self.mermaid_count) else {
+            return Err(self.malformed());
+        };
+        let svg = (self.render_mermaid)(source, mermaid_ordinal.0).map_err(|error| {
+            mermaid_error(
+                self.document,
+                MarkdownRenderLocation::CodeBlock {
+                    ordinal: code_ordinal,
+                },
+                error.code(),
+            )
+        })?;
+        self.reserve_mermaid_output(&svg, code_ordinal)?;
+        self.write_block_start(
+            "<div class=\"mermaid-diagram\" data-maincopy-mermaid=\"v1\" data-block=\"",
+        )?;
+        self.write(&mermaid_ordinal.get().to_string())?;
+        self.write("\">")?;
+        self.writer
+            .write_sanitized_svg(&svg)
+            .map_err(|_| rendered_html_limit_error(&self.document.path))?;
+        self.write("</div>\n")?;
+        self.mermaid_count = self
+            .mermaid_count
+            .checked_add(1)
+            .ok_or_else(|| self.malformed())?;
+        Ok(())
+    }
+
+    fn validate_mermaid_source(
+        &self,
+        source: &str,
+        code_ordinal: CodeBlockOrdinal,
+    ) -> Result<(), MarkdownRenderError> {
+        let location = MarkdownRenderLocation::CodeBlock {
+            ordinal: code_ordinal,
+        };
+        if self.mermaid_count >= self.limits.mermaid_blocks {
+            return Err(MarkdownRenderError::new(
+                self.document,
+                location,
+                MarkdownRenderErrorCode::MermaidBlockCountExceeded,
+                "post contains more Mermaid blocks than the configured limit",
+            ));
+        }
+        if source.len() > self.limits.mermaid_source_bytes {
+            return Err(MarkdownRenderError::new(
+                self.document,
+                location,
+                MarkdownRenderErrorCode::MermaidBlockTooLarge,
+                "Mermaid source exceeds the configured byte limit",
+            ));
         }
         Ok(())
+    }
+
+    fn reserve_mermaid_output(
+        &mut self,
+        svg: &SanitizedSvg,
+        code_ordinal: CodeBlockOrdinal,
+    ) -> Result<(), MarkdownRenderError> {
+        self.mermaid_svg_bytes = self
+            .mermaid_svg_bytes
+            .checked_add(svg.as_str().len())
+            .filter(|size| *size <= self.limits.mermaid_svg_bytes)
+            .ok_or_else(|| {
+                MarkdownRenderError::new(
+                    self.document,
+                    MarkdownRenderLocation::CodeBlock {
+                        ordinal: code_ordinal,
+                    },
+                    MarkdownRenderErrorCode::MermaidRenderedOutputTooLarge,
+                    "rendered Mermaid SVG exceeds the per-post byte limit",
+                )
+            })?;
+        Ok(())
+    }
+
+    fn render_plain_code_block(
+        &mut self,
+        source: &str,
+        language: Option<CodeLanguage>,
+    ) -> Result<(), MarkdownRenderError> {
+        if let Some(language) = language {
+            self.write_block_start("<pre class=\"article-code\"><code class=\"")?;
+            self.write(language.html_class())?;
+            self.write("\">")?;
+        } else {
+            self.write_block_start("<pre><code>")?;
+        }
+        self.write_escaped_body(source)?;
+        self.write("</code></pre>\n")
     }
 
     fn collect_code_block(&mut self) -> Result<String, MarkdownRenderError> {
@@ -1529,7 +1603,7 @@ mod tests {
 
     #[test]
     fn exact_commonmark_html_and_typed_asset_projection_are_deterministic() {
-        let body = "# Heading\n\nRaw <b>& text</b>.\n\n[route](/notes?x=1&y=2)\n\n![diagram](assets/images/diagram.png \"Diagram\")\n\n[manual](assets/files/manual.pdf)\n\n```rust\n<a>&\n```\n\n```mermaid\ngraph TD\nA-->B\n```\n";
+        let body = "# Heading\n\nRaw <b>& text</b>.\n\n[route](/notes?x=1&y=2)\n\n![diagram](assets/images/diagram.png \"Diagram\")\n\n[manual](assets/files/manual.pdf)\n\n```rust\n<a>&\n```\n\n```ascii\n+---+\n| A |\n+---+\n```\n\n```mermaid\ngraph TD\nA-->B\n```\n";
         let first = render(
             &[],
             body,
@@ -1545,7 +1619,8 @@ mod tests {
                         <p><a href=\"/notes?x=1&amp;y=2\">route</a></p>\n\
                         <p><img src=\"assets/images/diagram.png\" alt=\"diagram\" title=\"Diagram\" /></p>\n\
                         <p><a href=\"assets/files/manual.pdf\">manual</a></p>\n\
-                        <pre><code>&lt;a&gt;&amp;\n</code></pre>\n\
+                        <pre class=\"article-code\"><code class=\"language-rust\">&lt;a&gt;&amp;\n</code></pre>\n\
+                        <pre><code>+---+\n| A |\n+---+\n</code></pre>\n\
                         <div class=\"mermaid-diagram\" data-maincopy-mermaid=\"v1\" data-block=\"1\"><svg viewBox=\"0 0 1 1\" xmlns=\"http://www.w3.org/2000/svg\"><text x=\"0\" y=\"1\">diagram</text></svg></div>\n";
         assert_eq!(first.article.identity_html.as_ref(), expected);
         assert_eq!(second.article.identity_html.as_ref(), expected);
@@ -1664,9 +1739,16 @@ mod tests {
     }
 
     #[test]
-    fn all_non_mermaid_fence_labels_render_identically_without_authored_classes() {
+    fn declared_fence_aliases_are_canonical_and_unknown_values_remain_plain() {
         let expected = render(&[], "```\n<a>&\n```\n", &[]);
-        for label in ["text", "ascii", "rust", "Mermaid", "mermaid trailing"] {
+        for label in [
+            "text",
+            "ascii",
+            "Mermaid",
+            "mermaid trailing",
+            "rust linenos",
+            "rüst",
+        ] {
             let rendered = render(&[], &format!("```{label}\n<a>&\n```\n"), &[]);
             assert_eq!(
                 rendered.article.identity_html,
@@ -1675,6 +1757,15 @@ mod tests {
             assert!(!rendered.article.identity_html.contains("mermaid-diagram"));
             assert!(!rendered.article.identity_html.contains("language-"));
         }
+        let rust = render(&[], "```RuSt\n<a>&\n```\n", &[]);
+        let alias = render(&[], "```rs\n<a>&\n```\n", &[]);
+        assert_eq!(rust.article.identity_html, alias.article.identity_html);
+        assert!(
+            rust.article
+                .identity_html
+                .contains("class=\"language-rust\"")
+        );
+        assert!(!rust.article.identity_html.contains("RuSt"));
         let commonmark_decoded = render(&[], "```merm&#x61;id\na-->b\n```\n", &[]);
         assert!(
             commonmark_decoded
@@ -1682,6 +1773,37 @@ mod tests {
                 .identity_html
                 .contains("mermaid-diagram")
         );
+    }
+
+    #[test]
+    fn preview_and_public_projection_reuse_exact_release_rendering() {
+        let body = "```rust\nfn main() {}\n```\n\n```ascii\n+---+\n| A |\n+---+\n```\n\n```mermaid\nflowchart LR\nA-->B\n```\n";
+        let (content, assets) = candidate("Renderer", &[], body, false, &[]);
+        let document = &content.posts[0];
+        let rendered = render_markdown_for_test(
+            document,
+            assets.assets_for(document).unwrap(),
+            &assets.site,
+            RendererLimits::production(),
+        )
+        .unwrap();
+
+        let preview = rendered
+            .project_for_preview(
+                "/api/admin/v1/preview-assets",
+                &assets.site,
+                &assets.local_assets,
+            )
+            .unwrap();
+        let public = rendered
+            .project_for_snapshot(&snapshot(), &assets.site, &assets.local_assets)
+            .unwrap();
+
+        assert_eq!(preview, public);
+        assert!(public.contains("class=\"language-rust\""));
+        assert!(public.contains("<pre><code>+---+"));
+        assert!(public.contains("class=\"mermaid-diagram\""));
+        assert!(!public.contains("flowchart LR"));
     }
 
     #[test]
@@ -1796,6 +1918,7 @@ mod tests {
             mermaid_source_bytes: 4,
             mermaid_svg_bytes: 1_024,
             mermaid_blocks: 1,
+            code_blocks: 256,
         };
         render_markdown_with_limits(document, post_assets, &assets.site, base).unwrap();
         let error = render_markdown_with_limits(
@@ -1857,6 +1980,21 @@ mod tests {
             error.code,
             MarkdownRenderErrorCode::MermaidBlockCountExceeded
         );
+
+        let (two_code_content, two_code_assets) =
+            candidate("Renderer", &[], "```\na\n```\n\n```\nb\n```\n", false, &[]);
+        let two_code_document = &two_code_content.posts[0];
+        let error = render_markdown_with_limits(
+            two_code_document,
+            two_code_assets.assets_for(two_code_document).unwrap(),
+            &two_code_assets.site,
+            RendererLimits {
+                code_blocks: 1,
+                ..base
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, MarkdownRenderErrorCode::CodeBlockCountExceeded);
 
         let mut writer = ArticleWriter::new(3);
         assert!(writer.write("abc").is_ok());
@@ -2115,6 +2253,10 @@ mod tests {
             (
                 MarkdownRenderErrorCode::MermaidRendererInternal,
                 "mermaid_renderer_internal",
+            ),
+            (
+                MarkdownRenderErrorCode::CodeBlockCountExceeded,
+                "code_block_count_exceeded",
             ),
             (
                 MarkdownRenderErrorCode::RenderedHtmlTooLarge,

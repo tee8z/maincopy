@@ -16,7 +16,7 @@ use crate::{
             ContentReloadError, PublicationCoordinatorHandle, PublicationCoordinatorUnavailable,
         },
     },
-    render::{ContentCatalog, compile_content_catalog},
+    render::{ContentCatalog, ContentCompiler},
     source_provenance::{SourceCommitDiscovery, discover_source_commit},
 };
 
@@ -30,6 +30,7 @@ pub(crate) struct ContentSync {
     active: CandidateKey,
     publications: PublicationCoordinatorHandle,
     cancellation: CancellationToken,
+    compiler: ContentCompiler,
 }
 
 impl ContentSync {
@@ -40,6 +41,7 @@ impl ContentSync {
         active_digest: ContentTreeDigest,
         publications: PublicationCoordinatorHandle,
         cancellation: CancellationToken,
+        compiler: ContentCompiler,
     ) -> Self {
         Self {
             root,
@@ -50,6 +52,7 @@ impl ContentSync {
             },
             publications,
             cancellation,
+            compiler,
         }
     }
 
@@ -121,7 +124,7 @@ impl ContentSync {
             state.pending = Some(observed);
             return Ok(None);
         }
-        let compiled = compile_observed(observed, self.root.clone()).await?;
+        let compiled = compile_observed(observed, self.root.clone(), self.compiler.clone()).await?;
         let Some(candidate) = state.accept_compiled(compiled) else {
             return Ok(None);
         };
@@ -372,6 +375,7 @@ async fn observe_tree(
 async fn compile_observed(
     observed: ObservedCandidate,
     root: PathBuf,
+    compiler: ContentCompiler,
 ) -> Result<Result<CompiledCandidate, CandidateFailure>, ContentSyncError> {
     tokio::task::spawn_blocking(move || {
         let key = observed.key.clone();
@@ -382,7 +386,8 @@ async fn compile_observed(
                 .map_err(|error| error.to_string())?;
             let assets = resolve_content_assets(&observed.tree, &content)
                 .map_err(|error| error.to_string())?;
-            let catalog = compile_content_catalog(&content, &assets)
+            let catalog = compiler
+                .compile(&content, &assets)
                 .map(Arc::new)
                 .map_err(|error| error.to_string())?;
             let source_commit = match discover_source_commit(&root) {
@@ -462,6 +467,7 @@ mod tests {
     use markdown_compiler::{PostCollection, PostId, PostRevisionDigest};
 
     use crate::content_fixtures::{content_tree, post, publication};
+    use crate::render::compile_content_catalog;
 
     fn compiled_candidate() -> CompiledCandidate {
         let publication_source = "[site]\n\

@@ -16,7 +16,7 @@ pub(crate) const MAX_STACK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(feature = "helper")]
 pub(crate) const MAX_CPU_SECONDS: u64 = 5;
 #[cfg(feature = "client")]
-pub(crate) const MAX_WALL_TIME: Duration = Duration::from_secs(6);
+pub(crate) const MAX_WALL_TIME: Duration = Duration::from_secs(10);
 
 #[cfg(any(feature = "client", feature = "helper"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

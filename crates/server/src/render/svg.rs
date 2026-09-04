@@ -1785,10 +1785,21 @@ mod tests {
     use super::*;
     use mermaid_rs_renderer::{RenderOptions, render_strict};
 
+    const MERMAID_GOLDEN: &str =
+        include_str!("../../tests/fixtures/mermaid/selected-corpus.golden");
+
     fn sanitize(input: &str) -> Result<SanitizedSvg, SvgSanitizeError> {
-        MermaidSvgSanitizer::sanitize(
+        sanitize_with_limits(input, SvgLimits::production())
+    }
+
+    fn sanitize_with_limits(
+        input: &str,
+        limits: SvgLimits,
+    ) -> Result<SanitizedSvg, SvgSanitizeError> {
+        MermaidSvgSanitizer::sanitize_with_limits(
             input,
             SvgScope::new(b"post-fixture", NonZeroUsize::new(2).unwrap()),
+            limits,
         )
     }
 
@@ -1802,24 +1813,46 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(diagrams.len(), 10, "update the reviewed corpus count");
 
-        for (index, source) in diagrams.iter().enumerate() {
-            let mut options = RenderOptions::default();
-            options.layout.fast_text_metrics = true;
-            let raw = render_strict(source, options)
-                .unwrap_or_else(|error| panic!("diagram {} must render: {error}", index + 1));
-            let sanitized = MermaidSvgSanitizer::sanitize(
-                &raw,
-                SvgScope::new(b"repository-corpus", NonZeroUsize::new(index + 1).unwrap()),
-            )
-            .unwrap_or_else(|error| {
-                panic!("diagram {} must satisfy the SVG policy: {error}", index + 1)
-            });
-            assert!(
-                !sanitized.as_str().contains(" style="),
-                "diagram {} retained an inline style",
-                index + 1
-            );
-        }
+        let sanitized_digests = diagrams
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let mut options = RenderOptions::default();
+                options.layout.fast_text_metrics = true;
+                let raw = render_strict(source, options)
+                    .unwrap_or_else(|error| panic!("diagram {} must render: {error}", index + 1));
+                let sanitized = MermaidSvgSanitizer::sanitize(
+                    &raw,
+                    SvgScope::new(b"repository-corpus", NonZeroUsize::new(index + 1).unwrap()),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("diagram {} must satisfy the SVG policy: {error}", index + 1)
+                });
+                assert!(
+                    !sanitized.as_str().contains(" style="),
+                    "diagram {} retained an inline style",
+                    index + 1
+                );
+                blake3::hash(sanitized.as_str().as_bytes())
+                    .to_hex()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sanitized_digests, golden_column(2));
+    }
+
+    fn golden_column(index: usize) -> Vec<String> {
+        MERMAID_GOLDEN
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                line.split_ascii_whitespace()
+                    .nth(index)
+                    .expect("golden corpus row must contain every digest")
+                    .to_owned()
+            })
+            .collect()
     }
 
     fn mermaid_fences(markdown: &str) -> Vec<String> {
@@ -2069,49 +2102,161 @@ mod tests {
     }
 
     #[test]
-    fn configured_input_depth_and_output_limits_fail_closed() {
+    fn configured_input_and_output_byte_limits_are_inclusive() {
+        let input = r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#;
+
         let mut limits = SvgLimits::production();
-        limits.input_bytes = 10;
+        limits.input_bytes = input.len();
+        assert!(sanitize_with_limits(input, limits).is_ok());
+
+        limits.input_bytes = input.len() - 1;
         assert!(matches!(
-            MermaidSvgSanitizer::sanitize_with_limits(
-                r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#,
-                SvgScope::new(b"post", NonZeroUsize::MIN),
-                limits,
-            ),
-            Err(SvgSanitizeError::InputTooLarge { .. })
+            sanitize_with_limits(input, limits),
+            Err(SvgSanitizeError::InputTooLarge { limit, actual })
+                if limit == input.len() - 1 && actual == input.len()
+        ));
+
+        let output_bytes = sanitize(input).unwrap().as_str().len();
+        limits = SvgLimits::production();
+        limits.output_bytes = output_bytes;
+        assert_eq!(
+            sanitize_with_limits(input, limits).unwrap().as_str().len(),
+            output_bytes
+        );
+
+        limits.output_bytes = output_bytes - 1;
+        assert!(matches!(
+            sanitize_with_limits(input, limits),
+            Err(SvgSanitizeError::OutputTooLarge { limit }) if limit == output_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn configured_element_and_depth_limits_are_inclusive() {
+        let root = r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#;
+        let nested = r#"<svg xmlns="http://www.w3.org/2000/svg"><g/></svg>"#;
+
+        let mut limits = SvgLimits::production();
+        limits.elements = 1;
+        assert!(sanitize_with_limits(root, limits).is_ok());
+        assert!(matches!(
+            sanitize_with_limits(nested, limits),
+            Err(SvgSanitizeError::ElementLimitExceeded { limit: 1 })
         ));
 
         limits = SvgLimits::production();
         limits.depth = 1;
+        assert!(sanitize_with_limits(root, limits).is_ok());
         assert!(matches!(
-            MermaidSvgSanitizer::sanitize_with_limits(
-                r#"<svg xmlns="http://www.w3.org/2000/svg"><g/></svg>"#,
-                SvgScope::new(b"post", NonZeroUsize::MIN),
-                limits,
-            ),
-            Err(SvgSanitizeError::DepthExceeded { .. })
+            sanitize_with_limits(nested, limits),
+            Err(SvgSanitizeError::DepthExceeded { limit: 1 })
         ));
+    }
 
-        limits = SvgLimits::production();
-        limits.attributes_per_element = 1;
+    #[test]
+    fn configured_attribute_limits_are_inclusive() {
+        let one_attribute = r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#;
+        let two_attributes = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100"/>"#;
+
+        let mut limits = SvgLimits::production();
+        limits.attributes = 1;
+        assert!(sanitize_with_limits(one_attribute, limits).is_ok());
         assert!(matches!(
-            MermaidSvgSanitizer::sanitize_with_limits(
-                r#"<svg xmlns="http://www.w3.org/2000/svg"><text style="text-anchor: middle; font-size: 14px; font-weight: bold; font-family: sans-serif;">x</text></svg>"#,
-                SvgScope::new(b"post", NonZeroUsize::MIN),
-                limits,
-            ),
+            sanitize_with_limits(two_attributes, limits),
             Err(SvgSanitizeError::AttributeLimitExceeded { limit: 1 })
         ));
 
         limits = SvgLimits::production();
-        limits.output_bytes = 10;
+        limits.attributes_per_element = 1;
+        assert!(sanitize_with_limits(one_attribute, limits).is_ok());
         assert!(matches!(
-            MermaidSvgSanitizer::sanitize_with_limits(
-                r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#,
-                SvgScope::new(b"post", NonZeroUsize::MIN),
-                limits,
-            ),
-            Err(SvgSanitizeError::OutputTooLarge { .. })
+            sanitize_with_limits(two_attributes, limits),
+            Err(SvgSanitizeError::AttributeLimitExceeded { limit: 1 })
         ));
+    }
+
+    #[test]
+    fn configured_id_and_reference_limits_are_inclusive() {
+        let one_id = r#"<svg xmlns="http://www.w3.org/2000/svg"><g id="a"/></svg>"#;
+        let two_ids = concat!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg">"#,
+            r#"<g id="a"/><g id="b"/></svg>"#,
+        );
+
+        let mut limits = SvgLimits::production();
+        limits.ids = 1;
+        assert!(sanitize_with_limits(one_id, limits).is_ok());
+        assert!(matches!(
+            sanitize_with_limits(two_ids, limits),
+            Err(SvgSanitizeError::IdLimitExceeded { limit: 1 })
+        ));
+
+        let one_reference = concat!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg">"#,
+            r#"<defs><marker id="a"/></defs>"#,
+            r#"<path d="M0 0" marker-end="url(#a)"/></svg>"#,
+        );
+        let two_references = concat!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg">"#,
+            r#"<defs><marker id="a"/></defs>"#,
+            r#"<path d="M0 0" marker-end="url(#a)"/>"#,
+            r#"<path d="M1 1" marker-end="url(#a)"/></svg>"#,
+        );
+
+        limits = SvgLimits::production();
+        limits.references = 1;
+        assert!(sanitize_with_limits(one_reference, limits).is_ok());
+        assert!(matches!(
+            sanitize_with_limits(two_references, limits),
+            Err(SvgSanitizeError::ReferenceLimitExceeded { limit: 1 })
+        ));
+    }
+
+    #[test]
+    fn configured_total_and_per_node_text_limits_are_inclusive() {
+        let one_byte = r#"<svg xmlns="http://www.w3.org/2000/svg"><text>a</text></svg>"#;
+        let two_bytes = r#"<svg xmlns="http://www.w3.org/2000/svg"><text>ab</text></svg>"#;
+
+        let mut limits = SvgLimits::production();
+        limits.text_bytes = 1;
+        assert!(sanitize_with_limits(one_byte, limits).is_ok());
+        assert!(matches!(
+            sanitize_with_limits(two_bytes, limits),
+            Err(SvgSanitizeError::TextLimitExceeded)
+        ));
+
+        limits = SvgLimits::production();
+        limits.text_node_bytes = 1;
+        assert!(sanitize_with_limits(one_byte, limits).is_ok());
+        assert!(matches!(
+            sanitize_with_limits(two_bytes, limits),
+            Err(SvgSanitizeError::TextLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn fixed_identifier_path_url_and_coordinate_limits_are_inclusive() {
+        let identifier = "a".repeat(MAX_ID_BYTES);
+        assert!(valid_id(&identifier));
+        assert!(valid_tokens(&identifier));
+        assert!(!valid_id(&format!("{identifier}a")));
+        assert!(!valid_tokens(&format!("{identifier}a")));
+
+        let path = format!("M{}", " ".repeat(MAX_PATH_BYTES - 1));
+        assert_eq!(path.len(), MAX_PATH_BYTES);
+        assert!(valid_path(&path));
+        assert!(!valid_path(&format!("{path} ")));
+
+        let root_relative = format!("/{}", "a".repeat(MAX_NAVIGATION_URL_BYTES - 1));
+        assert_eq!(root_relative.len(), MAX_NAVIGATION_URL_BYTES);
+        assert!(valid_root_relative_url(&root_relative));
+        assert!(!valid_root_relative_url(&format!("{root_relative}a")));
+
+        assert!(valid_number("10000000"));
+        assert!(valid_number("-10000000"));
+        assert!(valid_nonnegative_length("10000000", false));
+        assert!(!valid_number("10000000.1"));
+        assert!(!valid_number("-10000000.1"));
+        assert!(!valid_nonnegative_length("10000000.1", false));
     }
 }

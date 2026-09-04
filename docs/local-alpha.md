@@ -194,7 +194,10 @@ scripts/dev-maincopy.sh preview "$POST_ID" \
   --content-digest "$CONTENT_DIGEST"
 ```
 
-Open `PREVIEW_PATH` and review the article. Copy the reported `Preview` value:
+Open `PREVIEW_PATH` and review the article. Confirm that the Rust block remains
+escaped plain code inside the canonical `language-rust` wrapper and has no
+token-level highlighting spans. Confirm that the Mermaid source has become a
+diagram rather than remaining source text. Copy the reported `Preview` value:
 
 ```bash
 PREVIEW_DIGEST='COPY_THE_PREVIEW_DIGEST'
@@ -236,7 +239,15 @@ curl --noproxy '*' --cacert "$ROOT_CERTIFICATE" --max-time 5 \
   --output "$PREVIEW_DIRECTORY/published.html"
 grep -F '<h1>Hello, Maincopy</h1>' \
   "$PREVIEW_DIRECTORY/published.html"
+grep -F 'class="article-code"><code class="language-rust"' \
+  "$PREVIEW_DIRECTORY/published.html"
+grep -F 'class="mermaid-diagram"' \
+  "$PREVIEW_DIRECTORY/published.html"
 ```
+
+The code-language class records the author-declared language. V1 does not
+perform token-level syntax highlighting. These checks and all public
+navigation work without JavaScript.
 
 Fetch the RSS feed and verify its canonical post URL:
 

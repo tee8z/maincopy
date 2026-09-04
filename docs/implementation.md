@@ -38,7 +38,9 @@ release claim.
 | Managed Git synchronization and restricted bootstrap | Planned |
 | Snapshot-backed RSS feed, sitemap, robots policy, and HTML autodiscovery | Implemented foundation |
 | Canonical links, core non-image Open Graph fields, and `BlogPosting` JSON-LD | Implemented foundation |
+| Built-in public theme shell, packaged CSS, stable `maincopy-*` hooks, and previous/next navigation | Implemented |
 | Alias redirects, durable route ownership, snapshot-scoped content assets, and conditional application assets | Implemented |
+| Semantic code language classes, Mermaid rendering, and SVG sanitization | Implemented; Slice 6 gate passed |
 | Favicon and image metadata and page CSP | Planned |
 | Local HTTPS development gateway and explicit CLI CA trust | Implemented development harness; see the [runbook](local-alpha.md) |
 | Production HTTPS admin gateway and admin web interface | Planned; see work packages [4.5](#work-package-45-https-admin-gateway-contract) and [8.2](#work-package-82-nixos-module-and-admin-gateway) |
@@ -83,6 +85,9 @@ isolation, and security-review prerequisites pass their tests.
 | [Post-v1 assisted distribution](#post-v1-assisted-distribution-specification) | X and Substack handoff contracts |
 | [Post-v1 subscriptions and email](#post-v1-subscription-and-email-specification) | Mailing-list state, privacy, and delivery contracts |
 | [Post-v1 Obsidian authoring](#post-v1-obsidian-first-authoring-specification) | Headless Sync source and authoring compatibility |
+| [Post-v1 replaceable themes](#post-v1-replaceable-theme-specification) | Validated template packages and typed page contexts |
+| [Post-v1 typed widgets](#post-v1-typed-theme-widget-specification) | Safe article widgets implemented by packaged theme assets |
+| [Later post-v1 article code](#later-post-v1-article-code-sandbox-decision) | Separate trust and sandbox decision for arbitrary article JavaScript |
 | [Slice 8](#slice-8-litestream-nixos-and-restore) | Packaging, deployment, and restore |
 | [Slice 9](#slice-9-release-hardening) | End-to-end and release evidence |
 | [V1 release definition](#v1-release-definition) | Owner approval boundary |
@@ -307,7 +312,8 @@ Every slice must preserve these invariants:
     accepted preview digest for the exact post revision, renderer identity,
     page-shell identity, profile projection, and reviewed canonical URL.
 13. The live SQLite database always uses local storage.
-14. Public reading and navigation do not require JavaScript.
+14. Public reading and navigation do not require JavaScript. Article content
+    cannot supply scripts, event handlers, or executable expressions.
 15. Maincopy never fetches or proxies an external content asset.
 16. V1 stores no outbound provider credential, distribution job, delivery
     state, subscriber data, email address, or email-control token.
@@ -538,7 +544,7 @@ Rust toolchain and the project license.
 | Password credentials | Pin the direct RustCrypto `argon2` crate; use explicit Argon2id v19 PHC strings and no convenience authentication wrapper | 4 |
 | Browser session and CSRF secrets | Generate independent 256-bit random values and store only fixed-length digests | 4 |
 | Agent authentication | Verify NIP-98 per request against a scoped Nostr public-key record; keep the signer and private key outside Maincopy | 4 |
-| Syntax highlighting | Select through the rendering corpus | 6 |
+| Code-language metadata | Use one application-owned closed fence-alias table and static canonical language classes; add no highlighter, syntax-grammar, or token-theme dependency; see [ADR 0002](decisions/0002-code-language-classes.md) | 6 |
 | Mermaid | Pin `mermaid-rs-renderer` 0.3.1 behind the supervised `maincopy-mermaid` helper; see [ADR 0001](decisions/0001-mermaid-renderer.md) | 6 |
 | SVG sanitization | Use an explicit SVG allowlist boundary | 6 |
 | Lightning Address | A typed SQLite profile value and deterministic LUD-16/LUD-01 projection | 4 |
@@ -571,6 +577,10 @@ Maincopy package license.
 | `tokio-metrics` | 0.4.9 | Default features disabled; `rt`; do not enable unstable Tokio metrics | `MIT` | 1.70 |
 | `libsqlite3-sys` | 0.37.0 | Default features disabled; `bundled` | `MIT` | Not declared |
 | `mermaid-rs-renderer` | 0.3.1 | Default features disabled; no optional features | `MIT` | Not declared |
+
+The repository root `LICENSE` records Maincopy's license and retains the
+Mermaid renderer's MIT notice. This dependency register records selected
+upstream metadata; it does not make a broader legal-completeness claim.
 
 `libsqlite3-sys` 0.37.0 bundles SQLite 3.51.3. SQLite places its bundled source
 in the public domain. Maincopy rejects an older linked SQLite version at
@@ -628,7 +638,9 @@ A fixed row is binding. Resolve each selection row before its due work starts.
 | Tip recipient | Store one active recipient `UserId` in SQLite. Render a CTA only for an enabled user, profile, and Lightning Address. | Fixed | 7.1 |
 | V1 payment boundary | Use a static wallet handoff. Do not create invoices, query LNURL services, or store payment state. | Fixed | 7.1 |
 | Paid article access | Defer access control until the post-v1 settlement and entitlement contract is implemented. | Fixed | Post-v1 |
-| Mermaid engine | Use exact `mermaid-rs-renderer` 0.3.1 through a supervised, resource-limited helper. Treat raw SVG as untrusted. See [ADR 0001](decisions/0001-mermaid-renderer.md). | Fixed; verification in progress | 6.2 and 6.3 |
+| Code-language policy | Use one closed ASCII-case-insensitive alias table. Emit escaped source with only Maincopy-owned canonical language classes. Add no token highlighter, syntax-grammar corpus, or token-theme dependency. See [ADR 0002](decisions/0002-code-language-classes.md). | Fixed and verified | 6.1 |
+| Token-level code highlighting | Defer it. A future ADR must select the dependency and corpus and define deterministic output, resource limits, package notices, identity changes, and upgrades. | Deferred | Post-v1 |
+| Mermaid engine | Use exact `mermaid-rs-renderer` 0.3.1 through a supervised, resource-limited helper. Treat raw SVG as untrusted. See [ADR 0001](decisions/0001-mermaid-renderer.md). | Fixed and verified | 6.2 and 6.3 |
 | Metrics export | Serve Prometheus text for `GET /metrics` and standard empty-body `HEAD /metrics` on a dedicated loopback-only listener. Keep both off the public and admin routers and out of OpenAPI. | Fixed | 3.5 |
 | Recovery targets | Set measurable recovery point and recovery time targets. | Select | 8.4 |
 | Restore marker | Use a one-use marker bound to one offline-verified restored candidate. Consume it on the first accepted startup. Ordinary restarts do not require it. | Fixed | 8.4 |
@@ -1215,7 +1227,7 @@ Add the safe baseline renderer needed by the canonical web slice.
 Deliverables:
 
 - CommonMark parsing with raw HTML disabled.
-- Escaped code and ASCII blocks without syntax highlighting.
+- Escaped code and ASCII blocks without token-level syntax highlighting.
 - A typed Mermaid placeholder used before Slice 6 and removed when WP6.3
   installed sanitized inline SVG.
 - `pulldown-cmark` `Options::empty()` with no CommonMark extensions.
@@ -1224,7 +1236,7 @@ Deliverables:
 - Absolute HTTPS and same-site root-relative navigation only.
 - Recognition only when the complete CommonMark-decoded fence-info value is
   exact lowercase `mermaid`, with no trailing info tokens.
-- No V1 heading anchors or authored code-fence classes.
+- No V1 heading anchors and no class copied from authored code-fence text.
 - Inclusive limits of 32 MiB rendered HTML, 256 KiB per Mermaid block, and 64
   Mermaid blocks per post.
 - One opaque render product that binds the source, resolved assets, renderer
@@ -1249,8 +1261,8 @@ Tests:
   and SVG text.
 - Reject unsafe, protocol-relative, credential-bearing, control-containing,
   backslash-containing, and traversal-like destinations.
-- Produce identical escaped output for plain, `text`, `ascii`, and unknown code
-  fence labels.
+- Produce identical escaped plain-code output for empty, `text`, `ascii`, and
+  unknown code-fence labels.
 - Enforce each renderer limit at its boundary and one unit past it.
 - Lock exact HTML goldens and repeated-build byte equality.
 - Reject every Markdown image or file destination that has no matching
@@ -1546,14 +1558,35 @@ Deliverables:
 
 - An exported pure `public_router` constructor.
 - Index, post, tag, archive, liveness, and readiness routes.
-- Maud layouts with semantic HTML.
+- One built-in, opinionated Maud theme shell with the document and head,
+  server-rendered header and footer, article metadata and frame, home and
+  archive links, and chronological previous-post and next-post navigation.
+- One explicit compiled-article content slot. The shell controls page context,
+  metadata, surrounding structure, and stable `maincopy-*` class and
+  `data-maincopy-*` hooks; compiled Markdown controls only the escaped or
+  capability-checked article fragment placed in that slot.
+- Body context hooks `maincopy-site` plus exactly one of
+  `maincopy-page-index`, `maincopy-page-archive`, `maincopy-page-tag`,
+  `maincopy-page-post`, or `maincopy-page-error`; shell hooks
+  `maincopy-site-header`, `maincopy-site-title`,
+  `maincopy-site-navigation`, `maincopy-site-main`, and
+  `maincopy-site-footer`; and post hooks `maincopy-post-page`,
+  `maincopy-post`, `maincopy-post-header`, `maincopy-post-content`, and
+  `maincopy-post-navigation`.
+- Canonical adjacent-post links with `maincopy-post-navigation-link` and the
+  application-owned `maincopy-post-navigation-previous` or
+  `maincopy-post-navigation-next` direction class, plus standard `rel="prev"`
+  or `rel="next"` semantics.
 - Maud templates that remain ordinary Rust modules and are not concatenated by
   the asset build.
 - Dedicated first-party application and theme input roots for CSS and optional
   JavaScript. Content-repository favicons, post images, attachments, and CDN
   references do not enter this build.
-- Required `crates/server/frontend/css/site.css`; V1 emits no JavaScript bundle
-  until a feature supplies a reviewed JavaScript input.
+- Required, reviewed `crates/server/frontend/css/site.css` and
+  `crates/server/frontend/js/site.js` inputs. An operator edits these packaged
+  whole-server theme assets and rebuilds Maincopy. Public reading remains
+  complete without the JavaScript enhancement. V1 does not load arbitrary
+  templates, CSS, or JavaScript from an article repository or at runtime.
 - `crates/server/build.rs` normalizes and sorts declared input paths, combines
   them in that order, minifies each output, and computes content hashes.
 - Descriptor-relative, no-follow input and output access on Linux and macOS.
@@ -1603,6 +1636,9 @@ Deliverables:
   renderer, page shell, metadata, profile projection, and resolved assets as
   the public page. It returns a typed preview document and asset capability;
   it cannot add the revision to `SiteSnapshot`.
+- The preview page uses the same article frame but omits previous-post and
+  next-post links. Those links depend on the active public ledger and remain
+  outside the schedule-independent article preview identity.
 
 WP2.1 accepts a typed, database-neutral public-ledger projection. It has no
 default and cannot infer visibility from the catalog. Production startup now
@@ -1615,6 +1651,14 @@ Tests:
 - Call every route with `ServiceExt::oneshot` and no listener.
 - Consume a compiled snapshot after the source tree is removed.
 - Escape titles, descriptions, tags, and route parameters.
+- Derive previous and next links from exact chronological snapshot neighbors.
+  Prove home, archive, article, first-post, last-post, and one-post contexts
+  expose only their applicable navigation.
+- Omit adjacent-post navigation from a private preview and keep its compiled
+  article region byte-equal to the corresponding public article region.
+- Insert compiled content only through the explicit article slot and prove
+  article bytes cannot replace the head, header, footer, wrapper, or page
+  context.
 - Randomize frontend input discovery order and require identical combined
   bytes, manifest metadata, and digest.
 - Change emitted CSS or JavaScript bytes and require a new bundle digest,
@@ -3568,28 +3612,93 @@ Render technical content during compilation within strict security limits.
 Keep one reviewed HTML trust boundary.
 Full Mermaid rendering and SVG sanitization are required for v1.
 
-### Work package 6.1: Code and syntax rendering
+### Work package 6.1: Code-language rendering
 
-Add deterministic syntax highlighting and code-block behavior.
+Status: complete
+
+Add deterministic language metadata and safe code-block behavior without
+token-level syntax highlighting. [ADR
+0002](decisions/0002-code-language-classes.md) records the exact output policy.
+
+V1 uses no syntax-highlighting dependency, syntax-grammar corpus, runtime
+language parser, or token-color theme data. One application-owned enum and
+alias table convert author-declared language metadata into static canonical
+classes.
+
+The complete, ASCII-case-insensitive fence value selects one of these
+canonical languages:
+
+| Canonical value | Accepted fence aliases |
+| --- | --- |
+| `bash` | `bash`, `sh`, `shell` |
+| `c` | `c` |
+| `cpp` | `cpp`, `c++` |
+| `csharp` | `csharp`, `cs` |
+| `css` | `css` |
+| `diff` | `diff`, `patch` |
+| `dockerfile` | `dockerfile` |
+| `go` | `go` |
+| `html` | `html` |
+| `java` | `java` |
+| `javascript` | `javascript`, `js` |
+| `json` | `json` |
+| `nix` | `nix` |
+| `python` | `python`, `py` |
+| `ruby` | `ruby`, `rb` |
+| `rust` | `rust`, `rs` |
+| `sql` | `sql` |
+| `toml` | `toml` |
+| `typescript` | `typescript`, `ts` |
+| `tsx` | `tsx` |
+| `xml` | `xml` |
+| `yaml` | `yaml`, `yml` |
+
+Exact lowercase `mermaid` remains reserved for diagram rendering. Empty,
+unknown, non-ASCII, or multi-token fence values use escaped plain-code output.
+Authored fence text never becomes an HTML class.
+
+A known alias emits escaped source inside
+`<pre class="article-code"><code class="language-CANONICAL">`. `CANONICAL`
+comes only from the closed enum. Empty, `text`, `ascii`, unknown, non-ASCII,
+and multi-token values emit escaped source inside `<pre><code>`. Neither path
+emits token spans, inline style, or JavaScript.
+
+The inclusive limit of 256 code blocks per post applies before either the
+Mermaid or plain-code path. Every block also remains inside the content-tree
+and 32 MiB final rendered-HTML limits. This path performs no grammar work, so
+it has no parser-line, region-count, per-language-source, or aggregate
+highlighted-source limit.
 
 Deliverables:
 
 - An explicit language-name policy.
-- Escaped source before highlighting.
-- Deterministic CSS classes and output.
-- Bounded source size and highlighting work.
+- Escaped source for every code-block path.
+- Deterministic canonical language classes and output.
+- No token-level highlighter, runtime syntax corpus, or token-color theme.
+- Bounded block count and final output.
 - Plain code fallback for an unknown language.
 
 Tests:
 
-- Render the representative code fixture corpus.
+- Render every canonical language and alias family.
+- Accept ASCII-case variants and reject non-ASCII, multi-token, and
+  whitespace-padded aliases.
 - Escape hostile code text.
-- Fall back safely for an unknown language.
+- Produce identical plain-code structure for empty, `text`, `ascii`, and
+  unknown fence values.
+- Prove no authored fence value becomes an HTML class.
+- Exercise the configured code-block limit at its boundary and one block past
+  it.
 - Produce stable output and snapshot digests.
+
+The release corpus exercises every canonical language, every alias family,
+hostile HTML text, ASCII case variants, unknown and multi-token fallbacks,
+inclusive limits, stable canonical classes, exact HTML output, and renderer
+identity changes.
 
 ### Work package 6.2: Mermaid implementation spike
 
-Status: renderer selected; core integration complete; release verification is in progress
+Status: complete
 
 Use exact `mermaid-rs-renderer` 0.3.1 through the supervised
 `maincopy-mermaid` helper. [ADR 0001](decisions/0001-mermaid-renderer.md)
@@ -3600,10 +3709,19 @@ diagram also produced identical bytes in two fresh processes under one fixed
 host environment. This result covers six flowcharts, two sequence diagrams,
 and two state diagrams.
 
-The selection is complete. The implementation uses a deterministic fontless
-metric environment rather than packaged host fonts. Process-limit tests, the
-full representative corpus, and the deterministic failure protocol remain in
-progress.
+The implementation uses a deterministic fontless metric environment rather
+than packaged host fonts. One application-owned `ContentCompiler` is created
+during startup and shared by startup recovery and live content synchronization;
+its single renderer admission slot bounds the process to one Mermaid helper at
+a time. The helper clears its environment, installs its process limits before
+rendering, uses a fixed protocol, and is terminated and reaped at the parent
+deadline.
+
+The complete ten-diagram corpus runs through the supervised helper. Fixed
+raw-SVG BLAKE3 values make a renderer change visible in clean builds. Invalid
+syntax, initialization directives, oversized and deeply recursive input,
+resource signals, output overflow, protocol mismatch, and wall timeout have
+stable typed failure classes.
 
 Deliverables:
 
@@ -3624,7 +3742,7 @@ Tests:
 
 ### Work package 6.3: SVG sanitization and trust boundary
 
-Status: implementation complete; release verification is in progress
+Status: complete
 
 Implement `DiagramRenderer` and the single audited HTML boundary.
 
@@ -3637,7 +3755,10 @@ C4 PNG payloads shipped by renderer 0.3.1. Markdown can insert only the private
 `SanitizedSvg` capability; raw helper output cannot reach the article writer.
 Approved renderer style declarations are canonicalized into SVG presentation
 attributes or one scoped stylesheet class. This removes the known inline-style
-CSP mismatch; WP6.4 still owns full preview/public equivalence evidence.
+CSP mismatch. All ten selected renderer outputs cross the sanitizer and have
+separate namespace-sensitive BLAKE3 goldens. Every byte, element, depth,
+total/per-element attribute, ID, reference, and total/per-node text limit
+accepts its boundary and rejects one step beyond it.
 
 Deliverables:
 
@@ -3662,7 +3783,27 @@ Failure tests:
 
 ### Work package 6.4: Rendering corpus and asset limits
 
+Status: complete
+
 Promote rendering fixtures into a release gate.
+
+The application-owned compiler composes the closed code-language policy and
+one shared Mermaid admission capability. Initial content, retained recovery
+candidates, and live synchronized candidates use that same concrete compiler.
+The release corpus fixes representative Markdown, plain ASCII, every supported
+code-language class, raw Mermaid SVG, and sanitized Mermaid SVG output. Preview
+and canonical projection reuse one identity-bound `RenderedPost`; an explicit
+mixed code/ASCII/Mermaid test requires their article regions to be byte-equal.
+
+`PostRendererIdentity` stores and encodes each frozen CommonMark, raw-HTML,
+code, Mermaid, renderer-version, and sanitizer-version value. Tests mutate
+each field independently and require new post, preview, and downstream site
+digests. Output bytes remain separate identity inputs.
+
+The Nix output installs the repository root `LICENSE`, which records
+Maincopy's license and retains the Mermaid renderer's MIT notice. The package
+check compares the installed file byte-for-byte with the reviewed repository
+copy. V1 ships no syntax-grammar or token-color theme corpus.
 
 Deliverables:
 
@@ -3675,28 +3816,44 @@ Deliverables:
 - Digests of deterministic rendered fragments and generated asset bytes before
   snapshot-URL injection included in the post or site digest that serves that
   output.
-- Third-party license records for shipped renderer assets.
+- The reviewed root `LICENSE` in the packaged output, including its retained
+  Mermaid MIT notice.
 
 Tests:
 
 - Run the full corpus in `nix flake check`.
-- Prove deterministic output in repeated clean builds.
+- Prove fixed-golden output in clean Nix builds and identical Mermaid output
+  across repeated fresh renderer processes.
 - Fail compilation when any configured limit is exceeded.
 - Verify that renderer changes produce a new site digest.
 - Change only a renderer identity or rendered output and require a new digest.
-- Change a renderer identity or output and require a new preview digest. A
-  scheduled release with the old digest becomes stale before activation.
+- Change a renderer identity or output and require a new preview digest.
+  Pre-release renderer upgrades may invalidate retained schedules at startup;
+  there is no legacy database or artifact compatibility path before v1.
 
 ### Slice 6 exit gate
+
+Status: passed
 
 - The complete representative corpus passes.
 - Rendering uses no external network service.
 - Hostile SVG cannot cross the reviewed boundary.
 - The selected Mermaid renderer produces sanitized SVG for the complete corpus.
-- Every rendering limit has a deterministic failure test.
+- Every compiler, sanitizer, and accepted-output byte or structural limit has
+  deterministic boundary evidence. The code-language path has exact block
+  count and final-output boundary evidence. The helper's fixed OS ceilings
+  additionally have hostile resource-containment evidence.
 - Preview and public article regions use the same release renderer for the same
   bound inputs.
-- The release closure contains every renderer dependency and license.
+- The release closure contains the reviewed repository root `LICENSE`,
+  including the retained Mermaid MIT notice. It contains no syntax-grammar or
+  token-color theme corpus.
+
+The canonical `nix flake check` runs the code-language goldens, supervised
+Mermaid goldens, sanitizer goldens, hostile fixtures, typed limit tests,
+identity tests, and preview/public projection equality. Rendering has no
+network client or request-time rendering path; public pages require neither
+JavaScript nor an external rendering service.
 
 ## Slice 7: Profile-backed Lightning Address tips
 
@@ -4357,6 +4514,216 @@ Tests:
   OpenAPI, or audit events.
 - Litestream and revision-artifact restore work without Obsidian availability.
 
+## Post-v1 replaceable theme specification
+
+This specification preserves the concrete future template boundary. It is not
+a V1 dependency or release gate. V1 ships one built-in opinionated Maud shell.
+
+The future model is inspired by Ghost's separation of a base layout,
+page-context templates, reusable partials, and one article-content slot. This
+plan does not select Handlebars or another engine, crate, library, or template
+syntax. A future architecture decision record must compare and pin that choice,
+its features, license, execution model, deterministic behavior, resource
+controls, and upgrade policy before implementation.
+
+### Post-v1 work package T.1: Theme contract and engine decision
+
+Deliverables:
+
+- A versioned `ThemeManifest` with a stable theme ID, theme version, required
+  theme-contract version, required engine version, supplied templates and
+  partials, registered helper requirements, and declared CSS and JavaScript
+  inputs.
+- A closed `PageContext` enum with `Post`, `Index`, `Archive`, `Tag`, and
+  `Error` variants. Each variant exposes one purpose-built immutable view model
+  rather than a generic object graph.
+- Required base or default layout and context-template slots. Reusable partials
+  resolve only by validated manifest names below the theme root.
+- A single `content` value that accepts the private compiled-article
+  capability. No other slot or helper accepts trusted article HTML, and the
+  engine never reparses article bytes as template source.
+- Server-derived chronological previous-post and next-post values in the
+  `Post` view model. Templates cannot query or reorder the publication ledger.
+- A closed, versioned helper registry. Each helper has typed input and output,
+  deterministic behavior, and no authority to read SQLite, a source checkout,
+  process environment, credentials, arbitrary files, clocks, randomness, or
+  the network.
+- An engine-selection ADR with fixture evidence for escaping, partial
+  resolution, cycle handling, deterministic output, error stability, Rust and
+  Nix packaging, maintenance, features, license, and upgrade compatibility.
+
+Tests:
+
+- Prove that each context exposes only its documented fields and applicable
+  navigation.
+- Reject an unknown context, helper, partial, manifest field, engine version,
+  or contract version with a typed diagnostic.
+- Keep compiled article HTML opaque and accepted only by the sole `content`
+  slot. Escape every ordinary template value.
+- Deny attempts to access secrets, SQLite, filesystem paths outside the theme,
+  environment variables, clocks, randomness, process execution, or network
+  clients.
+- Render the same manifest, typed context, article, and assets to identical
+  bytes across fresh processes in the locked Nix environment.
+
+### Post-v1 work package T.2: Theme validation, assets, and activation
+
+Deliverables:
+
+- Descriptor-relative, no-follow discovery for every declared template,
+  partial, and asset input. Reject undeclared files, duplicate normalized
+  paths, path escapes, symlinks, non-regular files, and mutation during read.
+- Documented inclusive ceilings for template and partial count, nesting and
+  recursion depth, path length and depth, source bytes per file and package,
+  compiled-template bytes, emitted page bytes, asset bytes, and render time.
+  Exercise every boundary and one unit beyond it.
+- Cycle detection for layout and partial expansion before the theme becomes a
+  preview candidate.
+- Theme-owned CSS and JavaScript fed into the existing deterministic frontend
+  build. Their exact emitted bytes receive content-hashed URLs and enter the
+  `SiteShellRendererIdentity` and site snapshot identity.
+- A complete immutable candidate that binds the manifest, engine and contract
+  versions, templates, partials, helper registry, frontend assets, page-context
+  projection, and rendered page bytes.
+- An authenticated preview of the exact candidate before activation. Theme
+  activation requires the accepted preview identity and uses the same
+  fail-closed snapshot swap as other presentation changes.
+- Preservation of the active shell after discovery, validation, compilation,
+  render, preview, or activation failure.
+
+Tests:
+
+- Render base, post, index, archive, tag, error, partial, first-post,
+  middle-post, last-post, and one-post fixtures.
+- Reject each path, mutation, cycle, count, depth, byte, and time failure at its
+  boundary and one unit beyond it.
+- Change the manifest, engine version, helper registry, one template, one
+  partial, CSS, JavaScript, page context, and emitted output independently and
+  require the applicable candidate, shell, preview, and site identity changes.
+- Prove that a failed candidate cannot alter the current public shell and that
+  the same bound page context renders byte-equal shell output in theme preview
+  and activation.
+- Build the selected engine and a complete fixture theme in the canonical Nix
+  check without an external network connection.
+
+### Post-v1 replaceable-theme acceptance gate
+
+- The selected engine and syntax have an accepted ADR and locked package
+  closure.
+- Every page context, helper, trusted slot, template, partial, and asset is
+  manifest-bound and versioned.
+- `content` remains the only compiled-article HTML slot.
+- Themes receive no database, secret, arbitrary filesystem, process, or network
+  authority.
+- Server-derived previous and next values agree with the active snapshot's
+  chronology.
+- The exact theme and content-hashed assets pass preview before activation.
+- Failed theme work preserves the active built-in or previously activated
+  shell.
+
+Theme JavaScript is operator-reviewed whole-server code. Arbitrary
+article-supplied JavaScript remains a separate trust and sandbox design and
+cannot reuse this theme capability.
+
+## Post-v1 typed theme widget specification
+
+This specification is not a V1 dependency or release gate. V1 keeps the
+built-in theme shell and compiled article body fully usable without JavaScript.
+
+### Goal
+
+Allow a bounded authored widget to request one prepackaged theme behavior
+without granting an article authority to supply code, selectors, or page-shell
+markup.
+
+### Post-v1 work package W.1: Typed button directive
+
+Add the exact `:::maincopy-button` directive only after its first action and
+no-JavaScript behavior are selected.
+
+Deliverables:
+
+- A closed `ArticleWidget` enum whose first variant is `MaincopyButton`, plus
+  distinct typed action, target, presentation-variant, and size-limited label
+  values. Raw strings do not pass beyond directive parsing.
+- One bounded directive grammar with a closed attribute schema. Reject unknown
+  widget names, duplicate or unknown attributes, invalid enum values,
+  unresolved targets, nested widgets, and any input over its documented limit.
+- Application-selected semantic HTML with escaped label content. The selected
+  native link, form control, disclosure, or other control must perform its
+  meaningful base operation without JavaScript; do not emit an inert button as
+  the only fallback.
+- Only validated, application-owned `maincopy-*` class tokens and inert
+  `data-maincopy-action` and `data-maincopy-target` values. Map authored enum
+  choices to canonical tokens; never copy authored names or values into an
+  attribute name, class, selector, URL, function name, or script body.
+- One event-delegated handler in the operator-edited build input
+  `crates/server/frontend/js/site.js`. It maps the closed packaged action IDs
+  to prepackaged functions and treats an absent, unknown, or mismatched hook as
+  inert. It performs no `eval`, dynamic function construction, inline event
+  handling, dynamic script import, or article-controlled selector execution.
+- Presentation only from the operator-edited build input
+  `crates/server/frontend/css/site.css`. Article repositories cannot supply a
+  stylesheet, script, event-handler attribute, or theme asset.
+- The existing deterministic frontend build, content hashes, shell identity,
+  preview binding, and CSP apply to both packaged files. An operator rebuilds
+  Maincopy after changing either file.
+- The same compiled widget bytes in the exact private preview and public
+  article. A widget-policy, CSS, JavaScript, action-map, or rendered-output
+  change produces a new applicable renderer or shell identity.
+
+Tests:
+
+- Parse every accepted enum value and reject each unknown, duplicate,
+  unresolved, nested, oversized, and malformed form with a typed diagnostic.
+- Escape hostile label and attribute text. Prove that no authored token becomes
+  a class, attribute name, selector, URL, or executable source.
+- Verify the exact native no-JavaScript behavior for each action before testing
+  its enhancement.
+- Dispatch each packaged action through one delegated listener. Keep unknown,
+  removed, cross-widget, and forged action/target combinations inert.
+- Search emitted article HTML and bundles for inline scripts, inline event
+  handlers, `eval`, dynamic function construction, and article-supplied code.
+- Change `site.css`, `site.js`, the action map, directive policy, and rendered
+  bytes independently and require the documented identity changes.
+- Require byte-equal widget regions in the private preview and public article.
+
+### Post-v1 widget acceptance gate
+
+- The widget remains useful when JavaScript is unavailable or fails to load.
+- Article Markdown can select only closed typed behavior and cannot supply
+  executable code.
+- CSS and JavaScript behavior comes only from the two reviewed packaged theme
+  inputs and changes only after an operator rebuild.
+- The page shell retains ownership of the document, head, header, footer,
+  article frame, navigation, and page context.
+
+General theme or template replacement is a separate post-v1 design. Arbitrary
+article-supplied JavaScript is also a separate, stronger trust boundary. It
+requires an explicit sandbox, capability, origin, CSP, data-access, navigation,
+storage, network, preview, audit, and failure-isolation design and cannot reuse
+the trusted compiled-article slot or typed-widget capability.
+
+### Later post-v1 article-code sandbox decision
+
+This is a decision route, not authorized implementation work. Before Maincopy
+accepts arbitrary article JavaScript, a dedicated ADR must define and prove:
+
+- reviewed code provenance, ownership, update, revocation, and audit rules;
+- isolation from the canonical page, trusted article slot, operator theme,
+  admin origin, sessions, and credentials;
+- the selected execution and iframe sandbox, isolation origin, CSP, cookies,
+  storage, network, navigation, downloads, and typed message protocol;
+- inclusive source, bundle, memory, CPU, message, and lifetime limits with
+  boundary and containment evidence;
+- exact preview and activation behavior plus fail-closed runtime recovery; and
+- a release-blocking security review for every granted capability.
+
+Begin evaluation with a sandboxed opaque-origin frame that has no ambient
+credential, storage, top-level-navigation, or network authority. Do not add an
+article script, inline event handler, `eval`, same-origin frame, or trusted
+theme hook as an interim path.
+
 ## Slice 8: Litestream, NixOS, and restore
 
 ### Goal
@@ -4865,6 +5232,17 @@ V1 is ready for owner approval when all of these statements are true:
 - `maincopyd` embeds deterministic content-hashed frontend bundles. Their
   generated manifest, MIME types, cache headers, and snapshot identity pass the
   build contract.
+- The built-in theme shell owns the document and head, server-rendered header
+  and footer, article frame, home and archive links, and chronological previous
+  and next navigation. Compiled article content enters only its explicit
+  content slot.
+- Public previous and next links come only from active chronological neighbors.
+  Private article previews omit those ledger-dependent links while retaining
+  the same compiled article region.
+- Operators customize packaged whole-server presentation in
+  `crates/server/frontend/css/site.css` and
+  `crates/server/frontend/js/site.js`, then rebuild. V1 accepts no arbitrary
+  theme, template, stylesheet, or script from article content or at runtime.
 - Git content uses required offset-aware `authored_at` metadata.
 - Draft, unpublished, and scheduled content cannot leak through public output.
 - An authenticated admin can render an effective draft or unpublished revision
@@ -4934,8 +5312,12 @@ V1 is ready for owner approval when all of these statements are true:
   transport, article-distribution adapter, provider schedule, delivery worker,
   browser automation, completion tracking, Nostr article signing, or relay
   publication.
-- Technical Markdown renders with deterministic syntax highlighting and bounded
-  resource use. Unsupported languages use the documented safe fallback.
+- Technical Markdown uses a closed ASCII-case-insensitive fence alias map.
+  Known languages emit escaped plain source with a static canonical
+  `language-*` class; empty, `text`, `ascii`, unknown, non-ASCII, and
+  multi-token fences emit escaped `<pre><code>` output. V1 performs no
+  token-level syntax highlighting and loads no syntax-grammar or token-color
+  theme corpus.
 - Mermaid diagrams use the selected local renderer, pass through the SVG
   sanitizer, and render identically in the exact preview and public article.
   A rendering or sanitization failure preserves the current live snapshot.
@@ -4950,6 +5332,9 @@ V1 is ready for owner approval when all of these statements are true:
   migration checksums reject older development databases before mutation, and
   release notes state that no pre-v1 state is retained.
 - The dedicated flake builds the package and NixOS module.
+- Public pages, including shell navigation and article content, remain usable
+  without JavaScript. V1 has no article widget directive or article-authored
+  JavaScript path.
 - The authentication security review has no unresolved critical or high-risk
   finding.
 - A clean release candidate passes all quality gates.

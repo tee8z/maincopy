@@ -2,6 +2,7 @@
 
 mod asset_path;
 mod catalog;
+mod code;
 mod diagram;
 mod markdown;
 mod metadata;
@@ -12,6 +13,7 @@ mod sitemap;
 mod svg;
 
 pub(crate) use asset_path::SnapshotAssetPath;
+pub(crate) use catalog::ContentCompiler;
 pub use catalog::{
     CatalogBuildError, CatalogBuildErrorCode, ContentCatalog, compile_content_catalog,
 };

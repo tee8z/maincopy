@@ -2,6 +2,7 @@
 name = "maincopy-diagram-renderer"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 autobins = false
 
 [features]
@@ -19,3 +20,6 @@ mermaid-rs-renderer = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true

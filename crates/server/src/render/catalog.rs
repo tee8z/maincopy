@@ -10,7 +10,11 @@ use thiserror::Error;
 
 #[cfg(test)]
 use super::GeneratedPostAsset;
-use super::{MarkdownRenderError, RenderedPost, render_markdown};
+use super::{
+    MarkdownRenderError, RenderedPost,
+    diagram::{DiagramRenderError, MermaidDiagramRenderer},
+    markdown::render_markdown_with_diagrams,
+};
 #[cfg(test)]
 use markdown_compiler::{DigestedAsset, ResolvedPostAssets};
 
@@ -18,6 +22,51 @@ use markdown_compiler::{DigestedAsset, ResolvedPostAssets};
 pub fn compile_content_catalog(
     content: &ValidatedContent,
     assets: &ResolvedContentAssets,
+) -> Result<ContentCatalog, CatalogBuildError> {
+    let compiler = ContentCompiler::discover().map_err(CatalogBuildError::compiler)?;
+    compiler.compile(content, assets)
+}
+
+/// One application-owned compilation capability with shared renderer admission.
+#[derive(Clone, Debug)]
+pub(crate) struct ContentCompiler {
+    diagrams: Arc<MermaidDiagramRenderer>,
+}
+
+impl ContentCompiler {
+    pub(crate) fn discover() -> Result<Self, ContentCompilerInitializationError> {
+        let diagrams = MermaidDiagramRenderer::discover()
+            .map_err(ContentCompilerInitializationError::Diagram)?;
+        Ok(Self {
+            diagrams: Arc::new(diagrams),
+        })
+    }
+
+    pub(crate) fn compile(
+        &self,
+        content: &ValidatedContent,
+        assets: &ResolvedContentAssets,
+    ) -> Result<ContentCatalog, CatalogBuildError> {
+        compile_content_catalog_with(content, assets, |document, post_assets, site_assets| {
+            render_markdown_with_diagrams(document, post_assets, site_assets, &self.diagrams)
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ContentCompilerInitializationError {
+    #[error("initialize the supervised Mermaid renderer")]
+    Diagram(#[source] DiagramRenderError),
+}
+
+fn compile_content_catalog_with(
+    content: &ValidatedContent,
+    assets: &ResolvedContentAssets,
+    mut render: impl FnMut(
+        &markdown_compiler::PostDocument,
+        &markdown_compiler::ResolvedPostAssets,
+        &ResolvedSiteAssets,
+    ) -> Result<RenderedPost, MarkdownRenderError>,
 ) -> Result<ContentCatalog, CatalogBuildError> {
     if assets.posts.len() != content.posts.len() {
         return Err(CatalogBuildError::candidate_source_mismatch());
@@ -33,8 +82,8 @@ pub fn compile_content_catalog(
         let post_assets = assets
             .assets_for(document)
             .map_err(|error| CatalogBuildError::post_assets(document.path.clone(), error))?;
-        let rendered = render_markdown(document, post_assets, site_assets)
-            .map_err(CatalogBuildError::render)?;
+        let rendered =
+            render(document, post_assets, site_assets).map_err(CatalogBuildError::render)?;
         let key = (
             rendered.document.metadata.id.clone(),
             rendered.revision.clone(),
@@ -190,6 +239,7 @@ pub(crate) struct CatalogRetentionError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CatalogBuildErrorCode {
+    ContentCompilerUnavailable,
     CandidateSourceMismatch,
     PublicationAssetsUnavailable,
     PostAssetsUnavailable,
@@ -207,6 +257,14 @@ pub struct CatalogBuildError {
 }
 
 impl CatalogBuildError {
+    fn compiler(error: ContentCompilerInitializationError) -> Self {
+        Self {
+            path: LogicalContentPath::new("<content-catalog>"),
+            code: CatalogBuildErrorCode::ContentCompilerUnavailable,
+            message: error.to_string().into_boxed_str(),
+        }
+    }
+
     fn post_assets(path: LogicalContentPath, error: ResolvedPostAssetLookupError) -> Self {
         Self {
             path,
@@ -409,6 +467,14 @@ mod tests {
 
     fn compile(title: &str, origins: &[&str]) -> ContentCatalog {
         compile_tree(tree(title, origins, false))
+    }
+
+    #[test]
+    fn compiler_clones_share_renderer_admission() {
+        let compiler = ContentCompiler::discover().expect("test renderer path must resolve");
+        let cloned = compiler.clone();
+
+        assert!(Arc::ptr_eq(&compiler.diagrams, &cloned.diagrams));
     }
 
     fn local_asset_reference<'assets>(
@@ -743,6 +809,10 @@ mod tests {
     #[test]
     fn every_catalog_error_code_has_a_stable_wire_value() {
         for (value, expected) in [
+            (
+                CatalogBuildErrorCode::ContentCompilerUnavailable,
+                "content_compiler_unavailable",
+            ),
             (
                 CatalogBuildErrorCode::CandidateSourceMismatch,
                 "candidate_source_mismatch",
