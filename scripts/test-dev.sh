@@ -10,6 +10,10 @@ fixture_event() {
 run_fixture_command() {
   case $MAINCOPY_DEV_TEST_COMMAND in
     cargo)
+      if [[ $MAINCOPY_DEV_TEST_MODE == build-failure ]]; then
+        printf 'fixture build failed\n' >&2
+        exit 42
+      fi
       fixture_event cargo
       ;;
     curl)
@@ -49,6 +53,16 @@ run_fixture_command() {
       : >"$MAINCOPY_DEV_TEST_ROOT/daemon-started"
       exec tail -f /dev/null
       ;;
+    reset-dev.sh)
+      fixture_event reset
+      ;;
+    nix)
+      [[ $# == 4 && $1 == develop && $2 == -c && $3 == just ]] || exit 64
+      fixture_event nix
+      shift 2
+      export MAINCOPY_DEV_SHELL=1
+      exec "$@"
+      ;;
     dev-gateway.sh)
       if [[ ! -f $MAINCOPY_DEV_TEST_ROOT/daemon-ready ]]; then
         fixture_event gateway-before-daemon-ready
@@ -79,7 +93,7 @@ die() {
   exit 1
 }
 
-for command in bash chmod cp env find grep kill mkdir mktemp mv sed tail timeout; do
+for command in bash chmod cp env find grep just kill mkdir mktemp mv sed setsid tail timeout; do
   command -v "$command" >/dev/null || die "$command is required"
 done
 
@@ -87,11 +101,12 @@ case $# in
   0)
     script_dir=$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
     production_launcher="$script_dir/dev.sh"
+    production_justfile="$script_dir/../Justfile"
     ;;
-  1) production_launcher=$1 ;;
-  *) die "usage: scripts/test-dev.sh [DEV_SCRIPT]" ;;
+  2) production_launcher=$1; production_justfile=$2 ;;
+  *) die "usage: scripts/test-dev.sh [DEV_SCRIPT JUSTFILE]" ;;
 esac
-readonly production_launcher
+readonly production_launcher production_justfile
 [[ -x $production_launcher ]] || die "development launcher is not executable: $production_launcher"
 
 script_path=$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/${BASH_SOURCE[0]##*/}
@@ -139,7 +154,11 @@ prepare_scenario() {
     "$project_root/target/debug" \
     "$scenario_root/bin" \
     "$scenario_root/user-data"
-  cp -- "$production_launcher" "$project_root/scripts/dev.sh"
+  # The Nix sandbox has no /usr/bin/env for just's direct script invocation.
+  sed "1s|.*|#!$fixture_bash|" "$production_launcher" >"$project_root/scripts/dev.sh"
+  chmod 700 "$project_root/scripts/dev.sh"
+  cp -- "$production_justfile" "$project_root/Justfile"
+  create_fixture_command "$project_root/scripts/reset-dev.sh" reset-dev.sh
   create_fixture_command "$project_root/scripts/dev-gateway.sh" dev-gateway.sh
   create_fixture_command "$project_root/target/debug/maincopyd" maincopyd
   create_fixture_command "$scenario_root/bin/cargo" cargo
@@ -147,6 +166,7 @@ prepare_scenario() {
   create_fixture_command "$scenario_root/bin/caddy" caddy
   create_fixture_command "$scenario_root/bin/flock" flock
   create_fixture_command "$scenario_root/bin/mkcert" mkcert
+  create_fixture_command "$scenario_root/bin/nix" nix
   : >"$scenario_root/events"
 }
 
@@ -204,7 +224,7 @@ for signal in INT TERM; do
   launcher_status=0
   wait "$launcher_pid" || launcher_status=$?
   launcher_pid=
-  expected_status=0
+  expected_status=130
   [[ $signal != TERM ]] || expected_status=143
   ((launcher_status == expected_status)) ||
     die "the fixture launcher returned $launcher_status after SIG$signal, expected $expected_status"
@@ -218,6 +238,55 @@ for signal in INT TERM; do
     admin-ready
   assert_process_stopped "$success_root/daemon.pid" maincopyd
   assert_process_stopped "$success_root/gateway.pid" gateway
+done
+
+for shell_mode in 0 1; do
+  for recipe in quickstart start start-cli; do
+    recipe_root="$test_root/just-$shell_mode-$recipe"
+    prepare_scenario "$recipe_root"
+    env --default-signal=INT \
+      MAINCOPY_DEV_SHELL="$shell_mode" \
+      MAINCOPY_DEV_TEST_MODE=success \
+      MAINCOPY_DEV_TEST_ROOT="$recipe_root" \
+      XDG_DATA_HOME="$recipe_root/user-data" \
+      PATH="$recipe_root/bin:$PATH" \
+      setsid just --justfile "$recipe_root/project/Justfile" "$recipe" \
+      >"$recipe_root/launcher.log" 2>&1 </dev/null &
+    launcher_pid=$!
+
+    # shellcheck disable=SC2016
+    if ! timeout 5s sh -c '
+      tail --pid="$1" -n +1 -f "$2" |
+        grep -Fqm1 "Maincopy development environment is ready."
+    ' sh "$launcher_pid" "$recipe_root/launcher.log"; then
+      die "just $recipe did not report readiness: $(<"$recipe_root/launcher.log")"
+    fi
+
+    # Terminal Ctrl+C reaches every foreground process, including both just invocations.
+    kill -INT -- "-$launcher_pid"
+    launcher_status=0
+    wait "$launcher_pid" || launcher_status=$?
+    launcher_pid=
+    ((launcher_status == 130)) || die "just $recipe lost the interrupt status: $launcher_status"
+    if grep -F 'error:' "$recipe_root/launcher.log"; then
+      die "just $recipe reported orderly interruption as an error"
+    fi
+    assert_process_stopped "$recipe_root/daemon.pid" maincopyd
+    assert_process_stopped "$recipe_root/gateway.pid" gateway
+    if [[ $shell_mode == 0 ]]; then
+      grep -Fxq nix "$recipe_root/events" || die "just $recipe did not enter the Nix shell"
+    fi
+
+    failure_status=0
+    env MAINCOPY_DEV_SHELL="$shell_mode" MAINCOPY_DEV_TEST_MODE=build-failure \
+      MAINCOPY_DEV_TEST_ROOT="$recipe_root" \
+      XDG_DATA_HOME="$recipe_root/user-data" PATH="$recipe_root/bin:$PATH" \
+      just --justfile "$recipe_root/project/Justfile" "$recipe" \
+      >"$recipe_root/failure.log" 2>&1 || failure_status=$?
+    ((failure_status == 42)) || die "just $recipe hid a build failure: $failure_status"
+    grep -Fq 'fixture build failed' "$recipe_root/failure.log" ||
+      die "just $recipe hid the build diagnostic"
+  done
 done
 
 readonly timeout_root="$test_root/timeout"

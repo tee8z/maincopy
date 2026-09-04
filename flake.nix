@@ -194,7 +194,7 @@
                   ${./scripts/test-dev-browser-trust.sh} \
                   ${./scripts/dev-browser-trust.sh}
                 ${project.pkgs.bash}/bin/bash \
-                  ${./scripts/test-dev.sh} ${./scripts/dev.sh}
+                  ${./scripts/test-dev.sh} ${./scripts/dev.sh} ${./Justfile}
                 ${project.pkgs.bash}/bin/bash \
                   ${./scripts/test-reset-dev.sh} ${./scripts/reset-dev.sh}
                 ${project.pkgs.bash}/bin/bash \

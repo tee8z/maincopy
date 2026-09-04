@@ -5,9 +5,11 @@ default:
     @just --list
 
 # Clear disposable state, install browser trust, and start a fresh example.
+[no-exit-message]
 quickstart:
     @if [[ ${MAINCOPY_DEV_SHELL:-} == 1 ]]; then exec just _quickstart; else exec nix develop -c just _quickstart; fi
 
+[no-exit-message]
 [private]
 _quickstart: _reset
     ./scripts/dev.sh --trust-browser
@@ -21,17 +23,21 @@ _reset:
     ./scripts/reset-dev.sh
 
 # Start the browser example without clearing its publication state.
+[no-exit-message]
 start:
     @if [[ ${MAINCOPY_DEV_SHELL:-} == 1 ]]; then exec just _start; else exec nix develop -c just _start; fi
 
+[no-exit-message]
 [private]
 _start:
     ./scripts/dev.sh --trust-browser
 
 # Start without changing browser trust. Use this for CLI-only work.
+[no-exit-message]
 start-cli:
     @if [[ ${MAINCOPY_DEV_SHELL:-} == 1 ]]; then exec just _start-cli; else exec nix develop -c just _start-cli; fi
 
+[no-exit-message]
 [private]
 _start-cli:
     ./scripts/dev.sh

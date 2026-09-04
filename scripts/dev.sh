@@ -72,8 +72,8 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-# Ctrl+C is a normal stop for this interactive launcher, not a recipe failure.
-trap 'exit 0' INT
+# Preserve the conventional interrupt status; Justfile suppresses its exit message.
+trap 'exit 130' INT
 trap 'exit 143' TERM
 
 die_if_exited() {
