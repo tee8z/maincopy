@@ -181,6 +181,68 @@ pub struct PublishNowResponse {
     pub site_version: u64,
 }
 
+/// Durable releases are independent of the currently synchronized candidate.
+pub const RELEASES_PATH: &str = "/api/admin/v1/releases";
+pub const RELEASE_OPERATIONS_PATH: &str = "/api/admin/v1/release-operations";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseState {
+    Scheduled,
+    Activating,
+    Blocked,
+    Published,
+    Superseded,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseBlockReason {
+    RevisionUnavailable,
+    PreviewChanged,
+}
+
+/// Current durable state and the exact identity approved for a release.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+pub struct ReleaseResource {
+    pub publication_id: Uuid,
+    pub post_id: Uuid,
+    pub preview_digest: PreviewDigest,
+    #[serde(deserialize_with = "deserialize_post_revision")]
+    pub revision: Box<str>,
+    pub state: ReleaseState,
+    #[serde(deserialize_with = "deserialize_site_version")]
+    pub version: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub scheduled_for: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub published_at: Option<OffsetDateTime>,
+    pub block_reason: Option<ReleaseBlockReason>,
+}
+
+/// One bounded page, ordered by publication UUID.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+pub struct ListReleasesResponse {
+    pub releases: Vec<ReleaseResource>,
+    pub next_cursor: Option<Uuid>,
+}
+
+/// Immutable accepted result, which can precede the release's current state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+pub struct ReleaseOperationResource {
+    pub operation_id: Uuid,
+    pub publication_id: Uuid,
+    #[serde(deserialize_with = "deserialize_site_version")]
+    pub version: u64,
+    pub state: ReleaseState,
+}
+
 fn deserialize_post_revision<'de, D>(deserializer: D) -> Result<Box<str>, D::Error>
 where
     D: Deserializer<'de>,

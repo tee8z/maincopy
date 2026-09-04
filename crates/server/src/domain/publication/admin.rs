@@ -1,3 +1,5 @@
+pub(crate) mod releases;
+
 use std::sync::Arc;
 
 use axum::{

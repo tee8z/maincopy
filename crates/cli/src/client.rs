@@ -9,8 +9,10 @@ use maincopy_shared::{
     },
     posts::{ListPostsResponse, POSTS_PATH},
     publication::{
-        CONTENT_DIGEST_HEADER, IDEMPOTENCY_KEY_HEADER, POST_REVISION_HEADER, PREVIEW_DIGEST_HEADER,
-        PUBLICATIONS_PATH, PreviewDigest, PublishNowRequest, PublishNowResponse,
+        CONTENT_DIGEST_HEADER, IDEMPOTENCY_KEY_HEADER, ListReleasesResponse, POST_REVISION_HEADER,
+        PREVIEW_DIGEST_HEADER, PUBLICATIONS_PATH, PreviewDigest, PublishNowRequest,
+        PublishNowResponse, RELEASE_OPERATIONS_PATH, RELEASES_PATH, ReleaseOperationResource,
+        ReleaseResource,
     },
     source::{
         BeginSourceSyncResponse, SOURCE_PATH, SOURCE_SYNCS_PATH, SourceStatusResponse,
@@ -221,6 +223,47 @@ impl AdminClient {
         decode_preview_http_response(response)
     }
 
+    pub(crate) async fn releases(
+        &self,
+        cursor: Option<Uuid>,
+    ) -> Result<ListReleasesResponse, AdminClientError> {
+        let url = releases_page_url(&self.origin, cursor)?;
+        let response = self
+            .authenticated_request_url(Method::GET, url, Vec::new(), None)
+            .await?;
+        decode_status_json(response, StatusCode::OK)
+    }
+
+    pub(crate) async fn release(
+        &self,
+        publication_id: Uuid,
+    ) -> Result<ReleaseResource, AdminClientError> {
+        let response = self
+            .authenticated_request(
+                Method::GET,
+                &format!("{RELEASES_PATH}/{publication_id}"),
+                Vec::new(),
+                None,
+            )
+            .await?;
+        decode_status_json(response, StatusCode::OK)
+    }
+
+    pub(crate) async fn release_operation(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<ReleaseOperationResource, AdminClientError> {
+        let response = self
+            .authenticated_request(
+                Method::GET,
+                &format!("{RELEASE_OPERATIONS_PATH}/{operation_id}"),
+                Vec::new(),
+                None,
+            )
+            .await?;
+        decode_status_json(response, StatusCode::OK)
+    }
+
     /// Approves one exact post revision for immediate or scheduled publication.
     pub(crate) async fn approve_publication(
         &self,
@@ -354,6 +397,15 @@ impl AdminClient {
             .await
             .map_err(AdminClientError::from)
     }
+}
+
+fn releases_page_url(origin: &AdminOrigin, cursor: Option<Uuid>) -> Result<Url, AdminClientError> {
+    let mut url = origin.request_url(RELEASES_PATH)?;
+    if let Some(cursor) = cursor {
+        url.query_pairs_mut()
+            .append_pair("cursor", &cursor.to_string());
+    }
+    Ok(url)
 }
 
 fn posts_page_url(
@@ -1290,6 +1342,21 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn release_pagination_preserves_the_exact_origin_and_cursor_for_authentication() {
+        let origin = AdminOrigin::parse("https://admin.example.test:8443").unwrap();
+        assert_eq!(
+            releases_page_url(&origin, None).unwrap().as_str(),
+            "https://admin.example.test:8443/api/admin/v1/releases"
+        );
+        let cursor = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let url = releases_page_url(&origin, Some(cursor)).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://admin.example.test:8443/api/admin/v1/releases?cursor=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
     }
 
     #[test]

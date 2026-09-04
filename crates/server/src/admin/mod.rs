@@ -158,6 +158,21 @@ fn registered_router(security: &AdminSecurityState) -> (Router, utoipa::openapi:
             AdminScope::PreviewRead,
         ))
         .routes(scoped_routes(
+            publication_admin::releases::list_routes(),
+            security,
+            AdminScope::ReleaseManage,
+        ))
+        .routes(scoped_routes(
+            publication_admin::releases::item_routes(),
+            security,
+            AdminScope::ReleaseManage,
+        ))
+        .routes(scoped_routes(
+            publication_admin::releases::operation_routes(),
+            security,
+            AdminScope::ReleaseManage,
+        ))
+        .routes(scoped_routes(
             publication_admin::routes(),
             security,
             AdminScope::ReleaseManage,
@@ -501,6 +516,14 @@ mod tests {
         assert!(document["paths"][CAPABILITIES_PATH]["get"].is_object());
         assert!(document["paths"][POSTS_PATH]["get"].is_object());
         assert!(document["paths"][PUBLICATIONS_PATH]["post"].is_object());
+        for path in [
+            "/api/admin/v1/releases",
+            "/api/admin/v1/releases/{publication_id}",
+            "/api/admin/v1/release-operations/{operation_id}",
+        ] {
+            assert!(document["paths"][path]["get"].is_object(), "{path}");
+        }
+
         assert!(document["paths"][CURRENT_USER_PROFILE_PATH]["get"].is_object());
         assert!(document["paths"][CURRENT_USER_PROFILE_PATH]["put"].is_object());
         assert!(document["paths"][ACTIVE_TIP_RECIPIENT_PATH]["get"].is_object());

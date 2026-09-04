@@ -15,7 +15,10 @@ use maincopy_shared::{
     AdminApiVersion, Capabilities, CapabilityContractVersion,
     auth_api::{AdminSessionResponse, RevokeAdminSessionResponse, SecretString},
     posts::{ListPostsResponse, PostPublicationState, PostSummary},
-    publication::{PreviewDigest, PublicationApprovalState, PublishNowRequest, PublishNowResponse},
+    publication::{
+        ListReleasesResponse, PreviewDigest, PublicationApprovalState, PublishNowRequest,
+        PublishNowResponse, ReleaseOperationResource, ReleaseResource, ReleaseState,
+    },
     source::{
         BeginSourceSyncResponse, SourceStatusResponse, SourceSyncAdmission, SourceSyncFailureCode,
         SourceSyncId, SourceSyncOutcome, SourceSyncResource, valid_source_commit,
@@ -31,7 +34,7 @@ use uuid::Uuid;
 use crate::{
     client::{AdminClient, AdminClientError, AdminProblem, PostPreview},
     models::{
-        AgentKeyCommand, Arguments, Command, SourceCommand, SourceSyncDisposition,
+        AgentKeyCommand, Arguments, Command, ReleaseCommand, SourceCommand, SourceSyncDisposition,
         SourceSyncInvocation,
     },
     transport::AdditionalRootCertificateError,
@@ -60,6 +63,9 @@ enum CommandOutput {
     AgentKeyRemoved,
     Capabilities(Capabilities),
     Posts(ListPostsResponse),
+    Releases(ListReleasesResponse),
+    Release(ReleaseResource),
+    ReleaseOperation(ReleaseOperationResource),
     SourceStatus(Box<SourceStatusResponse>),
     SourceSync {
         idempotency_key: Uuid,
@@ -294,6 +300,23 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
             .map(CommandOutput::Capabilities)
             .map_err(CliError::from),
         Command::Posts => list_all_posts(&client).await.map(CommandOutput::Posts),
+        Command::Releases { command } => match command {
+            ReleaseCommand::List { cursor } => client
+                .releases(cursor)
+                .await
+                .map(CommandOutput::Releases)
+                .map_err(CliError::from),
+            ReleaseCommand::Inspect { publication_id } => client
+                .release(publication_id)
+                .await
+                .map(CommandOutput::Release)
+                .map_err(CliError::from),
+            ReleaseCommand::Operation { operation_id } => client
+                .release_operation(operation_id)
+                .await
+                .map(CommandOutput::ReleaseOperation)
+                .map_err(CliError::from),
+        },
         Command::Source {
             command: SourceCommand::Status,
         } => client
@@ -782,6 +805,11 @@ fn write_output(
         CommandOutput::AgentKeyRemoved => write_agent_key_removed(output, json),
         CommandOutput::Capabilities(capabilities) => write_capabilities(output, capabilities, json),
         CommandOutput::Posts(posts) => write_posts(output, posts, json),
+        CommandOutput::Releases(releases) => write_releases(output, releases, json),
+        CommandOutput::Release(release) => write_release(output, release, json),
+        CommandOutput::ReleaseOperation(operation) => {
+            write_release_operation(output, operation, json)
+        }
         CommandOutput::SourceStatus(status) => write_source_status(output, *status, json),
         CommandOutput::SourceSync {
             idempotency_key,
@@ -797,6 +825,98 @@ fn write_output(
             idempotency_key,
             response,
         } => write_publication(output, idempotency_key, response, json),
+    }
+}
+
+fn write_releases(
+    mut output: impl io::Write,
+    page: ListReleasesResponse,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        serde_json::to_writer(&mut output, &page)?;
+        writeln!(output)?;
+        return Ok(());
+    }
+    for release in page.releases {
+        writeln!(
+            output,
+            "{}  {}  version {}  post {}",
+            release.publication_id,
+            release_state_name(release.state),
+            release.version,
+            release.post_id
+        )?;
+    }
+    if let Some(cursor) = page.next_cursor {
+        writeln!(
+            output,
+            "Next page: maincopy releases list --cursor {cursor}"
+        )?;
+    }
+    Ok(())
+}
+
+fn write_release(
+    mut output: impl io::Write,
+    release: ReleaseResource,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        serde_json::to_writer(&mut output, &release)?;
+        writeln!(output)?;
+        return Ok(());
+    }
+    writeln!(output, "Release: {}", release.publication_id)?;
+    writeln!(output, "Post: {}", release.post_id)?;
+    writeln!(output, "State: {}", release_state_name(release.state))?;
+    writeln!(output, "Version: {}", release.version)?;
+    writeln!(output, "Revision: {}", release.revision)?;
+    writeln!(output, "Preview digest: {}", release.preview_digest)?;
+    writeln!(output, "Scheduled for: {}", release.scheduled_for)?;
+    if let Some(published_at) = release.published_at {
+        writeln!(output, "Published at: {published_at}")?;
+    }
+    if let Some(reason) = release.block_reason {
+        writeln!(output, "Block reason: {}", serde_json::to_value(reason)?)?;
+    }
+    Ok(())
+}
+
+fn write_release_operation(
+    mut output: impl io::Write,
+    operation: ReleaseOperationResource,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        serde_json::to_writer(&mut output, &operation)?;
+        writeln!(output)?;
+        return Ok(());
+    }
+    writeln!(output, "Operation: {}", operation.operation_id)?;
+    writeln!(output, "Release: {}", operation.publication_id)?;
+    writeln!(output, "Accepted version: {}", operation.version)?;
+    writeln!(
+        output,
+        "Accepted state: {}",
+        release_state_name(operation.state)
+    )?;
+    writeln!(
+        output,
+        "Inspect current state: maincopy releases inspect {}",
+        operation.publication_id
+    )?;
+    Ok(())
+}
+
+const fn release_state_name(state: ReleaseState) -> &'static str {
+    match state {
+        ReleaseState::Scheduled => "scheduled",
+        ReleaseState::Activating => "activating",
+        ReleaseState::Blocked => "blocked",
+        ReleaseState::Published => "published",
+        ReleaseState::Superseded => "superseded",
+        ReleaseState::Cancelled => "cancelled",
     }
 }
 
@@ -1721,6 +1841,71 @@ mod tests {
             posts,
             next_cursor,
         }
+    }
+
+    use maincopy_shared::publication::ReleaseBlockReason;
+
+    #[test]
+    fn release_output_distinguishes_current_state_from_accepted_receipts() {
+        let release = ReleaseResource {
+            publication_id: Uuid::from_u128(1),
+            post_id: Uuid::from_u128(2),
+            preview_digest: PreviewDigest::parse(&format!("preview-b3-v1-{}", "11".repeat(32)))
+                .unwrap(),
+            revision: format!("post-b3-v1-{}", "22".repeat(32)).into_boxed_str(),
+            state: ReleaseState::Blocked,
+            version: 3,
+            scheduled_for: OffsetDateTime::UNIX_EPOCH,
+            published_at: None,
+            block_reason: Some(ReleaseBlockReason::RevisionUnavailable),
+        };
+        let operation = ReleaseOperationResource {
+            operation_id: Uuid::from_u128(3),
+            publication_id: release.publication_id,
+            version: 2,
+            state: ReleaseState::Activating,
+        };
+        let mut output = Vec::new();
+        write_release(&mut output, release.clone(), true).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ReleaseResource>(&output).unwrap(),
+            release
+        );
+        output.clear();
+        write_release(&mut output, release.clone(), false).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("State: blocked\nVersion: 3"));
+        assert!(text.contains("revision_unavailable"));
+        let mut output = Vec::new();
+        write_release_operation(&mut output, operation.clone(), true).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ReleaseOperationResource>(&output).unwrap(),
+            operation
+        );
+        output.clear();
+        write_release_operation(&mut output, operation, false).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Accepted version: 2\nAccepted state: activating")
+        );
+        let page = ListReleasesResponse {
+            releases: vec![release],
+            next_cursor: Some(Uuid::from_u128(1)),
+        };
+        let mut output = Vec::new();
+        write_releases(&mut output, page.clone(), true).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ListReleasesResponse>(&output).unwrap(),
+            page
+        );
+        output.clear();
+        write_releases(&mut output, page, false).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Next page: maincopy releases list --cursor")
+        );
     }
 
     #[test]

@@ -1383,6 +1383,10 @@ mod workflow_tests {
         web::Readiness,
     };
 
+    use maincopy_shared::publication::{
+        ListReleasesResponse, ReleaseOperationResource, ReleaseResource, ReleaseState,
+    };
+
     use super::{
         CanonicalState, ChangeRelease, PREVIEW_ASSETS_PATH, PublicationActivationError,
         ReleaseChange, ReviewBinding, Schedule, ScheduledApprovalOutcome, confirmation_path,
@@ -2228,6 +2232,77 @@ mod workflow_tests {
         assert!(receipt.contains("accepted at release version 2: Scheduled"));
         assert!(receipt.contains("Cancelled"));
         assert!(!receipt.contains("Cancel this release"));
+        let api_path = format!("/api/admin/v1/releases/{release_id}");
+        let response = browser_get(&runtime, &browser, &api_path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+        let current: ReleaseResource =
+            serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(current.publication_id, release_id);
+        assert_eq!(current.version, 3);
+        assert_eq!(current.state, ReleaseState::Cancelled);
+        assert_eq!(current.revision.as_ref(), approval.revision.as_str());
+        let operation_path = format!("/api/admin/v1/release-operations/{operation_id}");
+        let response = browser_get(&runtime, &browser, &operation_path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: ReleaseOperationResource =
+            serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(accepted.operation_id, operation_id);
+        assert_eq!(accepted.publication_id, release_id);
+        assert_eq!(accepted.version, 2);
+        assert_eq!(accepted.state, ReleaseState::Scheduled);
+        let response = browser_get(&runtime, &browser, "/api/admin/v1/releases").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: ListReleasesResponse =
+            serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(page.releases, vec![current]);
+        assert_eq!(page.next_cursor, None);
+        let response = browser_get(
+            &runtime,
+            &browser,
+            &format!("/api/admin/v1/releases?cursor={release_id}"),
+        )
+        .await;
+        let page: ListReleasesResponse =
+            serde_json::from_str(&response_text(response).await).unwrap();
+        assert!(page.releases.is_empty());
+        for (path, status) in [
+            (
+                "/api/admin/v1/releases?cursor=bad".to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/admin/v1/releases?curser=bad".to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/admin/v1/releases/bad".to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/admin/v1/release-operations/bad".to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/api/admin/v1/releases/{}", Uuid::new_v4()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/api/admin/v1/release-operations/{}", Uuid::new_v4()),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = browser_get(&runtime, &browser, &path).await;
+            assert_eq!(response.status(), status, "{path}");
+            let request_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body: serde_json::Value =
+                serde_json::from_str(&response_text(response).await).unwrap();
+            assert_eq!(body["error"]["request_id"], request_id);
+        }
+
         let replay = runtime
             .router
             .clone()

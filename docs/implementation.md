@@ -44,14 +44,12 @@ activation coordinator.
 
 Deliverables:
 
-- Expose durable release listing and inspection through the API and CLI.
 - Expose schedule edits and cancellation through the API and CLI with exact
   resource versions.
 - Expose blocked-release retry and cancellation through the API and CLI without
   creating a second release.
-- Add release inspection, edit, cancel, and retry commands to the CLI.
+- Add release edit, cancel, and retry commands to the CLI.
 - Return stable conflicts for stale resource versions and idempotency reuse.
-- Expose durable release-operation inspection through the API and CLI.
 
 Required evidence:
 

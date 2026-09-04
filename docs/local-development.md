@@ -186,6 +186,24 @@ Cancelled releases remain in history. A fresh preview approval can release
 the same cancelled revision again. Cancellation retains route reservations
 and does not remove an existing public revision.
 
+The CLI can inspect the same durable records after login:
+
+```console
+maincopy releases list
+maincopy releases list --cursor <NEXT_CURSOR>
+maincopy releases inspect <PUBLICATION_ID>
+maincopy releases operation <OPERATION_ID>
+```
+
+Add `--json` for structured output. Listing returns at most 100 records and a
+continuation cursor. Operation output reports the immutable accepted result.
+Inspect the release separately for its current state.
+
+These commands use `GET /api/admin/v1/releases`,
+`GET /api/admin/v1/releases/{publication_id}`, and
+`GET /api/admin/v1/release-operations/{operation_id}`. All require `release_manage`.
+Schedule edits, cancellation, and retry currently use the browser forms.
+
 ### 5. Sign out before a state reset
 
 Return to the post list and choose `Sign out` before resetting local state.

@@ -63,6 +63,12 @@ pub(crate) enum Command {
     /// List post revisions loaded by the running server.
     Posts,
 
+    /// Inspect durable releases and accepted operation receipts.
+    Releases {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
+
     /// Inspect and synchronize the configured article source.
     Source {
         #[command(subcommand)]
@@ -129,6 +135,20 @@ pub(crate) enum Command {
         #[arg(long, value_name = "UUID")]
         idempotency_key: Option<Uuid>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ReleaseCommand {
+    /// Fetch at most 100 releases, ordered by UUID.
+    List {
+        /// Continue with the next cursor from a previous page.
+        #[arg(long)]
+        cursor: Option<Uuid>,
+    },
+    /// Inspect the current durable state of a release.
+    Inspect { publication_id: Uuid },
+    /// Recover an immutable accepted operation result.
+    Operation { operation_id: Uuid },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -214,6 +234,44 @@ mod tests {
 
     const PREVIEW_DIGEST: &str =
         "preview-b3-v1-4444444444444444444444444444444444444444444444444444444444444444";
+
+    #[test]
+    fn release_inspection_commands_parse_explicit_identities() {
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert!(matches!(
+            Arguments::try_parse_from(["maincopy", "releases", "list"])
+                .unwrap()
+                .command,
+            Command::Releases {
+                command: ReleaseCommand::List { cursor: None }
+            }
+        ));
+        assert!(matches!(
+            Arguments::try_parse_from(["maincopy", "releases", "list", "--cursor", id])
+                .unwrap()
+                .command,
+            Command::Releases {
+                command: ReleaseCommand::List { cursor: Some(_) }
+            }
+        ));
+        assert!(matches!(
+            Arguments::try_parse_from(["maincopy", "releases", "inspect", id])
+                .unwrap()
+                .command,
+            Command::Releases {
+                command: ReleaseCommand::Inspect { .. }
+            }
+        ));
+        assert!(matches!(
+            Arguments::try_parse_from(["maincopy", "releases", "operation", id])
+                .unwrap()
+                .command,
+            Command::Releases {
+                command: ReleaseCommand::Operation { .. }
+            }
+        ));
+        assert!(Arguments::try_parse_from(["maincopy", "releases", "inspect", "bad"]).is_err());
+    }
 
     #[test]
     fn client_arguments_select_capabilities_without_a_transport_flag() {

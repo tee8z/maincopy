@@ -11,6 +11,22 @@ use maincopy_shared::{
 use crate::helpers::{get, public_state, request};
 
 #[tokio::test]
+async fn public_router_does_not_expose_durable_releases_or_receipts() {
+    let app = public_router(public_state(Readiness::new(true)));
+    for path in [
+        "/api/admin/v1/releases",
+        "/api/admin/v1/releases/11111111-1111-4111-8111-111111111111",
+        "/api/admin/v1/release-operations/11111111-1111-4111-8111-111111111111",
+    ] {
+        assert_eq!(
+            get(app.clone(), path).await.status(),
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn public_router_does_not_expose_version_neutral_admin_discovery() {
     let response = get(
         public_router(public_state(Readiness::new(true))),
