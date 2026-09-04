@@ -76,7 +76,9 @@ where
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = request_id(parts, state).await?;
+        let request_id = RequestId::from_request_parts(parts, state)
+            .await
+            .map_err(|error| error.into_response())?;
         let Query(query) = Query::<ListSourceSyncsQuery>::from_request_parts(parts, state)
             .await
             .map_err(|_| {
@@ -126,7 +128,9 @@ where
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = request_id(parts, state).await?;
+        let request_id = RequestId::from_request_parts(parts, state)
+            .await
+            .map_err(|error| error.into_response())?;
         let Path(encoded) = Path::<String>::from_request_parts(parts, state)
             .await
             .map_err(|_| invalid_sync_id(request_id))?;
@@ -146,7 +150,9 @@ where
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = request_id(parts, state).await?;
+        let request_id = RequestId::from_request_parts(parts, state)
+            .await
+            .map_err(|error| error.into_response())?;
         parts
             .extensions
             .get::<SourceSyncHandle>()
@@ -174,7 +180,9 @@ where
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         let (mut parts, body) = request.into_parts();
-        let request_id = request_id(&mut parts, state).await?;
+        let request_id = RequestId::from_request_parts(&mut parts, state)
+            .await
+            .map_err(|error| error.into_response())?;
         let principal = AdminPrincipal::from_request_parts(&mut parts, state)
             .await
             .map_err(|error| error.into_response())?;
@@ -503,15 +511,6 @@ fn problem(spec: AdminProblem, request_id: RequestId) -> Response {
             .insert("retry-after", RETRY_AFTER_ONE_SECOND);
     }
     response
-}
-
-async fn request_id<S>(parts: &mut Parts, state: &S) -> Result<RequestId, Response>
-where
-    S: Send + Sync,
-{
-    RequestId::from_request_parts(parts, state)
-        .await
-        .map_err(|error| error.into_response())
 }
 
 #[cfg(test)]
