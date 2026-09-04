@@ -88,9 +88,59 @@ svg {
   overflow-x: auto;
 }
 
-.mermaid-diagram > svg {
+.diagram-canvas > svg {
   display: block;
   margin-inline: auto;
+}
+
+.diagram-controls {
+  padding-block: 0.5rem;
+}
+
+.diagram-close {
+  display: none;
+}
+
+.mermaid-diagram:target {
+  background: var(--page-background);
+  display: flex;
+  flex-direction: column;
+  inset: 0;
+  margin: 0;
+  padding: 1rem;
+  position: fixed;
+  z-index: 10;
+}
+
+.mermaid-diagram:target .diagram-enlarge {
+  display: none;
+}
+
+.mermaid-diagram:target .diagram-close {
+  display: inline;
+}
+
+.mermaid-diagram:target .diagram-canvas {
+  min-height: 0;
+  overflow: auto;
+}
+
+.mermaid-diagram:target .diagram-canvas > svg {
+  max-width: none;
+}
+
+@media print {
+  .mermaid-diagram:target {
+    position: static;
+  }
+
+  .diagram-controls {
+    display: none;
+  }
+
+  .mermaid-diagram:target .diagram-canvas > svg {
+    max-width: 100%;
+  }
 }
 
 .mermaid-diagram .mc-mermaid-mix-blend-multiply {

@@ -875,6 +875,7 @@ mod workflow_tests {
                 PublicLedgerProjection,
                 activation::{PublicationCoordinator, PublicationCoordinatorHandle},
                 store::{InstallStartupSnapshot, ObservedPostRevision, PublicationStore},
+                web as publication_web,
             },
         },
         frontend_assets::embedded_manifest,
@@ -1038,6 +1039,14 @@ mod workflow_tests {
                 .unwrap()
                 .contains("frame-ancestors 'self'")
         );
+        assert_eq!(
+            preview.headers()[axum::http::header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next(),
+            Some("sandbox allow-same-origin")
+        );
         assert!(
             response_text(preview)
                 .await
@@ -1049,6 +1058,23 @@ mod workflow_tests {
             stylesheet.headers()[axum::http::header::CONTENT_TYPE],
             "text/css; charset=utf-8"
         );
+        assert_eq!(stylesheet.headers()["cache-control"], "private, no-store");
+        let public_stylesheet = publication_web::router(runtime.snapshots.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(embedded_manifest().css.public_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_stylesheet.status(), StatusCode::OK);
+        let preview_css = to_bytes(stylesheet.into_body(), 1024 * 1024).await.unwrap();
+        let public_css = to_bytes(public_stylesheet.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(preview_css, public_css);
+        assert_eq!(preview_css.as_ref(), embedded_manifest().css.bytes);
 
         let confirmation = browser_get(&runtime, &browser, &initial.confirmation_path).await;
         assert_eq!(confirmation.status(), StatusCode::OK);

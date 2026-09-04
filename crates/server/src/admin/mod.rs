@@ -241,6 +241,21 @@ mod tests {
     use super::test_support::ProtectedAdminHarness;
 
     #[tokio::test]
+    async fn login_page_preserves_the_origin_of_native_form_posts() {
+        let harness = ProtectedAdminHarness::start().await;
+        let request = axum::http::Request::builder()
+            .uri("/admin/login")
+            .header("host", super::test_support::ADMIN_AUTHORITY)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = harness.router().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["referrer-policy"], "same-origin");
+        harness.stop().await;
+    }
+
+    #[tokio::test]
     async fn protected_registry_serves_contracts_only_after_authentication() {
         let harness = ProtectedAdminHarness::start().await;
         let router = harness.router();
@@ -272,7 +287,7 @@ mod tests {
             assert_eq!(response.headers()["cache-control"], "private, no-store");
             assert_eq!(response.headers()["x-content-type-options"], "nosniff");
             assert_eq!(response.headers()["x-frame-options"], "DENY");
-            assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+            assert_eq!(response.headers()["referrer-policy"], "same-origin");
             assert!(response.headers().get("content-security-policy").is_some());
 
             let body: Value = serde_json::from_slice(

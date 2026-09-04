@@ -656,15 +656,27 @@ impl<'input, 'renderer> MarkdownEventRenderer<'input, 'renderer> {
             )
         })?;
         self.reserve_mermaid_output(&svg, code_ordinal)?;
+        let ordinal = mermaid_ordinal.get().to_string();
+        self.write_block_start("<div id=\"maincopy-diagram-return-")?;
+        self.write(&ordinal)?;
+        self.write("\"></div>\n")?;
         self.write_block_start(
             "<div class=\"mermaid-diagram\" data-maincopy-mermaid=\"v1\" data-block=\"",
         )?;
-        self.write(&mermaid_ordinal.get().to_string())?;
-        self.write("\">")?;
+        self.write(&ordinal)?;
+        self.write("\" id=\"maincopy-diagram-")?;
+        self.write(&ordinal)?;
+        self.write("\"><div class=\"diagram-controls\"><a class=\"diagram-enlarge\" href=\"#maincopy-diagram-")?;
+        self.write(&ordinal)?;
+        self.write(
+            "\">Enlarge diagram</a><a class=\"diagram-close\" href=\"#maincopy-diagram-return-",
+        )?;
+        self.write(&ordinal)?;
+        self.write("\">Close diagram</a></div><div class=\"diagram-canvas\">")?;
         self.writer
             .write_sanitized_svg(&svg)
             .map_err(|_| rendered_html_limit_error(&self.document.path))?;
-        self.write("</div>\n")?;
+        self.write("</div></div>\n")?;
         self.mermaid_count = self
             .mermaid_count
             .checked_add(1)
@@ -1621,7 +1633,8 @@ mod tests {
                         <p><a href=\"assets/files/manual.pdf\">manual</a></p>\n\
                         <pre class=\"article-code\"><code class=\"language-rust\">&lt;a&gt;&amp;\n</code></pre>\n\
                         <pre><code>+---+\n| A |\n+---+\n</code></pre>\n\
-                        <div class=\"mermaid-diagram\" data-maincopy-mermaid=\"v1\" data-block=\"1\"><svg viewBox=\"0 0 1 1\" xmlns=\"http://www.w3.org/2000/svg\"><text x=\"0\" y=\"1\">diagram</text></svg></div>\n";
+                        <div id=\"maincopy-diagram-return-1\"></div>\n\
+                        <div class=\"mermaid-diagram\" data-maincopy-mermaid=\"v1\" data-block=\"1\" id=\"maincopy-diagram-1\"><div class=\"diagram-controls\"><a class=\"diagram-enlarge\" href=\"#maincopy-diagram-1\">Enlarge diagram</a><a class=\"diagram-close\" href=\"#maincopy-diagram-return-1\">Close diagram</a></div><div class=\"diagram-canvas\"><svg viewBox=\"0 0 1 1\" xmlns=\"http://www.w3.org/2000/svg\"><text x=\"0\" y=\"1\">diagram</text></svg></div></div>\n";
         assert_eq!(first.article.identity_html.as_ref(), expected);
         assert_eq!(second.article.identity_html.as_ref(), expected);
         assert_eq!(first.revision, second.revision);
@@ -1773,6 +1786,24 @@ mod tests {
                 .identity_html
                 .contains("mermaid-diagram")
         );
+    }
+
+    #[test]
+    fn diagrams_have_distinct_enlarge_and_return_targets() {
+        let rendered = render(
+            &[],
+            "```mermaid\nflowchart LR\nA-->B\n```\n\n```mermaid\nflowchart LR\nC-->D\n```\n",
+            &[],
+        );
+        let html = &rendered.article.identity_html;
+        for ordinal in [1, 2] {
+            for prefix in ["maincopy-diagram", "maincopy-diagram-return"] {
+                let target = format!("{prefix}-{ordinal}");
+                assert_eq!(html.matches(&format!("id=\"{target}\"")).count(), 1);
+                assert_eq!(html.matches(&format!("href=\"#{target}\"")).count(), 1);
+            }
+        }
+        assert_eq!(html.matches("<svg ").count(), 2);
     }
 
     #[test]

@@ -61,8 +61,10 @@ const MAX_POST_PAGE_LIMIT: u16 = 100;
 const PREVIEW_ASSETS_PATH: &str = "/api/admin/v1/preview-assets";
 const PREVIEW_CACHE_POLICY: HeaderValue = HeaderValue::from_static("private, no-store");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
+// Keep the admin origin so protected styles and media receive the session cookie.
+// Scripts and forms stay disabled; an opaque sandbox origin breaks styled previews.
 const PREVIEW_DOCUMENT_SANDBOX: HeaderValue = HeaderValue::from_static(
-    "sandbox; default-src 'none'; script-src 'none'; connect-src 'none'; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; img-src 'self' data:; style-src 'self'; font-src 'self'; media-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; navigate-to 'none'",
+    "sandbox allow-same-origin; default-src 'none'; script-src 'none'; connect-src 'none'; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; img-src 'self' data:; style-src 'self'; font-src 'self'; media-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; navigate-to 'none'",
 );
 const SAME_ORIGIN_FRAMING: HeaderValue = HeaderValue::from_static("SAMEORIGIN");
 const ASSET_SANDBOX: HeaderValue = HeaderValue::from_static("sandbox; default-src 'none'");
@@ -1514,8 +1516,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap();
-            assert!(sandbox.starts_with("sandbox;"));
-            assert!(!sandbox.contains("allow-"));
+            assert_eq!(sandbox.split(';').next(), Some("sandbox allow-same-origin"));
             assert!(sandbox.contains("default-src 'none'"));
             assert!(sandbox.contains("script-src 'none'"));
             assert!(sandbox.contains("connect-src 'none'"));

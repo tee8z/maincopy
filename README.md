@@ -43,16 +43,17 @@ local tree and performs no Git network operation.
 
 ## Try Maincopy locally
 
-Run these commands from the repository root on Linux:
+Run this command from the repository root on Linux:
 
 ```console
-nix develop
 just quickstart
 ```
 
-`quickstart` removes `target/maincopy-dev/` when it exists. It keeps the
-development certificate authority (CA), then installs browser trust and starts
-a fresh example.
+`quickstart` enters the project Nix shell before it removes
+`target/maincopy-dev/`. It keeps the development certificate authority (CA),
+then installs browser trust and starts a fresh example.
+
+If `just` is not installed outside Nix, run `nix develop -c just quickstart`.
 
 Keep the launcher open. Save the generated `owner` password. Maincopy displays
 it only once and stores only its Argon2id hash.
@@ -69,6 +70,8 @@ Then publish the included article:
 
 The included article is also a technical design document. It demonstrates
 code rendering, Mermaid diagrams, previews, and the publication boundary.
+Select **Enlarge diagram** to view a Mermaid diagram at full size. Select
+**Close diagram** to return to the article.
 
 The launcher preserves its database and candidate artifacts in
 `target/maincopy-dev/`. Follow the
@@ -77,6 +80,29 @@ certificate removal, troubleshooting, and safe state reset.
 
 After the first run, use `just start` to preserve publication state. Use
 `just start-cli` when you do not want to change browser trust.
+
+Press **Ctrl+C** in the launcher terminal to stop the server and gateway.
+
+## Browser workflow
+
+The published example uses the same article styles as its private preview.
+
+![Published Hello, Maincopy article with formatted text and an architecture diagram](docs/images/published-article.png)
+
+<details>
+<summary>See the admin and exact-preview screens</summary>
+
+The posts screen shows candidate and public revisions. Select **Review exact
+preview** to inspect a candidate before approving it.
+
+![Admin posts screen showing the candidate revision, public revision, and review action](docs/images/admin-posts.png)
+
+The review screen binds the rendered article to an exact revision and preview
+digest. Publication requires a separate confirmation.
+
+![Exact candidate review with revision metadata and the styled article preview](docs/images/exact-preview.png)
+
+</details>
 
 ## Write content
 

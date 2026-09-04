@@ -70,7 +70,7 @@ const ADMIN_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const PRIVATE_NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 const DENY_FRAMING: HeaderValue = HeaderValue::from_static("DENY");
-const NO_REFERRER: HeaderValue = HeaderValue::from_static("no-referrer");
+const SAME_ORIGIN_REFERRER: HeaderValue = HeaderValue::from_static("same-origin");
 const ADMIN_CSP: HeaderValue = HeaderValue::from_static(
     "default-src 'self'; script-src 'none'; connect-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
 );
@@ -412,7 +412,9 @@ pub(super) async fn harden_private_response(request: Request, next: Next) -> Res
     // Exact previews opt into SAMEORIGIN so the trusted admin review page can
     // frame them. Every other private response retains the DENY default.
     headers.entry(X_FRAME_OPTIONS).or_insert(DENY_FRAMING);
-    headers.insert(REFERRER_POLICY, NO_REFERRER);
+    // `no-referrer` gives native form submissions an opaque `Origin: null`.
+    // Keep referrers private to this origin while preserving exact-origin CSRF checks.
+    headers.insert(REFERRER_POLICY, SAME_ORIGIN_REFERRER);
     headers.entry(CONTENT_SECURITY_POLICY).or_insert(ADMIN_CSP);
     response
 }
@@ -2289,7 +2291,7 @@ mod tests {
         );
         assert_eq!(
             response.headers().get(REFERRER_POLICY).unwrap(),
-            NO_REFERRER
+            SAME_ORIGIN_REFERRER
         );
         assert_eq!(
             response.headers().get(CONTENT_SECURITY_POLICY).unwrap(),
