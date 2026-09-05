@@ -205,6 +205,57 @@ pub enum ReleaseBlockReason {
     PreviewChanged,
 }
 
+/// Exact-version release controls. Idempotency-Key identifies the operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChangeReleaseRequest {
+    Reschedule {
+        #[serde(deserialize_with = "deserialize_release_version")]
+        expected_version: u64,
+        #[serde(
+            serialize_with = "time::serde::rfc3339::serialize",
+            deserialize_with = "deserialize_release_time"
+        )]
+        scheduled_for: OffsetDateTime,
+    },
+    Cancel {
+        #[serde(deserialize_with = "deserialize_release_version")]
+        expected_version: u64,
+    },
+    Retry {
+        #[serde(deserialize_with = "deserialize_release_version")]
+        expected_version: u64,
+    },
+}
+
+fn deserialize_release_version<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    let version = u64::deserialize(deserializer)?;
+    if (1..i64::MAX as u64).contains(&version) {
+        Ok(version)
+    } else {
+        Err(D::Error::custom(
+            "expected_version must be positive and permit a stored version increment",
+        ))
+    }
+}
+
+fn deserialize_release_time<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<OffsetDateTime, D::Error> {
+    let timestamp = time::serde::rfc3339::deserialize(deserializer)?;
+    if timestamp.offset() != UtcOffset::UTC
+        || i64::try_from(timestamp.unix_timestamp_nanos()).is_err()
+    {
+        return Err(D::Error::custom(
+            "scheduled_for must be a UTC timestamp in the supported storage range",
+        ));
+    }
+    Ok(timestamp)
+}
+
 /// Current durable state and the exact identity approved for a release.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
@@ -365,6 +416,35 @@ mod tests {
             "site_digest": SITE_DIGEST,
             "site_version": 7
         })
+    }
+
+    #[test]
+    fn release_controls_require_exact_versions_and_action_specific_fields() {
+        for value in [
+            json!({"action":"reschedule", "expected_version":1, "scheduled_for":"2026-09-06T12:00:00Z"}),
+            json!({"action":"cancel", "expected_version":2}),
+            json!({"action":"retry", "expected_version":3}),
+        ] {
+            let command: ChangeReleaseRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(command).unwrap(), value);
+        }
+        for value in [
+            json!({"action":"cancel"}),
+            json!({"action":"cancel", "expected_version":0}),
+            json!({"action":"cancel", "expected_version":i64::MAX}),
+            json!({"action":"cancel", "expected_version":1, "scheduled_for":"2026-09-06T12:00:00Z"}),
+            json!({"action":"cancel", "expected_version":1, "expected_vesion":2}),
+            json!({"action":"retry", "expected_version":-1}),
+            json!({"action":"reschedule", "expected_version":1}),
+            json!({"action":"reschedule", "expected_version":1, "scheduled_for":"2026-09-06T12:00:00+01:00"}),
+            json!({"action":"reschedule", "expected_version":1, "scheduled_for":"9999-09-06T12:00:00Z"}),
+            json!({"action":"publish", "expected_version":1}),
+        ] {
+            assert!(
+                serde_json::from_value::<ChangeReleaseRequest>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
     }
 
     #[test]

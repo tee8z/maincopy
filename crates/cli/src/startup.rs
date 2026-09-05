@@ -16,8 +16,9 @@ use maincopy_shared::{
     auth_api::{AdminSessionResponse, RevokeAdminSessionResponse, SecretString},
     posts::{ListPostsResponse, PostPublicationState, PostSummary},
     publication::{
-        ListReleasesResponse, PreviewDigest, PublicationApprovalState, PublishNowRequest,
-        PublishNowResponse, ReleaseOperationResource, ReleaseResource, ReleaseState,
+        ChangeReleaseRequest, ListReleasesResponse, PreviewDigest, PublicationApprovalState,
+        PublishNowRequest, PublishNowResponse, ReleaseOperationResource, ReleaseResource,
+        ReleaseState,
     },
     source::{
         BeginSourceSyncResponse, SourceStatusResponse, SourceSyncAdmission, SourceSyncFailureCode,
@@ -34,8 +35,8 @@ use uuid::Uuid;
 use crate::{
     client::{AdminClient, AdminClientError, AdminProblem, PostPreview},
     models::{
-        AgentKeyCommand, Arguments, Command, ReleaseCommand, SourceCommand, SourceSyncDisposition,
-        SourceSyncInvocation,
+        AgentKeyCommand, Arguments, Command, ReleaseCommand, ReleaseTarget, SourceCommand,
+        SourceSyncDisposition, SourceSyncInvocation,
     },
     transport::AdditionalRootCertificateError,
 };
@@ -202,6 +203,14 @@ enum CliError {
         source: AdminClientError,
     },
 
+    #[error("release {publication_id} operation {operation_id} failed: {source}")]
+    ReleaseChange {
+        publication_id: Uuid,
+        operation_id: Uuid,
+        #[source]
+        source: AdminClientError,
+    },
+
     #[error("source synchronization command {idempotency_key} could not be started: {source}")]
     SourceSyncStart {
         idempotency_key: Uuid,
@@ -272,6 +281,66 @@ pub async fn run() -> ExitCode {
     }
 }
 
+async fn execute_releases(
+    client: &AdminClient,
+    command: ReleaseCommand,
+) -> Result<CommandOutput, CliError> {
+    match command {
+        ReleaseCommand::List { cursor } => client
+            .releases(cursor)
+            .await
+            .map(CommandOutput::Releases)
+            .map_err(CliError::from),
+        ReleaseCommand::Inspect { publication_id } => client
+            .release(publication_id)
+            .await
+            .map(CommandOutput::Release)
+            .map_err(CliError::from),
+        ReleaseCommand::Operation { operation_id } => client
+            .release_operation(operation_id)
+            .await
+            .map(CommandOutput::ReleaseOperation)
+            .map_err(CliError::from),
+        ReleaseCommand::Reschedule { target, at } => {
+            let request = ChangeReleaseRequest::Reschedule {
+                expected_version: target.expected_version,
+                scheduled_for: at,
+            };
+            change_release(client, target, request).await
+        }
+        ReleaseCommand::Cancel(target) => {
+            let request = ChangeReleaseRequest::Cancel {
+                expected_version: target.expected_version,
+            };
+            change_release(client, target, request).await
+        }
+        ReleaseCommand::Retry(target) => {
+            let request = ChangeReleaseRequest::Retry {
+                expected_version: target.expected_version,
+            };
+            change_release(client, target, request).await
+        }
+    }
+}
+
+async fn change_release(
+    client: &AdminClient,
+    target: ReleaseTarget,
+    request: ChangeReleaseRequest,
+) -> Result<CommandOutput, CliError> {
+    let publication_id = target.publication_id;
+    let operation_id = target.idempotency_key.unwrap_or_else(Uuid::new_v4);
+    client
+        .change_release(publication_id, operation_id, &request)
+        .await
+        .map(CommandOutput::ReleaseOperation)
+        .map_err(|source| CliError::ReleaseChange {
+            publication_id,
+            operation_id,
+            source,
+        })
+}
+
 async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
     let client = AdminClient::new(
         &arguments.admin_origin,
@@ -300,23 +369,7 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
             .map(CommandOutput::Capabilities)
             .map_err(CliError::from),
         Command::Posts => list_all_posts(&client).await.map(CommandOutput::Posts),
-        Command::Releases { command } => match command {
-            ReleaseCommand::List { cursor } => client
-                .releases(cursor)
-                .await
-                .map(CommandOutput::Releases)
-                .map_err(CliError::from),
-            ReleaseCommand::Inspect { publication_id } => client
-                .release(publication_id)
-                .await
-                .map(CommandOutput::Release)
-                .map_err(CliError::from),
-            ReleaseCommand::Operation { operation_id } => client
-                .release_operation(operation_id)
-                .await
-                .map(CommandOutput::ReleaseOperation)
-                .map_err(CliError::from),
-        },
+        Command::Releases { command } => execute_releases(&client, command).await,
         Command::Source {
             command: SourceCommand::Status,
         } => client
@@ -1363,6 +1416,7 @@ fn error_exit(error: &CliError) -> u8 {
         }
         CliError::Admin(_)
         | CliError::Publication { .. }
+        | CliError::ReleaseChange { .. }
         | CliError::SourceSyncStart { .. }
         | CliError::SourceSyncFollow { .. } => {}
     }
@@ -1445,6 +1499,10 @@ fn report_error(error: &CliError, exit: u8, json_output: bool) -> io::Result<()>
 enum ErrorRecovery {
     None,
     Publication(Uuid),
+    ReleaseChange {
+        publication_id: Uuid,
+        operation_id: Uuid,
+    },
     SourceSyncStart(Uuid),
     SourceSync {
         idempotency_key: Uuid,
@@ -1492,6 +1550,12 @@ fn write_human_error(
     }
     match recovery {
         ErrorRecovery::None | ErrorRecovery::Publication(_) => {}
+        ErrorRecovery::ReleaseChange { operation_id, .. } => {
+            writeln!(
+                output,
+                "maincopy: recover accepted result: maincopy releases operation {operation_id}"
+            )?;
+        }
         ErrorRecovery::SourceSyncStart(idempotency_key) => {
             writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
         }
@@ -1525,6 +1589,13 @@ fn write_json_error(
     ]);
     match recovery {
         ErrorRecovery::None => {}
+        ErrorRecovery::ReleaseChange {
+            publication_id,
+            operation_id,
+        } => {
+            details.insert("publication_id".into(), json!(publication_id));
+            details.insert("operation_id".into(), json!(operation_id));
+        }
         ErrorRecovery::Publication(idempotency_key)
         | ErrorRecovery::SourceSyncStart(idempotency_key) => {
             details.insert("idempotency_key".into(), json!(idempotency_key));
@@ -1560,6 +1631,14 @@ const fn error_recovery(error: &CliError) -> ErrorRecovery {
         CliError::Publication {
             idempotency_key, ..
         } => ErrorRecovery::Publication(*idempotency_key),
+        CliError::ReleaseChange {
+            publication_id,
+            operation_id,
+            ..
+        } => ErrorRecovery::ReleaseChange {
+            publication_id: *publication_id,
+            operation_id: *operation_id,
+        },
         CliError::SourceSyncStart {
             idempotency_key, ..
         } => ErrorRecovery::SourceSyncStart(*idempotency_key),
@@ -1630,6 +1709,7 @@ fn admin_error(error: &CliError) -> Option<&AdminClientError> {
     match error {
         CliError::Admin(error)
         | CliError::Publication { source: error, .. }
+        | CliError::ReleaseChange { source: error, .. }
         | CliError::SourceSyncStart { source: error, .. }
         | CliError::SourceSyncFollow { source: error, .. } => Some(error),
         CliError::PostsSnapshotChanged { .. }
@@ -1844,6 +1924,41 @@ mod tests {
     }
 
     use maincopy_shared::publication::ReleaseBlockReason;
+
+    #[test]
+    fn release_failures_preserve_recovery_identifiers_and_exit_categories() {
+        let publication_id = Uuid::from_u128(1);
+        let operation_id = Uuid::from_u128(2);
+        for (status, expected_exit) in [
+            (412, CONFLICT),
+            (409, CONFLICT),
+            (400, VALIDATION),
+            (503, UNAVAILABLE),
+        ] {
+            let error = CliError::ReleaseChange {
+                publication_id,
+                operation_id,
+                source: AdminClientError::HttpStatus {
+                    status: reqwest::StatusCode::from_u16(status).unwrap(),
+                    problem: None,
+                    request_id: None,
+                },
+            };
+            assert_eq!(error_exit(&error), expected_exit);
+            let mut output = Vec::new();
+            write_error(&mut output, &error, expected_exit, true).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["error"]["publication_id"], publication_id.to_string());
+            assert_eq!(value["error"]["operation_id"], operation_id.to_string());
+            output.clear();
+            write_error(&mut output, &error, expected_exit, false).unwrap();
+            assert!(
+                String::from_utf8(output)
+                    .unwrap()
+                    .contains(&format!("maincopy releases operation {operation_id}"))
+            );
+        }
+    }
 
     #[test]
     fn release_output_distinguishes_current_state_from_accepted_receipts() {

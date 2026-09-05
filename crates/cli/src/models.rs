@@ -149,6 +149,28 @@ pub(crate) enum ReleaseCommand {
     Inspect { publication_id: Uuid },
     /// Recover an immutable accepted operation result.
     Operation { operation_id: Uuid },
+    /// Change a scheduled release's time without changing its approved revision.
+    Reschedule {
+        #[command(flatten)]
+        target: ReleaseTarget,
+        #[arg(long, value_name = "UTC_RFC3339", value_parser = parse_utc_rfc3339)]
+        at: OffsetDateTime,
+    },
+    /// Cancel a scheduled or blocked release.
+    Cancel(ReleaseTarget),
+    /// Retry the exact approval of a blocked release.
+    Retry(ReleaseTarget),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReleaseTarget {
+    pub(crate) publication_id: Uuid,
+    /// Exact current resource version from releases inspect.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..i64::MAX as u64))]
+    pub(crate) expected_version: u64,
+    /// Operation UUID; generated when omitted. Reuse only with the identical command.
+    #[arg(long, value_name = "UUID")]
+    pub(crate) idempotency_key: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -234,6 +256,65 @@ mod tests {
 
     const PREVIEW_DIGEST: &str =
         "preview-b3-v1-4444444444444444444444444444444444444444444444444444444444444444";
+
+    #[test]
+    fn release_controls_require_a_version_and_accept_a_repeatable_operation() {
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        for action in ["cancel", "retry", "reschedule"] {
+            let mut args = vec![
+                "maincopy",
+                "releases",
+                action,
+                id,
+                "--expected-version",
+                "7",
+                "--idempotency-key",
+                id,
+            ];
+            if action == "reschedule" {
+                args.extend(["--at", "2026-09-06T12:00:00Z"]);
+            }
+            let command = Arguments::try_parse_from(&args).unwrap().command;
+            let Command::Releases { command } = command else {
+                panic!("release command expected");
+            };
+            let target = match command {
+                ReleaseCommand::Cancel(target)
+                | ReleaseCommand::Retry(target)
+                | ReleaseCommand::Reschedule { target, .. } => target,
+                _ => panic!("release mutation expected"),
+            };
+            assert_eq!(target.expected_version, 7);
+            assert_eq!(target.idempotency_key, Some(target.publication_id));
+            assert!(Arguments::try_parse_from(["maincopy", "releases", action, id]).is_err());
+        }
+        for version in ["0", "-1", "9223372036854775807"] {
+            assert!(
+                Arguments::try_parse_from([
+                    "maincopy",
+                    "releases",
+                    "cancel",
+                    id,
+                    "--expected-version",
+                    version
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Arguments::try_parse_from([
+                "maincopy",
+                "releases",
+                "reschedule",
+                id,
+                "--expected-version",
+                "1",
+                "--at",
+                "2026-09-06T12:00:00+01:00"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn release_inspection_commands_parse_explicit_identities() {

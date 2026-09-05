@@ -71,6 +71,39 @@ fn response_body_budget_accepts_the_exact_limit_and_rejects_the_next_byte() {
 }
 
 #[tokio::test]
+async fn release_controls_require_the_release_management_agent_scope() {
+    let harness = AdminProcessHarness::start().await;
+    let operator = SigningKey::from_bytes(&[4_u8; 32]).unwrap();
+    let observer = SigningKey::from_bytes(&[5_u8; 32]).unwrap();
+    for (key, scope) in [
+        (&operator, AdminScope::ReleaseManage),
+        (&observer, AdminScope::ContentRead),
+    ] {
+        let registered = harness.send_json(Method::POST, ADMIN_AGENT_CREDENTIALS_PATH, json!({
+            "owner_user_id":harness.owner_user_id, "public_key":public_key(key), "label":"release scope test", "scopes":[scope], "expires_at":null
+        })).await;
+        assert_eq!(registered.status(), StatusCode::CREATED);
+    }
+    let path = "/api/admin/v1/releases/11111111-1111-4111-8111-111111111111";
+    for (key, expected_status, expected_code) in [
+        (&operator, StatusCode::NOT_FOUND, "release_not_found"),
+        (&observer, StatusCode::FORBIDDEN, "insufficient_scope"),
+    ] {
+        let response = harness
+            .send_json_as(
+                key,
+                Method::POST,
+                path,
+                json!({"action":"cancel", "expected_version":1}),
+            )
+            .await;
+        assert_eq!(response.status(), expected_status);
+        assert_problem(response, expected_code).await;
+    }
+    harness.stop();
+}
+
+#[tokio::test]
 async fn identity_mutations_persist_a_complete_user_and_agent_lifecycle() {
     let harness = AdminProcessHarness::start().await;
     let users = harness.get(ADMIN_USERS_PATH).await;

@@ -1347,7 +1347,7 @@ mod workflow_tests {
         },
         response::Response,
     };
-    use maincopy_shared::auth_api::{CSRF_COOKIE_NAME, SESSION_COOKIE_NAME};
+    use maincopy_shared::auth_api::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME, SESSION_COOKIE_NAME};
     use markdown_compiler::{
         ContentTreeDigest, PostCollection, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
         resolve_content_assets,
@@ -2377,6 +2377,238 @@ mod workflow_tests {
         task.await.unwrap();
         drop(store);
         drop(root);
+    }
+
+    async fn api_release_change(
+        runtime: &WorkflowRuntime,
+        publication_id: Uuid,
+        operation_id: Uuid,
+        body: serde_json::Value,
+    ) -> Response {
+        let path = format!("/api/admin/v1/releases/{publication_id}");
+        let mut request = runtime.auth.request(
+            Method::POST,
+            &path,
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+            Some(&operation_id.to_string()),
+        );
+        request.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        runtime.router.clone().oneshot(request).await.unwrap()
+    }
+
+    async fn browser_api_release_change(
+        runtime: &WorkflowRuntime,
+        browser: &BrowserSession,
+        publication_id: Uuid,
+        operation_id: Uuid,
+        body: serde_json::Value,
+    ) -> Response {
+        let path = format!("/api/admin/v1/releases/{publication_id}");
+        let mut request = browser.request(
+            Method::POST,
+            &path,
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        );
+        request.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("idempotency-key", operation_id.to_string().parse().unwrap());
+        request
+            .headers_mut()
+            .insert(CSRF_HEADER_NAME, browser.as_csrf_token().parse().unwrap());
+        runtime.router.clone().oneshot(request).await.unwrap()
+    }
+
+    async fn api_receipt(response: Response) -> ReleaseOperationResource {
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str(&response_text(response).await).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_reschedules_cancels_and_recovers_an_accepted_operation_after_later_changes() {
+        let (initial, digest) = catalog("Approved API revision.");
+        let runtime = workflow_runtime(initial, digest).await;
+        let browser = runtime.auth.password_login(&runtime.router).await;
+        let approval = approval_fixture(&runtime.coordinator, &browser, Uuid::new_v4());
+        let publication_id = Uuid::new_v4();
+        let scheduled_at = OffsetDateTime::now_utc() + time::Duration::days(1);
+        runtime
+            .coordinator
+            .schedule(Schedule {
+                creation_key: Uuid::new_v4(),
+                publication_id,
+                stable_post_id: PostId::parse(POST_ID).unwrap(),
+                expected_revision: Some(approval.revision.clone()),
+                accepted_preview_digest: approval.preview_digest.clone(),
+                scheduled_at,
+            })
+            .await
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        let changed_at = scheduled_at + time::Duration::days(1);
+        let edit = serde_json::json!({ "action": "reschedule", "expected_version": 1, "scheduled_for": changed_at.format(&time::format_description::well_known::Rfc3339).unwrap() });
+        // Treat the first successful response as lost and recover via the durable operation.
+        let response =
+            api_release_change(&runtime, publication_id, operation_id, edit.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        let operation_path = format!("/api/admin/v1/release-operations/{operation_id}");
+        let recovered = api_receipt(browser_get(&runtime, &browser, &operation_path).await).await;
+        assert_eq!(recovered.operation_id, operation_id);
+        assert_eq!(recovered.publication_id, publication_id);
+        assert_eq!(recovered.version, 2);
+        assert_eq!(recovered.state, ReleaseState::Scheduled);
+        let cancel = serde_json::json!({"action":"cancel", "expected_version":2});
+        let cancelled = api_receipt(
+            api_release_change(&runtime, publication_id, Uuid::new_v4(), cancel.clone()).await,
+        )
+        .await;
+        assert_eq!(cancelled.state, ReleaseState::Cancelled);
+        assert_eq!(cancelled.version, 3);
+        let replayed = api_receipt(
+            browser_api_release_change(&runtime, &browser, publication_id, operation_id, edit)
+                .await,
+        )
+        .await;
+        assert_eq!(replayed, recovered);
+        let current = runtime
+            .coordinator
+            .release(publication_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.publication.state, CanonicalState::Cancelled);
+        assert_eq!(current.publication.pinned_post_digest, approval.revision);
+        assert_eq!(current.accepted_preview_digest, approval.preview_digest);
+        assert_eq!(current.publication.scheduled_at, changed_at);
+        assert!(runtime.coordinator.read().ledger.is_empty());
+        for (id, body, status, code) in [
+            (
+                operation_id,
+                cancel,
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+            ),
+            (
+                Uuid::new_v4(),
+                serde_json::json!({"action":"cancel", "expected_version":1}),
+                StatusCode::PRECONDITION_FAILED,
+                "stale_release_version",
+            ),
+            (
+                Uuid::new_v4(),
+                serde_json::json!({"action":"retry", "expected_version":3}),
+                StatusCode::CONFLICT,
+                "release_state_conflict",
+            ),
+        ] {
+            let response = api_release_change(&runtime, publication_id, id, body).await;
+            assert_eq!(response.status(), status);
+            let request_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let value: serde_json::Value =
+                serde_json::from_str(&response_text(response).await).unwrap();
+            assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["request_id"], request_id);
+        }
+        runtime.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_retries_or_cancels_a_blocked_release_without_a_new_approval() {
+        for action in ["retry", "cancel"] {
+            let (initial, digest) = catalog("Originally approved API body.");
+            let runtime = workflow_runtime_with_blocked(initial, digest, true).await;
+            let browser = runtime.auth.password_login(&runtime.router).await;
+            let blocked = runtime.coordinator.releases(None).await.unwrap().remove(0);
+            let operation_id = Uuid::new_v4();
+            let body = serde_json::json!({"action":action, "expected_version":blocked.publication.version});
+            let accepted = api_receipt(
+                api_release_change(&runtime, blocked.publication_id, operation_id, body.clone())
+                    .await,
+            )
+            .await;
+            assert_eq!(accepted.version, blocked.publication.version + 1);
+            let current = runtime
+                .coordinator
+                .release(blocked.publication_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if action == "retry" {
+                assert_eq!(accepted.state, ReleaseState::Activating);
+                assert_eq!(current.publication.state, CanonicalState::Published);
+                assert_eq!(runtime.coordinator.read().ledger.len(), 1);
+            } else {
+                assert_eq!(accepted.state, ReleaseState::Cancelled);
+                assert_eq!(current.publication.state, CanonicalState::Cancelled);
+                assert!(runtime.coordinator.read().ledger.is_empty());
+            }
+            assert_eq!(
+                current.publication.pinned_post_digest,
+                blocked.publication.pinned_post_digest
+            );
+            assert_eq!(
+                current.accepted_preview_digest,
+                blocked.accepted_preview_digest
+            );
+            assert_eq!(runtime.coordinator.releases(None).await.unwrap().len(), 1);
+            let replay = api_receipt(
+                browser_api_release_change(
+                    &runtime,
+                    &browser,
+                    blocked.publication_id,
+                    operation_id,
+                    body,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(replay, accepted);
+            runtime.stop().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_release_controls_reject_invalid_bodies_and_missing_resources() {
+        let (initial, digest) = catalog("Private API candidate.");
+        let runtime = workflow_runtime(initial, digest).await;
+        let publication_id = Uuid::new_v4();
+        for body in [
+            serde_json::json!({"action":"cancel"}),
+            serde_json::json!({"action":"cancel", "expected_version":0}),
+            serde_json::json!({"action":"cancel", "expected_version":1, "expected_vesion":2}),
+            serde_json::json!({"action":"reschedule", "expected_version":1, "scheduled_for":"2026-09-06T12:00:00+01:00"}),
+        ] {
+            let response = api_release_change(&runtime, publication_id, Uuid::new_v4(), body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = api_release_change(
+            &runtime,
+            publication_id,
+            Uuid::new_v4(),
+            serde_json::json!({"action":"cancel", "expected_version":1}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = api_release_change(
+            &runtime,
+            publication_id,
+            Uuid::new_v4(),
+            serde_json::json!({"action":"cancel", "expected_version":1, "extra":"x".repeat(4096)}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(runtime.coordinator.releases(None).await.unwrap().is_empty());
+        runtime.stop().await;
     }
 
     fn catalog(body: &str) -> (Arc<ContentCatalog>, ContentTreeDigest) {

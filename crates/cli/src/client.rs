@@ -9,10 +9,10 @@ use maincopy_shared::{
     },
     posts::{ListPostsResponse, POSTS_PATH},
     publication::{
-        CONTENT_DIGEST_HEADER, IDEMPOTENCY_KEY_HEADER, ListReleasesResponse, POST_REVISION_HEADER,
-        PREVIEW_DIGEST_HEADER, PUBLICATIONS_PATH, PreviewDigest, PublishNowRequest,
-        PublishNowResponse, RELEASE_OPERATIONS_PATH, RELEASES_PATH, ReleaseOperationResource,
-        ReleaseResource,
+        CONTENT_DIGEST_HEADER, ChangeReleaseRequest, IDEMPOTENCY_KEY_HEADER, ListReleasesResponse,
+        POST_REVISION_HEADER, PREVIEW_DIGEST_HEADER, PUBLICATIONS_PATH, PreviewDigest,
+        PublishNowRequest, PublishNowResponse, RELEASE_OPERATIONS_PATH, RELEASES_PATH,
+        ReleaseOperationResource, ReleaseResource, ReleaseState,
     },
     source::{
         BeginSourceSyncResponse, SOURCE_PATH, SOURCE_SYNCS_PATH, SourceStatusResponse,
@@ -262,6 +262,24 @@ impl AdminClient {
             )
             .await?;
         decode_status_json(response, StatusCode::OK)
+    }
+
+    pub(crate) async fn change_release(
+        &self,
+        publication_id: Uuid,
+        operation_id: Uuid,
+        request: &ChangeReleaseRequest,
+    ) -> Result<ReleaseOperationResource, AdminClientError> {
+        let body = serde_json::to_vec(request).map_err(AdminClientError::RequestEncoding)?;
+        let response = self
+            .authenticated_request(
+                Method::POST,
+                &format!("{RELEASES_PATH}/{publication_id}"),
+                body,
+                Some(operation_id),
+            )
+            .await?;
+        decode_release_change_response(response, publication_id, operation_id, request)
     }
 
     /// Approves one exact post revision for immediate or scheduled publication.
@@ -1007,6 +1025,36 @@ fn decode_preview_response(response: HttpResponse) -> Result<PostPreview, AdminC
     })
 }
 
+fn decode_release_change_response(
+    response: HttpResponse,
+    publication_id: Uuid,
+    operation_id: Uuid,
+    request: &ChangeReleaseRequest,
+) -> Result<ReleaseOperationResource, AdminClientError> {
+    let receipt: ReleaseOperationResource = decode_status_json(response, StatusCode::OK)?;
+    let (expected_version, expected_state) = match request {
+        ChangeReleaseRequest::Reschedule {
+            expected_version, ..
+        } => (*expected_version, ReleaseState::Scheduled),
+        ChangeReleaseRequest::Cancel { expected_version } => {
+            (*expected_version, ReleaseState::Cancelled)
+        }
+        ChangeReleaseRequest::Retry { expected_version } => {
+            (*expected_version, ReleaseState::Activating)
+        }
+    };
+    if receipt.publication_id != publication_id
+        || receipt.operation_id != operation_id
+        || Some(receipt.version) != expected_version.checked_add(1)
+        || receipt.state != expected_state
+    {
+        return Err(AdminClientError::InvalidPublicationResponse {
+            message: "the accepted release receipt does not match the requested operation",
+        });
+    }
+    Ok(receipt)
+}
+
 fn decode_publication_response(
     body: &[u8],
     expected_preview: &PreviewDigest,
@@ -1342,6 +1390,89 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn release_receipts_must_echo_the_exact_operation_and_accepted_transition() {
+        let publication_id = Uuid::from_u128(1);
+        let operation_id = Uuid::from_u128(2);
+        for (request, state) in [
+            (
+                ChangeReleaseRequest::Reschedule {
+                    expected_version: 4,
+                    scheduled_for: OffsetDateTime::UNIX_EPOCH,
+                },
+                ReleaseState::Scheduled,
+            ),
+            (
+                ChangeReleaseRequest::Cancel {
+                    expected_version: 4,
+                },
+                ReleaseState::Cancelled,
+            ),
+            (
+                ChangeReleaseRequest::Retry {
+                    expected_version: 4,
+                },
+                ReleaseState::Activating,
+            ),
+        ] {
+            let receipt = ReleaseOperationResource {
+                publication_id,
+                operation_id,
+                version: 5,
+                state,
+            };
+            let body = serde_json::to_vec(&receipt).unwrap();
+            assert_eq!(
+                decode_release_change_response(
+                    json_response(StatusCode::OK, body.clone()),
+                    publication_id,
+                    operation_id,
+                    &request
+                )
+                .unwrap(),
+                receipt
+            );
+            assert!(
+                decode_release_change_response(
+                    json_response(StatusCode::ACCEPTED, body),
+                    publication_id,
+                    operation_id,
+                    &request
+                )
+                .is_err()
+            );
+            for invalid in [
+                ReleaseOperationResource {
+                    publication_id: Uuid::from_u128(3),
+                    ..receipt.clone()
+                },
+                ReleaseOperationResource {
+                    operation_id: Uuid::from_u128(3),
+                    ..receipt.clone()
+                },
+                ReleaseOperationResource {
+                    version: 6,
+                    ..receipt.clone()
+                },
+                ReleaseOperationResource {
+                    state: ReleaseState::Published,
+                    ..receipt.clone()
+                },
+            ] {
+                let response = json_response(StatusCode::OK, serde_json::to_vec(&invalid).unwrap());
+                assert!(matches!(
+                    decode_release_change_response(
+                        response,
+                        publication_id,
+                        operation_id,
+                        &request
+                    ),
+                    Err(AdminClientError::InvalidPublicationResponse { .. })
+                ));
+            }
+        }
     }
 
     #[test]

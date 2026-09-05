@@ -202,7 +202,33 @@ Inspect the release separately for its current state.
 These commands use `GET /api/admin/v1/releases`,
 `GET /api/admin/v1/releases/{publication_id}`, and
 `GET /api/admin/v1/release-operations/{operation_id}`. All require `release_manage`.
-Schedule edits, cancellation, and retry currently use the browser forms.
+Use the displayed release version for each new change:
+
+```console
+maincopy releases reschedule <PUBLICATION_ID> --expected-version <VERSION> --at <UTC_RFC3339> --idempotency-key <OPERATION_ID>
+maincopy releases cancel <PUBLICATION_ID> --expected-version <VERSION> --idempotency-key <OPERATION_ID>
+maincopy releases retry <PUBLICATION_ID> --expected-version <VERSION> --idempotency-key <OPERATION_ID>
+```
+
+The CLI generates an operation UUID when `--idempotency-key` is omitted.
+Success and failure output retain that identifier. If a response is lost, inspect
+the operation or repeat the identical command with the same key. A retry receipt
+can report `activating` after the current release has reached `published`.
+
+These controls use `POST /api/admin/v1/releases/{publication_id}` with an
+`Idempotency-Key` header. The JSON body selects one action:
+
+```json
+{"action":"cancel","expected_version":2}
+```
+
+`retry` also requires `expected_version`. `reschedule` additionally requires
+`scheduled_for`, a future UTC RFC3339 timestamp. Every control preserves the
+approved revision. Cancellation applies to scheduled or blocked releases.
+
+Stale versions return `412 stale_release_version`. Reused keys with different
+inputs return `409 idempotency_conflict`. Refresh the release before starting
+a new operation after a conflict.
 
 ### 5. Sign out before a state reset
 

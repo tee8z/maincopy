@@ -516,6 +516,7 @@ mod tests {
         assert!(document["paths"][CAPABILITIES_PATH]["get"].is_object());
         assert!(document["paths"][POSTS_PATH]["get"].is_object());
         assert!(document["paths"][PUBLICATIONS_PATH]["post"].is_object());
+        assert!(document["paths"]["/api/admin/v1/releases/{publication_id}"]["post"].is_object());
         for path in [
             "/api/admin/v1/releases",
             "/api/admin/v1/releases/{publication_id}",

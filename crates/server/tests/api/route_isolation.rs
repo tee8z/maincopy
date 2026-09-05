@@ -23,6 +23,11 @@ async fn public_router_does_not_expose_durable_releases_or_receipts() {
             StatusCode::NOT_FOUND,
             "{path}"
         );
+        assert_eq!(
+            request(app.clone(), Method::POST, path).await.status(),
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
     }
 }
 

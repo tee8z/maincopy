@@ -27,7 +27,7 @@ flowchart LR
     Review --> Release[4. Release candidate]
 ```
 
-1. Complete update, schedule, cancel, retry, account, and profile workflows.
+1. Complete account, profile, and managed-source administration workflows.
 2. Add public-response metadata, Content Security Policy, and lifecycle polish.
 3. Add metrics, NixOS, Caddy, Litestream, backup, and restore support.
 4. Complete the security review, system matrix, documentation, and release dry run.
@@ -37,30 +37,7 @@ hosting, or Git write-back as part of V1.
 
 ## 1. Product closure
 
-### 1.1 Complete release management
-
-Expose the remaining release transitions through the typed writer and
-activation coordinator.
-
-Deliverables:
-
-- Expose schedule edits and cancellation through the API and CLI with exact
-  resource versions.
-- Expose blocked-release retry and cancellation through the API and CLI without
-  creating a second release.
-- Add release edit, cancel, and retry commands to the CLI.
-- Return stable conflicts for stale resource versions and idempotency reuse.
-
-Required evidence:
-
-- Complete initial, update, and scheduled publication through the browser.
-- Edit and cancel schedules with exact resource-version checks through the API
-  and CLI.
-- Retry and cancel a blocked release without changing its approved revision.
-- Lose a mutation response and recover through its operation identifier.
-- Keep draft and preview assets unreachable from the public router.
-
-### 1.2 Complete account and profile workflows
+### 1.1 Complete account and profile workflows
 
 Complete the browser and CLI operations needed for ordinary administration.
 Preserve the fixed Owner, Administrator, and Publisher scope boundaries.
@@ -84,7 +61,7 @@ Required evidence:
 - Revoke sessions and agent credentials after user disablement.
 - Reject stale profile and role mutations without partial state.
 
-### 1.3 Complete managed-source administration
+### 1.2 Complete managed-source administration
 
 The normal push-to-preview loop is complete. Add safe online operations for
 the source settings that still require daemon shutdown.
@@ -106,7 +83,7 @@ Required evidence:
 - Restart during reconfiguration and recover one durable terminal result.
 - Prove that no source response exposes a private-key or `known_hosts` path.
 
-### 1.4 Add image metadata and response policy
+### 1.3 Add image metadata and response policy
 
 Complete public image output and apply one least-privilege response policy.
 
@@ -129,7 +106,7 @@ Required evidence:
 - Serve local files with safe content types and disposition rules.
 - Keep preview-only assets unreachable from public routes.
 
-### 1.5 Finish listener and tip administration
+### 1.4 Finish listener and tip administration
 
 Complete the remaining lifecycle behavior on the public and profile surfaces.
 
