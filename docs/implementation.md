@@ -2,7 +2,7 @@
 
 Status: active backlog
 
-Last reviewed: 2026-09-04
+Last reviewed: 2026-09-05
 
 Related: [project overview](../README.md), [system design](design.md),
 [managed Git runbook](managed-source.md),
@@ -239,12 +239,6 @@ Required evidence:
 ## 3. Security and system evidence
 
 ### 3.1 Run the end-to-end matrix
-
-Repair the canonical Nix test environment before release acceptance. The current
-sandbox omits Git and `ssh-keygen` from the test PATH. Its root directory belongs
-to UID 65534, which the credential ancestor policy rejects. Preserve credential
-validation while providing a representative test environment. Local workspace
-tests and CRAP currently pass; the Nix gate remains failing.
 
 Exercise one representative managed Git site through browser, human CLI, and
 agent API workflows.

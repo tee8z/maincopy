@@ -249,5 +249,11 @@ nix flake check --print-build-logs
 nix build --print-build-logs
 ```
 
+Sandboxed Cargo tests receive Git and OpenSSH explicitly. They run through
+Bubblewrap (`LGPL-2.0-or-later`), a test dependency from the pinned Nixpkgs input.
+The runner creates a filesystem root owned by the build user and preserves
+the writable build workspace. Credential ownership and permission checks remain
+enabled. Linux builders must permit nested unprivileged user namespaces.
+
 The flake supports `x86_64-linux` and `aarch64-linux`. The default branch is
 `master`.

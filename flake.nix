@@ -63,21 +63,47 @@
             strictDeps = true;
           };
 
-          maincopy = craneLib.buildPackage {
-            inherit cargoArtifacts src;
-            pname = "maincopy-workspace";
-            version = "0.1.0";
-            cargoExtraArgs = "--locked";
-            nativeBuildInputs = [ pkgs.makeWrapper ];
-            strictDeps = true;
+          # Nix can expose unmapped root ownership inside its build namespace.
+          # Give tests real, trusted ancestors without changing credential policy.
+          testRunner = pkgs.writeShellScript "maincopy-nix-test-runner" ''
+            exec ${pkgs.bubblewrap}/bin/bwrap --unshare-user --die-with-parent \
+              --ro-bind /nix/store /nix/store \
+              --perms 1777 --tmpfs /tmp \
+              --bind "$NIX_BUILD_TOP" "$NIX_BUILD_TOP" \
+              --ro-bind /etc /etc \
+              --dir /bin --ro-bind /bin/sh /bin/sh \
+              --proc /proc --dev /dev \
+              --chdir "$PWD" -- "$@"
+          '';
+          testEnvironment = {
+            nativeCheckInputs = [
+              pkgs.git
+              pkgs.openssh
+            ];
             MAINCOPY_SSH_KEYGEN = "${pkgs.openssh}/bin/ssh-keygen";
-            postInstall = ''
-              install -Dm444 LICENSE "$out/share/licenses/maincopy/LICENSE"
-              wrapProgram "$out/bin/maincopyd" \
-                --set MAINCOPY_GIT_EXECUTABLE ${pkgs.git}/bin/git \
-                --set MAINCOPY_SSH_EXECUTABLE ${pkgs.openssh}/bin/ssh
-            '';
+            "CARGO_TARGET_${
+              pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] pkgs.stdenv.hostPlatform.rust.rustcTarget)
+            }_RUNNER" =
+              testRunner;
           };
+
+          maincopy = craneLib.buildPackage (
+            testEnvironment
+            // {
+              inherit cargoArtifacts src;
+              pname = "maincopy-workspace";
+              version = "0.1.0";
+              cargoExtraArgs = "--locked";
+              nativeBuildInputs = [ pkgs.makeWrapper ];
+              strictDeps = true;
+              postInstall = ''
+                install -Dm444 LICENSE "$out/share/licenses/maincopy/LICENSE"
+                wrapProgram "$out/bin/maincopyd" \
+                  --set MAINCOPY_GIT_EXECUTABLE ${pkgs.git}/bin/git \
+                  --set MAINCOPY_SSH_EXECUTABLE ${pkgs.openssh}/bin/ssh
+              '';
+            }
+          );
         in
         {
           inherit
@@ -87,6 +113,7 @@
             pkgs
             rustToolchain
             src
+            testEnvironment
             ;
         };
     in
@@ -144,11 +171,14 @@
             inherit (project) src;
           };
 
-          tests = project.craneLib.cargoTest {
-            inherit (project) cargoArtifacts src;
-            cargoTestExtraArgs = "--all-targets --all-features";
-            strictDeps = true;
-          };
+          tests = project.craneLib.cargoTest (
+            project.testEnvironment
+            // {
+              inherit (project) cargoArtifacts src;
+              cargoTestExtraArgs = "--all-targets --all-features";
+              strictDeps = true;
+            }
+          );
 
           nix-formatting = project.pkgs.runCommand "maincopy-nix-formatting" { } ''
             ${project.pkgs.nixfmt}/bin/nixfmt --check ${./flake.nix}
