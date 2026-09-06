@@ -33,6 +33,18 @@ jobs:
           use-gha-cache: enabled
           diagnostic-endpoint: ""
 
+      - name: Allow the Nix test sandbox to create user namespaces
+        run: |
+          # Ubuntu's packaged profiles do not cover Bubblewrap in the Nix store.
+          sudo tee /etc/apparmor.d/maincopy-nix-bwrap > /dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile maincopy-nix-bwrap /nix/store/*-bubblewrap-*/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/maincopy-nix-bwrap
+
       - name: Run flake checks
         run: nix flake check --print-build-logs
 
