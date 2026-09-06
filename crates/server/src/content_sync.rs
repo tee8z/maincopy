@@ -23,11 +23,11 @@ use crate::{
 
 const CONTENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// One immutable content-tree candidate prepared for the publication actor.
+/// One immutable content-tree candidate prepared from an exact source commit.
 pub(crate) struct PreparedContentCandidate {
     pub(crate) catalog: Arc<ContentCatalog>,
     pub(crate) content_digest: ContentTreeDigest,
-    pub(crate) source_commit: Option<SourceCommit>,
+    pub(crate) source_commit: SourceCommit,
 }
 
 /// Validates, compiles, and retains one already stable source candidate.
@@ -37,7 +37,7 @@ pub(crate) struct PreparedContentCandidate {
 /// its repeated-observation checks below because that tree can change in place.
 pub(crate) async fn prepare_immutable_candidate(
     tree: DiscoveredContentTree,
-    source_commit: Option<SourceCommit>,
+    source_commit: SourceCommit,
     candidate_store: ContentCandidateStore,
     compiler: ContentCompiler,
 ) -> Result<PreparedContentCandidate, ContentCandidatePreparationError> {
@@ -95,7 +95,7 @@ pub(crate) struct ContentSync {
     root: PathBuf,
     limits: ContentTreeLimits,
     candidate_store: ContentCandidateStore,
-    active: CandidateKey,
+    active: ContentTreeDigest,
     publications: PublicationCoordinatorHandle,
     cancellation: CancellationToken,
     compiler: ContentCompiler,
@@ -115,9 +115,7 @@ impl ContentSync {
             root,
             limits,
             candidate_store,
-            active: CandidateKey {
-                digest: active_digest,
-            },
+            active: active_digest,
             publications,
             cancellation,
             compiler,
@@ -172,7 +170,7 @@ impl ContentSync {
         if let Some(candidate) = state
             .retained
             .take()
-            .filter(|candidate| candidate.key == observed.key)
+            .filter(|candidate| candidate.digest == observed.digest)
         {
             return Ok(Some(candidate));
         }
@@ -184,12 +182,8 @@ impl ContentSync {
         observed: ObservedCandidate,
         state: &mut ContentSyncState,
     ) -> Result<Option<CompiledCandidate>, ContentSyncError> {
-        if !state
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.key == observed.key)
-        {
-            state.pending = Some(observed);
+        if state.pending.as_ref() != Some(&observed.digest) {
+            state.pending = Some(observed.digest);
             return Ok(None);
         }
         let compiled = compile_observed(observed, self.root.clone(), self.compiler.clone()).await?;
@@ -220,8 +214,8 @@ impl ContentSync {
                 return Ok(None);
             }
         };
-        if confirmed.key != candidate.key {
-            state.pending = Some(confirmed);
+        if confirmed.digest != candidate.digest {
+            state.pending = Some(confirmed.digest);
             return Ok(None);
         }
         Ok(Some(candidate))
@@ -244,8 +238,8 @@ impl ContentSync {
                 return Ok(None);
             }
         };
-        if confirmed.key != candidate.key {
-            state.pending = Some(confirmed);
+        if confirmed.digest != candidate.digest {
+            state.pending = Some(confirmed.digest);
             return Ok(None);
         }
         Ok(Some(candidate))
@@ -256,42 +250,39 @@ impl ContentSync {
         candidate: CompiledCandidate,
         state: &mut ContentSyncState,
     ) -> Result<SyncControl, ContentSyncError> {
-        let candidate_key = candidate.key.clone();
         // Once the bounded actor accepts this command, wait for its durable
         // outcome even if process cancellation arrives concurrently.
         let result = self
             .publications
             .apply_content_catalog(
                 Arc::clone(&candidate.catalog),
-                candidate.key.digest.clone(),
+                candidate.digest.clone(),
                 candidate.source_commit.clone(),
             )
             .await;
         match result {
             Ok(site) => {
                 tracing::info!(
-                    content_etag = %candidate_key.digest,
+                    content_etag = %candidate.digest,
                     site_etag = %site.digest,
                     site_version = site.version,
                     "live content snapshot synchronized"
                 );
-                self.active = candidate_key;
+                self.active = candidate.digest;
                 state.pending = None;
                 state.rejected = None;
                 Ok(SyncControl::Continue)
             }
-            Err(error) => {
-                state.handle_reload_failure(error, candidate, candidate_key, &self.cancellation)
-            }
+            Err(error) => state.handle_reload_failure(error, candidate, &self.cancellation),
         }
     }
 }
 
 #[derive(Default)]
 struct ContentSyncState {
-    pending: Option<ObservedCandidate>,
+    pending: Option<ContentTreeDigest>,
     retained: Option<CompiledCandidate>,
-    rejected: Option<CandidateKey>,
+    rejected: Option<ContentTreeDigest>,
     last_discovery_error: Option<Box<str>>,
 }
 
@@ -307,16 +298,16 @@ impl ContentSyncState {
     fn select_observed(
         &mut self,
         observed: ObservedCandidate,
-        active: &CandidateKey,
+        active: &ContentTreeDigest,
     ) -> Option<ObservedCandidate> {
         self.last_discovery_error = None;
-        if &observed.key == active {
+        if &observed.digest == active {
             self.pending = None;
             self.retained = None;
             self.rejected = None;
             return None;
         }
-        if self.rejected.as_ref() == Some(&observed.key) {
+        if self.rejected.as_ref() == Some(&observed.digest) {
             self.pending = None;
             self.retained = None;
             return None;
@@ -332,11 +323,11 @@ impl ContentSyncState {
             Ok(candidate) => Some(candidate),
             Err(failure) => {
                 tracing::warn!(
-                    content_etag = %failure.key.digest,
+                    content_etag = %failure.digest,
                     error = %failure.message,
                     "content sync rejected a compiler candidate and kept the last good snapshot"
                 );
-                self.rejected = Some(failure.key);
+                self.rejected = Some(failure.digest);
                 self.pending = None;
                 None
             }
@@ -347,7 +338,6 @@ impl ContentSyncState {
         &mut self,
         error: ContentReloadError,
         candidate: CompiledCandidate,
-        candidate_key: CandidateKey,
         cancellation: &CancellationToken,
     ) -> Result<SyncControl, ContentSyncError> {
         if reload_is_retryable(&error) {
@@ -366,11 +356,11 @@ impl ContentSyncState {
             return Ok(SyncControl::Stop);
         }
         tracing::warn!(
-            content_etag = %candidate_key.digest,
+            content_etag = %candidate.digest,
             error = %error,
             "content sync rejected a candidate and kept the last good snapshot"
         );
-        self.rejected = Some(candidate_key);
+        self.rejected = Some(candidate.digest);
         self.pending = None;
         Ok(SyncControl::Continue)
     }
@@ -386,9 +376,9 @@ async fn retain_candidate(
     candidate: CompiledCandidate,
     store: ContentCandidateStore,
 ) -> Result<CompiledCandidate, ContentSyncError> {
-    let expected = candidate.key.digest.clone();
+    let expected = candidate.digest.clone();
     let (candidate, retained) = tokio::task::spawn_blocking(move || {
-        let retained = store.retain(&candidate.observed.tree);
+        let retained = store.retain(&candidate.tree);
         (candidate, retained)
     })
     .await
@@ -400,25 +390,20 @@ async fn retain_candidate(
     Ok(candidate)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CandidateKey {
-    digest: ContentTreeDigest,
-}
-
 struct ObservedCandidate {
-    key: CandidateKey,
+    digest: ContentTreeDigest,
     tree: DiscoveredContentTree,
 }
 
 struct CompiledCandidate {
-    key: CandidateKey,
-    observed: ObservedCandidate,
+    digest: ContentTreeDigest,
+    tree: DiscoveredContentTree,
     catalog: Arc<ContentCatalog>,
     source_commit: Option<SourceCommit>,
 }
 
 struct CandidateFailure {
-    key: CandidateKey,
+    digest: ContentTreeDigest,
     message: Box<str>,
 }
 
@@ -430,9 +415,7 @@ async fn observe_tree(
         let tree = discover_content_tree(&root, limits)
             .map_err(|error| Box::<str>::from(error.to_string()))?;
         Ok(ObservedCandidate {
-            key: CandidateKey {
-                digest: tree.digest(),
-            },
+            digest: tree.digest(),
             tree,
         })
     })
@@ -446,7 +429,7 @@ async fn compile_observed(
     compiler: ContentCompiler,
 ) -> Result<Result<CompiledCandidate, CandidateFailure>, ContentSyncError> {
     tokio::task::spawn_blocking(move || {
-        let key = observed.key.clone();
+        let digest = observed.digest.clone();
         let compiled: Result<(Arc<ContentCatalog>, Option<SourceCommit>), String> = (|| {
             let content = observed
                 .tree
@@ -466,13 +449,13 @@ async fn compile_observed(
         })();
         match compiled {
             Ok((catalog, source_commit)) => Ok(CompiledCandidate {
-                key,
-                observed,
+                digest,
+                tree: observed.tree,
                 catalog,
                 source_commit,
             }),
             Err(message) => Err(CandidateFailure {
-                key,
+                digest,
                 message: message.into_boxed_str(),
             }),
         }
@@ -571,12 +554,9 @@ mod tests {
         let content = tree.validate().unwrap();
         let assets = resolve_content_assets(&tree, &content).unwrap();
         let catalog = Arc::new(compile_content_catalog(&content, &assets).unwrap());
-        let key = CandidateKey {
-            digest: tree.digest(),
-        };
         CompiledCandidate {
-            key: key.clone(),
-            observed: ObservedCandidate { key, tree },
+            digest: tree.digest(),
+            tree,
             catalog,
             source_commit: None,
         }
@@ -599,13 +579,13 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let store =
             ContentCandidateStore::open(state.path(), ContentTreeLimits::default()).unwrap();
-        let tree = compiled_candidate().observed.tree;
+        let tree = compiled_candidate().tree;
         let expected_digest = tree.digest();
         let commit = SourceCommit::parse(&format!("git-sha1:{}", "42".repeat(20))).unwrap();
 
         let prepared = prepare_immutable_candidate(
             tree.clone(),
-            Some(commit.clone()),
+            commit.clone(),
             store.clone(),
             ContentCompiler::discover().unwrap(),
         )
@@ -613,7 +593,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(prepared.content_digest, expected_digest);
-        assert_eq!(prepared.source_commit, Some(commit));
+        assert_eq!(prepared.source_commit, commit);
         assert_eq!(store.load(&expected_digest).unwrap(), tree);
         assert_eq!(prepared.catalog.rendered_posts().count(), 1);
     }
@@ -623,13 +603,13 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let store =
             ContentCandidateStore::open(state.path(), ContentTreeLimits::default()).unwrap();
-        let mut tree = compiled_candidate().observed.tree;
+        let mut tree = compiled_candidate().tree;
         tree.publication.source = "not valid publication TOML".into();
 
         assert!(matches!(
             prepare_immutable_candidate(
                 tree,
-                None,
+                SourceCommit::parse(&format!("git-sha1:{}", "42".repeat(20))).unwrap(),
                 store.clone(),
                 ContentCompiler::discover().unwrap(),
             )
@@ -645,13 +625,13 @@ mod tests {
         let store =
             ContentCandidateStore::open(state.path(), ContentTreeLimits::default()).unwrap();
         let candidate = compiled_candidate();
-        let expected_digest = candidate.key.digest.clone();
-        let expected_tree = candidate.observed.tree.clone();
+        let expected_digest = candidate.digest.clone();
+        let expected_tree = candidate.tree.clone();
 
         let retained = retain_candidate(candidate, store.clone()).await.unwrap();
 
-        assert_eq!(retained.key.digest, expected_digest);
-        assert_eq!(retained.observed.tree, expected_tree);
+        assert_eq!(retained.digest, expected_digest);
+        assert_eq!(retained.tree, expected_tree);
         assert_eq!(store.load(&expected_digest).unwrap(), expected_tree);
     }
 
@@ -669,7 +649,7 @@ mod tests {
         let occupied = state
             .path()
             .join("content-candidates")
-            .join(format!("{}.candidate", candidate.key.digest));
+            .join(format!("{}.candidate", candidate.digest));
         symlink(target, occupied).unwrap();
 
         assert!(matches!(
@@ -681,12 +661,9 @@ mod tests {
     #[test]
     fn reload_failures_retry_only_safe_outcomes_and_preserve_rejection_state() {
         let candidate = compiled_candidate();
-        let candidate_key = candidate.key.clone();
+        let candidate_digest = candidate.digest.clone();
         let mut retry = ContentSyncState {
-            pending: Some(ObservedCandidate {
-                key: candidate.key.clone(),
-                tree: candidate.observed.tree.clone(),
-            }),
+            pending: Some(candidate.digest.clone()),
             ..ContentSyncState::default()
         };
         assert_eq!(
@@ -694,7 +671,6 @@ mod tests {
                 .handle_reload_failure(
                     ContentReloadError::Database(DatabaseAdmissionError::QueueFull.into()),
                     candidate,
-                    candidate_key.clone(),
                     &CancellationToken::new(),
                 )
                 .unwrap(),
@@ -702,8 +678,8 @@ mod tests {
         );
         assert!(retry.pending.is_none());
         assert_eq!(
-            retry.retained.as_ref().map(|candidate| &candidate.key),
-            Some(&candidate_key)
+            retry.retained.as_ref().map(|candidate| &candidate.digest),
+            Some(&candidate_digest)
         );
 
         let cancellation = CancellationToken::new();
@@ -715,7 +691,6 @@ mod tests {
                 .handle_reload_failure(
                     ContentReloadError::Coordinator(PublicationCoordinatorUnavailable::Closed),
                     candidate,
-                    candidate_key.clone(),
                     &cancellation,
                 )
                 .unwrap(),
@@ -728,7 +703,6 @@ mod tests {
             fatal.handle_reload_failure(
                 ContentReloadError::Database(DatabaseAdmissionError::WriterClosed.into()),
                 candidate,
-                candidate_key.clone(),
                 &CancellationToken::new(),
             ),
             Err(ContentSyncError::Reload(ContentReloadError::Database(_)))
@@ -739,16 +713,11 @@ mod tests {
         let mut rejected = ContentSyncState::default();
         assert_eq!(
             rejected
-                .handle_reload_failure(
-                    rejection,
-                    candidate,
-                    candidate_key.clone(),
-                    &CancellationToken::new(),
-                )
+                .handle_reload_failure(rejection, candidate, &CancellationToken::new(),)
                 .unwrap(),
             SyncControl::Continue
         );
-        assert_eq!(rejected.rejected, Some(candidate_key));
+        assert_eq!(rejected.rejected, Some(candidate_digest));
         assert!(rejected.pending.is_none());
         assert!(rejected.retained.is_none());
     }

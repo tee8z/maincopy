@@ -217,16 +217,12 @@ pub(crate) async fn adapt_security_response(request: Request, next: Next) -> Res
     }
 }
 
-/// Presents a native form result without exposing internal response bodies.
-pub(crate) fn mutation_response(
-    response: Response,
+/// Presents a native form failure using a safe status-specific recovery message.
+pub(super) fn mutation_error_response(
+    status: StatusCode,
     location: &str,
     request_id: RequestId,
 ) -> Response {
-    let status = response.status();
-    if status.is_success() {
-        return redirect(location);
-    }
     let message = match status {
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
             "The form was not valid. Check the fields and submit a current page."
@@ -266,8 +262,9 @@ pub(crate) fn mutation_response(
             }
         },
     );
-    if let Some(retry_after) = response.headers().get(RETRY_AFTER) {
-        page.headers_mut().insert(RETRY_AFTER, retry_after.clone());
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        page.headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
     }
     page
 }

@@ -1,5 +1,6 @@
 //! SQLite schema bootstrap and single-writer ownership.
 
+pub(crate) mod fingerprint;
 pub(crate) mod store;
 mod writer;
 

@@ -1,5 +1,5 @@
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::domain::auth::store::{
     AcceptAgentProof, AgentCredentialMutationResult, AuthCommandError, AuthStore,
@@ -50,6 +50,38 @@ impl DatabaseStore {
             publications,
             source,
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MutationSender(mpsc::Sender<Mutation>);
+
+impl MutationSender {
+    pub(crate) const fn new(sender: mpsc::Sender<Mutation>) -> Self {
+        Self(sender)
+    }
+
+    /// Rejected admission means no write was accepted. Once admitted, losing
+    /// the reply leaves the outcome unknown and does not cancel the write.
+    pub(crate) async fn send<Output, CommandError, MutationError>(
+        &self,
+        mutation: impl FnOnce(oneshot::Sender<Result<Output, CommandError>>) -> Mutation,
+        outcome_unknown: CommandError,
+    ) -> Result<Output, MutationError>
+    where
+        MutationError: From<DatabaseAdmissionError> + From<CommandError>,
+    {
+        let (respond_to, response) = oneshot::channel();
+        self.0
+            .try_send(mutation(respond_to))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
+            })?;
+        response
+            .await
+            .map_err(|_| MutationError::from(outcome_unknown))?
+            .map_err(MutationError::from)
     }
 }
 

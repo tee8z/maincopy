@@ -18,16 +18,13 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{
-    AvailableProfileStore, PROFILE_REQUEST_BODY_LIMIT, load_problem, mutation_audit,
-    transition_problem, unavailable,
-};
+use super::{AvailableProfileStore, PROFILE_REQUEST_BODY_LIMIT, load_problem, transition_problem};
 use crate::{
     admin::{
         AdminSecurityState, BrowserFormSession, browser_scoped_router,
         principal::AdminPrincipal,
         request_id::RequestId,
-        ui::{PageKind, adapt_security_response, mutation_response, page_response, redirect},
+        ui::{PageKind, adapt_security_response, mutation_error_response, page_response, redirect},
     },
     domain::{
         auth::store::AdminMutationKey,
@@ -99,8 +96,8 @@ async fn show_profile(
     let profile = match store.profile(browser.session.user_id).await {
         Ok(profile) => profile,
         Err(error) => {
-            return mutation_response(
-                load_problem(error, request_id),
+            return mutation_error_response(
+                load_problem(error, request_id).status,
                 "/admin/profile",
                 request_id,
             );
@@ -160,9 +157,9 @@ async fn save_profile(
     coordinator: Option<Extension<PublicationCoordinatorHandle>>,
     form: Result<Form<ProfileForm>, FormRejection>,
 ) -> Response {
-    let response = match (coordinator, form) {
-        (_, Err(error)) => return invalid_form(error, "/admin/profile", request_id),
-        (None, _) => unavailable(request_id),
+    let status = match (coordinator, form) {
+        (_, Err(error)) => error.status(),
+        (None, _) => StatusCode::SERVICE_UNAVAILABLE,
         (Some(Extension(coordinator)), Ok(Form(form))) => {
             let result = coordinator
                 .update_profile(UpdateProfile {
@@ -172,20 +169,17 @@ async fn save_profile(
                     lightning_address: form.lightning_address,
                     tips_enabled: form.tips_enabled,
                     occurred_at: OffsetDateTime::now_utc(),
-                    audit: mutation_audit(
-                        &principal,
-                        request_id,
-                        AdminMutationKey(form.operation_id),
-                    ),
+                    audit: principal
+                        .mutation_audit(request_id, AdminMutationKey(form.operation_id)),
                 })
                 .await;
             match result {
                 Ok(_) => return redirect("/admin/profile"),
-                Err(error) => transition_problem(error, request_id),
+                Err(error) => transition_problem(error, request_id).status,
             }
         }
     };
-    mutation_response(response, "/admin/profile", request_id)
+    mutation_error_response(status, "/admin/profile", request_id)
 }
 
 async fn show_tip_recipient(
@@ -196,13 +190,21 @@ async fn show_tip_recipient(
     let setting = match store.active_tip_recipient().await {
         Ok(setting) => setting,
         Err(error) => {
-            return mutation_response(load_problem(error, request_id), "/admin/tips", request_id);
+            return mutation_error_response(
+                load_problem(error, request_id).status,
+                "/admin/tips",
+                request_id,
+            );
         }
     };
     let recipient = match store.effective_tip_recipient().await {
         Ok(recipient) => recipient,
         Err(error) => {
-            return mutation_response(load_problem(error, request_id), "/admin/tips", request_id);
+            return mutation_error_response(
+                load_problem(error, request_id).status,
+                "/admin/tips",
+                request_id,
+            );
         }
     };
     page_response(
@@ -245,33 +247,24 @@ async fn save_tip_recipient(
     coordinator: Option<Extension<PublicationCoordinatorHandle>>,
     form: Result<Form<TipRecipientForm>, FormRejection>,
 ) -> Response {
-    let response = match (coordinator, form) {
-        (_, Err(error)) => return invalid_form(error, "/admin/tips", request_id),
-        (None, _) => unavailable(request_id),
+    let status = match (coordinator, form) {
+        (_, Err(error)) => error.status(),
+        (None, _) => StatusCode::SERVICE_UNAVAILABLE,
         (Some(Extension(coordinator)), Ok(Form(form))) => {
             match coordinator
                 .set_tip_recipient(SetTipRecipient {
                     expected_version: form.expected_version,
                     recipient_user_id: form.user_id.map(UserId::from_uuid),
                     occurred_at: OffsetDateTime::now_utc(),
-                    audit: mutation_audit(
-                        &principal,
-                        request_id,
-                        AdminMutationKey(form.operation_id),
-                    ),
+                    audit: principal
+                        .mutation_audit(request_id, AdminMutationKey(form.operation_id)),
                 })
                 .await
             {
                 Ok(_) => return redirect("/admin/tips"),
-                Err(error) => transition_problem(error, request_id),
+                Err(error) => transition_problem(error, request_id).status,
             }
         }
     };
-    mutation_response(response, "/admin/tips", request_id)
-}
-
-fn invalid_form(error: FormRejection, location: &str, request_id: RequestId) -> Response {
-    let mut response = Response::default();
-    *response.status_mut() = error.status();
-    mutation_response(response, location, request_id)
+    mutation_error_response(status, "/admin/tips", request_id)
 }

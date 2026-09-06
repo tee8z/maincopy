@@ -10,13 +10,9 @@ use crate::database::store::{DatabaseAdmissionError, DatabaseCommandError, Datab
 
 use super::{
     activation::{
-        PublicationActivationError, PublicationCoordinatorHandle,
-        PublicationCoordinatorUnavailable, PublishedPublication,
+        PublicationActivationError, PublicationCoordinatorHandle, PublicationCoordinatorUnavailable,
     },
-    store::{
-        PublicationRouteOwnershipError, PublicationStore, ScheduledPublication,
-        StartupSnapshotLoadError,
-    },
+    store::{PublicationRouteOwnershipError, PublicationStore, StartupSnapshotLoadError},
 };
 
 const RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -54,28 +50,24 @@ impl PublicationScheduler {
     }
 
     async fn run_iteration(&self) -> Result<LoopControl, PublicationSchedulerError> {
-        match self.next_action().await? {
-            SchedulerAction::Stop => Ok(LoopControl::Stop),
-            SchedulerAction::Wait(delay) => Ok(self.wait(delay).await),
-            SchedulerAction::Activate(publication_id) => self.activate(publication_id).await,
-        }
-    }
-
-    async fn next_action(&self) -> Result<SchedulerAction, PublicationSchedulerError> {
-        let next = tokio::select! {
+        let scheduled = tokio::select! {
             biased;
-            _ = self.cancellation.cancelled() => return Ok(SchedulerAction::Stop),
+            _ = self.cancellation.cancelled() => return Ok(LoopControl::Stop),
             result = self.store.next_scheduled_publication() => {
                 result.map_err(PublicationSchedulerError::Load)?
             }
         };
-        Ok(scheduled_action(next, OffsetDateTime::now_utc()))
-    }
-
-    async fn wait(&self, delay: Option<Duration>) -> LoopControl {
-        match wait_for_requery(delay, &self.wakeup, &self.cancellation).await {
-            WaitOutcome::Requery => LoopControl::Continue,
-            WaitOutcome::Cancelled => LoopControl::Stop,
+        let Some(scheduled) = scheduled else {
+            return Ok(wait_for_requery(None, &self.wakeup, &self.cancellation).await);
+        };
+        let delay = delay_until(
+            scheduled.publication.view().scheduled_at,
+            OffsetDateTime::now_utc(),
+        );
+        if delay.is_zero() {
+            self.activate(scheduled.publication_id).await
+        } else {
+            Ok(wait_for_requery(Some(delay), &self.wakeup, &self.cancellation).await)
         }
     }
 
@@ -89,14 +81,16 @@ impl PublicationScheduler {
             .coordinator
             .activate_scheduled(publication_id, OffsetDateTime::now_utc())
             .await;
-        if cancelled_closed_activation(&self.cancellation, &result) {
-            return Ok(LoopControl::Stop);
-        }
         match result {
+            Err(PublicationActivationError::Coordinator(
+                PublicationCoordinatorUnavailable::Closed,
+            )) if self.cancellation.is_cancelled() => Ok(LoopControl::Stop),
             Ok(_) | Err(PublicationActivationError::ReleaseBlocked { .. }) => {
                 Ok(LoopControl::Continue)
             }
-            Err(error) if retryable(&error) => Ok(self.wait(Some(RETRY_DELAY)).await),
+            Err(error) if retryable(&error) => {
+                Ok(wait_for_requery(Some(RETRY_DELAY), &self.wakeup, &self.cancellation).await)
+            }
             Err(source) => Err(PublicationSchedulerError::Activation {
                 publication_id,
                 source,
@@ -105,44 +99,10 @@ impl PublicationScheduler {
     }
 }
 
-enum SchedulerAction {
-    Stop,
-    Wait(Option<Duration>),
-    Activate(Uuid),
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoopControl {
     Continue,
     Stop,
-}
-
-fn scheduled_action(
-    scheduled: Option<ScheduledPublication>,
-    now: OffsetDateTime,
-) -> SchedulerAction {
-    let Some(scheduled) = scheduled else {
-        return SchedulerAction::Wait(None);
-    };
-    let delay = delay_until(scheduled.publication.view().scheduled_at, now);
-    if delay.is_zero() {
-        SchedulerAction::Activate(scheduled.publication_id)
-    } else {
-        SchedulerAction::Wait(Some(delay))
-    }
-}
-
-fn cancelled_closed_activation(
-    cancellation: &CancellationToken,
-    result: &Result<PublishedPublication, PublicationActivationError>,
-) -> bool {
-    cancellation.is_cancelled()
-        && matches!(
-            result,
-            Err(PublicationActivationError::Coordinator(
-                PublicationCoordinatorUnavailable::Closed
-            ))
-        )
 }
 
 fn delay_until(scheduled_at: OffsetDateTime, now: OffsetDateTime) -> Duration {
@@ -164,31 +124,25 @@ fn retryable(error: &PublicationActivationError) -> bool {
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WaitOutcome {
-    Requery,
-    Cancelled,
-}
-
 async fn wait_for_requery(
     delay: Option<Duration>,
     wakeup: &Notify,
     cancellation: &CancellationToken,
-) -> WaitOutcome {
+) -> LoopControl {
     match delay {
         Some(delay) => {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => WaitOutcome::Cancelled,
-                _ = wakeup.notified() => WaitOutcome::Requery,
-                _ = tokio::time::sleep(delay) => WaitOutcome::Requery,
+                _ = cancellation.cancelled() => LoopControl::Stop,
+                _ = wakeup.notified() => LoopControl::Continue,
+                _ = tokio::time::sleep(delay) => LoopControl::Continue,
             }
         }
         None => {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => WaitOutcome::Cancelled,
-                _ = wakeup.notified() => WaitOutcome::Requery,
+                _ = cancellation.cancelled() => LoopControl::Stop,
+                _ = wakeup.notified() => LoopControl::Continue,
             }
         }
     }
@@ -664,7 +618,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(59)).await;
         assert!(!task.is_finished());
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(task.await.unwrap(), WaitOutcome::Requery);
+        assert_eq!(task.await.unwrap(), LoopControl::Continue);
     }
 
     #[tokio::test(start_paused = true)]
@@ -679,7 +633,7 @@ mod tests {
 
         tokio::task::yield_now().await;
         wakeup.notify_one();
-        assert_eq!(task.await.unwrap(), WaitOutcome::Requery);
+        assert_eq!(task.await.unwrap(), LoopControl::Continue);
     }
 
     #[tokio::test(start_paused = true)]
@@ -694,6 +648,6 @@ mod tests {
 
         tokio::task::yield_now().await;
         cancellation.cancel();
-        assert_eq!(task.await.unwrap(), WaitOutcome::Cancelled);
+        assert_eq!(task.await.unwrap(), LoopControl::Stop);
     }
 }

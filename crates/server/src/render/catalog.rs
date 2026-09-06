@@ -8,8 +8,6 @@ use markdown_compiler::{
 use serde::Serialize;
 use thiserror::Error;
 
-#[cfg(test)]
-use super::GeneratedPostAsset;
 use super::{
     MarkdownRenderError, RenderedPost,
     diagram::{DiagramRenderError, MermaidDiagramRenderer},
@@ -98,16 +96,9 @@ fn compile_content_catalog_with(
             rendered: Arc::new(rendered),
             local_assets: Arc::clone(&local_assets),
         };
-        if revisions.insert(key.clone(), revision).is_some() {
-            return Err(CatalogBuildError::duplicate(key));
-        }
+        // The unique current post ID also makes this (post, revision) key unique.
+        revisions.insert(key, revision);
     }
-    validate_catalog_generated_assets(
-        &local_assets,
-        revisions
-            .values()
-            .map(|revision| revision.rendered.as_ref()),
-    )?;
 
     Ok(ContentCatalog {
         publication: content.publication.clone(),
@@ -132,11 +123,6 @@ pub struct ContentCatalog {
 struct CatalogRevision {
     rendered: Arc<RenderedPost>,
     local_assets: Arc<ResolvedLocalAssetStore>,
-}
-
-pub(crate) enum PreviewAsset {
-    Authored(Arc<[u8]>),
-    RendererGenerated(Arc<[u8]>),
 }
 
 impl ContentCatalog {
@@ -174,7 +160,7 @@ impl ContentCatalog {
     pub(crate) fn current_preview_asset(
         &self,
         path: &LogicalAssetPath,
-    ) -> Result<Option<PreviewAsset>, ResolvedLocalAssetLookupError> {
+    ) -> Result<Option<Arc<[u8]>>, ResolvedLocalAssetLookupError> {
         let authored = self
             .site_assets
             .favicon
@@ -190,16 +176,11 @@ impl ContentCatalog {
                 AssetRevisionReference::Local(asset) if &asset.path == path => Some(asset),
                 AssetRevisionReference::Local(_) | AssetRevisionReference::External(_) => None,
             });
-        if let Some(reference) = authored {
-            let resolved = self.local_assets.resolve(reference)?;
-            return Ok(Some(PreviewAsset::Authored(Arc::clone(&resolved.bytes))));
-        }
-
-        Ok(self
-            .rendered_posts()
-            .flat_map(|post| post.generated_assets.iter())
-            .find(|generated| &generated.asset.path == path)
-            .map(|generated| PreviewAsset::RendererGenerated(Arc::clone(&generated.bytes))))
+        let Some(reference) = authored else {
+            return Ok(None);
+        };
+        let resolved = self.local_assets.resolve(reference)?;
+        Ok(Some(Arc::clone(&resolved.bytes)))
     }
 
     /// Atomically retains an explicit set of exact historical revision inputs.
@@ -244,7 +225,6 @@ pub enum CatalogBuildErrorCode {
     PublicationAssetsUnavailable,
     PostAssetsUnavailable,
     PostRenderFailed,
-    GeneratedAssetCollision,
     DuplicateRevision,
 }
 
@@ -309,66 +289,6 @@ impl CatalogBuildError {
             .into_boxed_str(),
         }
     }
-
-    fn generated_asset_collision(path: LogicalContentPath, asset: &str) -> Self {
-        Self {
-            path,
-            code: CatalogBuildErrorCode::GeneratedAssetCollision,
-            message: format!(
-                "generated asset path duplicates or ASCII-case-collides with another asset: {asset}"
-            )
-            .into_boxed_str(),
-        }
-    }
-}
-
-fn validate_catalog_generated_assets<'post>(
-    local_assets: &ResolvedLocalAssetStore,
-    rendered_posts: impl Iterator<Item = &'post RenderedPost>,
-) -> Result<(), CatalogBuildError> {
-    let mut paths = BTreeMap::new();
-    for path in local_assets {
-        paths.insert(path.as_str().to_ascii_lowercase(), path.as_str().to_owned());
-    }
-    for rendered in rendered_posts {
-        for generated in &*rendered.generated_assets {
-            let path = generated.asset.path.as_str();
-            if paths
-                .insert(path.to_ascii_lowercase(), path.to_owned())
-                .is_some()
-            {
-                return Err(CatalogBuildError::generated_asset_collision(
-                    rendered.document.path.clone(),
-                    path,
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn validate_generated_path_sets<'asset, 'path>(
-    authored: impl Iterator<Item = &'asset LogicalAssetPath>,
-    generated: impl Iterator<Item = (&'path LogicalContentPath, &'asset GeneratedPostAsset)>,
-) -> Result<(), CatalogBuildError> {
-    let mut paths = BTreeMap::new();
-    for path in authored {
-        paths.insert(path.as_str().to_ascii_lowercase(), path.as_str().to_owned());
-    }
-    for (post_path, asset) in generated {
-        let path = asset.asset.path.as_str();
-        if paths
-            .insert(path.to_ascii_lowercase(), path.to_owned())
-            .is_some()
-        {
-            return Err(CatalogBuildError::generated_asset_collision(
-                post_path.clone(),
-                path,
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -701,68 +621,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_paths_cannot_collide_with_authored_or_other_generated_assets() {
-        let authored = LogicalAssetPath::parse("assets/diagram.svg").unwrap();
-        let first_path = LogicalContentPath::new("posts/first.md");
-        let second_path = LogicalContentPath::new("posts/second.md");
-        let authored_collision = GeneratedPostAsset::from_owned_bytes(
-            LogicalAssetPath::parse("assets/DIAGRAM.svg").unwrap(),
-            Arc::from(&b"generated"[..]),
-        );
-        let error = validate_generated_path_sets(
-            std::iter::once(&authored),
-            std::iter::once((&first_path, &authored_collision)),
-        )
-        .unwrap_err();
-        assert_eq!(error.code, CatalogBuildErrorCode::GeneratedAssetCollision);
-
-        let first = GeneratedPostAsset::from_owned_bytes(
-            LogicalAssetPath::parse("assets/generated.svg").unwrap(),
-            Arc::from(&b"first"[..]),
-        );
-        let second = GeneratedPostAsset::from_owned_bytes(
-            LogicalAssetPath::parse("assets/GENERATED.svg").unwrap(),
-            Arc::from(&b"second"[..]),
-        );
-        let error = validate_generated_path_sets(
-            std::iter::empty(),
-            [(&first_path, &first), (&second_path, &second)].into_iter(),
-        )
-        .unwrap_err();
-        assert_eq!(error.code, CatalogBuildErrorCode::GeneratedAssetCollision);
-    }
-
-    #[test]
-    fn preview_asset_lookup_uses_current_authored_and_generated_bytes_only() {
-        let mut catalog = compile_tree(tree("Catalog", &[], false));
+    fn preview_asset_lookup_returns_only_referenced_authored_bytes() {
+        let catalog = compile_tree(tree("Catalog", &[], false));
         let authored = LogicalAssetPath::parse("assets/cover.png").unwrap();
-        let PreviewAsset::Authored(bytes) = catalog
+        let bytes = catalog
             .current_preview_asset(&authored)
             .unwrap()
-            .expect("referenced authored asset must resolve")
-        else {
-            panic!("authored asset must retain authored provenance")
-        };
+            .expect("referenced authored asset must resolve");
         assert_eq!(bytes.as_ref(), b"cover");
-
-        let generated_path = LogicalAssetPath::parse("assets/generated.svg").unwrap();
-        let generated = GeneratedPostAsset::from_owned_bytes(
-            generated_path.clone(),
-            Arc::from(&b"generated preview"[..]),
-        );
-        let current_key = catalog.current_revisions.first_key_value().unwrap();
-        let current_key = (current_key.0.clone(), current_key.1.clone());
-        Arc::make_mut(&mut catalog.revisions.get_mut(&current_key).unwrap().rendered)
-            .generated_assets = Arc::from([generated]);
-
-        let PreviewAsset::RendererGenerated(bytes) = catalog
-            .current_preview_asset(&generated_path)
-            .unwrap()
-            .expect("current renderer asset must resolve")
-        else {
-            panic!("renderer asset must retain generated provenance")
-        };
-        assert_eq!(bytes.as_ref(), b"generated preview");
         assert!(
             catalog
                 .current_preview_asset(&LogicalAssetPath::parse("assets/not-present.png").unwrap())
@@ -828,10 +694,6 @@ mod tests {
             (
                 CatalogBuildErrorCode::PostRenderFailed,
                 "post_render_failed",
-            ),
-            (
-                CatalogBuildErrorCode::GeneratedAssetCollision,
-                "generated_asset_collision",
             ),
             (
                 CatalogBuildErrorCode::DuplicateRevision,

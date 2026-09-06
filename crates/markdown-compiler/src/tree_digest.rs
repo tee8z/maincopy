@@ -1,9 +1,10 @@
 use std::{fmt, str::FromStr};
 
-use blake3::Hasher;
 use thiserror::Error;
 
-use super::{DiscoveredAsset, DiscoveredContentTree, DiscoveredPost, PostCollection};
+use super::{
+    DiscoveredAsset, DiscoveredContentTree, DiscoveredPost, PostCollection, transcript::Transcript,
+};
 
 const CONTENT_TREE_CONTEXT: &str = "maincopy content tree digest v1";
 const CONTENT_TREE_KIND: &[u8] = b"maincopy-content-tree";
@@ -13,8 +14,9 @@ const CONTENT_TREE_PREFIX: &str = "content-b3-v1-";
 const PUBLICATION_SECTION: u8 = 0;
 const POSTS_SECTION: u8 = 1;
 const ASSETS_SECTION: u8 = 2;
-const POSTS_COLLECTION: u8 = 0;
-const DRAFTS_COLLECTION: u8 = 1;
+// The v1 tree digest and candidate archive share these collection tags.
+pub(super) const POSTS_COLLECTION: u8 = 0;
+pub(super) const DRAFTS_COLLECTION: u8 = 1;
 
 /// Versioned identity of the exact managed inputs in one discovered content tree.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -86,7 +88,11 @@ const fn decode_nibble(byte: u8) -> Option<u8> {
 impl DiscoveredContentTree {
     /// Computes a deterministic token for the exact managed tree already in memory.
     pub fn digest(&self) -> ContentTreeDigest {
-        let mut transcript = ContentTreeTranscript::new();
+        let mut transcript = Transcript::new(
+            CONTENT_TREE_CONTEXT,
+            CONTENT_TREE_KIND,
+            CONTENT_TREE_VERSION,
+        );
 
         transcript.tag(PUBLICATION_SECTION);
         transcript.string(self.publication.path.as_str());
@@ -115,55 +121,27 @@ impl DiscoveredContentTree {
     }
 }
 
-fn compare_posts(left: &&DiscoveredPost, right: &&DiscoveredPost) -> std::cmp::Ordering {
+// Archives use the same canonical order as the tree identity they retain.
+pub(super) fn compare_posts(left: &&DiscoveredPost, right: &&DiscoveredPost) -> std::cmp::Ordering {
     left.path
         .cmp(&right.path)
         .then_with(|| collection_tag(left.collection).cmp(&collection_tag(right.collection)))
         .then_with(|| left.source.cmp(&right.source))
 }
 
-fn compare_assets(left: &&DiscoveredAsset, right: &&DiscoveredAsset) -> std::cmp::Ordering {
+pub(super) fn compare_assets(
+    left: &&DiscoveredAsset,
+    right: &&DiscoveredAsset,
+) -> std::cmp::Ordering {
     left.path
         .cmp(&right.path)
         .then_with(|| left.bytes.as_ref().cmp(right.bytes.as_ref()))
 }
 
-const fn collection_tag(collection: PostCollection) -> u8 {
+pub(super) const fn collection_tag(collection: PostCollection) -> u8 {
     match collection {
         PostCollection::Posts => POSTS_COLLECTION,
         PostCollection::Drafts => DRAFTS_COLLECTION,
-    }
-}
-
-struct ContentTreeTranscript(Hasher);
-
-impl ContentTreeTranscript {
-    fn new() -> Self {
-        let mut transcript = Self(Hasher::new_derive_key(CONTENT_TREE_CONTEXT));
-        transcript.bytes(CONTENT_TREE_KIND);
-        transcript.0.update(&CONTENT_TREE_VERSION.to_be_bytes());
-        transcript
-    }
-
-    fn finish(self) -> blake3::Hash {
-        self.0.finalize()
-    }
-
-    fn bytes(&mut self, bytes: &[u8]) {
-        self.0.update(&(bytes.len() as u64).to_be_bytes());
-        self.0.update(bytes);
-    }
-
-    fn string(&mut self, value: &str) {
-        self.bytes(value.as_bytes());
-    }
-
-    fn sequence_len(&mut self, length: usize) {
-        self.0.update(&(length as u64).to_be_bytes());
-    }
-
-    fn tag(&mut self, tag: u8) {
-        self.0.update(&[tag]);
     }
 }
 
@@ -207,6 +185,10 @@ mod tests {
     #[test]
     fn identical_logical_trees_have_one_order_independent_digest() {
         let first = fixture();
+        assert_eq!(
+            first.digest().to_string(),
+            "content-b3-v1-09af660c29bbee4fc3011605979181aac9b6733a37a275ddc3e5f222030186af"
+        );
         let mut reordered = first.clone();
         reordered.posts.reverse();
         reordered.assets.reverse();

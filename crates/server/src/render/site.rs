@@ -34,7 +34,7 @@ use super::metadata::{
 use super::robots::{RenderedRobots, RobotsRenderError, render_robots};
 use super::rss::{RenderedRssFeed, RssItem, RssRenderError, render_rss};
 use super::sitemap::{RenderedSitemap, SitemapRenderError, render_sitemap};
-use super::{ContentCatalog, GeneratedPostAsset, RenderedPost, SnapshotAssetPath};
+use super::{ContentCatalog, RenderedPost, SnapshotAssetPath};
 
 const MAX_PAGE_BYTES: usize = 40 * 1024 * 1024;
 const MAX_RETAINED_HTML_BYTES: usize = 512 * 1024 * 1024;
@@ -941,12 +941,7 @@ fn collect_public_assets(
                     "the selected post revision is unavailable while collecting assets",
                 )
             })?;
-        collect_selected_post_assets(
-            &mut selected,
-            &rendered.assets,
-            &rendered.generated_assets,
-            local_assets,
-        )?;
+        collect_selected_post_assets(&mut selected, &rendered.assets, local_assets)?;
     }
 
     materialize_public_assets(selected, digest)
@@ -971,7 +966,6 @@ fn collect_site_global_assets(
 fn collect_selected_post_assets(
     selected: &mut SelectedAssets,
     assets: &ResolvedPostAssets,
-    generated_assets: &[GeneratedPostAsset],
     store: &ResolvedLocalAssetStore,
 ) -> Result<(), SiteSnapshotBuildError> {
     if let Some(AssetRevisionReference::Local(asset)) = &assets.image {
@@ -981,13 +975,6 @@ fn collect_selected_post_assets(
         if let AssetRevisionReference::Local(asset) = reference {
             insert_authored_asset(selected, asset, store)?;
         }
-    }
-    for generated in generated_assets {
-        selected.insert(
-            generated.asset.clone(),
-            Arc::clone(&generated.bytes),
-            SelectedAssetProvenance::UntrustedRendererOutput,
-        )?;
     }
     Ok(())
 }
@@ -1002,7 +989,7 @@ fn materialize_public_assets(
         .by_path
         .into_values()
         .map(|selected| {
-            let delivery = selected.provenance.delivery(&selected.asset.path);
+            let delivery = AssetDelivery::for_authored(&selected.asset.path);
             let path = SnapshotAssetPath::new(digest, &selected.asset.path).map_err(|error| {
                 SiteSnapshotBuildError::new(
                     SiteSnapshotBuildErrorCode::AssetUnavailable,
@@ -1023,7 +1010,6 @@ fn materialize_public_assets(
 struct SelectedAsset {
     asset: DigestedAsset,
     bytes: Arc<[u8]>,
-    provenance: SelectedAssetProvenance,
 }
 
 struct SelectedAssets {
@@ -1043,10 +1029,9 @@ impl SelectedAssets {
         &mut self,
         asset: DigestedAsset,
         bytes: Arc<[u8]>,
-        provenance: SelectedAssetProvenance,
     ) -> Result<(), SiteSnapshotBuildError> {
         if let Some(existing) = self.by_path.get(&asset.path) {
-            if existing.asset == asset && existing.provenance == provenance {
+            if existing.asset == asset {
                 return Ok(());
             }
             return Err(SiteSnapshotBuildError::new(
@@ -1058,14 +1043,8 @@ impl SelectedAssets {
 
         let retained_bytes =
             next_public_asset_bytes(self.by_path.len(), self.retained_bytes, bytes.len())?;
-        self.by_path.insert(
-            asset.path.clone(),
-            SelectedAsset {
-                asset,
-                bytes,
-                provenance,
-            },
-        );
+        self.by_path
+            .insert(asset.path.clone(), SelectedAsset { asset, bytes });
         self.retained_bytes = retained_bytes;
         Ok(())
     }
@@ -1091,21 +1070,6 @@ fn next_public_asset_bytes(
     Ok(next_bytes)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SelectedAssetProvenance {
-    Authored,
-    UntrustedRendererOutput,
-}
-
-impl SelectedAssetProvenance {
-    fn delivery(self, path: &LogicalAssetPath) -> AssetDelivery {
-        match self {
-            Self::Authored => AssetDelivery::for_authored(path),
-            Self::UntrustedRendererOutput => AssetDelivery::for_untrusted_generated(),
-        }
-    }
-}
-
 fn insert_authored_asset(
     selected: &mut SelectedAssets,
     asset: &DigestedAsset,
@@ -1118,11 +1082,7 @@ fn insert_authored_asset(
             error.to_string(),
         )
     })?;
-    selected.insert(
-        asset.clone(),
-        Arc::clone(&resolved.bytes),
-        SelectedAssetProvenance::Authored,
-    )
+    selected.insert(asset.clone(), Arc::clone(&resolved.bytes))
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3098,21 +3058,12 @@ mod tests {
             Some(AssetRevisionReference::local(first_cover)),
             vec![AssetRevisionReference::local(shared_reference)],
         );
-        let generated = GeneratedPostAsset::from_owned_bytes(
-            LogicalAssetPath::parse("assets/generated.png").unwrap(),
-            Arc::from(&b"generated"[..]),
-        );
-        collect_selected_post_assets(
-            &mut selected,
-            &post_assets,
-            std::slice::from_ref(&generated),
-            &fixture.catalog.local_assets,
-        )
-        .unwrap();
+        collect_selected_post_assets(&mut selected, &post_assets, &fixture.catalog.local_assets)
+            .unwrap();
 
         assert_eq!(
             selected.by_path.len(),
-            4,
+            3,
             "the repeated post reference must dedupe"
         );
         let digest = SiteSnapshotDigest::parse(&format!("site-b3-v1-{}", "44".repeat(32))).unwrap();
@@ -3120,7 +3071,6 @@ mod tests {
         let paths: Vec<_> = [
             "assets/favicon.png",
             "assets/first-cover.png",
-            "assets/generated.png",
             "assets/public.png",
         ]
         .map(|path| {
@@ -3140,16 +3090,6 @@ mod tests {
         );
         assert_eq!(authored_png.delivery.content_type(), "image/png");
         assert!(matches!(authored_png.delivery, AssetDelivery::Inline(_)));
-        let generated_path = SnapshotAssetPath::new(&digest, &generated.asset.path).unwrap();
-        let generated_png = public.get(&generated_path).unwrap();
-        assert_eq!(generated_png.digest, generated.asset.digest);
-        assert_eq!(generated_png.bytes, generated.bytes);
-        assert_eq!(
-            generated_png.delivery.content_type(),
-            "application/octet-stream"
-        );
-        assert_eq!(generated_png.delivery, AssetDelivery::Attachment);
-
         let missing = DigestedAsset::new(
             LogicalAssetPath::parse("assets/missing.png").unwrap(),
             digest_asset(b"missing"),
@@ -3174,29 +3114,10 @@ mod tests {
         assert!(error.message.contains("does not match"));
 
         let mut collision = SelectedAssets::new();
-        collision
-            .insert(
-                generated.asset.clone(),
-                Arc::clone(&generated.bytes),
-                SelectedAssetProvenance::UntrustedRendererOutput,
-            )
-            .unwrap();
+        insert_authored_asset(&mut collision, &favicon, &fixture.catalog.local_assets).unwrap();
+        let conflicting = DigestedAsset::new(favicon.path.clone(), digest_asset(b"conflicting"));
         let error = collision
-            .insert(
-                generated.asset.clone(),
-                Arc::clone(&generated.bytes),
-                SelectedAssetProvenance::Authored,
-            )
-            .unwrap_err();
-        assert_eq!(error.code, SiteSnapshotBuildErrorCode::AssetCollision);
-        let conflicting =
-            DigestedAsset::new(generated.asset.path.clone(), digest_asset(b"conflicting"));
-        let error = collision
-            .insert(
-                conflicting,
-                Arc::from(&b"conflicting"[..]),
-                SelectedAssetProvenance::UntrustedRendererOutput,
-            )
+            .insert(conflicting, Arc::from(&b"conflicting"[..]))
             .unwrap_err();
         assert_eq!(error.code, SiteSnapshotBuildErrorCode::AssetCollision);
     }

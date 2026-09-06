@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Write},
@@ -14,6 +13,9 @@ use super::{
     ContentTreeDigest, ContentTreeLimits, DiscoveredAsset, DiscoveredContentTree, DiscoveredPost,
     DiscoveredPublication, LogicalAssetPath, LogicalContentPath, PostCollection,
     tree::PortableLogicalPath,
+    tree_digest::{
+        DRAFTS_COLLECTION, POSTS_COLLECTION, collection_tag, compare_assets, compare_posts,
+    },
 };
 
 const STORE_DIRECTORY: &str = "content-candidates";
@@ -31,9 +33,6 @@ const PUBLICATION_RECORD_OVERHEAD: u64 = 4 + 8;
 const POST_RECORD_OVERHEAD: u64 = 1 + 4 + 8;
 const ASSET_RECORD_OVERHEAD: u64 = 4 + 8;
 const SEQUENCE_LENGTH_BYTES: u64 = 4;
-
-const POSTS_COLLECTION: u8 = 0;
-const DRAFTS_COLLECTION: u8 = 1;
 
 fn prepare_private_directory(path: &Path) -> io::Result<()> {
     reject_symlink_components(path)?;
@@ -893,26 +892,6 @@ fn maximum_archive_bytes(limits: ContentTreeLimits) -> u128 {
         + u128::from(PUBLICATION_RECORD_OVERHEAD)
         + entries * (path_bytes + u128::from(POST_RECORD_OVERHEAD.max(ASSET_RECORD_OVERHEAD)))
         + u128::from(limits.total_tree_bytes.get())
-}
-
-fn compare_posts(left: &&DiscoveredPost, right: &&DiscoveredPost) -> Ordering {
-    left.path
-        .cmp(&right.path)
-        .then_with(|| collection_tag(left.collection).cmp(&collection_tag(right.collection)))
-        .then_with(|| left.source.cmp(&right.source))
-}
-
-fn compare_assets(left: &&DiscoveredAsset, right: &&DiscoveredAsset) -> Ordering {
-    left.path
-        .cmp(&right.path)
-        .then_with(|| left.bytes.as_ref().cmp(right.bytes.as_ref()))
-}
-
-const fn collection_tag(collection: PostCollection) -> u8 {
-    match collection {
-        PostCollection::Posts => POSTS_COLLECTION,
-        PostCollection::Drafts => DRAFTS_COLLECTION,
-    }
 }
 
 fn parse_collection(tag: u8) -> Result<PostCollection, ContentCandidateStoreError> {

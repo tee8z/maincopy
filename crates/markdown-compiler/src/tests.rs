@@ -789,6 +789,34 @@ fn duplicate_id_and_route_checks_use_partial_candidates() {
 }
 
 #[test]
+fn every_duplicate_post_id_refers_to_the_first_logical_path() {
+    let errors = validate(
+        MINIMAL_PUBLICATION,
+        &[
+            ("posts/z.md", MINIMAL_POST),
+            ("posts/a.md", MINIMAL_POST),
+            ("posts/m.md", MINIMAL_POST),
+        ],
+    )
+    .unwrap_err();
+    let duplicates = errors
+        .errors()
+        .iter()
+        .filter(|error| error.code == ContentValidationCode::DuplicatePostId)
+        .map(|error| {
+            (
+                error.path.as_str(),
+                error.related.as_ref().unwrap().path.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        duplicates,
+        [("posts/m.md", "posts/a.md"), ("posts/z.md", "posts/a.md")]
+    );
+}
+
+#[test]
 fn aliases_share_one_global_route_namespace() {
     let first = post(
         "11111111-1111-4111-8111-111111111111",

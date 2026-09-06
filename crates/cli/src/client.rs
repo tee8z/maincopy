@@ -30,6 +30,7 @@ use reqwest::{
         SET_COOKIE,
     },
 };
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -152,10 +153,8 @@ impl AdminClient {
 
     /// Fetches the versions advertised by the running server.
     pub(crate) async fn capabilities(&self) -> Result<Capabilities, AdminClientError> {
-        let response = self
-            .authenticated_request(Method::GET, CAPABILITIES_PATH, Vec::new(), None)
-            .await?;
-        decode_status_json(response, StatusCode::OK)
+        self.get_json(self.origin.request_url(CAPABILITIES_PATH)?)
+            .await
     }
 
     /// Lists one bounded page of post revisions loaded by the running server.
@@ -165,18 +164,12 @@ impl AdminClient {
         limit: u16,
     ) -> Result<ListPostsResponse, AdminClientError> {
         let url = posts_page_url(&self.origin, cursor, limit)?;
-        let response = self
-            .authenticated_request_url(Method::GET, url, Vec::new(), None)
-            .await?;
-        decode_status_json(response, StatusCode::OK)
+        self.get_json(url).await
     }
 
     /// Reports the configured source mode and its non-secret runtime state.
     pub(crate) async fn source_status(&self) -> Result<SourceStatusResponse, AdminClientError> {
-        let response = self
-            .authenticated_request(Method::GET, SOURCE_PATH, Vec::new(), None)
-            .await?;
-        decode_status_json(response, StatusCode::OK)
+        self.get_json(self.origin.request_url(SOURCE_PATH)?).await
     }
 
     pub(crate) async fn profile(&self) -> Result<Option<UserProfileResponse>, AdminClientError> {
@@ -191,13 +184,12 @@ impl AdminClient {
         operation_id: Uuid,
         request: &UpdateUserProfileRequest,
     ) -> Result<UserProfileResponse, AdminClientError> {
-        let body = serde_json::to_vec(request).map_err(AdminClientError::RequestEncoding)?;
         let response = self
-            .authenticated_request(
+            .json_mutation(
                 Method::PUT,
                 CURRENT_USER_PROFILE_PATH,
-                body,
-                Some(operation_id),
+                request,
+                operation_id,
             )
             .await?;
         decode_profile_change(response, request)
@@ -206,10 +198,8 @@ impl AdminClient {
     pub(crate) async fn tip_recipient(
         &self,
     ) -> Result<ActiveTipRecipientResponse, AdminClientError> {
-        let response = self
-            .authenticated_request(Method::GET, ACTIVE_TIP_RECIPIENT_PATH, Vec::new(), None)
-            .await?;
-        decode_status_json(response, StatusCode::OK)
+        self.get_json(self.origin.request_url(ACTIVE_TIP_RECIPIENT_PATH)?)
+            .await
     }
 
     pub(crate) async fn set_tip_recipient(
@@ -217,13 +207,12 @@ impl AdminClient {
         operation_id: Uuid,
         request: &PutActiveTipRecipientRequest,
     ) -> Result<ActiveTipRecipientResponse, AdminClientError> {
-        let body = serde_json::to_vec(request).map_err(AdminClientError::RequestEncoding)?;
         let response = self
-            .authenticated_request(
+            .json_mutation(
                 Method::PUT,
                 ACTIVE_TIP_RECIPIENT_PATH,
-                body,
-                Some(operation_id),
+                request,
+                operation_id,
             )
             .await?;
         decode_recipient_change(response, request)
@@ -251,10 +240,7 @@ impl AdminClient {
         source_sync_id: SourceSyncId,
     ) -> Result<SourceSyncResource, AdminClientError> {
         let url = source_sync_url(&self.origin, source_sync_id)?;
-        let response = self
-            .authenticated_request_url(Method::GET, url, Vec::new(), None)
-            .await?;
-        decode_status_json(response, StatusCode::OK)
+        self.get_json(url).await
     }
 
     /// Fetches one exact private preview and its server-authenticated metadata.
@@ -282,40 +268,27 @@ impl AdminClient {
         cursor: Option<Uuid>,
     ) -> Result<ListReleasesResponse, AdminClientError> {
         let url = releases_page_url(&self.origin, cursor)?;
-        let response = self
-            .authenticated_request_url(Method::GET, url, Vec::new(), None)
-            .await?;
-        decode_status_json(response, StatusCode::OK)
+        self.get_json(url).await
     }
 
     pub(crate) async fn release(
         &self,
         publication_id: Uuid,
     ) -> Result<ReleaseResource, AdminClientError> {
-        let response = self
-            .authenticated_request(
-                Method::GET,
-                &format!("{RELEASES_PATH}/{publication_id}"),
-                Vec::new(),
-                None,
-            )
-            .await?;
-        decode_status_json(response, StatusCode::OK)
+        let url = self
+            .origin
+            .request_url(&format!("{RELEASES_PATH}/{publication_id}"))?;
+        self.get_json(url).await
     }
 
     pub(crate) async fn release_operation(
         &self,
         operation_id: Uuid,
     ) -> Result<ReleaseOperationResource, AdminClientError> {
-        let response = self
-            .authenticated_request(
-                Method::GET,
-                &format!("{RELEASE_OPERATIONS_PATH}/{operation_id}"),
-                Vec::new(),
-                None,
-            )
-            .await?;
-        decode_status_json(response, StatusCode::OK)
+        let url = self
+            .origin
+            .request_url(&format!("{RELEASE_OPERATIONS_PATH}/{operation_id}"))?;
+        self.get_json(url).await
     }
 
     pub(crate) async fn change_release(
@@ -324,13 +297,12 @@ impl AdminClient {
         operation_id: Uuid,
         request: &ChangeReleaseRequest,
     ) -> Result<ReleaseOperationResource, AdminClientError> {
-        let body = serde_json::to_vec(request).map_err(AdminClientError::RequestEncoding)?;
         let response = self
-            .authenticated_request(
+            .json_mutation(
                 Method::POST,
                 &format!("{RELEASES_PATH}/{publication_id}"),
-                body,
-                Some(operation_id),
+                request,
+                operation_id,
             )
             .await?;
         decode_release_change_response(response, publication_id, operation_id, request)
@@ -342,9 +314,8 @@ impl AdminClient {
         idempotency_key: Uuid,
         request: &PublishNowRequest,
     ) -> Result<PublishNowResponse, AdminClientError> {
-        let body = serde_json::to_vec(request).map_err(AdminClientError::RequestEncoding)?;
         let response = self
-            .authenticated_request(Method::POST, PUBLICATIONS_PATH, body, Some(idempotency_key))
+            .json_mutation(Method::POST, PUBLICATIONS_PATH, request, idempotency_key)
             .await?;
         decode_publication_http_response(response, &request.preview_digest)
     }
@@ -408,6 +379,25 @@ impl AdminClient {
         self.credentials
             .delete(&CredentialKey::agent(self.origin.as_str()))?;
         Ok(())
+    }
+
+    async fn get_json<Value: DeserializeOwned>(&self, url: Url) -> Result<Value, AdminClientError> {
+        let response = self
+            .authenticated_request_url(Method::GET, url, Vec::new(), None)
+            .await?;
+        decode_status_json(response, StatusCode::OK)
+    }
+
+    async fn json_mutation<Value: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        request: &Value,
+        idempotency_key: Uuid,
+    ) -> Result<HttpResponse, AdminClientError> {
+        let body = serde_json::to_vec(request).map_err(AdminClientError::RequestEncoding)?;
+        self.authenticated_request(method, path, body, Some(idempotency_key))
+            .await
     }
 
     async fn authenticated_request(
@@ -1009,7 +999,7 @@ fn require_status(
 
 fn decode_json<Value>(response: &HttpResponse) -> Result<Value, AdminClientError>
 where
-    Value: serde::de::DeserializeOwned,
+    Value: DeserializeOwned,
 {
     require_content_type(&response.headers, "application/json")?;
     serde_json::from_slice(&response.body).map_err(AdminClientError::InvalidResponse)
@@ -1074,7 +1064,7 @@ fn decode_status_json<Value>(
     expected: StatusCode,
 ) -> Result<Value, AdminClientError>
 where
-    Value: serde::de::DeserializeOwned,
+    Value: DeserializeOwned,
 {
     decode_json(&require_status(response, expected)?)
 }

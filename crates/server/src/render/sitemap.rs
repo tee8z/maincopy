@@ -1,4 +1,4 @@
-use std::{fmt, io, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use quick_xml::{
     Writer,
@@ -7,6 +7,8 @@ use quick_xml::{
 use thiserror::Error;
 
 use crate::domain::publication::CanonicalSiteUrl;
+
+use super::xml::{BoundedOutput, is_xml_1_0_character};
 
 const MAX_SITEMAP_URLS: usize = 50_000;
 const MAX_SITEMAP_LOCATION_CHARACTERS: usize = 2_048;
@@ -141,16 +143,6 @@ fn validate_location(value: &str, url: &CanonicalSiteUrl) -> Result<(), SitemapR
     Ok(())
 }
 
-const fn is_xml_1_0_character(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}' | '\u{000A}' | '\u{000D}'
-            | '\u{0020}'..='\u{D7FF}'
-            | '\u{E000}'..='\u{FFFD}'
-            | '\u{10000}'..='\u{10FFFF}'
-    )
-}
-
 fn write_url(
     writer: &mut Writer<BoundedOutput>,
     url: &CanonicalSiteUrl,
@@ -180,46 +172,8 @@ fn sitemap_digest(bytes: &[u8]) -> SitemapDigest {
     SitemapDigest(*hasher.finalize().as_bytes())
 }
 
-struct BoundedOutput {
-    bytes: Vec<u8>,
-    max_bytes: usize,
-}
-
-impl BoundedOutput {
-    const fn new(max_bytes: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            max_bytes,
-        }
-    }
-
-    fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-}
-
-impl io::Write for BoundedOutput {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if self
-            .bytes
-            .len()
-            .checked_add(buffer.len())
-            .is_none_or(|length| length > self.max_bytes)
-        {
-            return Err(io::Error::other("sitemap output limit reached"));
-        }
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
 
     use markdown_compiler::{PostSlug, PublicationBaseUrl};
     use quick_xml::{Reader, escape::unescape, events::Event};
@@ -420,18 +374,8 @@ mod tests {
     }
 
     #[test]
-    fn bounded_output_accepts_its_inclusive_limit_and_rejects_the_next_byte() {
-        assert_eq!(MAX_SITEMAP_BYTES, 40 * 1024 * 1024);
-        let mut output = BoundedOutput::new(4);
-
-        output.write_all(b"1234").unwrap();
-        assert_eq!(output.bytes, b"1234");
-        assert!(output.write_all(b"5").is_err());
-        assert_eq!(output.bytes, b"1234");
-    }
-
-    #[test]
     fn renderer_maps_the_exact_output_boundary_to_a_typed_error() {
+        assert_eq!(MAX_SITEMAP_BYTES, 40 * 1024 * 1024);
         let url = post_url("output-boundary");
         let baseline = render_sitemap(std::slice::from_ref(&url)).unwrap();
         let exact =

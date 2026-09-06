@@ -6,13 +6,9 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION, request::Parts},
     response::{IntoResponse as _, Response},
 };
-use maincopy_shared::{
-    auth::AdminAuditEventId,
-    publication::IDEMPOTENCY_KEY_HEADER,
-    source::{
-        BeginSourceSyncResponse, ListSourceSyncsResponse, SourceStatusResponse, SourceSyncId,
-        SourceSyncResource,
-    },
+use maincopy_shared::source::{
+    BeginSourceSyncResponse, ListSourceSyncsResponse, SourceStatusResponse, SourceSyncId,
+    SourceSyncResource,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
@@ -24,13 +20,14 @@ use uuid::Uuid;
 
 use crate::{
     admin::{
-        principal::{AdminAuthentication, AdminPrincipal},
+        idempotency::{IdempotencyKeyError, parse_idempotency_key},
+        principal::AdminPrincipal,
         problem::{AdminProblem, AdminProblemEnvelope, problem_response},
         request_id::RequestId,
     },
     database::store::{DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError},
     domain::{
-        auth::store::{AdminMutationKey, AuditPrincipalReference, MutationAuditContext},
+        auth::store::{AdminMutationKey, MutationAuditContext},
         source::store::SourceLoadError,
     },
     source_sync::{SourceControlError, SourceSyncHandle, accepted_status},
@@ -199,7 +196,7 @@ where
         Ok(Self {
             request_id,
             handle,
-            audit: mutation_audit(&principal, request_id, idempotency_key),
+            audit: principal.mutation_audit(request_id, idempotency_key),
         })
     }
 }
@@ -378,19 +375,15 @@ fn source_sync_json_rejection(status: StatusCode, request_id: RequestId) -> Resp
 }
 
 fn source_sync_idempotency_key(headers: &HeaderMap) -> Result<AdminMutationKey, AdminProblem> {
-    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
-    let Some(value) = values.next() else {
-        return Err(AdminProblem::bad_request(
-            "missing_idempotency_key",
-            "Idempotency-Key is required for source synchronization requests",
-        ));
-    };
-    if values.next().is_some() {
-        return Err(invalid_idempotency_key());
-    }
-    let encoded = value.to_str().map_err(|_| invalid_idempotency_key())?;
-    let key = canonical_uuid(encoded).ok_or_else(invalid_idempotency_key)?;
-    Ok(AdminMutationKey(key))
+    parse_idempotency_key(headers)
+        .map(AdminMutationKey)
+        .map_err(|error| match error {
+            IdempotencyKeyError::Missing => AdminProblem::bad_request(
+                "missing_idempotency_key",
+                "Idempotency-Key is required for source synchronization requests",
+            ),
+            IdempotencyKeyError::Invalid => invalid_idempotency_key(),
+        })
 }
 
 fn canonical_uuid(encoded: &str) -> Option<Uuid> {
@@ -413,33 +406,6 @@ fn invalid_sync_id(request_id: RequestId) -> Response {
         ),
         request_id,
     )
-}
-
-fn mutation_audit(
-    principal: &AdminPrincipal,
-    request_id: RequestId,
-    idempotency_key: AdminMutationKey,
-) -> MutationAuditContext {
-    let principal = match principal.authentication {
-        AdminAuthentication::BrowserSession { session_id } => {
-            AuditPrincipalReference::BrowserSession {
-                user_id: principal.user_id,
-                session_id,
-            }
-        }
-        AdminAuthentication::AgentCredential { credential_id } => {
-            AuditPrincipalReference::AgentCredential {
-                user_id: principal.user_id,
-                credential_id,
-            }
-        }
-    };
-    MutationAuditContext {
-        audit_event_id: AdminAuditEventId::from_uuid(Uuid::new_v4()),
-        principal,
-        request_id: Some(request_id.0),
-        idempotency_key,
-    }
 }
 
 fn source_control_problem(error: SourceControlError, request_id: RequestId) -> Response {
@@ -515,6 +481,8 @@ fn problem(spec: AdminProblem, request_id: RequestId) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use maincopy_shared::publication::IDEMPOTENCY_KEY_HEADER;
+
     use super::*;
 
     #[test]

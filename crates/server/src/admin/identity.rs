@@ -22,7 +22,6 @@ use maincopy_shared::{
         ReplaceAgentScopesRequest, ReplaceUserRolesRequest, SetUserStatusRequest,
         UserMutationResponse, UserResponse, UserSummaryResponse,
     },
-    publication::IDEMPOTENCY_KEY_HEADER,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use time::{OffsetDateTime, UtcOffset};
@@ -34,6 +33,7 @@ use uuid::Uuid;
 
 use super::{
     AdminSecurityState, BrowserSessionContext,
+    idempotency::{IdempotencyKeyError, parse_idempotency_key},
     principal::{AdminAuthentication, AdminPrincipal},
     problem::{AdminProblem, AdminProblemEnvelope, problem_response},
     request_id::RequestId,
@@ -1242,53 +1242,20 @@ fn mutation_audit(
     request_id: RequestId,
     headers: &HeaderMap,
 ) -> Result<MutationAuditContext, Response> {
-    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
-    let value = values.next().ok_or_else(|| {
-        problem(
-            AdminProblem::bad_request(
+    let key = parse_idempotency_key(headers).map_err(|error| {
+        let spec = match error {
+            IdempotencyKeyError::Missing => AdminProblem::bad_request(
                 "missing_idempotency_key",
                 "Idempotency-Key is required for identity mutations",
             ),
-            request_id,
-        )
+            IdempotencyKeyError::Invalid => AdminProblem::bad_request(
+                "invalid_idempotency_key",
+                "Idempotency-Key must contain one canonical UUID",
+            ),
+        };
+        problem(spec, request_id)
     })?;
-    if values.next().is_some() {
-        return Err(invalid_idempotency_key(request_id));
-    }
-    let encoded = value
-        .to_str()
-        .map_err(|_| invalid_idempotency_key(request_id))?;
-    let key = parse_canonical_uuid(encoded).map_err(|()| invalid_idempotency_key(request_id))?;
-    let principal = match principal.authentication {
-        AdminAuthentication::BrowserSession { session_id } => {
-            AuditPrincipalReference::BrowserSession {
-                user_id: principal.user_id,
-                session_id,
-            }
-        }
-        AdminAuthentication::AgentCredential { credential_id } => {
-            AuditPrincipalReference::AgentCredential {
-                user_id: principal.user_id,
-                credential_id,
-            }
-        }
-    };
-    Ok(MutationAuditContext {
-        audit_event_id: AdminAuditEventId::from_uuid(Uuid::new_v4()),
-        principal,
-        request_id: Some(request_id.0),
-        idempotency_key: AdminMutationKey(key),
-    })
-}
-
-fn invalid_idempotency_key(request_id: RequestId) -> Response {
-    problem(
-        AdminProblem::bad_request(
-            "invalid_idempotency_key",
-            "Idempotency-Key must contain one canonical UUID",
-        ),
-        request_id,
-    )
+    Ok(principal.mutation_audit(request_id, AdminMutationKey(key)))
 }
 
 fn user_summary(user: &StoredUser) -> UserSummaryResponse {

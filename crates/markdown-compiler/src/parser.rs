@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use toml::{Table, Value};
@@ -720,28 +720,28 @@ fn looks_like_delimiter(line: &str) -> bool {
 }
 
 fn validate_post_identities(posts: &[PostCandidate], diagnostics: &mut DiagnosticCollector) {
-    let mut identities: BTreeMap<PostId, Vec<&PostCandidate>> = BTreeMap::new();
+    let mut identities: BTreeMap<&PostId, &PostCandidate> = BTreeMap::new();
     for post in posts {
-        if let Some(id) = &post.id {
-            identities.entry(id.clone()).or_default().push(post);
-        }
-    }
-    for duplicates in identities.into_values().filter(|values| values.len() > 1) {
-        let anchor = duplicates[0];
-        for duplicate in duplicates.into_iter().skip(1) {
-            diagnostics.push(
-                ContentValidationError::new(
-                    duplicate.path.clone(),
-                    "id",
-                    ContentValidationCode::DuplicatePostId,
-                    "post ID duplicates an earlier post",
-                )
-                .with_related(ValidationLocation::new(
-                    anchor.path.clone(),
-                    super::FieldPath::new("id"),
-                )),
-            );
-        }
+        let Some(id) = &post.id else { continue };
+        let anchor = match identities.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(post);
+                continue;
+            }
+            Entry::Occupied(entry) => *entry.get(),
+        };
+        diagnostics.push(
+            ContentValidationError::new(
+                post.path.clone(),
+                "id",
+                ContentValidationCode::DuplicatePostId,
+                "post ID duplicates an earlier post",
+            )
+            .with_related(ValidationLocation::new(
+                anchor.path.clone(),
+                super::FieldPath::new("id"),
+            )),
+        );
     }
 }
 

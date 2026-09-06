@@ -96,6 +96,33 @@ impl FromStr for SourceCommit {
     }
 }
 
+impl TryFrom<&[u8]> for SourceCommit {
+    type Error = SourceCommitParseError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let (algorithm, prefix) = match bytes.len() {
+            20 => (SourceCommitAlgorithm::Sha1, GIT_SHA1_SOURCE_COMMIT_PREFIX),
+            32 => (
+                SourceCommitAlgorithm::Sha256,
+                GIT_SHA256_SOURCE_COMMIT_PREFIX,
+            ),
+            _ => return Err(SourceCommitParseError::UnsupportedObjectFormat),
+        };
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(prefix.len() + bytes.len() * 2);
+        encoded.push_str(prefix);
+        for byte in bytes {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        Ok(Self {
+            algorithm,
+            bytes: bytes.into(),
+            encoded: encoded.into_boxed_str(),
+        })
+    }
+}
+
 impl Serialize for SourceCommit {
     fn serialize<SerializerType>(
         &self,
@@ -173,6 +200,22 @@ mod tests {
             serde_json::from_value::<SourceCommit>(serde_json::json!(value)).unwrap(),
             commit
         );
+    }
+
+    #[test]
+    fn stored_source_commit_bytes_preserve_the_canonical_encoding() {
+        for width in [20, 32] {
+            let bytes: Vec<_> = (0..width).map(|byte| byte * 7).collect();
+            let commit = SourceCommit::try_from(bytes.as_slice()).unwrap();
+            assert_eq!(commit.as_bytes(), bytes);
+            assert_eq!(SourceCommit::parse(commit.as_str()).unwrap(), commit);
+        }
+        for width in [0, 19, 21, 31, 33] {
+            assert_eq!(
+                SourceCommit::try_from(vec![0; width].as_slice()),
+                Err(SourceCommitParseError::UnsupportedObjectFormat),
+            );
+        }
     }
 
     #[test]

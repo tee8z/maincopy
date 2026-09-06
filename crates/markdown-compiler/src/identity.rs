@@ -1,9 +1,8 @@
-use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::{OffsetDateTime, UtcOffset};
+use time::OffsetDateTime;
 
-use crate::DefaultPostTipPolicy;
+use crate::{DefaultPostTipPolicy, transcript::Transcript};
 
 use super::{
     AssetDigest, AssetRevisionReference, DigestedAsset, DraftStatus, ExternalAssetOrigin,
@@ -412,9 +411,7 @@ pub fn finalize_preview_digest(
     transcript.bytes(input.pre_injection_post_shell);
     transcript.tag(6);
     transcript.tag(LOCAL_PROFILE_KIND_TAG);
-    transcript
-        .0
-        .update(&LOCAL_PROFILE_SCHEMA_VERSION.to_be_bytes());
+    transcript.fixed_bytes(&LOCAL_PROFILE_SCHEMA_VERSION.to_be_bytes());
     transcript.bytes(input.profile_projection);
     transcript.tag(7);
     transcript.string(input.canonical_url);
@@ -489,65 +486,6 @@ pub fn finalize_site_snapshot(
         pre_injection_shell,
         public_posts,
     ))
-}
-
-struct Transcript(Hasher);
-
-impl Transcript {
-    fn new(context: &'static str, kind: &[u8], version: u16) -> Self {
-        let mut transcript = Self(Hasher::new_derive_key(context));
-        transcript.bytes(kind);
-        transcript.0.update(&version.to_be_bytes());
-        transcript
-    }
-
-    fn finish(self) -> blake3::Hash {
-        self.0.finalize()
-    }
-
-    fn bytes(&mut self, bytes: &[u8]) {
-        self.0.update(&(bytes.len() as u64).to_be_bytes());
-        self.0.update(bytes);
-    }
-
-    fn string(&mut self, value: &str) {
-        self.bytes(value.as_bytes());
-    }
-
-    fn fixed_bytes(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
-
-    fn sequence_len(&mut self, length: usize) {
-        self.0.update(&(length as u64).to_be_bytes());
-    }
-
-    fn tag(&mut self, tag: u8) {
-        self.0.update(&[tag]);
-    }
-
-    fn optional<T>(&mut self, value: Option<T>, encode: impl FnOnce(&mut Self, T)) {
-        match value {
-            Some(value) => {
-                self.tag(1);
-                encode(self, value);
-            }
-            None => self.tag(0),
-        }
-    }
-
-    fn authored_timestamp(&mut self, timestamp: OffsetDateTime) {
-        self.0.update(&timestamp.unix_timestamp().to_be_bytes());
-        self.0.update(&timestamp.nanosecond().to_be_bytes());
-        self.0
-            .update(&timestamp.offset().whole_seconds().to_be_bytes());
-    }
-
-    fn utc_timestamp(&mut self, timestamp: OffsetDateTime) {
-        let timestamp = timestamp.to_offset(UtcOffset::UTC);
-        self.0.update(&timestamp.unix_timestamp().to_be_bytes());
-        self.0.update(&timestamp.nanosecond().to_be_bytes());
-    }
 }
 
 fn encode_post_document(transcript: &mut Transcript, document: &PostDocument) {
@@ -1183,6 +1121,18 @@ name = "Example Author"
             &generated,
         ))
         .unwrap();
+        let without_generated = digest_post_revision(&PostRevisionInput::new_unchecked(
+            &post,
+            &ResolvedPostAssets::new(&post, None, refs.to_vec()),
+            &renderer,
+            PreInjectionRenderedArticle::new(b"<h1>Body</h1>"),
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(
+            without_generated.as_str(),
+            "post-b3-v1-5c38447a9dbbe61da77fe4ffadec4431f5a915d3e226f55e053df8af37c97607"
+        );
         let changed = digest_post_revision(&PostRevisionInput::new_unchecked(
             &post,
             &ResolvedPostAssets::new(&post, None, refs.to_vec()),

@@ -4,13 +4,9 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, request::Parts},
     response::{IntoResponse as _, Response},
 };
-use maincopy_shared::{
-    auth::AdminAuditEventId,
-    profile_api::{
-        ActiveTipRecipientResponse, PutActiveTipRecipientRequest, UpdateUserProfileRequest,
-        UserProfileResponse,
-    },
-    publication::IDEMPOTENCY_KEY_HEADER,
+use maincopy_shared::profile_api::{
+    ActiveTipRecipientResponse, PutActiveTipRecipientRequest, UpdateUserProfileRequest,
+    UserProfileResponse,
 };
 use serde::de::DeserializeOwned;
 use time::{OffsetDateTime, UtcOffset};
@@ -18,20 +14,20 @@ use utoipa_axum::{
     router::{UtoipaMethodRouter, UtoipaMethodRouterExt as _},
     routes,
 };
-use uuid::Uuid;
 
 mod ui;
 pub(super) use ui::browser_router;
 
 use super::{
-    principal::{AdminAuthentication, AdminPrincipal},
+    idempotency::{IdempotencyKeyError, parse_idempotency_key},
+    principal::AdminPrincipal,
     problem::{AdminProblem, AdminProblemEnvelope, problem_response},
     request_id::RequestId,
 };
 use crate::{
     database::store::DatabaseAdmissionError,
     domain::{
-        auth::store::{AdminMutationKey, AuditPrincipalReference, MutationAuditContext},
+        auth::store::{AdminMutationKey, MutationAuditContext},
         profile::{
             ProfileCommandError, ProfileLoadError, ProfileMutationError, ProfilePrecondition,
             ProfileStore, SetTipRecipient, StoredTipRecipientSetting, StoredUserProfile,
@@ -73,8 +69,8 @@ async fn get_current_profile(
 ) -> Response {
     match store.profile(principal.user_id).await {
         Ok(Some(profile)) => Json(profile_response(profile)).into_response(),
-        Ok(None) => not_found(request_id),
-        Err(error) => load_problem(error, request_id),
+        Ok(None) => problem(not_found(), request_id),
+        Err(error) => problem(load_problem(error, request_id), request_id),
     }
 }
 
@@ -136,7 +132,7 @@ async fn put_current_profile(
             }
             response
         }
-        Err(error) => transition_problem(error, request_id),
+        Err(error) => problem(transition_problem(error, request_id), request_id),
     }
 }
 
@@ -155,7 +151,7 @@ async fn get_active_tip_recipient(
 ) -> Response {
     match store.active_tip_recipient().await {
         Ok(setting) => Json(recipient_response(setting)).into_response(),
-        Err(error) => load_problem(error, request_id),
+        Err(error) => problem(load_problem(error, request_id), request_id),
     }
 }
 
@@ -205,7 +201,7 @@ async fn put_active_tip_recipient(
         .await
     {
         Ok(setting) => Json(recipient_response(setting)).into_response(),
-        Err(error) => transition_problem(error, request_id),
+        Err(error) => problem(transition_problem(error, request_id), request_id),
     }
 }
 
@@ -265,7 +261,7 @@ where
         let idempotency_key =
             profile_idempotency_key(&headers).map_err(|spec| problem(spec, request_id))?;
         let coordinator = coordinator.ok_or_else(|| unavailable(request_id))?;
-        let audit = mutation_audit(&principal, request_id, idempotency_key);
+        let audit = principal.mutation_audit(request_id, idempotency_key);
         Ok(Self {
             request_id,
             principal,
@@ -277,56 +273,18 @@ where
 }
 
 fn profile_idempotency_key(headers: &HeaderMap) -> Result<AdminMutationKey, AdminProblem> {
-    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
-    let Some(value) = values.next() else {
-        return Err(AdminProblem::bad_request(
-            "missing_idempotency_key",
-            "Idempotency-Key is required for profile mutations",
-        ));
-    };
-    if values.next().is_some() {
-        return Err(invalid_idempotency_key());
-    }
-    let encoded = value.to_str().map_err(|_| invalid_idempotency_key())?;
-    let key = Uuid::parse_str(encoded).map_err(|_| invalid_idempotency_key())?;
-    if key.hyphenated().to_string() != encoded {
-        return Err(invalid_idempotency_key());
-    }
-    Ok(AdminMutationKey(key))
-}
-
-fn invalid_idempotency_key() -> AdminProblem {
-    AdminProblem::bad_request(
-        "invalid_idempotency_key",
-        "Idempotency-Key must be one canonical lowercase hyphenated UUID",
-    )
-}
-
-fn mutation_audit(
-    principal: &AdminPrincipal,
-    request_id: RequestId,
-    idempotency_key: AdminMutationKey,
-) -> MutationAuditContext {
-    let principal = match principal.authentication {
-        AdminAuthentication::BrowserSession { session_id } => {
-            AuditPrincipalReference::BrowserSession {
-                user_id: principal.user_id,
-                session_id,
-            }
-        }
-        AdminAuthentication::AgentCredential { credential_id } => {
-            AuditPrincipalReference::AgentCredential {
-                user_id: principal.user_id,
-                credential_id,
-            }
-        }
-    };
-    MutationAuditContext {
-        audit_event_id: AdminAuditEventId::from_uuid(Uuid::new_v4()),
-        principal,
-        request_id: Some(request_id.0),
-        idempotency_key,
-    }
+    parse_idempotency_key(headers)
+        .map(AdminMutationKey)
+        .map_err(|error| match error {
+            IdempotencyKeyError::Missing => AdminProblem::bad_request(
+                "missing_idempotency_key",
+                "Idempotency-Key is required for profile mutations",
+            ),
+            IdempotencyKeyError::Invalid => AdminProblem::bad_request(
+                "invalid_idempotency_key",
+                "Idempotency-Key must be one canonical lowercase hyphenated UUID",
+            ),
+        })
 }
 
 fn profile_response(profile: StoredUserProfile) -> UserProfileResponse {
@@ -348,51 +306,44 @@ fn recipient_response(setting: StoredTipRecipientSetting) -> ActiveTipRecipientR
     }
 }
 
-fn invalid_body(request_id: RequestId) -> Response {
-    problem(
-        AdminProblem::bad_request(
-            "invalid_profile_request",
-            "the profile request body is invalid",
-        ),
-        request_id,
+fn invalid_body() -> AdminProblem {
+    AdminProblem::bad_request(
+        "invalid_profile_request",
+        "the profile request body is invalid",
     )
 }
 
 fn json_rejection(rejection: JsonRejection, request_id: RequestId) -> Response {
-    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        return problem(
-            AdminProblem::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "profile_request_too_large",
-                "the profile request body exceeds 8192 bytes",
-            ),
-            request_id,
-        );
-    }
-    invalid_body(request_id)
+    let spec = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AdminProblem::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "profile_request_too_large",
+            "the profile request body exceeds 8192 bytes",
+        )
+    } else {
+        invalid_body()
+    };
+    problem(spec, request_id)
 }
 
-fn not_found(request_id: RequestId) -> Response {
-    problem(
-        AdminProblem::new(
-            StatusCode::NOT_FOUND,
-            "profile_not_found",
-            "the requested profile resource does not exist",
-        ),
-        request_id,
+fn not_found() -> AdminProblem {
+    AdminProblem::new(
+        StatusCode::NOT_FOUND,
+        "profile_not_found",
+        "the requested profile resource does not exist",
     )
 }
 
-fn load_problem(error: ProfileLoadError, request_id: RequestId) -> Response {
+fn load_problem(error: ProfileLoadError, request_id: RequestId) -> AdminProblem {
     tracing::error!(%request_id, error = %error, "profile state lookup failed");
-    unavailable(request_id)
+    profile_unavailable()
 }
 
-fn transition_problem(error: ProfileTransitionError, request_id: RequestId) -> Response {
+fn transition_problem(error: ProfileTransitionError, request_id: RequestId) -> AdminProblem {
     let spec = match error {
         ProfileTransitionError::Mutation(ProfileMutationError::Command(
             ProfileCommandError::NotFound,
-        )) => return not_found(request_id),
+        )) => not_found(),
         ProfileTransitionError::Mutation(ProfileMutationError::Command(
             ProfileCommandError::StaleVersion,
         )) => AdminProblem::new(
@@ -422,7 +373,7 @@ fn transition_problem(error: ProfileTransitionError, request_id: RequestId) -> R
         ),
         ProfileTransitionError::Mutation(ProfileMutationError::Command(
             ProfileCommandError::InvalidValue,
-        )) => return invalid_body(request_id),
+        )) => invalid_body(),
         ProfileTransitionError::Coordinator(
             PublicationCoordinatorUnavailable::Closed
             | PublicationCoordinatorUnavailable::OutcomeUnknown,
@@ -440,7 +391,7 @@ fn transition_problem(error: ProfileTransitionError, request_id: RequestId) -> R
     if spec.status.is_server_error() {
         tracing::error!(%request_id, error = %error, "profile presentation transition failed");
     }
-    problem(spec, request_id)
+    spec
 }
 
 fn unavailable(request_id: RequestId) -> Response {
@@ -468,15 +419,20 @@ fn problem(spec: AdminProblem, request_id: RequestId) -> Response {
 mod tests {
     use std::{collections::BTreeSet, sync::Arc};
 
+    use crate::admin::principal::AdminAuthentication;
     use axum::{
         Extension, Router,
         body::{Body, Bytes, to_bytes},
         http::{Method, Request as HttpRequest, StatusCode, header::CONTENT_TYPE},
         routing::put,
     };
-    use maincopy_shared::auth::{AdminScope, AdminSessionId, UserId};
+    use maincopy_shared::{
+        auth::{AdminScope, AdminSessionId, UserId},
+        publication::IDEMPOTENCY_KEY_HEADER,
+    };
     use serde_json::Value;
     use tower::ServiceExt as _;
+    use uuid::Uuid;
 
     use super::*;
 

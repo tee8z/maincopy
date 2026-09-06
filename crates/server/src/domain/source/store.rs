@@ -1,5 +1,3 @@
-use std::fmt;
-
 use maincopy_shared::{
     auth::AdminScope,
     source::{
@@ -14,17 +12,17 @@ use markdown_compiler::ContentTreeDigest;
 use sqlx::{FromRow, Sqlite, Transaction};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime, UtcOffset};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    database::store::{
-        DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError, Mutation,
-    },
+    database::fingerprint::CommandFingerprintBuilder,
+    database::store::{DatabaseCommandError, DatabaseMutationError, Mutation, MutationSender},
     domain::{
         auth::store::{
             AdminMutationKey, AuditPrincipalReference, AuthApplyError, AuthCommandError,
-            MutationAuditContext, append_success_audit, require_principal_scope,
+            MutationAuditContext, append_success_audit, decode_audit_principal,
+            require_principal_scope,
         },
         publication::{
             SourceCommit,
@@ -48,12 +46,15 @@ const MANUAL_SYNC_ACTION: &str = "source.sync.request";
 #[derive(Clone)]
 pub(crate) struct SourceStore {
     readers: sqlx::SqlitePool,
-    mutations: mpsc::Sender<Mutation>,
+    mutations: MutationSender,
 }
 
 impl SourceStore {
     pub(crate) const fn new(readers: sqlx::SqlitePool, mutations: mpsc::Sender<Mutation>) -> Self {
-        Self { readers, mutations }
+        Self {
+            readers,
+            mutations: MutationSender::new(mutations),
+        }
     }
 
     pub(crate) async fn configuration(
@@ -181,33 +182,45 @@ impl SourceStore {
         &self,
         command: PutSourceConfiguration,
     ) -> Result<StoredSourceConfiguration, DatabaseMutationError> {
-        self.send(|respond_to| Mutation::PutSourceConfiguration {
-            command,
-            respond_to,
-        })
-        .await
+        self.mutations
+            .send(
+                |respond_to| Mutation::PutSourceConfiguration {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn begin_sync(
         &self,
         command: BeginSourceSync,
     ) -> Result<BeginSourceSyncResult, DatabaseMutationError> {
-        self.send(|respond_to| Mutation::BeginSourceSync {
-            command,
-            respond_to,
-        })
-        .await
+        self.mutations
+            .send(
+                |respond_to| Mutation::BeginSourceSync {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn advance_sync(
         &self,
         command: AdvanceSourceSync,
     ) -> Result<StoredSourceSync, DatabaseMutationError> {
-        self.send(|respond_to| Mutation::AdvanceSourceSync {
-            command,
-            respond_to,
-        })
-        .await
+        self.mutations
+            .send(
+                |respond_to| Mutation::AdvanceSourceSync {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     /// Atomically indexes the exact preview catalog, installs its source head,
@@ -216,22 +229,30 @@ impl SourceStore {
         &self,
         command: ApplyManagedSourceCatalog,
     ) -> Result<StoredSourceSync, DatabaseMutationError> {
-        self.send(|respond_to| Mutation::ApplyManagedSourceCatalog {
-            command,
-            respond_to,
-        })
-        .await
+        self.mutations
+            .send(
+                |respond_to| Mutation::ApplyManagedSourceCatalog {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn finish_sync(
         &self,
         command: FinishSourceSync,
     ) -> Result<StoredSourceSync, DatabaseMutationError> {
-        self.send(|respond_to| Mutation::FinishSourceSync {
-            command,
-            respond_to,
-        })
-        .await
+        self.mutations
+            .send(
+                |respond_to| Mutation::FinishSourceSync {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn fail_interrupted_sync(
@@ -249,23 +270,6 @@ impl SourceStore {
             completed_at,
         })
         .await
-    }
-
-    async fn send<Output>(
-        &self,
-        mutation: impl FnOnce(oneshot::Sender<Result<Output, DatabaseCommandError>>) -> Mutation,
-    ) -> Result<Output, DatabaseMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.mutations
-            .try_send(mutation(respond_to))
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        response
-            .await
-            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
-            .map_err(DatabaseMutationError::Command)
     }
 }
 
@@ -545,11 +549,11 @@ fn decode_configuration(
 fn decode_installation(row: SourceInstallationRow) -> Result<InstalledSource, SourceLoadError> {
     Ok(InstalledSource {
         configuration_version: configuration_version(row.configuration_version)?,
-        source_commit: decode_source_commit(&row.source_commit).ok_or(
+        source_commit: SourceCommit::try_from(row.source_commit.as_slice()).map_err(|_| {
             SourceLoadError::Corrupt {
                 field: "installed source commit",
-            },
-        )?,
+            }
+        })?,
         content_digest: decode_content_digest(row.content_digest)?,
         source_sync_id: decode_source_sync_id(&row.source_sync_id)?,
         installed_at: source_timestamp(row.installed_at_ns, "installation timestamp")?,
@@ -575,9 +579,13 @@ fn decode_sync(row: SourceSyncRow) -> Result<StoredSourceSync, SourceLoadError> 
         None => None,
     };
     let source_commit = match row.source_commit.as_deref() {
-        Some(value) => Some(decode_source_commit(value).ok_or(SourceLoadError::Corrupt {
-            field: "sync source commit",
-        })?),
+        Some(value) => {
+            Some(
+                SourceCommit::try_from(value).map_err(|_| SourceLoadError::Corrupt {
+                    field: "sync source commit",
+                })?,
+            )
+        }
         None => None,
     };
     let content_digest = row.content_digest.map(decode_content_digest).transpose()?;
@@ -695,21 +703,6 @@ fn decode_source_sync_id(value: &[u8]) -> Result<SourceSyncId, SourceLoadError> 
         field: "source sync identifier",
     })?;
     Ok(SourceSyncId::from_uuid(identifier))
-}
-
-fn decode_source_commit(value: &[u8]) -> Option<SourceCommit> {
-    let prefix = match value.len() {
-        20 => "git-sha1:",
-        32 => "git-sha256:",
-        _ => return None,
-    };
-    let mut encoded = String::with_capacity(prefix.len() + value.len() * 2);
-    encoded.push_str(prefix);
-    for byte in value {
-        use fmt::Write as _;
-        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    SourceCommit::parse(&encoded).ok()
 }
 
 fn decode_content_digest(value: Vec<u8>) -> Result<ContentTreeDigest, SourceLoadError> {
@@ -1567,64 +1560,17 @@ async fn reject_claimed_idempotency_key(
 }
 
 fn stored_principal_matches(row: &MutationReceiptRow, principal: &AuditPrincipalReference) -> bool {
-    let bytes_match = |stored: Option<&Vec<u8>>, expected: Option<&[u8]>| match (stored, expected) {
-        (Some(stored), Some(expected)) => stored.as_slice() == expected,
-        (None, None) => true,
-        _ => false,
-    };
-    match principal {
-        AuditPrincipalReference::BrowserSession {
-            user_id,
-            session_id,
-        } => {
-            row.principal_kind == "browser_session"
-                && bytes_match(
-                    row.actor_user_id.as_ref(),
-                    Some(user_id.as_uuid().as_bytes()),
-                )
-                && bytes_match(
-                    row.session_id.as_ref(),
-                    Some(session_id.as_uuid().as_bytes()),
-                )
-                && row.agent_credential_id.is_none()
-        }
-        AuditPrincipalReference::AgentCredential {
-            user_id,
-            credential_id,
-        } => {
-            row.principal_kind == "agent_credential"
-                && bytes_match(
-                    row.actor_user_id.as_ref(),
-                    Some(user_id.as_uuid().as_bytes()),
-                )
-                && row.session_id.is_none()
-                && bytes_match(
-                    row.agent_credential_id.as_ref(),
-                    Some(credential_id.as_uuid().as_bytes()),
-                )
-        }
-        AuditPrincipalReference::Offline { user_id } => {
-            row.principal_kind == "offline"
-                && bytes_match(
-                    row.actor_user_id.as_ref(),
-                    user_id
-                        .as_ref()
-                        .map(|value| value.as_uuid().as_bytes().as_slice()),
-                )
-                && row.session_id.is_none()
-                && row.agent_credential_id.is_none()
-        }
-        AuditPrincipalReference::Unauthenticated => {
-            row.principal_kind == "unauthenticated"
-                && row.actor_user_id.is_none()
-                && row.session_id.is_none()
-                && row.agent_credential_id.is_none()
-        }
-    }
+    decode_audit_principal(
+        &row.principal_kind,
+        row.actor_user_id.as_deref(),
+        row.session_id.as_deref(),
+        row.agent_credential_id.as_deref(),
+    )
+    .is_ok_and(|stored| stored == *principal)
 }
 
 fn configuration_fingerprint(request: &ManagedSourceConfigurationInput) -> [u8; 32] {
-    let mut builder = SourceFingerprint::new(PUT_CONFIGURATION_ACTION);
+    let mut builder = CommandFingerprintBuilder::new(PUT_CONFIGURATION_ACTION);
     builder.field(request.remote.user.as_str().as_bytes());
     builder.field(request.remote.host.as_str().as_bytes());
     builder.field(&request.remote.port.get().to_be_bytes());
@@ -1644,28 +1590,9 @@ fn configuration_fingerprint(request: &ManagedSourceConfigurationInput) -> [u8; 
 }
 
 fn manual_sync_fingerprint(version: SourceConfigurationVersion) -> [u8; 32] {
-    let mut builder = SourceFingerprint::new(MANUAL_SYNC_ACTION);
+    let mut builder = CommandFingerprintBuilder::new(MANUAL_SYNC_ACTION);
     builder.field(&version.get().to_be_bytes());
     builder.finish()
-}
-
-struct SourceFingerprint(blake3::Hasher);
-
-impl SourceFingerprint {
-    fn new(action: &'static str) -> Self {
-        let mut builder = Self(blake3::Hasher::new());
-        builder.field(action.as_bytes());
-        builder
-    }
-
-    fn field(&mut self, value: &[u8]) {
-        self.0.update(&(value.len() as u64).to_be_bytes());
-        self.0.update(value);
-    }
-
-    fn finish(self) -> [u8; 32] {
-        *self.0.finalize().as_bytes()
-    }
 }
 
 fn map_auth_result<Output>(

@@ -11,11 +11,11 @@ use markdown_compiler::{
 use sqlx::{Executor, FromRow, QueryBuilder, Sqlite, Transaction, error::ErrorKind};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::database::store::{
-    DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError, Mutation,
+    DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError, Mutation, MutationSender,
 };
 
 use super::{
@@ -269,12 +269,15 @@ fn release_apply_load_error(error: PublicationMutationError) -> ReleaseApplyErro
 #[derive(Clone)]
 pub(crate) struct PublicationStore {
     readers: sqlx::SqlitePool,
-    mutations: mpsc::Sender<Mutation>,
+    mutations: MutationSender,
 }
 
 impl PublicationStore {
     pub(crate) const fn new(readers: sqlx::SqlitePool, mutations: mpsc::Sender<Mutation>) -> Self {
-        Self { readers, mutations }
+        Self {
+            readers,
+            mutations: MutationSender::new(mutations),
+        }
     }
 
     /// Checks permanent route ownership before the coordinator swaps public visibility.
@@ -406,20 +409,15 @@ impl PublicationStore {
         &self,
         command: InstallStartupSnapshot,
     ) -> Result<SiteHead, DatabaseMutationError> {
-        let (respond_to, response) = oneshot::channel();
         self.mutations
-            .try_send(Mutation::InstallStartupSnapshot {
-                command,
-                respond_to,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        response
+            .send(
+                |respond_to| Mutation::InstallStartupSnapshot {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
             .await
-            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
-            .map_err(DatabaseMutationError::Command)
     }
 
     /// Records one compiler-produced preview candidate through the sole writer task.
@@ -427,20 +425,15 @@ impl PublicationStore {
         &self,
         command: IndexContentCatalog,
     ) -> Result<(), DatabaseMutationError> {
-        let (respond_to, response) = oneshot::channel();
         self.mutations
-            .try_send(Mutation::IndexContentCatalog {
-                command,
-                respond_to,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        response
+            .send(
+                |respond_to| Mutation::IndexContentCatalog {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
             .await
-            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
-            .map_err(DatabaseMutationError::Command)
     }
 
     /// Replays a previously accepted immediate-publication request before catalog resolution.
@@ -504,20 +497,15 @@ impl PublicationStore {
         &self,
         command: ChangeRelease,
     ) -> Result<ReleaseChangeReceipt, ReleaseMutationError> {
-        let (respond_to, response) = oneshot::channel();
         self.mutations
-            .try_send(Mutation::ChangeRelease {
-                command,
-                respond_to,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        response
+            .send(
+                |respond_to| Mutation::ChangeRelease {
+                    command,
+                    respond_to,
+                },
+                ReleaseCommandError::OutcomeUnknown,
+            )
             .await
-            .map_err(|_| ReleaseCommandError::OutcomeUnknown)?
-            .map_err(ReleaseMutationError::Command)
     }
 
     pub(crate) async fn scheduled_release(
@@ -574,20 +562,15 @@ impl PublicationStore {
         &self,
         command: BlockScheduled,
     ) -> Result<(), DatabaseMutationError> {
-        let (respond_to, response) = oneshot::channel();
         self.mutations
-            .try_send(Mutation::BlockScheduled {
-                command,
-                respond_to,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        response
+            .send(
+                |respond_to| Mutation::BlockScheduled {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
             .await
-            .map_err(|_| DatabaseCommandError::OutcomeUnknown)?
-            .map_err(DatabaseMutationError::Command)
     }
 
     pub(crate) async fn release_operation(
@@ -632,20 +615,15 @@ impl PublicationStore {
         &self,
         command: BeginPublishNow,
     ) -> Result<PublishNowState, DatabaseMutationError> {
-        let (respond_to, response) = oneshot::channel();
         self.mutations
-            .try_send(Mutation::BeginPublishNow {
-                command,
-                respond_to,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        response
+            .send(
+                |respond_to| Mutation::BeginPublishNow {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
             .await
-            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
-            .map_err(DatabaseMutationError::Command)
     }
 
     /// Persists one exact future publication approval.
@@ -653,20 +631,15 @@ impl PublicationStore {
         &self,
         command: SchedulePublication,
     ) -> Result<ScheduledPublication, DatabaseMutationError> {
-        let (respond_to, response) = oneshot::channel();
         self.mutations
-            .try_send(Mutation::SchedulePublication {
-                command,
-                respond_to,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        response
+            .send(
+                |respond_to| Mutation::SchedulePublication {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
             .await
-            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
-            .map_err(DatabaseMutationError::Command)
     }
 
     /// Returns the earliest exact revision waiting for scheduled activation.
@@ -704,20 +677,15 @@ impl PublicationStore {
         &self,
         command: BeginScheduledActivation,
     ) -> Result<BegunPublication, DatabaseMutationError> {
-        let (respond_to, response) = oneshot::channel();
         self.mutations
-            .try_send(Mutation::BeginScheduledActivation {
-                command,
-                respond_to,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        response
+            .send(
+                |respond_to| Mutation::BeginScheduledActivation {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
             .await
-            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
-            .map_err(DatabaseMutationError::Command)
     }
 
     /// Commits a snapshot-visible canonical activation.
@@ -725,20 +693,15 @@ impl PublicationStore {
         &self,
         command: FinishPublication,
     ) -> Result<FinishedPublication, DatabaseMutationError> {
-        let (respond_to, response) = oneshot::channel();
         self.mutations
-            .try_send(Mutation::FinishPublication {
-                command,
-                respond_to,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        response
+            .send(
+                |respond_to| Mutation::FinishPublication {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
             .await
-            .map_err(|_| DatabaseMutationError::Command(DatabaseCommandError::OutcomeUnknown))?
-            .map_err(DatabaseMutationError::Command)
     }
 }
 
@@ -1208,7 +1171,8 @@ impl SiteHeadRow {
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(activated_at_ns))
             .map_err(|_| StartupSnapshotLoadError::InvalidSiteTimestamp)?;
         if let Some(commit) = self.source_commit {
-            decode_source_commit(&commit).ok_or(StartupSnapshotLoadError::InvalidSourceCommit)?;
+            SourceCommit::try_from(commit.as_slice())
+                .map_err(|_| StartupSnapshotLoadError::InvalidSourceCommit)?;
         }
         Ok(Some(SiteHead {
             digest,
@@ -1444,7 +1408,8 @@ fn decode_stored_source_commit(
 ) -> Result<Option<SourceCommit>, StartupSnapshotLoadError> {
     value
         .map(|value| {
-            decode_source_commit(&value).ok_or(StartupSnapshotLoadError::InvalidSourceCommit)
+            SourceCommit::try_from(value.as_slice())
+                .map_err(|_| StartupSnapshotLoadError::InvalidSourceCommit)
         })
         .transpose()
 }
@@ -1598,22 +1563,6 @@ fn publication_timestamp(value: i64) -> Result<OffsetDateTime, StartupSnapshotLo
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(value))
         .map(|timestamp| timestamp.to_offset(UtcOffset::UTC))
         .map_err(|_| StartupSnapshotLoadError::InvalidPublicationTimestamp)
-}
-
-fn decode_source_commit(value: &[u8]) -> Option<SourceCommit> {
-    let prefix = match value.len() {
-        20 => "git-sha1:",
-        32 => "git-sha256:",
-        _ => return None,
-    };
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(prefix.len() + value.len() * 2);
-    encoded.push_str(prefix);
-    for byte in value {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    SourceCommit::parse(&encoded).ok()
 }
 
 #[derive(Debug, Error)]
@@ -1921,7 +1870,8 @@ async fn retain_site_revision(
             .filter(|version| *version > 0)
             .ok_or(StartupSnapshotMutationError::CorruptStoredState)?;
         if !retained_revision_precedes_current(current, retained_version)
-            || source_commit.is_some_and(|commit| decode_source_commit(&commit).is_none())
+            || source_commit
+                .is_some_and(|commit| SourceCommit::try_from(commit.as_slice()).is_err())
         {
             return Err(StartupSnapshotMutationError::CorruptStoredState);
         }
@@ -2041,7 +1991,7 @@ async fn record_observed_posts(
                 || stored.as_ref().is_some_and(|(_, _, source_commit)| {
                     source_commit
                         .as_deref()
-                        .is_some_and(|commit| decode_source_commit(commit).is_none())
+                        .is_some_and(|commit| SourceCommit::try_from(commit).is_err())
                         || (command.source_commit.is_some() && source_commit.is_none())
                 })
             {
@@ -3297,7 +3247,7 @@ async fn load_retained_site_head(
         .ok_or(PublicationMutationError::CorruptStoredState)?;
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(activated_at_ns))
         .map_err(|_| PublicationMutationError::CorruptStoredState)?;
-    if source_commit.is_some_and(|commit| decode_source_commit(&commit).is_none()) {
+    if source_commit.is_some_and(|commit| SourceCommit::try_from(commit.as_slice()).is_err()) {
         return Err(PublicationMutationError::CorruptStoredState);
     }
     Ok(SiteHead {
@@ -4513,9 +4463,9 @@ mod tests {
             validate_reload_states(&["unknown".into()]),
             Err(StartupSnapshotLoadError::InvalidReloadState)
         ));
-        assert!(decode_source_commit(&[0xaa; 20]).is_some());
-        assert!(decode_source_commit(&[0xbb; 32]).is_some());
-        assert!(decode_source_commit(&[0xcc; 19]).is_none());
+        assert!(SourceCommit::try_from([0xaa; 20].as_slice()).is_ok());
+        assert!(SourceCommit::try_from([0xbb; 32].as_slice()).is_ok());
+        assert!(SourceCommit::try_from([0xcc; 19].as_slice()).is_err());
 
         let current = SiteHead {
             digest: SiteSnapshotDigest::from_bytes([0xdd; 32]),

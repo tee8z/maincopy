@@ -47,15 +47,6 @@ pub(crate) struct SourceSyncHandle {
     runtime: SourceRuntime,
 }
 
-/// Selects source behavior at the application composition boundary.
-pub(crate) enum SourceRuntimeMode {
-    ExternalCheckout,
-    ManagedGit {
-        configuration: StoredSourceConfiguration,
-        cancellation: CancellationToken,
-    },
-}
-
 #[derive(Clone)]
 enum SourceRuntime {
     ExternalCheckout,
@@ -70,20 +61,11 @@ struct ManagedSourceControl {
 }
 
 impl SourceSyncHandle {
-    pub(crate) fn new(store: SourceStore, mode: SourceRuntimeMode) -> Self {
-        let runtime = match mode {
-            SourceRuntimeMode::ExternalCheckout => SourceRuntime::ExternalCheckout,
-            SourceRuntimeMode::ManagedGit {
-                configuration,
-                cancellation,
-            } => SourceRuntime::ManagedGit(Arc::new(ManagedSourceControl {
-                configuration,
-                cancellation,
-                admission: Mutex::new(()),
-                wakeup: Notify::new(),
-            })),
-        };
-        Self { store, runtime }
+    pub(crate) fn external_checkout(store: SourceStore) -> Self {
+        Self {
+            store,
+            runtime: SourceRuntime::ExternalCheckout,
+        }
     }
 
     pub(crate) async fn status(&self) -> Result<SourceStatusResponse, SourceControlError> {
@@ -230,18 +212,15 @@ impl ManagedSourceEngine {
         compiler: ContentCompiler,
         cancellation: CancellationToken,
     ) -> (Self, SourceSyncHandle) {
-        let handle = SourceSyncHandle::new(
+        let managed = Arc::new(ManagedSourceControl {
+            configuration,
+            cancellation: cancellation.clone(),
+            admission: Mutex::new(()),
+            wakeup: Notify::new(),
+        });
+        let handle = SourceSyncHandle {
             store,
-            SourceRuntimeMode::ManagedGit {
-                configuration,
-                cancellation: cancellation.clone(),
-            },
-        );
-        let managed = match &handle.runtime {
-            SourceRuntime::ManagedGit(managed) => Arc::clone(managed),
-            SourceRuntime::ExternalCheckout => {
-                unreachable!("the managed engine installs managed source control")
-            }
+            runtime: SourceRuntime::ManagedGit(Arc::clone(&managed)),
         };
         let engine = Self {
             git,
@@ -304,22 +283,12 @@ impl ManagedSourceEngine {
                     .advance(
                         &sync,
                         SourceSyncProgress::Reloading {
-                            source_commit: candidate.source_commit.clone().ok_or(
-                                ManagedSourceSyncError::Invariant(
-                                    "managed candidate has no source commit",
-                                ),
-                            )?,
+                            source_commit: candidate.source_commit.clone(),
                             content_digest: candidate.content_digest.clone(),
                         },
                     )
                     .await?;
-                let source_commit =
-                    candidate
-                        .source_commit
-                        .clone()
-                        .ok_or(ManagedSourceSyncError::Invariant(
-                            "managed candidate has no source commit",
-                        ))?;
+                let source_commit = candidate.source_commit.clone();
                 self.handle
                     .store
                     .apply_catalog(ApplyManagedSourceCatalog {
@@ -551,7 +520,7 @@ impl ManagedSourceEngine {
     ) -> Result<PreparedContentCandidate, ManagedSourceSyncError> {
         match prepare_immutable_candidate(
             tree,
-            Some(source_commit),
+            source_commit,
             self.candidate_store.clone(),
             self.compiler.clone(),
         )
@@ -744,13 +713,7 @@ impl ManagedSourceSync {
         sync: StoredSourceSync,
         candidate: PreparedContentCandidate,
     ) -> Result<(), ManagedSourceSyncError> {
-        let source_commit =
-            candidate
-                .source_commit
-                .clone()
-                .ok_or(ManagedSourceSyncError::Invariant(
-                    "managed candidate has no source commit",
-                ))?;
+        let source_commit = candidate.source_commit.clone();
         let sync = self
             .engine
             .advance(

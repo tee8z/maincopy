@@ -45,7 +45,7 @@ use crate::{
         },
         publication::activation::PublicationCoordinatorHandle,
     },
-    source_sync::{SourceRuntimeMode, SourceSyncHandle},
+    source_sync::SourceSyncHandle,
 };
 
 pub(crate) const ADMIN_ORIGIN: &str = "https://admin.example.test";
@@ -182,10 +182,7 @@ impl ProtectedAdminHarness {
             publications,
             self.state.clone(),
             self.store.profiles.clone(),
-            SourceSyncHandle::new(
-                self.store.source.clone(),
-                SourceRuntimeMode::ExternalCheckout,
-            ),
+            SourceSyncHandle::external_checkout(self.store.source.clone()),
         )
     }
 

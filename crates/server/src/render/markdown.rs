@@ -5,7 +5,7 @@ use markdown_compiler::{
     AssetRevisionReference, DigestedAsset, LogicalAssetPath, LogicalContentPath,
     MarkdownDestinationKind, MarkdownDestinationOrdinal, PostDocument, PostRendererIdentity,
     PostRevisionDigest, ResolvedLocalAssetLookupError, ResolvedLocalAssetStore, ResolvedPostAssets,
-    ResolvedSiteAssets, RevisionIdentityError, SiteSnapshotDigest, digest_asset,
+    ResolvedSiteAssets, RevisionIdentityError, SiteSnapshotDigest,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::Serialize;
@@ -67,19 +67,14 @@ fn render_markdown_with_renderer(
     let identity = PostRendererIdentity::baseline();
     let article = MarkdownEventRenderer::new(document, assets, site_assets, render_mermaid, limits)
         .render()?;
-    let generated_assets: Vec<GeneratedPostAsset> = Vec::new();
-    validate_generated_assets(document, assets, &generated_assets)?;
-    let generated_identities = generated_assets
-        .iter()
-        .map(|generated| generated.asset.clone())
-        .collect::<Vec<_>>();
     let revision = finalize_post_revision(
         document,
         assets,
         site_assets,
         &identity,
         article.identity_html.as_bytes(),
-        &generated_identities,
+        // The v1 revision format retains an empty generated-file section; diagrams are inline.
+        &[],
     )
     .map_err(|error| identity_error(document, error))?;
 
@@ -88,7 +83,6 @@ fn render_markdown_with_renderer(
         assets: assets.clone(),
         renderer: identity,
         article,
-        generated_assets: generated_assets.into(),
         revision,
     })
 }
@@ -100,7 +94,6 @@ pub struct RenderedPost {
     pub(crate) assets: ResolvedPostAssets,
     pub(crate) renderer: PostRendererIdentity,
     pub(crate) article: RenderedArticle,
-    pub(crate) generated_assets: Arc<[GeneratedPostAsset]>,
     pub(crate) revision: PostRevisionDigest,
 }
 
@@ -165,27 +158,6 @@ impl RenderedPost {
     }
 }
 
-/// A generated post asset whose digest was calculated from its owned bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GeneratedPostAsset {
-    pub(super) asset: DigestedAsset,
-    pub(super) bytes: Arc<[u8]>,
-}
-
-impl GeneratedPostAsset {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Slice 6 is the first production producer of generated renderer assets"
-        )
-    )]
-    pub(super) fn from_owned_bytes(path: LogicalAssetPath, bytes: Arc<[u8]>) -> Self {
-        let asset = DigestedAsset::new(path, digest_asset(&bytes));
-        Self { asset, bytes }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct MermaidBlockOrdinal(NonZeroUsize);
 
@@ -231,7 +203,6 @@ pub enum MarkdownRenderLocation {
     CodeBlock {
         ordinal: CodeBlockOrdinal,
     },
-    GeneratedAsset,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -271,7 +242,6 @@ pub enum MarkdownRenderErrorCode {
     RenderedHtmlTooLarge,
     UnsupportedCommonMarkEvent,
     MalformedCommonMarkEvents,
-    GeneratedAssetCollision,
     AssetPolicyMismatch,
     LocalAssetMissing,
     LocalAssetDigestMismatch,
@@ -1319,36 +1289,6 @@ fn destination_kind(kind: MarkdownDestinationKind) -> RenderDestinationKind {
     }
 }
 
-fn validate_generated_assets(
-    document: &PostDocument,
-    authored: &ResolvedPostAssets,
-    generated: &[GeneratedPostAsset],
-) -> Result<(), MarkdownRenderError> {
-    let mut paths = std::collections::BTreeSet::new();
-    if let Some(AssetRevisionReference::Local(asset)) = &authored.image {
-        paths.insert(&asset.path);
-    }
-    for reference in &authored.references {
-        if let AssetRevisionReference::Local(asset) = reference {
-            paths.insert(&asset.path);
-        }
-    }
-    for asset in generated {
-        if !paths.insert(&asset.asset.path) {
-            return Err(MarkdownRenderError::new(
-                document,
-                MarkdownRenderLocation::GeneratedAsset,
-                MarkdownRenderErrorCode::GeneratedAssetCollision,
-                format!(
-                    "generated asset path collides with another post asset: {}",
-                    asset.asset.path
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn identity_error(document: &PostDocument, error: RevisionIdentityError) -> MarkdownRenderError {
     MarkdownRenderError::new(
         document,
@@ -1642,7 +1582,6 @@ mod tests {
         assert_eq!(first.revision, second.revision);
         assert!(first.article.identity_html.contains("<svg "));
         assert!(!first.article.identity_html.contains("graph TD"));
-        assert!(first.generated_assets.is_empty());
 
         let (_, projection_assets) = candidate(
             "Renderer",
@@ -2158,31 +2097,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_assets_own_bytes_digest_them_and_cannot_collide() {
-        let (content, assets) = candidate(
-            "Renderer",
-            &[],
-            "![image](assets/image.png)",
-            false,
-            &["assets/image.png"],
-        );
-        let bytes: Arc<[u8]> = Arc::from(&b"generated"[..]);
-        let generated = GeneratedPostAsset::from_owned_bytes(
-            LogicalAssetPath::parse("assets/image.png").unwrap(),
-            Arc::clone(&bytes),
-        );
-        assert_eq!(generated.asset.digest, digest_asset(&bytes));
-        assert_eq!(generated.bytes.as_ref(), bytes.as_ref());
-        let error = validate_generated_assets(
-            &content.posts[0],
-            assets.assets_for(&content.posts[0]).unwrap(),
-            &[generated],
-        )
-        .unwrap_err();
-        assert_eq!(error.code, MarkdownRenderErrorCode::GeneratedAssetCollision);
-    }
-
-    #[test]
     fn render_error_wire_contract_uses_typed_codes_and_ordinals() {
         let error = render_error("[bad](//example.com)");
         assert_eq!(
@@ -2237,10 +2151,6 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({ "kind": "code_block", "ordinal": 3 })
-        );
-        assert_eq!(
-            serde_json::to_value(MarkdownRenderLocation::GeneratedAsset).unwrap(),
-            serde_json::json!({ "kind": "generated_asset" })
         );
 
         for (value, expected) in [
@@ -2334,10 +2244,6 @@ mod tests {
             (
                 MarkdownRenderErrorCode::MalformedCommonMarkEvents,
                 "malformed_common_mark_events",
-            ),
-            (
-                MarkdownRenderErrorCode::GeneratedAssetCollision,
-                "generated_asset_collision",
             ),
             (
                 MarkdownRenderErrorCode::AssetPolicyMismatch,

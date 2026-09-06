@@ -86,7 +86,7 @@ async fn browser_profiles_and_tip_selection_preserve_versions_replay_and_restart
 
     // Restart the real daemon with the same SQLite ledger and content artifacts.
     harness.daemon.stop();
-    let (daemon, address) = Daemon::start(harness._root.path());
+    let (daemon, address) = start_admin_daemon(harness._root.path());
     let harness = AdminProcessHarness {
         daemon,
         admin_url: format!("http://{address}"),

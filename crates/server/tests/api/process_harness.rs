@@ -266,6 +266,14 @@ struct PendingAddresses {
 }
 
 impl PendingAddresses {
+    fn observe_line(&mut self, line: &str) -> Result<Option<DaemonAddresses>, &'static str> {
+        let Some((listener, address)) = listener_address_from_ready_line(line)? else {
+            return Ok(None);
+        };
+        self.observe(listener, address)?;
+        Ok(self.complete())
+    }
+
     fn observe(&mut self, listener: Listener, address: SocketAddr) -> Result<(), &'static str> {
         let slot = match listener {
             Listener::Public => &mut self.public,
@@ -291,15 +299,15 @@ impl PendingAddresses {
     }
 }
 
-fn drain_daemon_stderr<Reader>(
+fn drain_daemon_stderr<Reader, Ready>(
     mut reader: Reader,
-    ready_tx: mpsc::SyncSender<Result<DaemonAddresses, Box<str>>>,
+    ready_tx: mpsc::SyncSender<Result<Ready, Box<str>>>,
+    mut observe_ready: impl FnMut(&str) -> Result<Option<Ready>, &'static str>,
 ) -> Vec<u8>
 where
     Reader: Read,
 {
     let mut ready_tx = Some(ready_tx);
-    let mut pending = Some(PendingAddresses::default());
     let mut captured = Vec::new();
     let mut line = Vec::with_capacity(MAX_DAEMON_LOG_LINE_BYTES);
     let mut line_exceeded_limit = false;
@@ -309,11 +317,11 @@ where
         match reader.read(&mut buffer) {
             Ok(0) => {
                 if !line.is_empty() && !line_exceeded_limit {
-                    observe_daemon_ready_line(&line, &mut pending, &mut ready_tx);
+                    observe_daemon_ready_line(&line, &mut observe_ready, &mut ready_tx);
                 }
                 if let Some(sender) = ready_tx.take() {
                     let _ = sender.send(Err(
-                        "daemon exited before binding its public and admin listeners".into(),
+                        "daemon exited before satisfying its readiness condition".into(),
                     ));
                 }
                 break;
@@ -323,7 +331,7 @@ where
                 for &byte in &buffer[..count] {
                     if byte == b'\n' {
                         if !line_exceeded_limit {
-                            observe_daemon_ready_line(&line, &mut pending, &mut ready_tx);
+                            observe_daemon_ready_line(&line, &mut observe_ready, &mut ready_tx);
                         }
                         line.clear();
                         line_exceeded_limit = false;
@@ -364,41 +372,48 @@ where
     captured
 }
 
-fn observe_daemon_ready_line(
+fn observe_daemon_ready_line<Ready>(
     line: &[u8],
-    pending: &mut Option<PendingAddresses>,
-    ready_tx: &mut Option<mpsc::SyncSender<Result<DaemonAddresses, Box<str>>>>,
+    observe_ready: &mut impl FnMut(&str) -> Result<Option<Ready>, &'static str>,
+    ready_tx: &mut Option<mpsc::SyncSender<Result<Ready, Box<str>>>>,
 ) {
-    let (Some(sender), Some(addresses)) = (ready_tx.as_ref(), pending.as_mut()) else {
+    let Some(sender) = ready_tx.as_ref() else {
         return;
     };
     let line = String::from_utf8_lossy(line);
-    let result = match listener_address_from_ready_line(line.trim_end_matches('\r')) {
+    let result = match observe_ready(line.trim_end_matches('\r')) {
         Ok(None) => return,
-        Ok(Some((listener, address))) => addresses.observe(listener, address),
-        Err(error) => Err(error),
+        Ok(Some(ready)) => Ok(ready),
+        Err(error) => Err(error.into()),
     };
-    if let Err(error) = result {
-        let _ = sender.send(Err(error.into()));
-        *ready_tx = None;
-        *pending = None;
-        return;
-    }
-    if let Some(addresses) = addresses.complete() {
-        let _ = sender.send(Ok(addresses));
-        *ready_tx = None;
-        *pending = None;
-    }
+    let _ = sender.send(result);
+    *ready_tx = None;
 }
 
 pub(super) struct Daemon {
     child: Child,
     stderr: Option<JoinHandle<Vec<u8>>>,
     stopped: bool,
+    redact_output: fn(&[u8]) -> String,
 }
 
 impl Daemon {
-    pub(super) fn start(mut command: Command) -> (Self, DaemonAddresses) {
+    pub(super) fn start(command: Command) -> (Self, DaemonAddresses) {
+        let mut pending = PendingAddresses::default();
+        Self::start_with_readiness(
+            command,
+            SERVER_START_LIMIT,
+            move |line| pending.observe_line(line),
+            |bytes| String::from_utf8_lossy(bytes).into_owned(),
+        )
+    }
+
+    pub(super) fn start_with_readiness<Ready: Send + 'static>(
+        mut command: Command,
+        start_limit: Duration,
+        observe_ready: impl FnMut(&str) -> Result<Option<Ready>, &'static str> + Send + 'static,
+        redact_output: fn(&[u8]) -> String,
+    ) -> (Self, Ready) {
         let child = command
             .env("RUST_LOG", "info")
             .stdin(Stdio::null())
@@ -410,15 +425,18 @@ impl Daemon {
             child,
             stderr: None,
             stopped: false,
+            redact_output,
         };
         let stderr = daemon
             .child
             .stderr
             .take()
             .expect("integration daemon stderr must be captured");
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<DaemonAddresses, Box<str>>>(1);
-        daemon.stderr = Some(thread::spawn(move || drain_daemon_stderr(stderr, ready_tx)));
-        match ready_rx.recv_timeout(SERVER_START_LIMIT) {
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<Ready, Box<str>>>(1);
+        daemon.stderr = Some(thread::spawn(move || {
+            drain_daemon_stderr(stderr, ready_tx, observe_ready)
+        }));
+        match ready_rx.recv_timeout(start_limit) {
             Ok(Ok(addresses)) => (daemon, addresses),
             Ok(Err(message)) => {
                 let logs = daemon.force_stop();
@@ -503,7 +521,7 @@ impl Daemon {
 
     fn join_stderr(&mut self) -> String {
         let captured = self.stderr.take().map(join_output).unwrap_or_default();
-        String::from_utf8_lossy(&captured).into_owned()
+        (self.redact_output)(&captured)
     }
 }
 
@@ -551,7 +569,10 @@ mod tests {
         let input = vec![b'x'; MAX_DAEMON_LOG_LINE_BYTES + 1];
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 
-        let captured = drain_daemon_stderr(std::io::Cursor::new(input), ready_tx);
+        let mut pending = PendingAddresses::default();
+        let captured = drain_daemon_stderr(std::io::Cursor::new(input), ready_tx, |line| {
+            pending.observe_line(line)
+        });
         let error = ready_rx
             .recv()
             .expect("stderr framing must report its readiness result")
@@ -559,5 +580,33 @@ mod tests {
 
         assert!(error.contains("exceeded"), "unexpected error: {error}");
         assert!(captured.len() <= MAX_CAPTURED_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn daemon_readiness_waits_for_both_listeners_and_accepts_the_final_unterminated_line() {
+        let public_line = "INFO public listener bound bind=127.0.0.1:1234\n";
+        let admin_line = "INFO authenticated admin backend listener bound bind=127.0.0.1:4321";
+        for (input, ready) in [
+            (public_line.to_owned(), false),
+            (format!("{public_line}{admin_line}"), true),
+        ] {
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let mut pending = PendingAddresses::default();
+            drain_daemon_stderr(input.as_bytes(), ready_tx, |line| {
+                pending.observe_line(line)
+            });
+            let result = ready_rx.recv().unwrap();
+            if ready {
+                assert_eq!(
+                    result.unwrap(),
+                    DaemonAddresses {
+                        public: "127.0.0.1:1234".parse().unwrap(),
+                        admin: "127.0.0.1:4321".parse().unwrap(),
+                    }
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
     }
 }

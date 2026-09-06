@@ -18,8 +18,8 @@ use axum::{
 };
 use maincopy_shared::posts::{ListPostsResponse, PostPublicationState, PostSummary};
 use maincopy_shared::publication::{
-    CONTENT_DIGEST_HEADER, IDEMPOTENCY_KEY_HEADER, POST_REVISION_HEADER, PREVIEW_DIGEST_HEADER,
-    PublicationApprovalState, PublishNowRequest, PublishNowResponse,
+    CONTENT_DIGEST_HEADER, POST_REVISION_HEADER, PREVIEW_DIGEST_HEADER, PublicationApprovalState,
+    PublishNowRequest, PublishNowResponse,
 };
 use markdown_compiler::{
     ContentTreeDigest, DraftStatus, LogicalAssetPath, PostId, PostRevisionDigest, PreviewDigest,
@@ -34,11 +34,12 @@ use uuid::Uuid;
 
 use crate::{
     admin::{
+        idempotency::{IdempotencyKeyError, parse_idempotency_key},
         problem::{AdminProblem, AdminProblemEnvelope, problem_response},
         request_id::RequestId,
     },
     database::store::{DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError},
-    render::{ContentCatalog, PreviewAsset, render_bound_post_preview},
+    render::{ContentCatalog, render_bound_post_preview},
 };
 
 use super::{
@@ -56,6 +57,8 @@ use super::{
 
 #[cfg(test)]
 use super::activation::PublishReviewError;
+#[cfg(test)]
+use maincopy_shared::publication::IDEMPOTENCY_KEY_HEADER;
 
 const MAX_PUBLICATION_REQUEST_BYTES: usize = 4 * 1024;
 const DEFAULT_POST_PAGE_LIMIT: u16 = 50;
@@ -694,7 +697,7 @@ async fn get_preview_asset(
     }: PreviewAssetInput,
     AvailablePreviewPublication(coordinator): AvailablePreviewPublication,
 ) -> Response {
-    let asset = {
+    let bytes = {
         let coordinator = coordinator.read();
         let Some(catalog) = coordinator.candidates.get(&content_digest) else {
             return preview_problem(
@@ -736,10 +739,7 @@ async fn get_preview_asset(
         }
     };
 
-    let (bytes, delivery) = match asset {
-        PreviewAsset::Authored(bytes) => (bytes, AssetDelivery::for_authored(&asset_path)),
-        PreviewAsset::RendererGenerated(bytes) => (bytes, AssetDelivery::for_untrusted_generated()),
-    };
+    let delivery = AssetDelivery::for_authored(&asset_path);
 
     let mut response = Response::new(Body::from(Bytes::from_owner(bytes)));
     *response.status_mut() = StatusCode::OK;
@@ -941,25 +941,15 @@ fn publication_problem(error: PublicationActivationError, request_id: RequestId)
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<Uuid, ErrorSpec> {
-    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
-    let value = values.next().ok_or_else(|| {
-        ErrorSpec::bad_request("missing_idempotency_key", "Idempotency-Key is required")
-    })?;
-    if values.next().is_some() {
-        return Err(ErrorSpec::bad_request(
+    parse_idempotency_key(headers).map_err(|error| match error {
+        IdempotencyKeyError::Missing => {
+            ErrorSpec::bad_request("missing_idempotency_key", "Idempotency-Key is required")
+        }
+        IdempotencyKeyError::Invalid => ErrorSpec::bad_request(
             "invalid_idempotency_key",
             "Idempotency-Key must contain one canonical UUID",
-        ));
-    }
-    let encoded = value.to_str().ok();
-    let parsed = encoded.and_then(|value| Uuid::parse_str(value).ok());
-    match (encoded, parsed) {
-        (Some(encoded), Some(parsed)) if parsed.hyphenated().to_string() == encoded => Ok(parsed),
-        _ => Err(ErrorSpec::bad_request(
-            "invalid_idempotency_key",
-            "Idempotency-Key must contain one canonical UUID",
-        )),
-    }
+        ),
+    })
 }
 
 pub(super) fn activation_error(error: &PublicationActivationError) -> ErrorSpec {

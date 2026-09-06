@@ -1,12 +1,9 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::{Read, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
-    thread::{self, JoinHandle},
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -17,16 +14,14 @@ use reqwest::{
     Method, Response, StatusCode,
     header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE},
 };
-use rustix::{
-    io::retry_on_intr,
-    process::{Pid, Signal, WaitId, WaitIdOptions, kill_process, waitid},
-};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+use super::process_harness::{CapturedChild, Daemon};
 
 mod profile_workflows;
 
@@ -48,11 +43,7 @@ const OWNER_PASSWORD: &str = "correct horse battery staple";
 const NIP98_EVENT_KIND: u64 = 27_235;
 const BOOTSTRAP_LIMIT: Duration = Duration::from_secs(20);
 const SERVER_START_LIMIT: Duration = Duration::from_secs(20);
-const SERVER_STOP_LIMIT: Duration = Duration::from_secs(20);
-const FORCED_STOP_LIMIT: Duration = Duration::from_secs(5);
 const REQUEST_LIMIT: Duration = Duration::from_secs(10);
-const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_DAEMON_LOG_LINE_BYTES: usize = 8 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 const READY_MESSAGE: &str = "authenticated admin backend listener bound";
 const TEST_PUBLICATION: &str = "[site]\n\
@@ -70,6 +61,26 @@ fn response_body_budget_accepts_the_exact_limit_and_rejects_the_next_byte() {
     assert_eq!(body.len(), MAX_RESPONSE_BODY_BYTES);
     assert!(append_response_chunk(&mut body, &[0]).is_err());
     assert_eq!(body.len(), MAX_RESPONSE_BODY_BYTES);
+}
+
+#[test]
+fn admin_readiness_ignores_the_public_listener_and_rejects_unsafe_addresses() {
+    assert_eq!(
+        admin_address_from_ready_line("INFO public listener bound bind=127.0.0.1:1234"),
+        Ok(None)
+    );
+    assert_eq!(
+        admin_address_from_ready_line(
+            "INFO authenticated admin backend listener bound bind=127.0.0.1:4321"
+        ),
+        Ok(Some("127.0.0.1:4321".parse().unwrap()))
+    );
+    assert!(
+        admin_address_from_ready_line(
+            "INFO authenticated admin backend listener bound bind=0.0.0.0:4321"
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -480,7 +491,7 @@ impl AdminProcessHarness {
         write_host_file(root.path());
         bootstrap_password_owner(root.path());
 
-        let (daemon, admin_address) = Daemon::start(root.path());
+        let (daemon, admin_address) = start_admin_daemon(root.path());
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -743,210 +754,6 @@ fn bootstrap_password_owner(root: &Path) {
     );
 }
 
-struct CapturedChild {
-    child: Child,
-    stdout: Option<JoinHandle<Vec<u8>>>,
-    stderr: Option<JoinHandle<Vec<u8>>>,
-    stopped: bool,
-}
-
-impl CapturedChild {
-    fn new(child: Child) -> Self {
-        let mut process = Self {
-            child,
-            stdout: None,
-            stderr: None,
-            stopped: false,
-        };
-        let stdout = process
-            .child
-            .stdout
-            .take()
-            .expect("captured child stdout must be piped");
-        process.stdout = Some(capture_output(stdout));
-        let stderr = process
-            .child
-            .stderr
-            .take()
-            .expect("captured child stderr must be piped");
-        process.stderr = Some(capture_output(stderr));
-        process
-    }
-
-    fn write_stdin(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.child
-            .stdin
-            .take()
-            .expect("captured child stdin must be piped")
-            .write_all(bytes)
-    }
-
-    fn wait(mut self, limit: Duration) -> (ProcessCompletion, Vec<u8>, Vec<u8>) {
-        let completion = wait_for_child(&mut self.child, limit);
-        self.stopped = true;
-        let (stdout, stderr) = self.join_output();
-        (completion, stdout, stderr)
-    }
-
-    fn force_stop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = wait_for_child(&mut self.child, FORCED_STOP_LIMIT);
-        self.stopped = true;
-        let _ = self.join_output();
-    }
-
-    fn join_output(&mut self) -> (Vec<u8>, Vec<u8>) {
-        let stdout = self.stdout.take().map(join_output).unwrap_or_default();
-        let stderr = self.stderr.take().map(join_output).unwrap_or_default();
-        (stdout, stderr)
-    }
-}
-
-impl Drop for CapturedChild {
-    fn drop(&mut self) {
-        if !self.stopped {
-            self.force_stop();
-        }
-    }
-}
-
-struct ProcessCompletion {
-    status: Result<ExitStatus, Box<str>>,
-    timed_out: bool,
-    wait_error: Option<Box<str>>,
-    termination_error: Option<Box<str>>,
-}
-
-fn wait_for_child(child: &mut Child, limit: Duration) -> ProcessCompletion {
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            return ProcessCompletion {
-                status: Ok(status),
-                timed_out: false,
-                wait_error: None,
-                termination_error: None,
-            };
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return kill_and_reap(child, false, Some(error.to_string().into_boxed_str()));
-        }
-    }
-
-    let pid = Pid::from_child(child);
-    let (observed_tx, observed_rx) = mpsc::sync_channel(1);
-    let observer = thread::spawn(move || {
-        let observed = observe_child_exit(pid);
-        let _ = observed_tx.send(observed);
-    });
-    match observed_rx.recv_timeout(limit) {
-        Ok(Ok(())) => {
-            let observer_error = observer
-                .join()
-                .err()
-                .map(|_| "child exit observer panicked".into());
-            ProcessCompletion {
-                status: child
-                    .wait()
-                    .map_err(|error| error.to_string().into_boxed_str()),
-                timed_out: false,
-                wait_error: observer_error,
-                termination_error: None,
-            }
-        }
-        Ok(Err(error)) => {
-            let observer_error = observer
-                .join()
-                .err()
-                .map(|_| "child exit observer panicked".into());
-            kill_and_reap(child, false, observer_error.or(Some(error)))
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let completion = kill_and_reap(child, true, None);
-            let _ = observer.join();
-            completion
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let observer_error = observer
-                .join()
-                .err()
-                .map(|_| "child exit observer panicked".into())
-                .or_else(|| Some("child exit observer disconnected".into()));
-            kill_and_reap(child, false, observer_error)
-        }
-    }
-}
-
-fn observe_child_exit(pid: Pid) -> Result<(), Box<str>> {
-    match retry_on_intr(|| {
-        waitid(
-            WaitId::Pid(pid),
-            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-        )
-    }) {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err("child exit observer returned without an exit".into()),
-        Err(error) => Err(error.to_string().into_boxed_str()),
-    }
-}
-
-fn kill_and_reap(
-    child: &mut Child,
-    timed_out: bool,
-    wait_error: Option<Box<str>>,
-) -> ProcessCompletion {
-    let termination_error = child
-        .kill()
-        .err()
-        .map(|error| error.to_string().into_boxed_str());
-    let status = child
-        .wait()
-        .map_err(|error| error.to_string().into_boxed_str());
-    ProcessCompletion {
-        status,
-        timed_out,
-        wait_error,
-        termination_error,
-    }
-}
-
-fn capture_output<Reader>(mut reader: Reader) -> JoinHandle<Vec<u8>>
-where
-    Reader: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut captured = Vec::new();
-        let mut buffer = [0_u8; 4 * 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => append_captured_bytes(&mut captured, &buffer[..count]),
-                Err(error) => {
-                    append_captured_bytes(
-                        &mut captured,
-                        format!("\nfailed to read child output: {error}\n").as_bytes(),
-                    );
-                    break;
-                }
-            }
-        }
-        captured
-    })
-}
-
-fn append_captured_bytes(captured: &mut Vec<u8>, bytes: &[u8]) {
-    let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(captured.len());
-    captured.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-}
-
-fn join_output(reader: JoinHandle<Vec<u8>>) -> Vec<u8> {
-    reader
-        .join()
-        .unwrap_or_else(|_| b"child output reader panicked".to_vec())
-}
-
 fn captured_process_diagnostic(stdout: &[u8], stderr: &[u8]) -> String {
     format!(
         "stdout: {}; stderr: {}",
@@ -957,6 +764,19 @@ fn captured_process_diagnostic(stdout: &[u8], stderr: &[u8]) -> String {
 
 fn redacted_output(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace(OWNER_PASSWORD, "<redacted>")
+}
+
+fn start_admin_daemon(root: &Path) -> (Daemon, SocketAddr) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maincopyd"));
+    command
+        .args(["--config", "maincopy.toml"])
+        .current_dir(root);
+    Daemon::start_with_readiness(
+        command,
+        SERVER_START_LIMIT,
+        admin_address_from_ready_line,
+        redacted_output,
+    )
 }
 
 fn admin_address_from_ready_line(line: &str) -> Result<Option<SocketAddr>, &'static str> {
@@ -974,223 +794,6 @@ fn admin_address_from_ready_line(line: &str) -> Result<Option<SocketAddr>, &'sta
         return Err("admin readiness log contained an unsafe bound address");
     }
     Ok(Some(address))
-}
-
-fn drain_daemon_stderr<Reader>(
-    mut reader: Reader,
-    ready_tx: mpsc::SyncSender<Result<SocketAddr, Box<str>>>,
-) -> Vec<u8>
-where
-    Reader: Read,
-{
-    let mut ready_tx = Some(ready_tx);
-    let mut captured = Vec::new();
-    let mut line = Vec::with_capacity(MAX_DAEMON_LOG_LINE_BYTES);
-    let mut line_exceeded_limit = false;
-    let mut buffer = [0_u8; 4 * 1024];
-
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => {
-                if !line.is_empty() && !line_exceeded_limit {
-                    observe_daemon_ready_line(&line, &mut ready_tx);
-                }
-                if let Some(sender) = ready_tx.take() {
-                    let _ =
-                        sender.send(Err("daemon exited before binding its admin listener".into()));
-                }
-                break;
-            }
-            Ok(count) => {
-                append_captured_bytes(&mut captured, &buffer[..count]);
-                for &byte in &buffer[..count] {
-                    if byte == b'\n' {
-                        if !line_exceeded_limit {
-                            observe_daemon_ready_line(&line, &mut ready_tx);
-                        }
-                        line.clear();
-                        line_exceeded_limit = false;
-                    } else if !line_exceeded_limit {
-                        if line.len() < MAX_DAEMON_LOG_LINE_BYTES {
-                            line.push(byte);
-                        } else {
-                            line.clear();
-                            line_exceeded_limit = true;
-                            if let Some(sender) = ready_tx.take() {
-                                let _ = sender.send(Err(
-                                    format!(
-                                        "daemon stderr line exceeded {MAX_DAEMON_LOG_LINE_BYTES} bytes before readiness"
-                                    )
-                                    .into_boxed_str(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                append_captured_bytes(
-                    &mut captured,
-                    format!("\nfailed to read daemon stderr: {error}\n").as_bytes(),
-                );
-                if let Some(sender) = ready_tx.take() {
-                    let _ = sender.send(Err(format!(
-                        "failed to read daemon stderr before readiness: {error}"
-                    )
-                    .into_boxed_str()));
-                }
-                break;
-            }
-        }
-    }
-
-    captured
-}
-
-fn observe_daemon_ready_line(
-    line: &[u8],
-    ready_tx: &mut Option<mpsc::SyncSender<Result<SocketAddr, Box<str>>>>,
-) {
-    let Some(sender) = ready_tx.as_ref() else {
-        return;
-    };
-    let line = String::from_utf8_lossy(line);
-    let result = match admin_address_from_ready_line(line.trim_end_matches('\r')) {
-        Ok(None) => return,
-        Ok(Some(address)) => Ok(address),
-        Err(error) => Err(error.into()),
-    };
-    let _ = sender.send(result);
-    *ready_tx = None;
-}
-
-struct Daemon {
-    child: Child,
-    stderr: Option<JoinHandle<Vec<u8>>>,
-    stopped: bool,
-}
-
-impl Daemon {
-    fn start(root: &Path) -> (Self, SocketAddr) {
-        let child = Command::new(env!("CARGO_BIN_EXE_maincopyd"))
-            .args(["--config", "maincopy.toml"])
-            .current_dir(root)
-            .env("RUST_LOG", "info")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("admin integration daemon must start");
-        let mut daemon = Self {
-            child,
-            stderr: None,
-            stopped: false,
-        };
-        let stderr = daemon
-            .child
-            .stderr
-            .take()
-            .expect("admin integration daemon stderr must be captured");
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, Box<str>>>(1);
-        let stderr = thread::spawn(move || drain_daemon_stderr(stderr, ready_tx));
-        daemon.stderr = Some(stderr);
-        match ready_rx.recv_timeout(SERVER_START_LIMIT) {
-            Ok(Ok(address)) => (daemon, address),
-            Ok(Err(message)) => {
-                let logs = daemon.force_stop();
-                panic!("admin integration daemon did not become ready: {message}: {logs}");
-            }
-            Err(error) => {
-                let logs = daemon.force_stop();
-                panic!("admin integration daemon readiness timed out ({error}): {logs}");
-            }
-        }
-    }
-
-    fn stop(mut self) {
-        let graceful_shutdown_error = match self.child.try_wait() {
-            Ok(Some(_)) => None,
-            Ok(None) => kill_process(Pid::from_child(&self.child), Signal::TERM)
-                .err()
-                .map(|error| error.to_string().into_boxed_str()),
-            Err(error) => {
-                let termination = kill_process(Pid::from_child(&self.child), Signal::TERM)
-                    .err()
-                    .map(|error| error.to_string());
-                Some(
-                    match termination {
-                        Some(termination) => {
-                            format!("status check failed: {error}; SIGTERM failed: {termination}")
-                        }
-                        None => format!("status check failed before SIGTERM: {error}"),
-                    }
-                    .into_boxed_str(),
-                )
-            }
-        };
-        let completion = wait_for_child(&mut self.child, SERVER_STOP_LIMIT);
-        self.stopped = true;
-        let logs = self.join_stderr();
-        assert!(
-            graceful_shutdown_error.is_none(),
-            "admin integration daemon could not begin graceful shutdown: {}: {logs}",
-            graceful_shutdown_error
-                .as_deref()
-                .unwrap_or("unknown shutdown failure")
-        );
-        assert!(
-            completion.wait_error.is_none(),
-            "admin integration daemon wait failed: {}: {logs}",
-            completion
-                .wait_error
-                .as_deref()
-                .unwrap_or("unknown wait failure")
-        );
-        assert!(
-            !completion.timed_out,
-            "admin integration daemon exceeded its shutdown limit: {logs}"
-        );
-        assert!(
-            completion.termination_error.is_none(),
-            "admin integration daemon could not be killed after its shutdown timeout: {}: {logs}",
-            completion
-                .termination_error
-                .as_deref()
-                .unwrap_or("unknown termination failure")
-        );
-        assert!(
-            completion
-                .status
-                .as_ref()
-                .unwrap_or_else(|error| {
-                    panic!("admin integration daemon could not be reaped: {error}")
-                })
-                .success(),
-            "admin integration daemon failed: {logs}"
-        );
-    }
-
-    fn force_stop(&mut self) -> String {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = wait_for_child(&mut self.child, FORCED_STOP_LIMIT);
-        self.stopped = true;
-        self.join_stderr()
-    }
-
-    fn join_stderr(&mut self) -> String {
-        let captured = self.stderr.take().map(join_output).unwrap_or_default();
-        redacted_output(&captured)
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        if !self.stopped {
-            let _ = self.force_stop();
-        }
-    }
 }
 
 async fn assert_problem(response: Response, expected_code: &str) {

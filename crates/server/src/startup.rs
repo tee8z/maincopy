@@ -60,7 +60,7 @@ use crate::{
     },
     source_bootstrap::{configure_source, generate_source_key},
     source_provenance::{SourceCommitDiscovery, discover_source_commit},
-    source_sync::{ManagedSourceEngine, SourceRuntimeMode, SourceSyncHandle},
+    source_sync::{ManagedSourceEngine, SourceSyncHandle},
     web::{PublicServer, PublicState, Readiness},
 };
 
@@ -319,24 +319,16 @@ impl Application {
         })?;
         let compiled = compile_startup_content(&startup, host.content_root, &content_compiler)?;
         let active_content_digest = compiled.content_digest.clone();
-        let StartedDatabase {
-            store: database_store,
-            shutdown: database_shutdown,
-            task: database_task,
-            security,
-        } = start_database(&startup._host).await?;
-        let source = SourceSyncHandle::new(
-            database_store.source.clone(),
-            SourceRuntimeMode::ExternalCheckout,
-        );
+        let database = start_database(&startup._host).await?;
+        let source = SourceSyncHandle::external_checkout(database.store.source.clone());
 
         let serving_state = match prepare_serving_state(ServingStateInput {
-            database: &database_store,
+            database: &database.store,
             compiled,
             frontend,
             public_bind: host.public_bind,
             admin_bind: host.admin_bind,
-            security,
+            security: database.security.clone(),
             cancellation: cancellation.clone(),
             candidate_store: &candidate_store,
             content_compiler: &content_compiler,
@@ -346,54 +338,15 @@ impl Application {
         {
             Ok(setup) => setup,
             Err(error) => {
-                return Err(close_writer_after_startup_failure(
-                    database_store,
-                    database_shutdown,
-                    database_task,
-                    error,
-                )
-                .await);
+                return Err(close_started_database(database, error).await);
             }
         };
-        let ServingState {
-            readiness,
-            publication_coordinator,
-            publication_actor,
-            public_server,
-            admin_server,
-        } = serving_state;
-        #[cfg(test)]
-        let public_addr = public_server.local_addr;
-        #[cfg(test)]
-        let admin_addr = admin_server.local_addr;
-        let public_cancellation = cancellation.clone();
-        let public_task = CriticalTask::new(CriticalTaskName::PublicServer, async move {
-            public_server
-                .serve(public_cancellation)
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
-        let admin_cancellation = cancellation.clone();
-        let admin_task = CriticalTask::new(CriticalTaskName::AdminServer, async move {
-            admin_server
-                .serve(admin_cancellation)
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
-        let actor_cancellation = cancellation.clone();
-        let publication_actor_task =
-            CriticalTask::new(CriticalTaskName::PublicationCoordinator, async move {
-                publication_actor
-                    .run(actor_cancellation)
-                    .await
-                    .map_err(|error| Box::new(error) as CriticalTaskFailure)
-            });
         let content_sync = ContentSync::new(
             content_root,
             content_limits,
             candidate_store,
             active_content_digest,
-            publication_coordinator.clone(),
+            serving_state.publication_coordinator.clone(),
             cancellation.clone(),
             content_compiler,
         );
@@ -403,45 +356,16 @@ impl Application {
                 .await
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
-        let scheduler_wakeup = publication_coordinator.scheduler_wakeup();
-        let scheduler = PublicationScheduler::new(
-            database_store.publications.clone(),
-            publication_coordinator.clone(),
-            scheduler_wakeup,
-            cancellation.clone(),
-        );
-        let scheduler_task = CriticalTask::new(CriticalTaskName::Scheduler, async move {
-            scheduler
-                .run()
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
-
-        Ok(Self {
-            _startup: StartupResources::External {
+        Ok(Self::assemble(
+            StartupResources::External {
                 _resources: Box::new(startup),
             },
-            _database: database_store,
-            publication_coordinator,
-            runtime: ApplicationRuntime::with_database_writer(
-                readiness,
-                cancellation,
-                database_shutdown,
-                shutdown,
-                vec![
-                    publication_actor_task,
-                    public_task,
-                    admin_task,
-                    content_task,
-                    scheduler_task,
-                ],
-                database_task,
-            ),
-            #[cfg(test)]
-            public_addr,
-            #[cfg(test)]
-            admin_addr,
-        })
+            database,
+            serving_state,
+            cancellation,
+            shutdown,
+            content_task,
+        ))
     }
 
     async fn build_managed(startup: StartupHostConfiguration) -> Result<Self, ProcessError> {
@@ -540,36 +464,19 @@ impl Application {
                 return Err(close_started_database(database, error).await);
             }
         };
-        let source_commit = match candidate.source_commit.clone() {
-            Some(source_commit) => source_commit,
-            None => {
-                let error = startup_failure(
-                    StartupStage::Source,
-                    "prepare the managed source head",
-                    StartupInvariantError::ManagedSourceCommitMissing,
-                );
-                return Err(close_started_database(database, error).await);
-            }
-        };
         let compiled = CompiledStartupContent {
             observed_posts: observed_post_revisions(&candidate.catalog),
             catalog: candidate.catalog,
-            source_commit: Some(source_commit),
+            source_commit: Some(candidate.source_commit),
             content_digest: candidate.content_digest,
         };
-        let StartedDatabase {
-            store: database_store,
-            shutdown: database_shutdown,
-            task: database_task,
-            security,
-        } = database;
         let serving_state = match prepare_serving_state(ServingStateInput {
-            database: &database_store,
+            database: &database.store,
             compiled,
             frontend,
             public_bind: host.public_bind,
             admin_bind: host.admin_bind,
-            security,
+            security: database.security.clone(),
             cancellation: cancellation.clone(),
             candidate_store: &candidate_store,
             content_compiler: &content_compiler,
@@ -579,15 +486,37 @@ impl Application {
         {
             Ok(setup) => setup,
             Err(error) => {
-                return Err(close_writer_after_startup_failure(
-                    database_store,
-                    database_shutdown,
-                    database_task,
-                    error,
-                )
-                .await);
+                return Err(close_started_database(database, error).await);
             }
         };
+        let source_sync = source_engine.into_live(serving_state.publication_coordinator.clone());
+        let source_task = CriticalTask::new(CriticalTaskName::SourceSync, async move {
+            source_sync
+                .run()
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
+        Ok(Self::assemble(
+            StartupResources::Managed {
+                _resources: Box::new(startup),
+            },
+            database,
+            serving_state,
+            cancellation,
+            shutdown,
+            source_task,
+        ))
+    }
+
+    /// Starts the same supervised services after either source finishes preparation.
+    fn assemble(
+        startup: StartupResources,
+        database: StartedDatabase,
+        serving_state: ServingState,
+        cancellation: CancellationToken,
+        shutdown: ShutdownFuture,
+        source_task: CriticalTask,
+    ) -> Self {
         let ServingState {
             readiness,
             publication_coordinator,
@@ -621,18 +550,10 @@ impl Application {
                     .await
                     .map_err(|error| Box::new(error) as CriticalTaskFailure)
             });
-        let source_sync = source_engine.into_live(publication_coordinator.clone());
-        let source_task = CriticalTask::new(CriticalTaskName::SourceSync, async move {
-            source_sync
-                .run()
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
-        let scheduler_wakeup = publication_coordinator.scheduler_wakeup();
         let scheduler = PublicationScheduler::new(
-            database_store.publications.clone(),
+            database.store.publications.clone(),
             publication_coordinator.clone(),
-            scheduler_wakeup,
+            publication_coordinator.scheduler_wakeup(),
             cancellation.clone(),
         );
         let scheduler_task = CriticalTask::new(CriticalTaskName::Scheduler, async move {
@@ -642,16 +563,14 @@ impl Application {
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
 
-        Ok(Self {
-            _startup: StartupResources::Managed {
-                _resources: Box::new(startup),
-            },
-            _database: database_store,
+        Self {
+            _startup: startup,
+            _database: database.store,
             publication_coordinator,
             runtime: ApplicationRuntime::with_database_writer(
                 readiness,
                 cancellation,
-                database_shutdown,
+                database.shutdown,
                 shutdown,
                 vec![
                     publication_actor_task,
@@ -660,13 +579,13 @@ impl Application {
                     source_task,
                     scheduler_task,
                 ],
-                database_task,
+                database.task,
             ),
             #[cfg(test)]
             public_addr,
             #[cfg(test)]
             admin_addr,
-        })
+        }
     }
 
     async fn run_until_stop(self) -> Result<(), ApplicationError> {
@@ -705,15 +624,7 @@ fn compile_startup_content(
                 startup_failure(StartupStage::Content, "compile the content catalog", error)
             })?,
     );
-    let observed_posts = catalog
-        .rendered_posts()
-        .map(|post| ObservedPostRevision {
-            stable_post_id: post.document.metadata.id.clone(),
-            revision_digest: post.revision.clone(),
-            publication_status: post.document.metadata.draft,
-            slug: post.document.metadata.slug.clone(),
-        })
-        .collect();
+    let observed_posts = observed_post_revisions(&catalog);
     let source_commit = match discover_source_commit(content_root) {
         SourceCommitDiscovery::Discovered(commit) => Some(commit),
         SourceCommitDiscovery::Unavailable(reason) => {
@@ -1247,8 +1158,6 @@ enum StartupInvariantError {
     BaseSnapshotMismatch,
     #[error("the retained public representation does not match the durable site head")]
     PublicSnapshotMismatch,
-    #[error("a managed source candidate has no exact source commit")]
-    ManagedSourceCommitMissing,
 }
 
 async fn close_started_database(

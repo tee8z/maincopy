@@ -557,14 +557,14 @@ impl<'input> Resolver<'input> {
             ));
             return None;
         };
-        let asset = DigestedAsset::new(logical_path.clone(), digest_asset(&bytes));
-        self.resolved_local_assets
-            .entry(logical_path)
+        let resolved = self
+            .resolved_local_assets
+            .entry(logical_path.clone())
             .or_insert_with(|| ResolvedLocalAsset {
-                asset: asset.clone(),
+                asset: DigestedAsset::new(logical_path, digest_asset(&bytes)),
                 bytes,
             });
-        Some(AssetRevisionReference::local(asset))
+        Some(AssetRevisionReference::local(resolved.asset.clone()))
     }
 
     fn resolve_external(
@@ -1150,20 +1150,33 @@ mod tests {
     }
 
     #[test]
-    fn changed_local_bytes_change_identity_and_store_lookup_checks_the_digest() {
+    fn shared_local_assets_keep_occurrences_and_refresh_identity_when_bytes_change() {
         let make_tree = |bytes: &'static [u8]| {
             content_tree(
-                publication_source(Some("assets/favicon.png"), &[]),
+                publication_source(Some("assets/shared.png"), &[]),
                 vec![(
                     "posts/local.md",
                     PostCollection::Posts,
-                    post_source(POST_ID, "local", None, false, "![local](assets/image.png)"),
+                    post_source(
+                        POST_ID,
+                        "local",
+                        Some("assets/shared.png"),
+                        false,
+                        "![local](assets/shared.png)\n[download](assets/shared.png)",
+                    ),
                 )],
-                vec![("assets/favicon.png", bytes), ("assets/image.png", bytes)],
+                vec![("assets/shared.png", bytes)],
             )
         };
         let first = resolve(&make_tree(b"first"));
         let second = resolve(&make_tree(b"second"));
+        assert_eq!(first.local_assets.assets.len(), 1);
+        assert_eq!(first.posts[0].assets.image, first.site.favicon);
+        let occurrences = &first.posts[0].assets.markdown_destinations;
+        assert_eq!(occurrences.len(), 2);
+        for occurrence in occurrences {
+            assert_eq!(Some(&occurrence.target), first.site.favicon.as_ref());
+        }
         let Some(AssetRevisionReference::Local(first_favicon)) = first.site.favicon.as_ref() else {
             panic!("local favicon was expected")
         };

@@ -11,14 +11,14 @@ mod rss;
 mod site;
 mod sitemap;
 mod svg;
+mod xml;
 
 pub(crate) use asset_path::SnapshotAssetPath;
+pub(crate) use catalog::CatalogRetentionError;
 pub(crate) use catalog::ContentCompiler;
 pub use catalog::{
     CatalogBuildError, CatalogBuildErrorCode, ContentCatalog, compile_content_catalog,
 };
-pub(crate) use catalog::{CatalogRetentionError, PreviewAsset};
-pub(crate) use markdown::GeneratedPostAsset;
 pub use markdown::{
     CodeBlockOrdinal, MarkdownRenderError, MarkdownRenderErrorCode, MarkdownRenderLocation,
     NavigationRejection, RenderDestinationKind, RenderedPost, render_markdown,

@@ -314,7 +314,6 @@ impl PublicationCoordinatorHandle {
             respond_to,
         })
         .await
-        .map_err(ReleaseTransitionError::from)?
     }
 
     pub(crate) async fn change_release(
@@ -326,7 +325,6 @@ impl PublicationCoordinatorHandle {
             respond_to,
         })
         .await
-        .map_err(ReleaseTransitionError::from)?
     }
 
     pub(crate) async fn release_operation(
@@ -374,7 +372,6 @@ impl PublicationCoordinatorHandle {
             },
         )
         .await
-        .map_err(ContentReloadError::from)?
     }
 
     /// Installs one managed candidate and commits its source operation in the
@@ -400,7 +397,6 @@ impl PublicationCoordinatorHandle {
             },
         )
         .await
-        .map_err(ContentReloadError::from)?
     }
 
     pub(crate) async fn publish_now(
@@ -412,7 +408,6 @@ impl PublicationCoordinatorHandle {
             respond_to,
         })
         .await
-        .map_err(PublicationActivationError::from)?
     }
 
     pub(crate) async fn publish_reviewed_now(
@@ -426,7 +421,6 @@ impl PublicationCoordinatorHandle {
             },
         )
         .await
-        .map_err(PublicationActivationError::from)?
     }
 
     pub(crate) async fn schedule(
@@ -438,7 +432,6 @@ impl PublicationCoordinatorHandle {
             respond_to,
         })
         .await
-        .map_err(PublicationActivationError::from)?
     }
 
     pub(crate) async fn schedule_reviewed(
@@ -452,7 +445,6 @@ impl PublicationCoordinatorHandle {
             },
         )
         .await
-        .map_err(PublicationActivationError::from)?
     }
 
     pub(crate) async fn activate_scheduled(
@@ -468,7 +460,6 @@ impl PublicationCoordinatorHandle {
             },
         )
         .await
-        .map_err(PublicationActivationError::from)?
     }
 
     pub(crate) async fn update_profile(
@@ -480,7 +471,6 @@ impl PublicationCoordinatorHandle {
             respond_to,
         })
         .await
-        .map_err(ProfileTransitionError::from)?
     }
 
     pub(crate) async fn set_tip_recipient(
@@ -494,7 +484,6 @@ impl PublicationCoordinatorHandle {
             },
         )
         .await
-        .map_err(ProfileTransitionError::from)?
     }
 
     pub(crate) async fn set_user_status(
@@ -508,13 +497,15 @@ impl PublicationCoordinatorHandle {
             respond_to,
         })
         .await
-        .map_err(UserStatusTransitionError::from)?
     }
 
-    async fn request<Response>(
+    async fn request<Response, Error>(
         &self,
-        command: impl FnOnce(oneshot::Sender<Response>) -> PublicationCoordinatorCommand,
-    ) -> Result<Response, PublicationCoordinatorUnavailable> {
+        command: impl FnOnce(oneshot::Sender<Result<Response, Error>>) -> PublicationCoordinatorCommand,
+    ) -> Result<Response, Error>
+    where
+        Error: From<PublicationCoordinatorUnavailable>,
+    {
         let (respond_to, response) = oneshot::channel();
         self.commands
             .send(command(respond_to))
@@ -522,7 +513,7 @@ impl PublicationCoordinatorHandle {
             .map_err(|_| PublicationCoordinatorUnavailable::Closed)?;
         response
             .await
-            .map_err(|_| PublicationCoordinatorUnavailable::OutcomeUnknown)
+            .map_err(|_| PublicationCoordinatorUnavailable::OutcomeUnknown)?
     }
 }
 

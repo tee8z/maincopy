@@ -13,9 +13,12 @@ not precedent. Reviews must approve and document exceptions.
 - Start with a concrete type. Put behavior in its inherent `impl` blocks.
 - Use a closed enum when Maincopy knows all implementations.
 - Use a closure or function parameter to replace one operation.
-- Add a project trait only for a real, open production substitution or
-  extension boundary. Testing and possible future use are not sufficient.
+- Add a project trait for a current production substitution boundary or a
+  shared behavioral contract used by a common algorithm. Testing and possible
+  future use are not sufficient.
 - Use standard and framework traits for Rust interoperability.
+- Keep orchestration, authorization, and state transitions explicit. Extract
+  repeated mechanics without hiding operation order or failure behavior.
 - Pass dependencies through constructors. Do not use mutable global state or a
   service locator.
 

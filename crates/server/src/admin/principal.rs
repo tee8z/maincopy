@@ -5,7 +5,13 @@ use axum::{
     extract::{FromRequestParts, rejection::ExtensionRejection},
     http::request::Parts,
 };
-use maincopy_shared::auth::{AdminScope, AdminSessionId, AgentCredentialId, UserId};
+use maincopy_shared::auth::{
+    AdminAuditEventId, AdminScope, AdminSessionId, AgentCredentialId, UserId,
+};
+use uuid::Uuid;
+
+use super::request_id::RequestId;
+use crate::domain::auth::store::{AdminMutationKey, AuditPrincipalReference, MutationAuditContext};
 
 /// Fully resolved authority for one authenticated admin request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +30,33 @@ pub(crate) enum AdminAuthentication {
 impl AdminPrincipal {
     pub(crate) fn allows(&self, scope: AdminScope) -> bool {
         self.scopes.contains(&scope)
+    }
+
+    pub(crate) fn mutation_audit(
+        &self,
+        request_id: RequestId,
+        idempotency_key: AdminMutationKey,
+    ) -> MutationAuditContext {
+        let principal = match self.authentication {
+            AdminAuthentication::BrowserSession { session_id } => {
+                AuditPrincipalReference::BrowserSession {
+                    user_id: self.user_id,
+                    session_id,
+                }
+            }
+            AdminAuthentication::AgentCredential { credential_id } => {
+                AuditPrincipalReference::AgentCredential {
+                    user_id: self.user_id,
+                    credential_id,
+                }
+            }
+        };
+        MutationAuditContext {
+            audit_event_id: AdminAuditEventId::from_uuid(Uuid::new_v4()),
+            principal,
+            request_id: Some(request_id.0),
+            idempotency_key,
+        }
     }
 }
 
@@ -44,7 +77,45 @@ mod tests {
     use super::*;
     use axum::{Router, http::StatusCode, routing::get};
     use tower::ServiceExt as _;
-    use uuid::Uuid;
+
+    #[test]
+    fn mutation_audit_retains_the_authenticated_actor_and_retry_identity() {
+        let user_id = UserId::from_uuid(Uuid::new_v4());
+        let session_id = AdminSessionId::from_uuid(Uuid::new_v4());
+        let credential_id = AgentCredentialId::from_uuid(Uuid::new_v4());
+        let request_id = RequestId(Uuid::new_v4());
+        let key = AdminMutationKey(Uuid::new_v4());
+        for (authentication, expected) in [
+            (
+                AdminAuthentication::BrowserSession { session_id },
+                AuditPrincipalReference::BrowserSession {
+                    user_id,
+                    session_id,
+                },
+            ),
+            (
+                AdminAuthentication::AgentCredential { credential_id },
+                AuditPrincipalReference::AgentCredential {
+                    user_id,
+                    credential_id,
+                },
+            ),
+        ] {
+            let principal = AdminPrincipal {
+                user_id,
+                scopes: Arc::new(BTreeSet::new()),
+                authentication,
+            };
+            let audit = principal.mutation_audit(request_id, key);
+            assert_eq!(audit.principal, expected);
+            assert_eq!(audit.request_id, Some(request_id.0));
+            assert_eq!(audit.idempotency_key, key);
+            assert_ne!(
+                audit.audit_event_id,
+                principal.mutation_audit(request_id, key).audit_event_id
+            );
+        }
+    }
 
     #[test]
     fn principals_expose_only_their_resolved_scope_set() {

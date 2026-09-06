@@ -16,6 +16,7 @@ use maincopy_shared::auth::AdminScope;
 
 mod assets;
 mod capabilities;
+pub(crate) mod idempotency;
 mod identity;
 mod openapi;
 pub(crate) mod origin;

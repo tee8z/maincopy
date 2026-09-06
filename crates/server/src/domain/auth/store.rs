@@ -7,14 +7,15 @@ use maincopy_shared::auth::{
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime, UtcOffset};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::{
     CanonicalUsername, CsrfTokenDigest, LoginChallengeDigest, NIP98_FRESHNESS_SECONDS,
     Nip98EventId, NostrPublicKey, SessionTokenDigest, StoredPasswordHash,
 };
-use crate::database::store::{DatabaseAdmissionError, Mutation};
+use crate::database::fingerprint::CommandFingerprintBuilder;
+use crate::database::store::{DatabaseAdmissionError, Mutation, MutationSender};
 
 const MAX_AGENT_LABEL_BYTES: usize = 96;
 const MAX_AUDIT_ACTION_BYTES: usize = 96;
@@ -30,12 +31,15 @@ const MAX_AUTH_PAGE_ROWS: u16 = 100;
 #[derive(Clone)]
 pub(crate) struct AuthStore {
     readers: SqlitePool,
-    mutations: mpsc::Sender<Mutation>,
+    mutations: MutationSender,
 }
 
 impl AuthStore {
     pub(crate) const fn new(readers: SqlitePool, mutations: mpsc::Sender<Mutation>) -> Self {
-        Self { readers, mutations }
+        Self {
+            readers,
+            mutations: MutationSender::new(mutations),
+        }
     }
 
     pub(crate) async fn identity_state(&self) -> Result<IdentityState, AuthLoadError> {
@@ -445,188 +449,211 @@ impl AuthStore {
         &self,
         command: RecordAdminAuditFailure,
     ) -> Result<(), AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::RecordAdminAuditFailure {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::RecordAdminAuditFailure {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn bootstrap_identity(
         &self,
         command: BootstrapIdentity,
     ) -> Result<BootstrapIdentityResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::BootstrapIdentity {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::BootstrapIdentity {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn create_user(
         &self,
         command: CreateUser,
     ) -> Result<UserMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::CreateUser {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::CreateUser {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn set_user_status(
         &self,
         command: SetUserStatus,
     ) -> Result<UserMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::SetUserStatus {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::SetUserStatus {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn replace_user_roles(
         &self,
         command: ReplaceUserRoles,
     ) -> Result<UserMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::ReplaceUserRoles {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::ReplaceUserRoles {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn put_human_credential(
         &self,
         command: PutHumanCredential,
     ) -> Result<UserMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::PutHumanCredential {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::PutHumanCredential {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn remove_human_credential(
         &self,
         command: RemoveHumanCredential,
     ) -> Result<UserMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::RemoveHumanCredential {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::RemoveHumanCredential {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn create_login_challenge(
         &self,
         command: CreateLoginChallenge,
     ) -> Result<StoredLoginChallenge, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::CreateLoginChallenge {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::CreateLoginChallenge {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn create_browser_session(
         &self,
         command: CreateBrowserSession,
     ) -> Result<BrowserSessionMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::CreateBrowserSession {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::CreateBrowserSession {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn revoke_browser_session(
         &self,
         command: RevokeBrowserSession,
     ) -> Result<BrowserSessionMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::RevokeBrowserSession {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::RevokeBrowserSession {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn register_agent_credential(
         &self,
         command: RegisterAgentCredential,
     ) -> Result<AgentCredentialMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::RegisterAgentCredential {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::RegisterAgentCredential {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn replace_agent_scopes(
         &self,
         command: ReplaceAgentScopes,
     ) -> Result<AgentCredentialMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::ReplaceAgentScopes {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::ReplaceAgentScopes {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn revoke_agent_credential(
         &self,
         command: RevokeAgentCredential,
     ) -> Result<AgentCredentialMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::RevokeAgentCredential {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::RevokeAgentCredential {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn accept_agent_proof(
         &self,
         command: AcceptAgentProof,
     ) -> Result<AgentCredentialMutationResult, AuthMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::AcceptAgentProof {
-            command,
-            respond_to,
-        })?;
-        receive_auth_mutation(response).await
-    }
-
-    fn admit(&self, mutation: Mutation) -> Result<(), AuthMutationError> {
         self.mutations
-            .try_send(mutation)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        Ok(())
+            .send(
+                |respond_to| Mutation::AcceptAgentProof {
+                    command,
+                    respond_to,
+                },
+                AuthCommandError::OutcomeUnknown,
+            )
+            .await
     }
-}
-
-async fn receive_auth_mutation<Output>(
-    response: oneshot::Receiver<Result<Output, AuthCommandError>>,
-) -> Result<Output, AuthMutationError> {
-    response
-        .await
-        .map_err(|_| AuthMutationError::Command(AuthCommandError::OutcomeUnknown))?
-        .map_err(AuthMutationError::Command)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1066,18 +1093,12 @@ impl TryFrom<AdminAuditEventRow> for StoredAdminAuditEvent {
     type Error = AuthLoadError;
 
     fn try_from(row: AdminAuditEventRow) -> Result<Self, Self::Error> {
-        let actor = row.actor_user_id.as_deref().map(user_id).transpose()?;
-        let session = row
-            .session_id
-            .as_deref()
-            .map(admin_session_id)
-            .transpose()?;
-        let agent = row
-            .agent_credential_id
-            .as_deref()
-            .map(agent_credential_id)
-            .transpose()?;
-        let principal = audit_principal(&row.principal_kind, actor, session, agent)?;
+        let principal = decode_audit_principal(
+            &row.principal_kind,
+            row.actor_user_id.as_deref(),
+            row.session_id.as_deref(),
+            row.agent_credential_id.as_deref(),
+        )?;
         if row.action.is_empty()
             || row.action.len() > MAX_AUDIT_ACTION_BYTES
             || row.action.chars().any(char::is_control)
@@ -1108,12 +1129,15 @@ impl TryFrom<AdminAuditEventRow> for StoredAdminAuditEvent {
     }
 }
 
-fn audit_principal(
+pub(crate) fn decode_audit_principal(
     kind: &str,
-    actor: Option<UserId>,
-    session: Option<AdminSessionId>,
-    agent: Option<AgentCredentialId>,
+    actor: Option<&[u8]>,
+    session: Option<&[u8]>,
+    agent: Option<&[u8]>,
 ) -> Result<AuditPrincipalReference, AuthLoadError> {
+    let actor = actor.map(user_id).transpose()?;
+    let session = session.map(admin_session_id).transpose()?;
+    let agent = agent.map(agent_credential_id).transpose()?;
     match (kind, actor, session, agent) {
         ("browser_session", Some(user_id), Some(session_id), None) => {
             Ok(AuditPrincipalReference::BrowserSession {
@@ -1586,39 +1610,39 @@ pub(crate) struct RevokeAgentCredential {
 
 impl CreateUser {
     fn fingerprint(&self) -> CommandFingerprint {
-        let mut builder = FingerprintBuilder::new("identity.user.create");
+        let mut builder = CommandFingerprintBuilder::new("identity.user.create");
         builder.field(self.status.as_str().as_bytes());
         fingerprint_roles(&mut builder, &self.roles);
         for credential in &self.credentials {
             fingerprint_credential(&mut builder, credential);
         }
-        builder.finish()
+        CommandFingerprint(builder.finish())
     }
 }
 
 impl SetUserStatus {
     fn fingerprint(&self) -> CommandFingerprint {
-        let mut builder = FingerprintBuilder::new("identity.user.status.replace");
+        let mut builder = CommandFingerprintBuilder::new("identity.user.status.replace");
         builder.uuid(self.user_id.as_uuid());
         builder.version(self.expected_version);
         builder.field(self.status.as_str().as_bytes());
-        builder.finish()
+        CommandFingerprint(builder.finish())
     }
 }
 
 impl ReplaceUserRoles {
     fn fingerprint(&self) -> CommandFingerprint {
-        let mut builder = FingerprintBuilder::new("identity.user.roles.replace");
+        let mut builder = CommandFingerprintBuilder::new("identity.user.roles.replace");
         builder.uuid(self.user_id.as_uuid());
         builder.version(self.expected_version);
         fingerprint_roles(&mut builder, &self.roles);
-        builder.finish()
+        CommandFingerprint(builder.finish())
     }
 }
 
 impl PutHumanCredential {
     fn fingerprint(&self) -> CommandFingerprint {
-        let mut builder = FingerprintBuilder::new("identity.user.credential.put");
+        let mut builder = CommandFingerprintBuilder::new("identity.user.credential.put");
         builder.uuid(self.user_id.as_uuid());
         match self.expected_version {
             Some(version) => {
@@ -1628,23 +1652,23 @@ impl PutHumanCredential {
             None => builder.field(b"create"),
         }
         fingerprint_credential(&mut builder, &self.credential);
-        builder.finish()
+        CommandFingerprint(builder.finish())
     }
 }
 
 impl RemoveHumanCredential {
     fn fingerprint(&self) -> CommandFingerprint {
-        let mut builder = FingerprintBuilder::new("identity.user.credential.remove");
+        let mut builder = CommandFingerprintBuilder::new("identity.user.credential.remove");
         builder.uuid(self.user_id.as_uuid());
         builder.version(self.expected_version);
         builder.field(self.kind.provider().as_str().as_bytes());
-        builder.finish()
+        CommandFingerprint(builder.finish())
     }
 }
 
 impl RegisterAgentCredential {
     fn fingerprint(&self) -> CommandFingerprint {
-        let mut builder = FingerprintBuilder::new("identity.agent.register");
+        let mut builder = CommandFingerprintBuilder::new("identity.agent.register");
         builder.uuid(self.owner_user_id.as_uuid());
         builder.field(self.public_key.as_bytes());
         builder.field(self.label.as_bytes());
@@ -1653,42 +1677,45 @@ impl RegisterAgentCredential {
             Some(expires_at) => builder.field(&expires_at.unix_timestamp_nanos().to_be_bytes()),
             None => builder.field(b"no-expiry"),
         }
-        builder.finish()
+        CommandFingerprint(builder.finish())
     }
 }
 
 impl ReplaceAgentScopes {
     fn fingerprint(&self) -> CommandFingerprint {
-        let mut builder = FingerprintBuilder::new("identity.agent.scopes.replace");
+        let mut builder = CommandFingerprintBuilder::new("identity.agent.scopes.replace");
         builder.uuid(self.credential_id.as_uuid());
         builder.version(self.expected_version);
         fingerprint_scopes(&mut builder, &self.scopes);
-        builder.finish()
+        CommandFingerprint(builder.finish())
     }
 }
 
 impl RevokeAgentCredential {
     fn fingerprint(&self) -> CommandFingerprint {
-        let mut builder = FingerprintBuilder::new("identity.agent.revoke");
+        let mut builder = CommandFingerprintBuilder::new("identity.agent.revoke");
         builder.uuid(self.credential_id.as_uuid());
         builder.version(self.expected_version);
-        builder.finish()
+        CommandFingerprint(builder.finish())
     }
 }
 
-fn fingerprint_roles(builder: &mut FingerprintBuilder, roles: &BTreeSet<UserRole>) {
+fn fingerprint_roles(builder: &mut CommandFingerprintBuilder, roles: &BTreeSet<UserRole>) {
     for role in roles {
         builder.field(role.as_str().as_bytes());
     }
 }
 
-fn fingerprint_scopes(builder: &mut FingerprintBuilder, scopes: &BTreeSet<AdminScope>) {
+fn fingerprint_scopes(builder: &mut CommandFingerprintBuilder, scopes: &BTreeSet<AdminScope>) {
     for scope in scopes {
         builder.field(scope.as_str().as_bytes());
     }
 }
 
-fn fingerprint_credential(builder: &mut FingerprintBuilder, credential: &NewHumanCredential) {
+fn fingerprint_credential(
+    builder: &mut CommandFingerprintBuilder,
+    credential: &NewHumanCredential,
+) {
     match credential {
         NewHumanCredential::Password { username, .. } => {
             builder.field(HumanLoginProvider::Password.as_str().as_bytes());
@@ -1748,33 +1775,6 @@ struct CommandFingerprint([u8; 32]);
 impl CommandFingerprint {
     const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
-    }
-}
-
-struct FingerprintBuilder(blake3::Hasher);
-
-impl FingerprintBuilder {
-    fn new(action: &'static str) -> Self {
-        let mut builder = Self(blake3::Hasher::new());
-        builder.field(action.as_bytes());
-        builder
-    }
-
-    fn field(&mut self, value: &[u8]) {
-        self.0.update(&(value.len() as u64).to_be_bytes());
-        self.0.update(value);
-    }
-
-    fn uuid(&mut self, value: &Uuid) {
-        self.field(value.as_bytes());
-    }
-
-    fn version(&mut self, value: u64) {
-        self.field(&value.to_be_bytes());
-    }
-
-    fn finish(self) -> CommandFingerprint {
-        CommandFingerprint(*self.0.finalize().as_bytes())
     }
 }
 
@@ -2984,26 +2984,13 @@ async fn replay_identity_mutation(
             Ok(None)
         };
     };
-    let actor = row
-        .actor_user_id
-        .as_deref()
-        .map(user_id)
-        .transpose()
-        .map_err(AuthApplyError::from_load)?;
-    let session = row
-        .session_id
-        .as_deref()
-        .map(admin_session_id)
-        .transpose()
-        .map_err(AuthApplyError::from_load)?;
-    let agent = row
-        .agent_credential_id
-        .as_deref()
-        .map(agent_credential_id)
-        .transpose()
-        .map_err(AuthApplyError::from_load)?;
-    let principal = audit_principal(&row.principal_kind, actor, session, agent)
-        .map_err(AuthApplyError::from_load)?;
+    let principal = decode_audit_principal(
+        &row.principal_kind,
+        row.actor_user_id.as_deref(),
+        row.session_id.as_deref(),
+        row.agent_credential_id.as_deref(),
+    )
+    .map_err(AuthApplyError::from_load)?;
     if row.command_fingerprint.as_slice() != fingerprint.as_bytes()
         || row.action != action
         || row.result_kind != expected_result_kind

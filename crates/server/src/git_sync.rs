@@ -2044,7 +2044,7 @@ mod tests {
             fixture: &ManagedSourceFixture,
             candidate: &PreparedContentCandidate,
         ) -> Self {
-            let source_commit = candidate.source_commit.clone().unwrap();
+            let source_commit = candidate.source_commit.clone();
             let ledger = PublicLedgerProjection::empty();
             let shell =
                 render_site_shell(Arc::clone(&candidate.catalog), embedded_manifest(), &ledger)
@@ -2590,7 +2590,7 @@ mod tests {
 
         let initial_commit = fixture_commit(&fixture.work);
         let initial = fixture.prepare().await.unwrap();
-        assert_eq!(initial.source_commit.as_ref(), Some(&initial_commit));
+        assert_eq!(initial.source_commit, initial_commit);
         assert_only_candidate_title(&initial, "Initial managed post");
         let initial_installation = fixture.store.source.installation().await.unwrap().unwrap();
         assert_eq!(initial_installation.source_commit, initial_commit);
@@ -2642,7 +2642,7 @@ mod tests {
         fixture.commit_valid_revision();
         let updated_commit = fixture_commit(&fixture.work);
         let updated = fixture.prepare().await.unwrap();
-        assert_eq!(updated.source_commit.as_ref(), Some(&updated_commit));
+        assert_eq!(updated.source_commit, updated_commit);
         assert_only_candidate_title(&updated, "Updated managed post");
         assert_ne!(updated.content_digest, initial.content_digest);
         let last_good = fixture.store.source.installation().await.unwrap().unwrap();

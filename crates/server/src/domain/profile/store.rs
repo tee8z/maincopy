@@ -1,19 +1,22 @@
+#[cfg(test)]
+use maincopy_shared::auth::{AdminSessionId, AgentCredentialId};
 use maincopy_shared::{
-    auth::{AdminScope, AdminSessionId, AgentCredentialId, UserId, UserStatus},
+    auth::{AdminScope, UserId, UserStatus},
     profile::{LightningAddress, ProfileDisplayName, ProfileVersion},
 };
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::database::store::{DatabaseAdmissionError, Mutation};
+use crate::database::fingerprint::CommandFingerprintBuilder;
+use crate::database::store::{DatabaseAdmissionError, Mutation, MutationSender};
 #[cfg(test)]
 use crate::domain::auth::store::AdminMutationKey;
 use crate::domain::auth::store::{
     AuditPrincipalReference, AuthApplyError, AuthCommandError, MutationAuditContext,
-    append_success_audit, require_principal_scope,
+    append_success_audit, decode_audit_principal, require_principal_scope,
 };
 
 use super::ProfilePrecondition;
@@ -25,12 +28,15 @@ const LNURL_PAY_PATH: &str = "/.well-known/lnurlp/";
 #[derive(Clone)]
 pub(crate) struct ProfileStore {
     readers: SqlitePool,
-    mutations: mpsc::Sender<Mutation>,
+    mutations: MutationSender,
 }
 
 impl ProfileStore {
     pub(crate) const fn new(readers: SqlitePool, mutations: mpsc::Sender<Mutation>) -> Self {
-        Self { readers, mutations }
+        Self {
+            readers,
+            mutations: MutationSender::new(mutations),
+        }
     }
 
     pub(crate) async fn profile(
@@ -115,44 +121,31 @@ impl ProfileStore {
         &self,
         command: UpdateProfile,
     ) -> Result<StoredUserProfile, ProfileMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::UpdateProfile {
-            command,
-            respond_to,
-        })?;
-        receive_mutation(response).await
+        self.mutations
+            .send(
+                |respond_to| Mutation::UpdateProfile {
+                    command,
+                    respond_to,
+                },
+                ProfileCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn set_tip_recipient(
         &self,
         command: SetTipRecipient,
     ) -> Result<StoredTipRecipientSetting, ProfileMutationError> {
-        let (respond_to, response) = oneshot::channel();
-        self.admit(Mutation::SetTipRecipient {
-            command,
-            respond_to,
-        })?;
-        receive_mutation(response).await
-    }
-
-    fn admit(&self, mutation: Mutation) -> Result<(), ProfileMutationError> {
         self.mutations
-            .try_send(mutation)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => DatabaseAdmissionError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => DatabaseAdmissionError::WriterClosed,
-            })?;
-        Ok(())
+            .send(
+                |respond_to| Mutation::SetTipRecipient {
+                    command,
+                    respond_to,
+                },
+                ProfileCommandError::OutcomeUnknown,
+            )
+            .await
     }
-}
-
-async fn receive_mutation<Output>(
-    response: oneshot::Receiver<Result<Output, ProfileCommandError>>,
-) -> Result<Output, ProfileMutationError> {
-    response
-        .await
-        .map_err(|_| ProfileMutationError::Command(ProfileCommandError::OutcomeUnknown))?
-        .map_err(ProfileMutationError::Command)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -307,13 +300,14 @@ pub(crate) struct SetTipRecipient {
 
 impl UpdateProfile {
     fn fingerprint(&self) -> ProfileCommandFingerprint {
-        let mut builder = ProfileFingerprintBuilder::new(ProfileMutationAction::PutUserProfile);
+        let mut builder =
+            CommandFingerprintBuilder::new(ProfileMutationAction::PutUserProfile.as_str());
         builder.uuid(self.user_id.as_uuid());
         match self.precondition {
             ProfilePrecondition::Create => builder.field(b"create"),
             ProfilePrecondition::Replace(version) => {
                 builder.field(b"replace");
-                builder.version(version);
+                builder.version(version.into_u64());
             }
         }
         builder.optional_field(
@@ -327,21 +321,21 @@ impl UpdateProfile {
                 .map(|value| value.as_str().as_bytes()),
         );
         builder.boolean(self.tips_enabled);
-        builder.finish()
+        ProfileCommandFingerprint(builder.finish())
     }
 }
 
 impl SetTipRecipient {
     fn fingerprint(&self) -> ProfileCommandFingerprint {
         let mut builder =
-            ProfileFingerprintBuilder::new(ProfileMutationAction::ReplaceTipRecipient);
-        builder.version(self.expected_version);
+            CommandFingerprintBuilder::new(ProfileMutationAction::ReplaceTipRecipient.as_str());
+        builder.version(self.expected_version.into_u64());
         builder.optional_field(
             self.recipient_user_id
                 .as_ref()
                 .map(|value| value.as_uuid().as_bytes().as_slice()),
         );
-        builder.finish()
+        ProfileCommandFingerprint(builder.finish())
     }
 }
 
@@ -366,47 +360,6 @@ struct ProfileCommandFingerprint([u8; 32]);
 impl ProfileCommandFingerprint {
     const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
-    }
-}
-
-struct ProfileFingerprintBuilder(blake3::Hasher);
-
-impl ProfileFingerprintBuilder {
-    fn new(action: ProfileMutationAction) -> Self {
-        let mut builder = Self(blake3::Hasher::new());
-        builder.field(action.as_str().as_bytes());
-        builder
-    }
-
-    fn field(&mut self, value: &[u8]) {
-        self.0.update(&(value.len() as u64).to_be_bytes());
-        self.0.update(value);
-    }
-
-    fn optional_field(&mut self, value: Option<&[u8]>) {
-        match value {
-            Some(value) => {
-                self.field(b"some");
-                self.field(value);
-            }
-            None => self.field(b"none"),
-        }
-    }
-
-    fn uuid(&mut self, value: &Uuid) {
-        self.field(value.as_bytes());
-    }
-
-    fn version(&mut self, value: ProfileVersion) {
-        self.field(&value.into_u64().to_be_bytes());
-    }
-
-    fn boolean(&mut self, value: bool) {
-        self.field(&[u8::from(value)]);
-    }
-
-    fn finish(self) -> ProfileCommandFingerprint {
-        ProfileCommandFingerprint(*self.0.finalize().as_bytes())
     }
 }
 
@@ -671,7 +624,13 @@ fn validate_receipt_binding(
     if receipt_idempotency_key != audit.idempotency_key.0.as_bytes() {
         return Err(ProfileApplyError::CorruptStoredState);
     }
-    let principal = receipt_principal(row)?;
+    let principal = decode_audit_principal(
+        &row.principal_kind,
+        row.actor_user_id.as_deref(),
+        row.session_id.as_deref(),
+        row.agent_credential_id.as_deref(),
+    )
+    .map_err(|_| ProfileApplyError::CorruptStoredState)?;
     if row.action != action.as_str() || principal != audit.principal {
         return Err(ProfileCommandError::IdempotencyConflict.into());
     }
@@ -788,56 +747,6 @@ fn require_runtime_actor(audit: &MutationAuditContext) -> Result<UserId, Profile
             Err(ProfileCommandError::Forbidden.into())
         }
     }
-}
-
-fn receipt_principal(
-    row: &ProfileMutationReceiptRow,
-) -> Result<AuditPrincipalReference, ProfileApplyError> {
-    let actor = row
-        .actor_user_id
-        .as_deref()
-        .map(user_id)
-        .transpose()
-        .map_err(|_| ProfileApplyError::CorruptStoredState)?;
-    let session = row
-        .session_id
-        .as_deref()
-        .map(admin_session_id)
-        .transpose()?;
-    let agent = row
-        .agent_credential_id
-        .as_deref()
-        .map(agent_credential_id)
-        .transpose()?;
-    match (row.principal_kind.as_str(), actor, session, agent) {
-        ("browser_session", Some(user_id), Some(session_id), None) => {
-            Ok(AuditPrincipalReference::BrowserSession {
-                user_id,
-                session_id,
-            })
-        }
-        ("agent_credential", Some(user_id), None, Some(credential_id)) => {
-            Ok(AuditPrincipalReference::AgentCredential {
-                user_id,
-                credential_id,
-            })
-        }
-        ("offline", user_id, None, None) => Ok(AuditPrincipalReference::Offline { user_id }),
-        ("unauthenticated", None, None, None) => Ok(AuditPrincipalReference::Unauthenticated),
-        _ => Err(ProfileApplyError::CorruptStoredState),
-    }
-}
-
-fn admin_session_id(value: &[u8]) -> Result<AdminSessionId, ProfileApplyError> {
-    Uuid::from_slice(value)
-        .map(AdminSessionId::from_uuid)
-        .map_err(|_| ProfileApplyError::CorruptStoredState)
-}
-
-fn agent_credential_id(value: &[u8]) -> Result<AgentCredentialId, ProfileApplyError> {
-    Uuid::from_slice(value)
-        .map(AgentCredentialId::from_uuid)
-        .map_err(|_| ProfileApplyError::CorruptStoredState)
 }
 
 fn map_auth_apply<T>(result: Result<T, AuthApplyError>) -> Result<T, ProfileApplyError> {

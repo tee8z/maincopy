@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, Write},
     num::NonZeroUsize,
 };
 
@@ -15,6 +14,8 @@ use quick_xml::{
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use url::Url;
+
+use super::xml::BoundedOutput;
 
 const MAX_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -517,9 +518,9 @@ impl ParsedSvg {
         let replacements = self.replacements(scope);
         let mut writer = Writer::new(BoundedOutput::new(output_limit));
         for event in self.events {
-            write_event(&mut writer, event, &self.ids, &replacements)?;
+            write_event(&mut writer, event, &self.ids, &replacements, output_limit)?;
         }
-        let bytes = writer.into_inner().bytes;
+        let bytes = writer.into_inner().into_bytes();
         let output =
             String::from_utf8(bytes).map_err(|_| SvgSanitizeError::InvalidOutputEncoding)?;
         Ok(SanitizedSvg(output.into_boxed_str()))
@@ -1682,6 +1683,7 @@ fn write_event(
     event: ParsedEvent,
     ids: &BTreeMap<Box<str>, (Box<str>, SvgElement)>,
     replacements: &BTreeMap<Box<str>, Box<str>>,
+    output_limit: usize,
 ) -> Result<(), SvgSanitizeError> {
     let result = match event {
         ParsedEvent::Start(element) => {
@@ -1696,7 +1698,7 @@ fn write_event(
         ParsedEvent::Text(text) => writer.write_event(Event::Text(BytesText::new(&text))),
     };
     result.map_err(|_| SvgSanitizeError::OutputTooLarge {
-        limit: writer.get_ref().limit,
+        limit: output_limit,
     })
 }
 
@@ -1744,39 +1746,6 @@ fn rewrite_value(
         Ok(format!("#{replacement}").into_boxed_str())
     } else {
         Ok(format!("url(#{replacement})").into_boxed_str())
-    }
-}
-
-struct BoundedOutput {
-    bytes: Vec<u8>,
-    limit: usize,
-}
-
-impl BoundedOutput {
-    const fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            limit,
-        }
-    }
-}
-
-impl Write for BoundedOutput {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if self
-            .bytes
-            .len()
-            .checked_add(buffer.len())
-            .is_none_or(|next| next > self.limit)
-        {
-            return Err(io::Error::other("sanitized SVG output limit exceeded"));
-        }
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 

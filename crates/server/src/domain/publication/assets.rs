@@ -13,12 +13,6 @@ impl AssetDelivery {
         inline_media_type(path).map_or(Self::Attachment, Self::Inline)
     }
 
-    /// Renderer output is inert until a renderer-specific sanitizer grants a
-    /// more capable delivery type.
-    pub(crate) const fn for_untrusted_generated() -> Self {
-        Self::Attachment
-    }
-
     pub(crate) const fn content_type(self) -> &'static str {
         match self {
             Self::Inline(media_type) => media_type.as_str(),
@@ -159,14 +153,6 @@ mod tests {
         let opaque = path("assets/archive.bin");
         assert_eq!(
             AssetDelivery::for_authored(&opaque),
-            AssetDelivery::Attachment
-        );
-    }
-
-    #[test]
-    fn generated_assets_are_inert_until_a_sanitizer_grants_capability() {
-        assert_eq!(
-            AssetDelivery::for_untrusted_generated(),
             AssetDelivery::Attachment
         );
     }

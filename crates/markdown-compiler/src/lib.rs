@@ -10,6 +10,7 @@ mod parser;
 mod path;
 mod resolver;
 mod startup;
+mod transcript;
 pub mod tree;
 mod tree_digest;
 mod validation;
