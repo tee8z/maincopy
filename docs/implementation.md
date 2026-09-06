@@ -2,7 +2,7 @@
 
 Status: active backlog
 
-Last reviewed: 2026-09-05
+Last reviewed: 2026-09-06
 
 Related: [project overview](../README.md), [system design](design.md),
 [managed Git runbook](managed-source.md),
@@ -44,7 +44,7 @@ Preserve the fixed Owner, Administrator, and Publisher scope boundaries.
 
 Deliverables:
 
-- Add CLI user inspection, creation, status, role, and login credential commands.
+- Add CLI user creation and login credential commands.
 - Rotate passwords through the CLI without exposing secrets in arguments or
   diagnostics.
 - Complete Nostr sign-in in the human CLI.

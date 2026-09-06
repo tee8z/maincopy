@@ -1,3 +1,5 @@
+mod identity;
+
 use std::{fmt, future::Future, path::Path};
 
 use maincopy_shared::{
@@ -1410,6 +1412,9 @@ pub(crate) enum AdminClientError {
 
     #[error("the admin server returned an inconsistent publication response: {message}")]
     InvalidPublicationResponse { message: &'static str },
+
+    #[error("the admin server returned inconsistent account state: {message}")]
+    InvalidIdentityResponse { message: &'static str },
 
     #[error("the admin server returned inconsistent profile state: {message}")]
     InvalidProfileResponse { message: &'static str },

@@ -297,6 +297,37 @@ inspect the account and use a newly loaded form for further changes.
 User pages contain at most 100 accounts. Account form bodies are limited to
 16 KiB.
 
+Inspect the same account state from the CLI:
+
+```console
+maincopy users list
+maincopy users inspect USER_UUID
+maincopy --json users inspect USER_UUID
+```
+
+Use the same `--admin-origin` and `--admin-ca-file` settings as your login.
+Each list request returns at most 100 accounts. Use the returned cursor with
+`maincopy users list --cursor NEXT_CURSOR` to request another page.
+Inspection reports status, roles, scopes, and public credential metadata.
+Account versions and individual credential versions are separate preconditions.
+An empty page prints a clear message; JSON output preserves the pagination fields.
+Inspection requires account-management authority. To change an account, inspect
+its current version and sign in again if your authentication is no longer fresh.
+
+```console
+maincopy users status USER_UUID --expected-version 5 --status disabled
+maincopy users roles USER_UUID --expected-version 6 --roles publisher
+```
+
+Role replacement requires an Owner. `--roles` replaces the complete role set.
+Each accepted change increments the account version. Disabling an account also
+revokes its sessions and agent grants.
+
+Success and failure output retain the operation UUID. After an uncertain result,
+inspect the account before retrying. Use `--idempotency-key OPERATION_UUID` only
+with the identical command and authorizing session. After signing in again,
+inspect current state and use a new operation UUID for another change.
+
 ### 7. Sign out before a state reset
 
 Return to the post list and choose `Sign out` before resetting local state.

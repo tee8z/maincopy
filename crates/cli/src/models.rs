@@ -1,9 +1,11 @@
 //! Command-line input models.
 
 mod profile;
+mod users;
 pub(crate) use profile::{
     ProfileCommand, ProfileInvocation, TipRecipientCommand, TipRecipientInvocation,
 };
+pub(crate) use users::{UserCommand, UserTarget};
 
 use std::path::PathBuf;
 
@@ -46,6 +48,11 @@ pub(crate) struct Arguments {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Inspect accounts and replace their status or roles.
+    Users {
+        #[command(subcommand)]
+        command: UserCommand,
+    },
     /// Inspect or replace your public display profile and Lightning Address.
     Profile {
         #[command(subcommand)]
