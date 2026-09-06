@@ -30,8 +30,8 @@ flowchart LR
 ```
 
 1. Complete real-signer acceptance for the browser and human CLI.
-2. Finish public-listener lifecycle and restore evidence.
-3. Add metrics, NixOS, Caddy, encrypted Backblaze B2 backups, and restore support.
+2. Complete deployed-host acceptance and actual encrypted Backblaze B2 recovery.
+3. Record representative production limits, backup lag, and recovery measurements.
 4. Complete the security review, system matrix, documentation, and release dry run.
 5. After core V1 passes, implement the conditional mailing-list increment if its
    full privacy and dispatch gates can pass before the first release.
@@ -58,23 +58,6 @@ Test-signer automation does not complete this acceptance.
 - Complete human CLI Nostr sign-in with an external signer and confirm protected
   session storage. Record the signer and operating system used.
 
-### 1.2 Finish listener and tip administration
-
-Complete the remaining lifecycle behavior on the public and profile surfaces.
-
-Deliverables:
-
-- Apply bounded request limits and structured access logs.
-- Drain active public requests during orderly shutdown.
-- Keep liveness independent from snapshot readiness.
-- Include the active tip projection in offline restore evidence.
-
-Required evidence:
-
-- Drain an active request before the writer closes.
-- Fail readiness after a required supervised task exits.
-- Reconstruct the same eligible tip projection after offline restore.
-
 ### Product-closure gate
 
 - Browser and CLI users can complete every supported release transition.
@@ -82,99 +65,45 @@ Required evidence:
 - Every public response has the accepted metadata and security headers.
 - Public routes expose no admin, metrics, draft, or preview capability.
 
-## 2. Deployment and recovery
+## 2. Deployment and recovery acceptance
 
-### 2.1 Add metrics and database health
+Use the [deployment runbook](deployment.md), [backup runbook](backup-restore.md),
+and [system evidence](system-evidence.md) for these remaining checks.
+Keep test transport evidence separate from actual B2 recovery.
 
-Create one application-owned Prometheus registry. Do not use the default
-registry or user-controlled metric labels.
+### 2.1 Verify the deployed host
 
-Deliverables:
+- Deploy the reviewed Nix outputs with protected runtime credentials and the owner's content.
+- Verify public HTTPS, private administration, origin enforcement, and forwarded-header removal.
+- Complete explicit owner initialization and verify restart behavior without journaled credentials.
+- Scrape the loopback metrics endpoint from the intended Prometheus instance.
+- Confirm state ownership, local database storage, service isolation, and protected key recovery.
 
-- Serve `GET` and `HEAD /metrics` from a dedicated loopback listener.
-- Record bounded writer queue, pool, transaction, WAL, and checkpoint metrics.
-- Record stable Tokio runtime and Linux process metrics.
-- Supervise the metrics listener and runtime collector with the application.
-- Add a checked-in Grafana dashboard whose queries match emitted metrics.
-- Convert corruption, disk-full, and checkpoint failures into typed health
-  and shutdown behavior.
+### 2.2 Recover from actual B2 and retained local ciphertext
 
-Required evidence:
+- Publish a complete encrypted checkpoint to the owner's dedicated B2 bucket.
+- Restore that checkpoint with an independent protected copy of its encryption key.
+- Recover a retained local ciphertext checkpoint without depending on the active object cache.
+- Verify released pages, RSS, sitemap, profiles, tips, and rejected pre-restore credentials.
+- Record the checkpoint identity, cutoff, compatible package, and off-site object identities.
+- Confirm production backup failures degrade backup health while public reads remain available.
 
-- Keep `/metrics` absent from public and admin routers.
-- Construct multiple isolated registries in one test process.
-- Verify metric names, types, labels, content type, and cardinality.
-- Fail the listener or collector and start controlled shutdown.
-- Prove that labels contain no path, URL, identifier, slug, or secret.
+### 2.3 Measure the production recovery envelope
 
-### 2.2 Package the production topology
+- Measure capture, native replay, content verification, encryption, upload, and restore separately.
+- Record end-to-end recovery point and recovery time objectives with representative content and SQLite size.
+- Verify disk capacity for temporary capture, replay, replica storage, and seven-day local encrypted retention.
+- Review remote storage growth; immutable remote objects have no automatic deletion policy yet.
 
-Add a NixOS module that owns the complete service boundary.
+Litestream continuously maintains the local replica. Complete encrypted off-site
+checkpoints use a one-minute scheduling target after each preceding job finishes.
+Replay, validation, encryption, and upload add to the effective recovery-point lag.
 
-Deliverables:
+### Operations acceptance gate
 
-- Package `maincopyd`, `maincopy`, `maincopy-mermaid`, Caddy, Litestream, and standard client-side encryption tools.
-- Isolate service identities and state paths. Run backup processes under
-  restricted identities that preserve database mode `0600`.
-- Bind public traffic according to configuration.
-- Keep admin and metrics upstreams on loopback.
-- Make private-network admin exposure the default.
-- Require explicit configuration for an Internet-reachable admin origin.
-- Remove untrusted identity and forwarding headers at the gateway.
-- Disable automatic retries for admin mutations.
-- Keep SSH, TLS, B2 credentials, and backup encryption keys outside Git
-  and the Nix store.
-
-Required evidence:
-
-- Evaluate minimal and complete module configurations.
-- Boot the topology in a NixOS virtual machine.
-- Prove route and origin isolation through Caddy.
-- Reject unsafe ownership, permissions, paths, and listener addresses.
-
-### 2.3 Add encrypted B2 backups and offline restore
-
-Back up the operational SQLite ledger and retain compatible revision artifacts.
-
-Deliverables:
-
-- Replicate SQLite continuously with Litestream to Backblaze B2.
-- Pin and validate the current Litestream file replica with rclone crypt uploads.
-  Encrypt on the source server with protected server-supplied keys.
-- Upload complete recovery checkpoints every minute. Publish the checkpoint
-  manifest only after its required replica files and artifacts reach B2.
-- Keep seven days of local encrypted recovery bundles.
-- Back up immutable revision artifacts and identify complete recovery points
-  whose required artifacts are already available off-site.
-- Recover after replication or artifact-upload interruption without stopping
-  the running publication.
-- Reject missing or invalid keys and failed exports before upload. Never upload plaintext.
-- Document key recovery and retain the keys needed for older backups.
-- Expose degraded backup health without blocking public reads.
-- Document recovery point objective and recovery time objective measurements.
-- Restore into an empty destination only.
-- Verify schema, database digest, artifact digest, and restore acceptance offline.
-- Consume one typed restore marker before normal startup.
-- Invalidate restored browser sessions and agent credentials.
-- Refuse migration or mutation before the restored candidate is accepted.
-
-Required evidence:
-
-- Interrupt backup and upload, then retry without corrupting the live database.
-- Restore after removing every local SQLite sidecar file.
-- Prove encrypted off-site backup and successful recovery with the correct key.
-  Reject missing and incorrect keys without accepting a restore candidate.
-- Reject a marker for different bytes, schema, artifacts, or binary.
-- Reproduce released pages, RSS, routes, profiles, and tip projection.
-- Measure the documented recovery targets.
-
-### Operations gate
-
-- The NixOS virtual machine runs Maincopy, Caddy, and encrypted continuous replication.
-- Local Prometheus can scrape the loopback metrics listener.
-- The live database remains on local storage.
-- The restore drill preserves the operational ledger and required artifacts.
-- Restart and restore complete before public or admin readiness.
+- Actual off-site and retained-local recovery preserve the operational ledger and required artifacts.
+- The deployed service consumes restore acceptance before replication can modify the restored database.
+- The owner accepts the measured recovery lag, recovery duration, storage budget, and key-recovery procedure.
 
 ## 3. Security and system evidence
 
@@ -277,7 +206,7 @@ Prepare a candidate without publishing an artifact until the owner approves it.
 
 Deliverables:
 
-- Select a semantic version and write the changelog.
+- Select a semantic version and finalize the [Unreleased changelog](../CHANGELOG.md#unreleased).
 - Verify crate metadata, included files, README, and license.
 - Build the source archive and Nix outputs from clean inputs.
 - Generate checksums and a dependency inventory.

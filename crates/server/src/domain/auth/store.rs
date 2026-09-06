@@ -3210,6 +3210,40 @@ pub(crate) async fn require_user_scope(
     Ok(())
 }
 
+/// Explicit offline restore acceptance invalidates every previously issued proof.
+pub(crate) async fn invalidate_restored_credentials(
+    transaction: &mut Transaction<'_, Sqlite>,
+    restore_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<(), AuthApplyError> {
+    let timestamp = command_timestamp(now)?;
+    sqlx::query("UPDATE instance_identity SET version = version + 1 WHERE singleton = 1")
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query("UPDATE browser_sessions SET revoked_at_ns = max(authenticated_at_ns, ?), version = version + 1 WHERE revoked_at_ns IS NULL")
+        .bind(timestamp).execute(&mut **transaction).await?;
+    sqlx::query("UPDATE agent_credentials SET revoked_at_ns = max(created_at_ns, ?), version = version + 1 WHERE revoked_at_ns IS NULL")
+        .bind(timestamp).execute(&mut **transaction).await?;
+    sqlx::query("DELETE FROM login_challenges")
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query("DELETE FROM nip98_replay_events")
+        .execute(&mut **transaction)
+        .await?;
+    append_success_audit(
+        transaction,
+        &MutationAuditContext {
+            audit_event_id: AdminAuditEventId::from_uuid(Uuid::new_v4()),
+            principal: AuditPrincipalReference::Offline { user_id: None },
+            request_id: None,
+            idempotency_key: AdminMutationKey(restore_id),
+        },
+        now,
+        "instance.restore.accept",
+    )
+    .await
+}
+
 pub(crate) async fn require_fresh_browser_scope(
     transaction: &mut Transaction<'_, Sqlite>,
     principal: &AuditPrincipalReference,
@@ -3969,6 +4003,7 @@ mod tests {
         database,
         domain::auth::Argon2idPolicy,
     };
+    use sqlx::{ConnectOptions as _, Connection as _, sqlite::SqliteConnectOptions};
 
     const OWNER_KEY: &str = "63fe6318dc58583cfe16810f86dd09e18bfd76aabc24a0081ce2856f330504ed";
     const PUBLISHER_KEY: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
@@ -4480,6 +4515,117 @@ mod tests {
         );
 
         harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn offline_restore_revokes_session_and_agent_proofs_and_preserves_owner_login() {
+        let harness = Harness::start().await;
+        let owner = user(127);
+        harness
+            .store
+            .auth
+            .bootstrap_identity(bootstrap_with(owner, password_credential()))
+            .await
+            .unwrap();
+        let credential_id = agent(127);
+        harness
+            .store
+            .auth
+            .register_agent_credential(RegisterAgentCredential {
+                credential_id,
+                owner_user_id: owner,
+                issuer_user_id: owner,
+                public_key: NostrPublicKey::parse(AGENT_KEY).unwrap(),
+                label: "backup recovery agent".into(),
+                scopes: BTreeSet::from([AdminScope::PreviewRead]),
+                created_at: at(12),
+                expires_at: None,
+                audit: mutation_audit(owner, 127),
+            })
+            .await
+            .unwrap();
+        let token_digest = SessionTokenDigest::from_bytes([0x7f; 32]);
+        harness
+            .store
+            .auth
+            .create_browser_session(CreateBrowserSession {
+                session_id: session(127),
+                user_id: owner,
+                expected_user_version: 1,
+                session_token_digest: token_digest,
+                csrf_token_digest: CsrfTokenDigest::from_bytes([0x7e; 32]),
+                evidence: SessionAuthenticationEvidence::Password {
+                    expected_credential_version: 1,
+                },
+                authenticated_at: at(13),
+                fresh_until: at(14),
+                expires_at: at(30),
+                audit: session_audit(127),
+            })
+            .await
+            .unwrap();
+        let Harness {
+            _root,
+            path,
+            store,
+            shutdown,
+            writer,
+        } = harness;
+        drop(store);
+        shutdown.cancel();
+        writer.await.unwrap();
+        let mut connection = SqliteConnectOptions::new()
+            .filename(&path)
+            .connect()
+            .await
+            .unwrap();
+        let mut transaction = connection.begin().await.unwrap();
+        invalidate_restored_credentials(&mut transaction, Uuid::new_v4(), at(14))
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        connection.close().await.unwrap();
+        let inspection = database::restore::inspect(&path).await.unwrap();
+        let session = inspection
+            .store
+            .auth
+            .browser_session(token_digest)
+            .await
+            .unwrap();
+        let session = session.unwrap();
+        assert_eq!(session.revoked_at, Some(at(14)));
+        assert!(!session.is_active_at(at(14)));
+        let agent = inspection
+            .store
+            .auth
+            .agent_credential_by_id(credential_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.revoked_at, Some(at(14)));
+        assert_eq!(agent.version, 2);
+        assert!(
+            inspection
+                .store
+                .auth
+                .password_login(&CanonicalUsername::parse("owner").unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            inspection
+                .store
+                .auth
+                .audit_events_page(None, 100)
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .any(|event| event.action.as_ref() == "instance.restore.accept")
+        );
+        inspection.close().await;
+        drop(_root);
     }
 
     #[tokio::test]

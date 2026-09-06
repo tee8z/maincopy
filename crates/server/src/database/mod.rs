@@ -1,6 +1,8 @@
 //! SQLite schema bootstrap and single-writer ownership.
 
 pub(crate) mod fingerprint;
+pub(crate) mod health;
+pub(crate) mod restore;
 pub(crate) mod store;
 mod writer;
 
@@ -16,6 +18,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
+use crate::metrics::DatabaseMetrics;
 use sqlx::{
     ConnectOptions as _, Connection as _, SqliteConnection,
     migrate::{MigrateError, Migrator},
@@ -26,6 +29,7 @@ use thiserror::Error;
 use crate::{
     config::DatabaseConfigurationView,
     process_lock::{open_private_file, prepare_private_directory},
+    restore::{RestoreError, reject_unaccepted_candidate},
 };
 
 const APPLICATION_ID: i64 = 0x4D43_5059;
@@ -38,6 +42,8 @@ pub(crate) struct BootstrappedDatabase {
     _writer: SqliteConnection,
     _readers: SqlitePool,
     _ownership_lock: File,
+    metrics: DatabaseMetrics,
+    wal_path: PathBuf,
 }
 
 impl BootstrappedDatabase {
@@ -47,6 +53,8 @@ impl BootstrappedDatabase {
             _writer,
             _readers,
             _ownership_lock,
+            metrics: _,
+            wal_path: _,
         } = self;
         _readers.close().await;
         let result = _writer.close().await;
@@ -64,6 +72,13 @@ impl BootstrappedDatabase {
 pub(crate) async fn bootstrap(
     configuration: DatabaseConfigurationView<'_>,
 ) -> Result<BootstrappedDatabase, DatabaseStartupError> {
+    reject_unaccepted_candidate(configuration.path).map_err(|source| {
+        DatabaseStartupError::RestoreAcceptance {
+            source: Box::new(source),
+        }
+    })?;
+    let metrics =
+        DatabaseMetrics::new().map_err(|source| DatabaseStartupError::Metrics { source })?;
     prepare_database_parent(configuration.path)?;
     let ownership_lock = acquire_database_lock(configuration.path)?;
     let expected_file = prepare_database_file(configuration.path)?;
@@ -78,22 +93,8 @@ pub(crate) async fn bootstrap(
         .connect()
         .await
         .map_err(|source| DatabaseStartupError::OpenWriter { source })?;
-    let initialization = async {
-        verify_opened_file(configuration.path, expected_file)?;
-
-        if matches!(identity, DatabaseIdentity::Empty) {
-            mark_database_as_maincopy(&mut writer).await?;
-        }
-        configure_connection(&mut writer, configuration.busy_timeout.get()).await?;
-
-        MIGRATOR
-            .run(&mut writer)
-            .await
-            .map_err(map_migration_error)?;
-        verify_foreign_keys(&mut writer).await?;
-        open_read_pool(configuration).await
-    }
-    .await;
+    let initialization =
+        initialize_connections(configuration, expected_file, identity, &mut writer).await;
     let readers = match initialization {
         Ok(readers) => readers,
         Err(error) => {
@@ -108,11 +109,35 @@ pub(crate) async fn bootstrap(
         }
     };
 
+    let mut wal_path = configuration.path.as_os_str().to_owned();
+    wal_path.push("-wal");
     Ok(BootstrappedDatabase {
+        metrics,
+        wal_path: PathBuf::from(wal_path),
         _writer: writer,
         _readers: readers,
         _ownership_lock: ownership_lock,
     })
+}
+
+/// Initialize the verified writer and readers before handing ownership to runtime tasks.
+async fn initialize_connections(
+    configuration: DatabaseConfigurationView<'_>,
+    expected_file: ExpectedFile,
+    identity: DatabaseIdentity,
+    writer: &mut SqliteConnection,
+) -> Result<SqlitePool, DatabaseStartupError> {
+    verify_opened_file(configuration.path, expected_file)?;
+    if matches!(identity, DatabaseIdentity::Empty) {
+        mark_database_as_maincopy(writer).await?;
+    }
+    configure_connection(writer, configuration.busy_timeout.get()).await?;
+    MIGRATOR
+        .run(&mut *writer)
+        .await
+        .map_err(map_migration_error)?;
+    verify_foreign_keys(writer).await?;
+    open_read_pool(configuration).await
 }
 
 async fn open_read_pool(
@@ -589,6 +614,16 @@ fn map_migration_error(error: MigrateError) -> DatabaseStartupError {
 
 #[derive(Debug, Error)]
 pub(crate) enum DatabaseStartupError {
+    #[error("restored candidate must be accepted before database startup")]
+    RestoreAcceptance {
+        #[source]
+        source: Box<RestoreError>,
+    },
+    #[error("the database metrics could not be constructed")]
+    Metrics {
+        #[source]
+        source: prometheus::Error,
+    },
     #[error("database path must include a parent directory")]
     InvalidPath,
     #[error("database path preparation failed")]

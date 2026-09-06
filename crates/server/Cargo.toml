@@ -28,6 +28,7 @@ maincopy-diagram-renderer = { workspace = true, features = ["client"] }
 maincopy-shared = { workspace = true, features = ["schema"] }
 markdown-compiler.workspace = true
 maud.workspace = true
+prometheus.workspace = true
 pulldown-cmark.workspace = true
 qrcode.workspace = true
 quick-xml.workspace = true
@@ -37,6 +38,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
+tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -52,7 +54,7 @@ uuid = { workspace = true, features = ["v4"] }
 zeroize = { workspace = true, default-features = false, features = ["alloc"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-rustix = { workspace = true, features = ["fs", "process", "std"] }
+rustix = { workspace = true, features = ["fs", "process", "std", "param"] }
 
 [build-dependencies]
 blake3 = { version = "=1.8.7", default-features = false, features = ["std"] }

@@ -14,13 +14,16 @@ use axum::{
     response::Response,
 };
 
+mod connection;
 mod health;
+mod request_limits;
 mod server;
 
 use crate::{
     domain::publication::web::router as publication_router,
     render::{REFERRER_POLICY, SiteSnapshotReader},
 };
+pub(crate) use connection::PublicListener as ConnectionListener;
 use health::router as health_router;
 pub(crate) use server::PublicServer;
 
@@ -62,13 +65,15 @@ pub struct PublicState {
 
 /// Builds the public router without binding a listener.
 pub fn public_router(state: PublicState) -> Router {
-    Router::new()
-        .merge(publication_router(state.snapshots.clone()))
-        .merge(health_router(state.readiness))
-        .layer(middleware::from_fn_with_state(
-            state.snapshots,
-            public_response_policy,
-        ))
+    request_limits::apply(
+        Router::new()
+            .merge(publication_router(state.snapshots.clone()))
+            .merge(health_router(state.readiness)),
+    )
+    .layer(middleware::from_fn_with_state(
+        state.snapshots,
+        public_response_policy,
+    ))
 }
 
 async fn public_response_policy(

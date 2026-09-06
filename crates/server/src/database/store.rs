@@ -1,3 +1,4 @@
+use super::health::DatabaseHealth;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -31,6 +32,7 @@ use crate::domain::source::store::{
 /// commands to the sole writer task. This type never exposes a SQLx connection.
 #[derive(Clone)]
 pub(crate) struct DatabaseStore {
+    pub(crate) health: DatabaseHealth,
     pub(crate) auth: AuthStore,
     pub(crate) profiles: ProfileStore,
     pub(crate) publications: PublicationStore,
@@ -43,8 +45,10 @@ impl DatabaseStore {
         profiles: ProfileStore,
         publications: PublicationStore,
         source: SourceStore,
+        health: DatabaseHealth,
     ) -> Self {
         Self {
+            health,
             auth,
             profiles,
             publications,

@@ -41,12 +41,8 @@ impl CapturedChild {
             stderr: None,
             stopped: false,
         };
-        let stdout = process
-            .child
-            .stdout
-            .take()
-            .expect("captured child stdout must be piped");
-        process.stdout = Some(capture_output(stdout));
+        // Binary export commands can send stdout directly to a protected file.
+        process.stdout = process.child.stdout.take().map(capture_output);
         let stderr = process
             .child
             .stderr

@@ -404,6 +404,34 @@ impl PublicationStore {
         })
     }
 
+    /// Includes blocked approvals, which retain inputs until explicit retry or cancellation.
+    pub(crate) async fn retained_release_inputs(
+        &self,
+    ) -> Result<Vec<RetainedReleaseInput>, StartupSnapshotLoadError> {
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT * FROM (");
+        query
+            .push(LOAD_CANONICAL_PUBLICATIONS)
+            .push(") WHERE state IN ('scheduled', 'activating', 'blocked') LIMIT 10001");
+        let rows = query
+            .build_query_as::<CanonicalPublicationRow>()
+            .fetch_all(&self.readers)
+            .await?;
+        if rows.len() > MAX_STARTUP_POST_REVISIONS {
+            return Err(StartupSnapshotLoadError::TooManyRetainedReleases);
+        }
+        rows.into_iter()
+            .map(|row| {
+                let stored = decode_canonical_publication(row)?;
+                let view = canonical_view(&stored.status);
+                Ok(RetainedReleaseInput {
+                    post_id: view.stable_post_id.clone(),
+                    revision: view.pinned_post_digest.clone(),
+                    content_digest: stored.content_digest,
+                })
+            })
+            .collect()
+    }
+
     /// Installs a fully built startup snapshot through the sole writer task.
     pub(crate) async fn install_startup_snapshot(
         &self,
@@ -712,6 +740,12 @@ pub(crate) struct StartupSnapshotState {
     pub ledger: PublicLedgerProjection,
     pub activating: Vec<RecoverablePublicationActivation>,
     pub scheduled: Vec<ScheduledPublication>,
+}
+
+pub(crate) struct RetainedReleaseInput {
+    pub(crate) post_id: PostId,
+    pub(crate) revision: PostRevisionDigest,
+    pub(crate) content_digest: ContentTreeDigest,
 }
 
 /// One exact activation that startup must reconcile before listener binding.
@@ -1567,6 +1601,8 @@ fn publication_timestamp(value: i64) -> Result<OffsetDateTime, StartupSnapshotLo
 
 #[derive(Debug, Error)]
 pub(crate) enum StartupSnapshotLoadError {
+    #[error("retained release inputs exceed the offline verification limit")]
+    TooManyRetainedReleases,
     #[error("could not read the startup publication ledger")]
     Query(#[from] sqlx::Error),
     #[error("the current site head is missing")]

@@ -4,7 +4,7 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use super::{PublicState, public_router};
+use super::{PublicState, connection::PublicListener, public_router};
 
 /// Bound public HTTP server and its request-facing dependencies.
 pub(crate) struct PublicServer {
@@ -25,7 +25,7 @@ impl PublicServer {
     }
 
     pub(crate) async fn serve(self, cancellation: CancellationToken) -> io::Result<()> {
-        axum::serve(self.listener, self.router)
+        axum::serve(PublicListener::new(self.listener), self.router)
             .with_graceful_shutdown(cancellation.cancelled_owned())
             .await
     }

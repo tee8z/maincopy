@@ -5,10 +5,11 @@ mod host;
 pub(crate) mod secret;
 
 pub use diagnostic::{ConfigurationDiagnostic, ConfigurationErrors, ConfigurationValidationCode};
+pub(crate) use host::{
+    BackupStatusConfigurationView, DatabaseConfigurationView, GitProcessLimits, HostConfiguration,
+    HostConfigurationLoader, IdentityStartupBootstrap, SourceConfigurationView,
+    SshCredentialReference,
+};
 #[cfg(test)]
 pub(crate) use host::{DatabaseBusyTimeout, DatabaseReadPoolSize, DatabaseWriterQueueCapacity};
-pub(crate) use host::{
-    DatabaseConfigurationView, GitProcessLimits, HostConfiguration, HostConfigurationLoader,
-    SourceConfigurationView, SshCredentialReference,
-};
 pub use secret::{SecretFileReference, SensitivePath};

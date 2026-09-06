@@ -30,6 +30,7 @@ const DEFAULT_RUNTIME_ROOT: &str = "run";
 const DEFAULT_DATABASE_FILE_NAME: &str = "maincopy.db";
 const DEFAULT_PUBLIC_PORT: u16 = 3000;
 const DEFAULT_ADMIN_PORT: u16 = 3001;
+const DEFAULT_METRICS_PORT: u16 = 3002;
 const DEFAULT_ADMIN_ORIGIN: &str = "https://admin.localhost";
 const DEFAULT_BUSY_TIMEOUT_MILLISECONDS: u64 = 5_000;
 const DEFAULT_WRITER_QUEUE_CAPACITY: usize = 128;
@@ -143,6 +144,15 @@ enum SourceMode {
     ManagedGit,
 }
 
+/// Controls whether ordinary startup may create and display an owner password.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IdentityStartupBootstrap {
+    #[default]
+    GenerateOwner,
+    RequireExisting,
+}
+
 /// Host paths for one SSH identity. Both paths stay redacted under `Debug`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SshCredentialReference {
@@ -224,6 +234,18 @@ pub struct DatabaseConfigurationView<'configuration> {
     pub read_pool_size: DatabaseReadPoolSize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackupStatusConfiguration {
+    status_file: PathBuf,
+    stale_after: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackupStatusConfigurationView<'configuration> {
+    pub status_file: &'configuration Path,
+    pub stale_after: Duration,
+}
+
 /// Effective host-owned runtime configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostConfiguration {
@@ -233,9 +255,12 @@ pub struct HostConfiguration {
     content_limits: ContentTreeLimits,
     public_bind: SocketAddr,
     admin_bind: AdminBind,
+    metrics_bind: SocketAddr,
     admin_origin: AdminOrigin,
     database: DatabaseConfiguration,
     source: SourceConfiguration,
+    identity_startup_bootstrap: IdentityStartupBootstrap,
+    backup: Option<BackupStatusConfiguration>,
 }
 
 /// Read-only settings borrowed from validated host configuration.
@@ -247,9 +272,12 @@ pub struct HostConfigurationView<'configuration> {
     pub content_limits: ContentTreeLimits,
     pub public_bind: SocketAddr,
     pub admin_bind: AdminBind,
+    pub metrics_bind: SocketAddr,
     pub admin_origin: &'configuration AdminOrigin,
     pub database: DatabaseConfigurationView<'configuration>,
     pub source: SourceConfigurationView<'configuration>,
+    pub identity_startup_bootstrap: IdentityStartupBootstrap,
+    pub backup: Option<BackupStatusConfigurationView<'configuration>>,
 }
 
 impl HostConfiguration {
@@ -261,6 +289,7 @@ impl HostConfiguration {
             content_limits: self.content_limits,
             public_bind: self.public_bind,
             admin_bind: self.admin_bind,
+            metrics_bind: self.metrics_bind,
             admin_origin: &self.admin_origin,
             database: DatabaseConfigurationView {
                 path: &self.database.path,
@@ -268,6 +297,14 @@ impl HostConfiguration {
                 writer_queue_capacity: self.database.writer_queue_capacity,
                 read_pool_size: self.database.read_pool_size,
             },
+            identity_startup_bootstrap: self.identity_startup_bootstrap,
+            backup: self
+                .backup
+                .as_ref()
+                .map(|backup| BackupStatusConfigurationView {
+                    status_file: &backup.status_file,
+                    stale_after: backup.stale_after,
+                }),
             source: match &self.source {
                 SourceConfiguration::ExternalCheckout => SourceConfigurationView::ExternalCheckout,
                 SourceConfiguration::ManagedGit(managed) => SourceConfigurationView::ManagedGit {
@@ -343,8 +380,24 @@ struct HostCandidate {
     content: ContentCandidate,
     public: PublicCandidate,
     admin: AdminCandidate,
+    metrics: PublicCandidate,
     database: DatabaseCandidate,
     source: SourceCandidate,
+    identity: IdentityCandidate,
+    backup: Option<BackupCandidate>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IdentityCandidate {
+    startup_bootstrap: IdentityStartupBootstrap,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupCandidate {
+    status_file: PathBuf,
+    stale_after_seconds: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -494,6 +547,17 @@ fn finalize_host(
         candidate.admin.bind.unwrap_or_else(default_admin_bind),
         &mut diagnostics,
     );
+    let metrics_bind = candidate
+        .metrics
+        .bind
+        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_METRICS_PORT));
+    if !metrics_bind.ip().is_loopback() {
+        diagnostics.push(host_diagnostic(
+            "metrics.bind",
+            ConfigurationValidationCode::MetricsBindInvalid,
+            "metrics.bind must use a loopback address",
+        ));
+    }
     let admin_origin = validate_admin_origin(
         candidate
             .admin
@@ -540,6 +604,9 @@ fn finalize_host(
         runtime_root.as_deref(),
         &mut diagnostics,
     );
+    let backup = candidate
+        .backup
+        .and_then(|backup| validate_backup(backup, file_base, &mut diagnostics));
     diagnostics.into_result()?;
     match (
         content_root,
@@ -573,6 +640,7 @@ fn finalize_host(
             content_limits: content,
             public_bind,
             admin_bind,
+            metrics_bind,
             admin_origin,
             database: DatabaseConfiguration {
                 path: database_path,
@@ -581,6 +649,8 @@ fn finalize_host(
                 read_pool_size,
             },
             source,
+            identity_startup_bootstrap: candidate.identity.startup_bootstrap,
+            backup,
         }),
         _ => Err(single_error(host_diagnostic(
             "$document",
@@ -588,6 +658,31 @@ fn finalize_host(
             "effective host settings could not be constructed",
         ))),
     }
+}
+
+fn validate_backup(
+    candidate: BackupCandidate,
+    file_base: &Path,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<BackupStatusConfiguration> {
+    let path = validate_resolved_path(
+        resolve_path(file_base, &candidate.status_file),
+        "backup.status_file",
+        diagnostics,
+    );
+    let seconds = candidate.stale_after_seconds.unwrap_or(300);
+    if !(60..=604_800).contains(&seconds) {
+        diagnostics.push(ConfigurationDiagnostic::new(
+            "backup.stale_after_seconds",
+            ConfigurationValidationCode::LimitOutOfRange,
+            "backup report freshness must be between 60 and 604800 seconds",
+        ));
+        return None;
+    }
+    path.map(|status_file| BackupStatusConfiguration {
+        status_file,
+        stale_after: Duration::from_secs(seconds),
+    })
 }
 
 fn validate_source_configuration(
@@ -1208,6 +1303,58 @@ mod tests {
     }
 
     #[test]
+    fn identity_bootstrap_policy_requires_an_explicit_closed_value() {
+        let root = tempdir().unwrap();
+        for (source, expected) in [
+            ("", IdentityStartupBootstrap::GenerateOwner),
+            (
+                "[identity]\nstartup_bootstrap = \"require_existing\"\n",
+                IdentityStartupBootstrap::RequireExisting,
+            ),
+        ] {
+            let path = write_config(root.path(), "maincopy.toml", source);
+            let config = loader(root.path()).load(&path).unwrap();
+            assert_eq!(config.view().identity_startup_bootstrap, expected);
+        }
+        for source in [
+            "[identity]\nstartup_bootstrap = \"unknown\"\n",
+            "[identity]\nrequire_existing = true\n",
+        ] {
+            let path = write_config(root.path(), "maincopy.toml", source);
+            assert!(loader(root.path()).load(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn backup_status_paths_are_relative_to_host_file_and_checkpoint_freshness_is_bounded() {
+        let root = tempdir().unwrap();
+        for (freshness, valid) in [
+            ("", true),
+            ("stale_after_seconds = 300", true),
+            ("stale_after_seconds = 59", false),
+            ("stale_after_seconds = 604801", false),
+        ] {
+            write_config(
+                root.path(),
+                "host/maincopy.toml",
+                &format!("[backup]\nstatus_file = \"../backup/status.json\"\n{freshness}\n"),
+            );
+            let result = loader(root.path()).load(Path::new("host/maincopy.toml"));
+            if valid {
+                let configuration = result.unwrap();
+                let backup = configuration.view().backup.unwrap();
+                assert_eq!(backup.stale_after, Duration::from_secs(300));
+                assert_eq!(
+                    backup.status_file,
+                    root.path().join("host/../backup/status.json")
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
     fn empty_file_locks_every_built_in_host_default() {
         let root = tempdir().unwrap();
         write_config(root.path(), "maincopy.toml", "");
@@ -1273,6 +1420,50 @@ mod tests {
             config.view().admin_origin.as_str(),
             "https://admin.localhost:8443"
         );
+    }
+
+    #[test]
+    fn metrics_configuration_defaults_to_loopback_and_rejects_external_interfaces() {
+        let root = tempdir().unwrap();
+        write_config(root.path(), "default.toml", "");
+        assert_eq!(
+            loader(root.path())
+                .load(Path::new("default.toml"))
+                .unwrap()
+                .view()
+                .metrics_bind
+                .to_string(),
+            "127.0.0.1:3002"
+        );
+        for address in ["127.0.0.1:0", "[::1]:3002"] {
+            write_config(
+                root.path(),
+                "metrics.toml",
+                &format!("[metrics]\nbind = \"{address}\"\n"),
+            );
+            assert_eq!(
+                loader(root.path())
+                    .load(Path::new("metrics.toml"))
+                    .unwrap()
+                    .view()
+                    .metrics_bind
+                    .to_string(),
+                address
+            );
+        }
+        for address in ["0.0.0.0:3002", "[::]:3002", "192.0.2.1:3002"] {
+            write_config(
+                root.path(),
+                "metrics.toml",
+                &format!("[metrics]\nbind = \"{address}\"\n"),
+            );
+            let error = loader(root.path())
+                .load(Path::new("metrics.toml"))
+                .unwrap_err();
+            assert!(error.diagnostics().iter().any(
+                |diagnostic| diagnostic.code == ConfigurationValidationCode::MetricsBindInvalid
+            ));
+        }
     }
 
     #[test]

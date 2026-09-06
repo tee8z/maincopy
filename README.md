@@ -10,9 +10,10 @@ An author pushes Markdown to one configured branch. Maincopy fetches that
 branch, builds a private candidate, and presents an exact rendered preview.
 Only an explicit release action can change the public website.
 
-Production deployment tooling is still in development. Use the local workflow
-below to evaluate Maincopy. See the [remaining work](docs/implementation.md)
-before you operate a public instance.
+The [NixOS module](docs/deployment.md) packages the production gateway, metrics,
+and encrypted backups. V1 acceptance and release preparation remain in progress;
+see the [remaining work](docs/implementation.md). Use the local workflow below
+to evaluate Maincopy.
 
 ## How publishing works
 
@@ -206,8 +207,8 @@ The SSH helper is an outbound client. It binds no listener and requests no
 tunnel. The virtual private cloud and host firewall remain the ingress
 boundary.
 
-The remaining deployment work adds a dedicated loopback metrics listener. It
-will not share the public or administration routers.
+A dedicated loopback listener exposes [Prometheus metrics](docs/observability.md).
+It shares neither the public nor the administration router.
 
 ## Documentation
 
@@ -217,6 +218,10 @@ will not share the public or administration routers.
   status, and failure recovery.
 - [Local development runbook](docs/local-development.md) covers the included
   HTTPS environment and browser workflow.
+- [NixOS deployment](docs/deployment.md) covers the gateway, service boundaries,
+  credentials, and initialization.
+- [Backup and restore](docs/backup-restore.md) covers encrypted Litestream
+  checkpoints, key recovery, and offline acceptance.
 - [Remaining implementation work](docs/implementation.md) lists unfinished
   product, operations, and release work.
 - [Engineering style](docs/quality.md) defines code, test, and documentation

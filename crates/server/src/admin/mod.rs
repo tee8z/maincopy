@@ -532,6 +532,21 @@ mod tests {
         harness.stop().await;
     }
 
+    #[tokio::test]
+    async fn admin_router_does_not_expose_metrics_even_with_valid_authentication() {
+        let harness = ProtectedAdminHarness::start().await;
+        let router = harness.router();
+        for method in [Method::GET, Method::HEAD] {
+            let response = router
+                .clone()
+                .oneshot(harness.request(method, "/metrics", Bytes::new(), None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        harness.stop().await;
+    }
+
     fn assert_openapi_contract(document: &Value) {
         assert_eq!(document["openapi"], "3.1.0");
         assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
@@ -573,6 +588,7 @@ mod tests {
         );
         assert!(document["paths"]["/api/admin/v1/auth/sessions"]["post"].is_object());
         assert!(document["paths"]["/health/live"].is_null());
+        assert!(document["paths"]["/metrics"].is_null());
         let posts = &document["paths"][POSTS_PATH]["get"];
         for parameter in ["cursor", "limit"] {
             assert!(

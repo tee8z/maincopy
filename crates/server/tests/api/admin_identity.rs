@@ -710,6 +710,8 @@ fn write_host_file(root: &Path) {
              runtime_root = \"run\"\n\
              [public]\n\
              bind = \"127.0.0.1:0\"\n\
+             [metrics]\n\
+             bind = \"127.0.0.1:0\"\n\
              [admin]\n\
              bind = \"127.0.0.1:0\"\n\
              origin = \"{ADMIN_ORIGIN}\"\n"

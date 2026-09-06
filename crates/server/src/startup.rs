@@ -26,6 +26,7 @@ use crate::{
         AdminSecurityState, AdminServer, AdminSessionPolicy, origin::AdminBind,
         runtime_admin_router,
     },
+    backup_health::BackupHealth,
     cli::{ServerInvocation, parse_process_invocation},
     config::{HostConfiguration, HostConfigurationLoader, SourceConfigurationView},
     content_sync::ContentSync,
@@ -40,7 +41,10 @@ use crate::{
                 PublicationCoordinatorActor, PublicationCoordinatorHandle, observed_post_revisions,
             },
             scheduler::PublicationScheduler,
-            store::{InstallStartupSnapshot, ObservedPostRevision, StartupSnapshotState},
+            store::{
+                InstallStartupSnapshot, ObservedPostRevision, RetainedReleaseInput,
+                StartupSnapshotState,
+            },
         },
     },
     error::{
@@ -49,12 +53,14 @@ use crate::{
     frontend_assets::{FrontendAssetManifest, embedded_manifest},
     git_sync::GitSync,
     identity_bootstrap,
+    metrics::{Metrics, MetricsCollector, MetricsServer},
     observability::{initialize_logging, task_span},
     process_lock::{ProcessLock, ProcessLockError},
     render::{
         CatalogBuildError, CatalogRetentionError, ContentCatalog, ContentCompiler, SiteSnapshot,
         render_site_shell, snapshot_store,
     },
+    restore,
     source_bootstrap::{configure_source, generate_source_key},
     source_provenance::{SourceCommitDiscovery, discover_source_commit},
     source_sync::{ManagedSourceEngine, SourceSyncHandle},
@@ -125,6 +131,8 @@ struct ServingState {
     publication_actor: PublicationCoordinatorActor,
     public_server: PublicServer,
     admin_server: AdminServer,
+    metrics_server: MetricsServer,
+    metrics_collector: MetricsCollector,
 }
 
 struct StartedDatabase {
@@ -206,6 +214,67 @@ pub async fn run_until_stop() -> ProcessExit {
     };
     let result: Result<(), ProcessError> = async {
         match invocation {
+            ServerInvocation::CheckpointManifest {
+                config_path,
+                database_file,
+                plan_file,
+                ltx_root,
+                artifact_root,
+                output,
+            } => {
+                restore::checkpoint::write_manifest(
+                    config_path,
+                    database_file,
+                    plan_file,
+                    ltx_root,
+                    artifact_root,
+                    output,
+                )
+                .await
+            }
+            ServerInvocation::VerifyCheckpoint {
+                manifest_file,
+                ltx_root,
+                artifact_root,
+            } => {
+                restore::checkpoint::verify_checkpoint(manifest_file, ltx_root, artifact_root).await
+            }
+            ServerInvocation::RestoreReplica {
+                config_path,
+                database_file,
+                artifact_root,
+                manifest_file,
+                ltx_root,
+            } => {
+                restore::restore(
+                    config_path,
+                    database_file,
+                    artifact_root,
+                    restore::RestoreManifest::Replica {
+                        path: manifest_file,
+                        ltx_root,
+                    },
+                )
+                .await
+            }
+            ServerInvocation::ExportBackup {
+                config_path,
+                database_file,
+            } => restore::export_backup(config_path, database_file).await,
+            ServerInvocation::Restore {
+                config_path,
+                database_file,
+                artifact_root,
+                manifest_file,
+            } => {
+                restore::restore(
+                    config_path,
+                    database_file,
+                    artifact_root,
+                    restore::RestoreManifest::Bundle(manifest_file),
+                )
+                .await
+            }
             ServerInvocation::Serve { config_path } => {
                 let startup = StartupHostConfiguration::load(config_path)?;
                 let application = match startup.host.view().source {
@@ -321,6 +390,8 @@ impl Application {
             frontend,
             public_bind: host.public_bind,
             admin_bind: host.admin_bind,
+            metrics_bind: host.metrics_bind,
+            backup: BackupHealth::new(host.backup),
             security: database.security.clone(),
             cancellation: cancellation.clone(),
             candidate_store: &candidate_store,
@@ -466,6 +537,8 @@ impl Application {
             frontend,
             public_bind: host.public_bind,
             admin_bind: host.admin_bind,
+            metrics_bind: host.metrics_bind,
+            backup: BackupHealth::new(host.backup),
             security: database.security.clone(),
             cancellation: cancellation.clone(),
             candidate_store: &candidate_store,
@@ -511,6 +584,8 @@ impl Application {
             publication_actor,
             public_server,
             admin_server,
+            metrics_server,
+            metrics_collector,
         } = serving_state;
         #[cfg(test)]
         let public_addr = public_server.local_addr;
@@ -527,6 +602,20 @@ impl Application {
         let admin_task = CriticalTask::new(CriticalTaskName::AdminServer, async move {
             admin_server
                 .serve(admin_cancellation)
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
+        let metrics_cancellation = cancellation.clone();
+        let metrics_task = CriticalTask::new(CriticalTaskName::MetricsServer, async move {
+            metrics_server
+                .serve(metrics_cancellation)
+                .await
+                .map_err(|error| Box::new(error) as CriticalTaskFailure)
+        });
+        let collector_cancellation = cancellation.clone();
+        let collector_task = CriticalTask::new(CriticalTaskName::MetricsCollector, async move {
+            metrics_collector
+                .run(collector_cancellation)
                 .await
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
@@ -564,6 +653,8 @@ impl Application {
                     publication_actor_task,
                     public_task,
                     admin_task,
+                    metrics_task,
+                    collector_task,
                     source_task,
                     scheduler_task,
                 ],
@@ -618,6 +709,194 @@ fn compile_startup_content(
         source_commit,
         content_digest,
     })
+}
+
+/// Rebuilds durable release and public inputs without admitting any mutation.
+pub(crate) async fn verify_restore_content(
+    database: &DatabaseStore,
+    state_root: &Path,
+    limits: ContentTreeLimits,
+) -> Result<(), ProcessError> {
+    let inputs = RestoreContentInputs::load(database).await?;
+    let state_root = state_root.to_path_buf();
+    tokio::task::spawn_blocking(move || inputs.verify(&state_root, limits))
+        .await
+        .map_err(|error| {
+            startup_failure(
+                StartupStage::Content,
+                "await offline restore verification",
+                error,
+            )
+        })?
+}
+
+/// Owned durable facts cross into the blocking compiler without a database handle.
+struct RestoreContentInputs {
+    tip_recipient: Option<TipRecipientProjection>,
+    startup: StartupSnapshotState,
+    installed_content: Option<ContentTreeDigest>,
+    retained: Vec<RetainedReleaseInput>,
+}
+
+impl RestoreContentInputs {
+    async fn load(database: &DatabaseStore) -> Result<Self, ProcessError> {
+        let tip_recipient = database
+            .profiles
+            .effective_tip_recipient()
+            .await
+            .map_err(|error| {
+                startup_failure(
+                    StartupStage::Database,
+                    "verify restored tip projection",
+                    error,
+                )
+            })?;
+        let startup = database
+            .publications
+            .startup_snapshot_state()
+            .await
+            .map_err(|error| {
+                startup_failure(
+                    StartupStage::Database,
+                    "verify restored publication ledger",
+                    error,
+                )
+            })?;
+        let source = database.source.status().await.map_err(|error| {
+            startup_failure(
+                StartupStage::Database,
+                "verify restored source ledger",
+                error,
+            )
+        })?;
+        let retained = database
+            .publications
+            .retained_release_inputs()
+            .await
+            .map_err(|error| {
+                startup_failure(
+                    StartupStage::Database,
+                    "verify retained restore approvals",
+                    error,
+                )
+            })?;
+        Ok(Self {
+            tip_recipient,
+            startup,
+            installed_content: source.installation.map(|source| source.content_digest),
+            retained,
+        })
+    }
+
+    fn verify(&self, state_root: &Path, limits: ContentTreeLimits) -> Result<(), ProcessError> {
+        let candidates = ContentCandidateStore::open(state_root, limits).map_err(|error| {
+            startup_failure(
+                StartupStage::Content,
+                "inspect restored candidate archives",
+                error,
+            )
+        })?;
+        let compiler = ContentCompiler::discover().map_err(|error| {
+            startup_failure(StartupStage::Content, "initialize restore compiler", error)
+        })?;
+        let catalogs = compile_retained_catalogs(&candidates, &compiler).map_err(|error| {
+            startup_failure(
+                StartupStage::Content,
+                "compile restored candidate archives",
+                error,
+            )
+        })?;
+        let base = catalogs.values().next().ok_or_else(|| {
+            startup_failure(
+                StartupStage::Content,
+                "verify retained restore inputs",
+                RetainedCatalogError::CandidateUnavailable,
+            )
+        })?;
+        let pins = self.startup.ledger.revision_keys().chain(
+            self.retained
+                .iter()
+                .map(|input| (input.post_id.clone(), input.revision.clone())),
+        );
+        let preview = hydrate_catalog(base.as_ref().clone(), &catalogs, pins).map_err(|error| {
+            startup_failure(
+                StartupStage::Content,
+                "verify restored release revisions",
+                error,
+            )
+        })?;
+        for digest in self
+            .installed_content
+            .iter()
+            .chain(self.retained.iter().map(|item| &item.content_digest))
+        {
+            if !catalogs.contains_key(digest) {
+                return Err(startup_failure(
+                    StartupStage::Content,
+                    "verify restored pinned candidates",
+                    RetainedCatalogError::CandidateUnavailable,
+                ));
+            }
+        }
+        self.verify_activations(&catalogs, &preview)?;
+        rebuild_public_snapshot(
+            &self.startup,
+            &catalogs,
+            &preview,
+            embedded_manifest(),
+            self.tip_recipient.as_ref(),
+        )?;
+        Ok(())
+    }
+
+    /// Preflight interrupted activations without finishing them or changing the public head.
+    fn verify_activations(
+        &self,
+        catalogs: &BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>,
+        preview: &Arc<ContentCatalog>,
+    ) -> Result<(), ProcessError> {
+        for activation in self.startup.activating.iter().cloned() {
+            let site = self.startup.site.clone().ok_or_else(|| {
+                startup_failure(
+                    StartupStage::Content,
+                    "verify restored activation head",
+                    PublicationActivationError::DurableStateMismatch,
+                )
+            })?;
+            let mut catalog = catalogs
+                .get(&activation.content_digest)
+                .ok_or_else(|| {
+                    startup_failure(
+                        StartupStage::Content,
+                        "verify restored activation candidate",
+                        RetainedCatalogError::CandidateUnavailable,
+                    )
+                })?
+                .as_ref()
+                .clone();
+            catalog
+                .retain_revisions_from(preview, self.startup.ledger.revision_keys())
+                .map_err(|error| {
+                    startup_failure(
+                        StartupStage::Content,
+                        "verify restored activation revisions",
+                        error,
+                    )
+                })?;
+            PreparedPublicationRecovery::prepare(
+                activation,
+                Arc::new(catalog),
+                embedded_manifest(),
+                &self.startup.ledger,
+                self.tip_recipient.as_ref(),
+                site,
+            )
+            .map_err(|error| {
+                startup_failure(StartupStage::Content, "verify restored activation", error)
+            })?;
+        }
+        Ok(())
+    }
 }
 
 fn compile_retained_catalogs(
@@ -730,6 +1009,8 @@ fn rebuild_public_snapshot(
 
 #[derive(Debug, thiserror::Error)]
 enum RetainedCatalogError {
+    #[error("a required retained content candidate is unavailable")]
+    CandidateUnavailable,
     #[error("retained content candidates could not be loaded")]
     Load(#[source] ContentCandidateStoreError),
     #[error("retained content candidate {digest} could not be prepared")]
@@ -761,6 +1042,8 @@ struct ServingStateInput<'resources> {
     frontend: &'static FrontendAssetManifest,
     public_bind: std::net::SocketAddr,
     admin_bind: AdminBind,
+    metrics_bind: std::net::SocketAddr,
+    backup: BackupHealth,
     security: AdminSecurityState,
     cancellation: CancellationToken,
     candidate_store: &'resources ContentCandidateStore,
@@ -775,6 +1058,8 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         frontend,
         public_bind,
         admin_bind,
+        metrics_bind,
+        backup,
         security,
         cancellation,
         candidate_store,
@@ -955,7 +1240,28 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         bind = %admin_server.local_addr,
         "authenticated admin backend listener bound"
     );
+    let metrics = Metrics::new(&database.health.metrics).map_err(|error| {
+        startup_failure(
+            StartupStage::Listeners,
+            "construct the application metrics registry",
+            error,
+        )
+    })?;
+    let metrics_server = MetricsServer::bind(metrics_bind, metrics.clone())
+        .await
+        .map_err(|error| {
+            startup_failure(StartupStage::Listeners, "bind the metrics listener", error)
+        })?;
+    tracing::info!(bind = %metrics_server.local_addr, "loopback metrics listener bound");
+    let metrics_collector = MetricsCollector::new(
+        metrics,
+        database.health.clone(),
+        backup,
+        tokio::runtime::Handle::current(),
+    );
     Ok(ServingState {
+        metrics_server,
+        metrics_collector,
         readiness,
         publication_coordinator,
         publication_actor,
@@ -980,6 +1286,15 @@ fn startup_failure(
 
 async fn start_database(host: &HostConfiguration) -> Result<StartedDatabase, ProcessError> {
     let host = host.view();
+    restore::verify_startup_candidate(host.database.path, host.state_root)
+        .await
+        .map_err(|error| {
+            startup_failure(
+                StartupStage::Database,
+                "verify restored startup candidate",
+                error,
+            )
+        })?;
     let database = match database::bootstrap(host.database).await {
         Ok(database) => database,
         Err(database::DatabaseStartupError::AlreadyOwned) => {
@@ -1006,12 +1321,16 @@ async fn start_database(host: &HostConfiguration) -> Result<StartedDatabase, Pro
         },
     ));
 
-    if let Err(error) =
-        identity_bootstrap::bootstrap_generated_owner(&store, std::io::stdout()).await
+    if let Err(error) = identity_bootstrap::initialize_startup_identity(
+        &store,
+        host.identity_startup_bootstrap,
+        std::io::stdout(),
+    )
+    .await
     {
         let error = startup_failure(
             StartupStage::Identity,
-            "bootstrap a generated initial owner",
+            "apply the owner identity startup policy",
             error,
         );
         return Err(close_writer_after_startup_failure(store, shutdown, task, error).await);
@@ -1367,7 +1686,11 @@ mod tests {
     use k256::schnorr::SigningKey;
     use markdown_compiler::DefaultPostTipPolicy;
     use serde::{Serialize, de::DeserializeOwned};
-    use tokio::sync::oneshot;
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::TcpStream,
+        sync::oneshot,
+    };
 
     use maincopy_shared::auth::{
         AdminAuditEventId, AdminScope, AgentCredentialId, InstanceId, UserId,
@@ -1375,7 +1698,8 @@ mod tests {
 
     use crate::{
         admin::test_support::{ADMIN_AUTHORITY, ADMIN_ORIGIN, agent_authorization},
-        config::ConfigurationValidationCode,
+        cli::BootstrapCredential,
+        config::{ConfigurationValidationCode, IdentityStartupBootstrap},
         domain::auth::{
             NostrPublicKey,
             store::{
@@ -1423,6 +1747,8 @@ Durable article body.\n";
              [public]\n\
              bind = \"{public_bind}\"\n\
              {extra}\n\
+             [metrics]\n\
+             bind = \"127.0.0.1:0\"\n\
              [admin]\n\
              bind = \"{admin_bind}\"\n\
              origin = \"https://admin.example.test\"\n"
@@ -1800,6 +2126,99 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
     }
 
     #[tokio::test]
+    async fn production_identity_policy_refuses_credential_output_and_accepts_offline_nostr_bootstrap()
+     {
+        let (_root, config_path, _) = startup_fixture(
+            "[identity]\nstartup_bootstrap = \"require_existing\"\n",
+            VALID_PUBLICATION,
+        );
+        let host = HostConfigurationLoader::from_process_working_directory()
+            .unwrap()
+            .load(&config_path)
+            .unwrap();
+        let database = database::bootstrap(host.view().database).await.unwrap();
+        let (store, writer) = database.into_store(host.view().database.writer_queue_capacity.get());
+        let cancellation = CancellationToken::new();
+        let running = tokio::spawn(writer.run(cancellation.clone()));
+        let mut output = Vec::new();
+        let failure = identity_bootstrap::initialize_startup_identity(
+            &store,
+            IdentityStartupBootstrap::RequireExisting,
+            &mut output,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            identity_bootstrap::GeneratedOwnerBootstrapError::ExistingIdentityRequired
+        ));
+        assert!(output.is_empty());
+        assert!(
+            store
+                .auth
+                .identity_state()
+                .await
+                .unwrap()
+                .bootstrap_required
+        );
+        cancellation.cancel();
+        running.await.unwrap().unwrap();
+        drop(store);
+        let startup =
+            StartupConfiguration::load_with_discovery(config_path.clone(), discover_content_tree)
+                .unwrap();
+        let failure = match Application::build(startup).await {
+            Ok(application) => {
+                stop_built_application(application).await;
+                panic!("production startup must refuse an uninitialized identity");
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(
+            failure,
+            ProcessError::Application(ApplicationError::Startup {
+                stage: StartupStage::Identity,
+                operation: "apply the owner identity startup policy",
+                ..
+            })
+        ));
+        let public_key = NostrPublicKey::parse(
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+        )
+        .unwrap();
+        identity_bootstrap::bootstrap_owner(
+            config_path.clone(),
+            BootstrapCredential::Nostr { public_key },
+        )
+        .await
+        .unwrap();
+        let startup =
+            StartupConfiguration::load_with_discovery(config_path, discover_content_tree).unwrap();
+        let application = Application::build(startup).await.unwrap();
+        let owner = application
+            ._database
+            .auth
+            .users_page(None, 2)
+            .await
+            .unwrap();
+        assert_eq!(owner.items.len(), 1);
+        assert!(owner.items[0].has_nostr);
+        assert!(!owner.items[0].has_password);
+        let mut output = Vec::new();
+        assert!(
+            !identity_bootstrap::initialize_startup_identity(
+                &application._database,
+                IdentityStartupBootstrap::RequireExisting,
+                &mut output
+            )
+            .await
+            .unwrap()
+        );
+        assert!(output.is_empty());
+        stop_built_application(application).await;
+    }
+
+    #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn unbootstrapped_identity_generates_owner_and_starts_the_application() {
         let (root, _, _) = startup_fixture("", VALID_PUBLICATION);
@@ -1850,9 +2269,13 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             }] if username.as_str() == "owner"
         ));
         assert!(
-            !identity_bootstrap::bootstrap_generated_owner(&application._database, std::io::sink())
-                .await
-                .unwrap()
+            !identity_bootstrap::initialize_startup_identity(
+                &application._database,
+                IdentityStartupBootstrap::GenerateOwner,
+                std::io::sink()
+            )
+            .await
+            .unwrap()
         );
 
         stop_built_application(application).await;
@@ -1871,7 +2294,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             StartupHostConfiguration::load(root.path().join("maincopy.toml")),
             Err(ProcessError::AlreadyRunning)
         ));
-        assert_eq!(application.runtime.critical_tasks.len(), 5);
+        assert_eq!(application.runtime.critical_tasks.len(), 7);
         assert!(application.runtime.database_writer.is_some());
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -2458,6 +2881,173 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
+    async fn offline_restore_requires_exact_scheduled_and_blocked_candidate_inputs() {
+        use sqlx::{ConnectOptions as _, Connection as _};
+
+        let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
+        let content_root = root.path().join("content");
+        write_durable_post(&content_root);
+        let startup =
+            StartupConfiguration::load_with_discovery(arguments.clone(), discover_content_tree)
+                .unwrap();
+        let database_path = startup._host.view().database.path.to_owned();
+        let limits = startup._host.view().content_limits;
+        let state_root = root.path().join("state");
+        stop_built_application(build_test_application(startup).await.unwrap()).await;
+
+        let approved = discover_content_tree(&content_root, limits).unwrap();
+        let approved_digest = approved.digest();
+        let catalog =
+            Arc::new(compile_content_catalog(&prepare_content(&approved).unwrap()).unwrap());
+        let post_id = PostId::parse(DURABLE_POST_ID).unwrap();
+        let revision = catalog.current_post(&post_id).unwrap().revision.clone();
+        let preview = render_bound_post_preview(
+            &catalog,
+            embedded_manifest(),
+            &post_id,
+            None,
+            "/api/admin/v1/preview-assets/retained-fixture",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let candidates = ContentCandidateStore::open(&state_root, limits).unwrap();
+
+        // A different site can retain the same article revision. Its presence must
+        // not substitute for the exact candidate approved by a pending release.
+        fs::write(
+            content_root.join("publication.toml"),
+            VALID_PUBLICATION.replace("Pinned startup source", "Another publication title"),
+        )
+        .unwrap();
+        let same_revision = discover_content_tree(&content_root, limits).unwrap();
+        assert_eq!(
+            compile_content_catalog(&prepare_content(&same_revision).unwrap())
+                .unwrap()
+                .current_post(&post_id)
+                .unwrap()
+                .revision,
+            revision,
+        );
+        let alternate_digest = candidates.retain(&same_revision).unwrap();
+        assert_ne!(alternate_digest, approved_digest);
+        fs::write(
+            content_root.join("posts/durable-publication.md"),
+            DURABLE_POST.replace("Durable article body.", "A later unapproved revision."),
+        )
+        .unwrap();
+        let later = discover_content_tree(&content_root, limits).unwrap();
+        candidates.retain(&later).unwrap();
+
+        let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database_path)
+            .foreign_keys(true)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO canonical_publications (\
+                publication_id, creation_key, command_kind, stable_post_id, pinned_post_digest, \
+                state, version, scheduled_at_ns, content_tree_digest, accepted_preview_digest\
+             ) VALUES (?, ?, 'scheduled', ?, ?, 'scheduled', 1, ?, ?, ?)",
+        )
+        .bind(
+            uuid::Uuid::parse_str(DURABLE_PUBLICATION_ID)
+                .unwrap()
+                .as_bytes()
+                .as_slice(),
+        )
+        .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+        .bind(post_id.as_uuid().as_bytes().as_slice())
+        .bind(revision.as_bytes().as_slice())
+        .bind(1_900_000_000_000_000_000_i64)
+        .bind(approved_digest.as_bytes().as_slice())
+        .bind(preview.digest.as_bytes().as_slice())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+
+        for (state, version, activation, reason) in [
+            ("scheduled", 1_i64, None, None),
+            (
+                "blocked",
+                3_i64,
+                Some(1_900_000_000_000_000_000_i64),
+                Some("preview_changed"),
+            ),
+        ] {
+            let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .connect()
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE canonical_publications SET state = ?, version = ?, \
+                 activation_at_ns = ?, block_reason = ?",
+            )
+            .bind(state)
+            .bind(version)
+            .bind(activation)
+            .bind(reason)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+            connection.close().await.unwrap();
+            verify_offline_content_without_mutation(&database_path, &state_root, limits)
+                .await
+                .unwrap();
+
+            fs::remove_file(
+                state_root.join(format!("content-candidates/{approved_digest}.candidate")),
+            )
+            .unwrap();
+            let error =
+                verify_offline_content_without_mutation(&database_path, &state_root, limits)
+                    .await
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                ProcessError::Application(ApplicationError::Startup {
+                    operation: "verify restored pinned candidates",
+                    ..
+                })
+            ));
+            fs::remove_file(
+                state_root.join(format!("content-candidates/{alternate_digest}.candidate")),
+            )
+            .unwrap();
+            let error =
+                verify_offline_content_without_mutation(&database_path, &state_root, limits)
+                    .await
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                ProcessError::Application(ApplicationError::Startup {
+                    operation: "verify restored release revisions",
+                    ..
+                })
+            ));
+            candidates.retain(&approved).unwrap();
+            candidates.retain(&same_revision).unwrap();
+        }
+    }
+
+    async fn verify_offline_content_without_mutation(
+        database_path: &Path,
+        state_root: &Path,
+        limits: ContentTreeLimits,
+    ) -> Result<(), ProcessError> {
+        let before = blake3::hash(&fs::read(database_path).unwrap());
+        let inspected = database::restore::inspect(database_path).await.unwrap();
+        let result = verify_restore_content(&inspected.store, state_root, limits).await;
+        inspected.close().await;
+        assert_eq!(blake3::hash(&fs::read(database_path).unwrap()), before);
+        result
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn startup_preflights_exact_activation_before_indexing_new_content_or_binding() {
         use sqlx::{ConnectOptions as _, Connection as _};
 
@@ -2467,6 +3057,8 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
         let database_path = startup._host.view().database.path.to_owned();
+        let limits = startup._host.view().content_limits;
+        let state_root = root.path().join("state");
         stop_built_application(build_test_application(startup).await.unwrap()).await;
 
         let arguments = root.path().join("maincopy.toml");
@@ -2545,6 +3137,17 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             .unwrap();
         connection.close().await.unwrap();
         drop(startup);
+        let error = verify_offline_content_without_mutation(&database_path, &state_root, limits)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProcessError::Application(ApplicationError::Startup {
+                stage: StartupStage::Content,
+                operation: "verify restored activation",
+                ..
+            })
+        ));
 
         fs::write(
             content_root.join("posts/durable-publication.md"),
@@ -2597,6 +3200,9 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             .await
             .unwrap();
         connection.close().await.unwrap();
+        verify_offline_content_without_mutation(&database_path, &state_root, limits)
+            .await
+            .unwrap();
 
         let startup = StartupConfiguration::load_with_discovery(
             root.path().join("maincopy.toml"),
@@ -2767,6 +3373,120 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                 stage: StartupStage::Database,
                 ..
             })
+        ));
+    }
+
+    async fn begin_public_request(address: std::net::SocketAddr, path: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let head = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut interim = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !interim.ends_with(b"\r\n\r\n") {
+                assert!(interim.len() < 1024);
+                interim.push(stream.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&interim).unwrap(),
+            "HTTP/1.1 100 Continue\r\n\r\n"
+        );
+        stream
+    }
+
+    async fn finish_public_request(mut stream: TcpStream) -> String {
+        stream.write_all(b"x").await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.take(64 * 1024).read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn shutdown_finishes_an_accepted_public_request_before_closing_the_real_writer() {
+        let (_root, config, _) = startup_fixture("", VALID_PUBLICATION);
+        let startup =
+            StartupConfiguration::load_with_discovery(config, discover_content_tree).unwrap();
+        let mut application = build_test_application(startup).await.unwrap();
+        let address = application.public_addr;
+        let readiness = application.runtime.readiness.clone();
+        let cancellation = application.runtime.cancellation.clone();
+        let database_shutdown = application.runtime.database_shutdown.clone();
+        let (stop, stopped) = oneshot::channel();
+        application.runtime.shutdown = Box::pin(async {
+            stopped.await.unwrap();
+            Ok(())
+        });
+        let running = tokio::spawn(application.run_until_stop());
+        let request = begin_public_request(address, "/health/live").await;
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancellation.cancelled())
+            .await
+            .unwrap();
+        assert!(!readiness.is_ready());
+        assert!(!database_shutdown.is_cancelled());
+        assert!(!running.is_finished());
+        let response = finish_public_request(request).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(r#"{"status":"live"}"#));
+        tokio::time::timeout(std::time::Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(database_shutdown.is_cancelled());
+        let rebound = tokio::net::TcpListener::bind(address).await.unwrap();
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn supervised_task_failure_makes_pending_readiness_fail_while_liveness_stays_live() {
+        let (_root, config, _) = startup_fixture("", VALID_PUBLICATION);
+        let startup =
+            StartupConfiguration::load_with_discovery(config, discover_content_tree).unwrap();
+        let mut application = build_test_application(startup).await.unwrap();
+        let address = application.public_addr;
+        let cancellation = application.runtime.cancellation.clone();
+        let (fail, failed) = oneshot::channel();
+        application.runtime.critical_tasks.spawn(CriticalTask::new(
+            CriticalTaskName::Worker,
+            async {
+                failed.await.unwrap();
+                Ok(())
+            },
+        ));
+        let running = tokio::spawn(application.run_until_stop());
+        let ready = begin_public_request(address, "/health/ready").await;
+        let live = begin_public_request(address, "/health/live").await;
+        fail.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancellation.cancelled())
+            .await
+            .unwrap();
+        let ready = finish_public_request(ready).await;
+        let live = finish_public_request(live).await;
+        assert!(ready.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(ready.contains(r#"{"status":"not_ready"}"#));
+        assert!(live.starts_with("HTTP/1.1 200 OK"));
+        assert!(live.contains(r#"{"status":"live"}"#));
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            ApplicationError::CriticalTaskExited {
+                task: CriticalTaskName::Worker
+            }
         ));
     }
 
@@ -2958,6 +3678,72 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             })
         ));
         assert_shutdown_state(readiness, cancellation, companion_drained);
+    }
+
+    #[tokio::test]
+    async fn metrics_collector_storage_failure_marks_unready_and_drains_the_writer() {
+        let (root, config_path, _publication_path) = startup_fixture("", VALID_PUBLICATION);
+        let startup =
+            StartupConfiguration::load_with_discovery(config_path, discover_content_tree).unwrap();
+        let host = startup._host.view();
+        let bootstrapped = database::bootstrap(host.database).await.unwrap();
+        let (store, writer) = bootstrapped.into_store(4);
+        let metrics = Metrics::new(&store.health.metrics).unwrap();
+        let collector = MetricsCollector::new(
+            metrics,
+            store.health.clone(),
+            BackupHealth::new(None),
+            tokio::runtime::Handle::current(),
+        );
+        // Existing SQLite handles remain valid, but the collector's next metadata lookup fails.
+        fs::rename(root.path().join("state"), root.path().join("moved-state")).unwrap();
+        fs::write(root.path().join("state"), []).unwrap();
+        let readiness = Readiness::default();
+        let cancellation = CancellationToken::new();
+        let writer_shutdown = CancellationToken::new();
+        let collector_cancellation = cancellation.clone();
+        let shutdown = writer_shutdown.clone();
+        let application = ApplicationRuntime::with_database_writer(
+            readiness.clone(),
+            cancellation.clone(),
+            writer_shutdown.clone(),
+            Box::pin(std::future::pending()),
+            vec![CriticalTask::new(
+                CriticalTaskName::MetricsCollector,
+                async move {
+                    collector
+                        .run(collector_cancellation)
+                        .await
+                        .map_err(|error| Box::new(error) as CriticalTaskFailure)
+                },
+            )],
+            spawn_critical_task(CriticalTask::new(
+                CriticalTaskName::DatabaseWriter,
+                async move {
+                    writer
+                        .run(shutdown)
+                        .await
+                        .map_err(|error| Box::new(error) as CriticalTaskFailure)
+                },
+            )),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            application.run_until_stop(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(ApplicationError::CriticalTaskFailed {
+                task: CriticalTaskName::MetricsCollector,
+                ..
+            })
+        ));
+        assert!(!readiness.is_ready());
+        assert!(cancellation.is_cancelled());
+        assert!(writer_shutdown.is_cancelled());
+        assert_eq!(store.health.metrics.writer_up.get(), 0);
     }
 
     #[tokio::test]

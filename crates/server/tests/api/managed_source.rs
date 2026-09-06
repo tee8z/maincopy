@@ -1,3 +1,5 @@
+mod restore;
+
 use std::{
     ffi::OsStr,
     fs,
@@ -48,6 +50,8 @@ const UPDATED_TITLE: &str = "Updated managed post";
 const UPDATED_BODY: &str = "This push became a private preview without a restart.";
 const COMMAND_LIMIT: Duration = Duration::from_secs(30);
 const REQUEST_LIMIT: Duration = Duration::from_secs(10);
+// Observe the whole local source workflow separately from each HTTP request.
+// This fixture expectation is not the production timeout for a native Git phase.
 const POLL_LIMIT: Duration = Duration::from_secs(75);
 const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_SYNC_REQUEST_BYTES: usize = 4 * 1024;
@@ -762,13 +766,20 @@ impl ManagedGitFixture {
         &self,
         source_sync_id: SourceSyncId,
     ) -> SourceSyncResource {
-        tokio::time::timeout(REQUEST_LIMIT, async {
+        let mut last_observed = None;
+        tokio::time::timeout(POLL_LIMIT, async {
             loop {
-                let sync: SourceSyncResource = response_json(
-                    self.admin_get(&format!("{SOURCE_SYNCS_PATH}/{source_sync_id}"))
-                        .await,
-                )
-                .await;
+                let response = self
+                    .admin_get(&format!("{SOURCE_SYNCS_PATH}/{source_sync_id}"))
+                    .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "source operation {source_sync_id} status request failed; last stage/version: {last_observed:?}"
+                );
+                let sync: SourceSyncResource = response_json(response).await;
+                assert_eq!(sync.source_sync_id, source_sync_id);
+                last_observed = Some((sync.stage.as_str(), sync.version));
                 if sync.outcome.is_some() {
                     return sync;
                 }
@@ -776,26 +787,27 @@ impl ManagedGitFixture {
             }
         })
         .await
-        .expect("source operation must finish within its fixture limit")
+        .unwrap_or_else(|_| {
+            panic!(
+                "source operation {source_sync_id} did not reach a durable terminal outcome within {POLL_LIMIT:?}; last stage/version: {last_observed:?}"
+            )
+        })
     }
 
     async fn wait_for_manual_no_change(&self, source_sync_id: &str) {
-        tokio::time::timeout(REQUEST_LIMIT, async {
-            loop {
-                let response = self
-                    .admin_get(&format!("{}/{source_sync_id}", SOURCE_SYNCS_PATH))
-                    .await;
-                assert_eq!(response.status(), StatusCode::OK);
-                let sync: SourceSyncResource = response_json(response).await;
-                if sync.outcome == Some(SourceSyncOutcome::NoChange) {
-                    assert_eq!(sync.request_origin, SourceSyncRequestOrigin::Manual);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("the native admin sync must reach a durable no-change result");
+        let source_sync_id = source_sync_id
+            .parse()
+            .expect("source UI redirect must contain a canonical operation UUID");
+        let sync = self.wait_for_terminal_source_sync(source_sync_id).await;
+        assert_eq!(
+            sync.outcome,
+            Some(SourceSyncOutcome::NoChange),
+            "source operation {source_sync_id} terminated unexpectedly; stage={}, version={}, failure={:?}",
+            sync.stage.as_str(),
+            sync.version,
+            sync.failure_code
+        );
+        assert_eq!(sync.request_origin, SourceSyncRequestOrigin::Manual);
     }
 
     async fn restart_without_retained_candidates(self) -> Self {
@@ -1074,6 +1086,8 @@ fn write_host_file_with_fetch_timeout(root: &Path, fetch_timeout_seconds: Option
              state_root = \"state\"\n\
              runtime_root = \"run\"\n\
              [public]\n\
+             bind = \"127.0.0.1:0\"\n\
+             [metrics]\n\
              bind = \"127.0.0.1:0\"\n\
              [admin]\n\
              bind = \"127.0.0.1:0\"\n\

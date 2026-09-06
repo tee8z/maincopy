@@ -197,3 +197,14 @@ async fn public_router_does_not_expose_admin_openapi() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn public_router_does_not_expose_metrics() {
+    let app = public_router(public_state(Readiness::new(true)));
+    for method in [Method::GET, Method::HEAD] {
+        assert_eq!(
+            request(app.clone(), method, "/metrics").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+}

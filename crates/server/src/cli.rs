@@ -28,6 +28,54 @@ struct ServerArguments {
 
 #[derive(Debug, Subcommand)]
 enum ServerCommand {
+    /// Hash a pinned native Litestream plan and its copied immutable candidates.
+    CheckpointManifest {
+        #[arg(long)]
+        database_file: PathBuf,
+        #[arg(long)]
+        plan_file: PathBuf,
+        #[arg(long)]
+        ltx_root: PathBuf,
+        #[arg(long)]
+        artifact_root: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify a decrypted complete checkpoint and return its exact native replay cutoff.
+    VerifyCheckpoint {
+        #[arg(long)]
+        manifest_file: PathBuf,
+        #[arg(long)]
+        ltx_root: PathBuf,
+        #[arg(long)]
+        artifact_root: PathBuf,
+    },
+    /// Accept the direct SQLite output of verified native Litestream replay.
+    RestoreReplica {
+        #[arg(long)]
+        database_file: PathBuf,
+        #[arg(long)]
+        artifact_root: PathBuf,
+        #[arg(long)]
+        manifest_file: PathBuf,
+        #[arg(long)]
+        ltx_root: PathBuf,
+    },
+    /// Emit a private recovery tar stream; pipe directly through encryption before storage or upload.
+    ExportBackup {
+        /// A protected, consistent, sidecar-free SQLite snapshot made before this export.
+        #[arg(long, value_name = "PATH")]
+        database_file: PathBuf,
+    },
+    /// Verify and accept a decrypted replica and retained artifacts into empty state.
+    Restore {
+        #[arg(long, value_name = "PATH")]
+        database_file: PathBuf,
+        #[arg(long, value_name = "DIRECTORY")]
+        artifact_root: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        manifest_file: PathBuf,
+    },
     /// Perform offline identity operations without starting the server.
     Identity {
         #[command(subcommand)]
@@ -106,6 +154,36 @@ pub(crate) enum BootstrapCredential {
 
 #[derive(Debug)]
 pub(crate) enum ServerInvocation {
+    CheckpointManifest {
+        config_path: PathBuf,
+        database_file: PathBuf,
+        plan_file: PathBuf,
+        ltx_root: PathBuf,
+        artifact_root: PathBuf,
+        output: PathBuf,
+    },
+    VerifyCheckpoint {
+        manifest_file: PathBuf,
+        ltx_root: PathBuf,
+        artifact_root: PathBuf,
+    },
+    RestoreReplica {
+        config_path: PathBuf,
+        database_file: PathBuf,
+        artifact_root: PathBuf,
+        manifest_file: PathBuf,
+        ltx_root: PathBuf,
+    },
+    ExportBackup {
+        config_path: PathBuf,
+        database_file: PathBuf,
+    },
+    Restore {
+        config_path: PathBuf,
+        database_file: PathBuf,
+        artifact_root: PathBuf,
+        manifest_file: PathBuf,
+    },
     Serve {
         config_path: PathBuf,
     },
@@ -132,6 +210,55 @@ impl From<ServerArguments> for ServerInvocation {
     fn from(arguments: ServerArguments) -> Self {
         let ServerArguments { config, command } = arguments;
         match command {
+            Some(ServerCommand::CheckpointManifest {
+                database_file,
+                plan_file,
+                ltx_root,
+                artifact_root,
+                output,
+            }) => Self::CheckpointManifest {
+                config_path: config,
+                database_file,
+                plan_file,
+                ltx_root,
+                artifact_root,
+                output,
+            },
+            Some(ServerCommand::VerifyCheckpoint {
+                manifest_file,
+                ltx_root,
+                artifact_root,
+            }) => Self::VerifyCheckpoint {
+                manifest_file,
+                ltx_root,
+                artifact_root,
+            },
+            Some(ServerCommand::RestoreReplica {
+                database_file,
+                artifact_root,
+                manifest_file,
+                ltx_root,
+            }) => Self::RestoreReplica {
+                config_path: config,
+                database_file,
+                artifact_root,
+                manifest_file,
+                ltx_root,
+            },
+            Some(ServerCommand::ExportBackup { database_file }) => Self::ExportBackup {
+                config_path: config,
+                database_file,
+            },
+            Some(ServerCommand::Restore {
+                database_file,
+                artifact_root,
+                manifest_file,
+            }) => Self::Restore {
+                config_path: config,
+                database_file,
+                artifact_root,
+                manifest_file,
+            },
             None => Self::Serve {
                 config_path: config,
             },

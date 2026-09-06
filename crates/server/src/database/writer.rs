@@ -1,4 +1,10 @@
-use std::{fs::File, io};
+use super::health::DatabaseHealth;
+use crate::metrics::{CheckpointOutcome, DatabaseCondition, DatabaseMetrics, TransactionOutcome};
+use std::{
+    fs::File,
+    io,
+    time::{Duration, Instant},
+};
 
 use sqlx::{Connection as _, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use thiserror::Error;
@@ -38,6 +44,7 @@ use crate::domain::source::store::{
 };
 
 pub(crate) struct DatabaseWriter {
+    metrics: DatabaseMetrics,
     connection: SqliteConnection,
     readers: SqlitePool,
     ownership_lock: File,
@@ -52,16 +59,27 @@ impl BootstrappedDatabase {
             _writer: connection,
             _readers: readers,
             _ownership_lock: ownership_lock,
+            metrics,
+            wal_path,
         } = self;
         let (mutations, receiver) = mpsc::channel(capacity);
+        let health = DatabaseHealth::new(
+            metrics.clone(),
+            readers.clone(),
+            mutations.clone(),
+            wal_path,
+        );
+        metrics.queue_capacity.set(capacity as i64);
         (
             DatabaseStore::new(
                 AuthStore::new(readers.clone(), mutations.clone()),
                 ProfileStore::new(readers.clone(), mutations.clone()),
                 PublicationStore::new(readers.clone(), mutations.clone()),
                 SourceStore::new(readers.clone(), mutations),
+                health,
             ),
             DatabaseWriter {
+                metrics,
                 connection,
                 readers,
                 ownership_lock,
@@ -89,10 +107,13 @@ impl DatabaseWriter {
         mut self,
         shutdown: CancellationToken,
     ) -> Result<(), DatabaseWriterError> {
+        self.metrics.writer_up.set(1);
         let processing = self.process_until_shutdown(shutdown).await;
+        self.metrics.writer_up.set(0);
         self.mutations.close();
 
         let Self {
+            metrics,
             connection,
             readers,
             ownership_lock,
@@ -108,7 +129,7 @@ impl DatabaseWriter {
         let unlock = ownership_lock.unlock();
         drop(ownership_lock);
 
-        match (processing, close, unlock) {
+        let result = match (processing, close, unlock) {
             (Err(error), close, unlock) => {
                 if let Err(source) = close {
                     tracing::error!(error = %source, "database writer close failed after task failure");
@@ -126,19 +147,33 @@ impl DatabaseWriter {
             }
             (Ok(()), Ok(()), Err(source)) => Err(DatabaseWriterError::Unlock { source }),
             (Ok(()), Ok(()), Ok(())) => Ok(()),
-        }
+        };
+        metrics.set_condition(match &result {
+            Ok(()) => DatabaseCondition::Stopped,
+            Err(error) => error.condition(),
+        });
+        result
     }
 
     async fn process_until_shutdown(
         &mut self,
         shutdown: CancellationToken,
     ) -> Result<(), DatabaseWriterError> {
+        let mut checkpoint = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
+        checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let mutation = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => {
                     self.mutations.close();
                     break;
+                }
+                _ = checkpoint.tick() => {
+                    self.checkpoint().await?;
+                    continue;
                 }
                 mutation = self.mutations.recv() => {
                     mutation.ok_or(DatabaseWriterError::MutationChannelClosed)?
@@ -153,7 +188,44 @@ impl DatabaseWriter {
         Ok(())
     }
 
+    async fn checkpoint(&mut self) -> Result<(), DatabaseWriterError> {
+        let result = sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(PASSIVE)")
+            .fetch_one(&mut self.connection)
+            .await;
+        let report = result
+            .map_err(|source| DatabaseWriterError::Checkpoint { source })
+            .and_then(CheckpointReport::try_from);
+        match report {
+            Ok(report) => {
+                self.metrics.wal_frames.set(report.frames);
+                self.metrics.checkpointed_frames.set(report.copied);
+                self.metrics.observe_checkpoint(report.outcome);
+                Ok(())
+            }
+            Err(error) => {
+                self.metrics.observe_checkpoint(CheckpointOutcome::Failed);
+                Err(error)
+            }
+        }
+    }
+
     async fn execute(&mut self, mutation: Mutation) -> Result<(), DatabaseWriterError> {
+        let started = Instant::now();
+        let result = self.execute_transaction(mutation).await;
+        self.metrics.observe_transaction(
+            started.elapsed(),
+            match &result {
+                Ok(outcome) => *outcome,
+                Err(_) => TransactionOutcome::Failed,
+            },
+        );
+        result.map(|_| ())
+    }
+
+    async fn execute_transaction(
+        &mut self,
+        mutation: Mutation,
+    ) -> Result<TransactionOutcome, DatabaseWriterError> {
         #[cfg(test)]
         if let Some(control) = self.control.take() {
             control.dequeued.wait().await;
@@ -171,7 +243,8 @@ impl DatabaseWriter {
                     .rollback()
                     .await
                     .map_err(|source| DatabaseWriterError::Rollback { source })?;
-                return failed.finish();
+                failed.finish()?;
+                return Ok(TransactionOutcome::Rejected);
             }
         };
 
@@ -191,7 +264,36 @@ impl DatabaseWriter {
         }
 
         applied.send_success();
-        Ok(())
+        Ok(TransactionOutcome::Committed)
+    }
+}
+
+/// SQLite reports -1/-1 only when the connection has no WAL; mixed sentinel values are invalid.
+struct CheckpointReport {
+    frames: i64,
+    copied: i64,
+    outcome: CheckpointOutcome,
+}
+
+impl TryFrom<(i64, i64, i64)> for CheckpointReport {
+    type Error = DatabaseWriterError;
+
+    fn try_from((busy, frames, copied): (i64, i64, i64)) -> Result<Self, Self::Error> {
+        let (frames, copied) = match (frames, copied) {
+            (-1, -1) => (0, 0),
+            (frames, copied) if copied >= 0 && frames >= copied => (frames, copied),
+            _ => return Err(DatabaseWriterError::InvalidCheckpoint),
+        };
+        let outcome = match busy {
+            0 if copied == frames => CheckpointOutcome::Complete,
+            0 | 1 => CheckpointOutcome::Busy,
+            _ => return Err(DatabaseWriterError::InvalidCheckpoint),
+        };
+        Ok(Self {
+            frames,
+            copied,
+            outcome,
+        })
     }
 }
 
@@ -663,6 +765,13 @@ impl WriterTestControl {
 
 #[derive(Debug, Error)]
 pub(crate) enum DatabaseWriterError {
+    #[error("the passive WAL checkpoint failed")]
+    Checkpoint {
+        #[source]
+        source: sqlx::Error,
+    },
+    #[error("the passive WAL checkpoint returned invalid state")]
+    InvalidCheckpoint,
     #[error("all database store handles closed unexpectedly")]
     MutationChannelClosed,
     #[error("database transaction could not begin")]
@@ -697,6 +806,37 @@ pub(crate) enum DatabaseWriterError {
         #[source]
         source: io::Error,
     },
+}
+
+impl DatabaseWriterError {
+    fn condition(&self) -> DatabaseCondition {
+        match self {
+            Self::CorruptData { .. } => DatabaseCondition::Corruption,
+            Self::Checkpoint { .. } | Self::InvalidCheckpoint => {
+                DatabaseCondition::CheckpointFailed
+            }
+            Self::MutationChannelClosed => DatabaseCondition::Stopped,
+            Self::Begin { source }
+            | Self::Operation { source }
+            | Self::Rollback { source }
+            | Self::Commit { source }
+            | Self::Close { source } => classify_database_failure(source),
+            Self::Unlock { .. } => DatabaseCondition::IoFailure,
+        }
+    }
+}
+
+fn classify_database_failure(error: &sqlx::Error) -> DatabaseCondition {
+    let code = error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .and_then(|code| code.parse::<u32>().ok())
+        .map(|code| code & 0xff);
+    match code {
+        Some(11 | 26) => DatabaseCondition::Corruption,
+        Some(13) => DatabaseCondition::DiskFull,
+        _ => DatabaseCondition::IoFailure,
+    }
 }
 
 #[cfg(test)]
@@ -1783,6 +1923,111 @@ mod tests {
         reopened.close().await.unwrap();
     }
 
+    #[test]
+    fn checkpoint_rows_reject_impossible_counts_and_classify_partial_progress() {
+        for (row, frames, copied, outcome) in [
+            ((0, 5, 5), 5, 5, CheckpointOutcome::Complete),
+            ((0, 5, 3), 5, 3, CheckpointOutcome::Busy),
+            ((1, 5, 5), 5, 5, CheckpointOutcome::Busy),
+            ((0, -1, -1), 0, 0, CheckpointOutcome::Complete),
+        ] {
+            let report = CheckpointReport::try_from(row).unwrap();
+            assert_eq!((report.frames, report.copied), (frames, copied));
+            assert_eq!(report.outcome, outcome);
+        }
+        for row in [(2, 5, 5), (0, -2, -2), (0, -1, 0), (0, 0, -1), (0, 3, 4)] {
+            assert!(matches!(
+                CheckpointReport::try_from(row),
+                Err(DatabaseWriterError::InvalidCheckpoint)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_checkpoints_the_wal_and_returns_typed_failure_when_a_transaction_blocks_it() {
+        let (_root, _path, database) = database_with_initial_snapshot().await;
+        let (handle, mut writer) = database.into_store(4);
+        writer.checkpoint().await.unwrap();
+        assert!(handle.health.metrics.wal_frames.get() >= 1);
+        assert_eq!(
+            handle.health.metrics.wal_frames.get(),
+            handle.health.metrics.checkpointed_frames.get()
+        );
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer.connection)
+            .await
+            .unwrap();
+        let error = writer.checkpoint().await.unwrap_err();
+        assert!(matches!(error, DatabaseWriterError::Checkpoint { .. }));
+        assert_eq!(error.condition(), DatabaseCondition::CheckpointFailed);
+        sqlx::query("ROLLBACK")
+            .execute(&mut writer.connection)
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        writer.run(shutdown).await.unwrap();
+        assert_eq!(handle.health.metrics.writer_up.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_disk_full_and_corrupt_file_errors_map_to_typed_database_conditions() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("PRAGMA max_page_count = 2")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE payload (bytes BLOB)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let source = sqlx::query("INSERT INTO payload VALUES (zeroblob(8192))")
+            .execute(&mut connection)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            DatabaseWriterError::Operation { source }.condition(),
+            DatabaseCondition::DiskFull
+        );
+        connection.close().await.unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("corrupt.db");
+        std::fs::write(&path, [0xab; 8192]).unwrap();
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        let source = sqlx::query("SELECT name FROM sqlite_schema")
+            .fetch_all(&mut connection)
+            .await
+            .unwrap_err();
+        connection.close().await.unwrap();
+        assert_eq!(
+            DatabaseWriterError::Begin { source }.condition(),
+            DatabaseCondition::Corruption
+        );
+        assert_eq!(
+            DatabaseWriterError::CorruptData { entity: "fixture" }.condition(),
+            DatabaseCondition::Corruption
+        );
+        assert_eq!(
+            DatabaseWriterError::InvalidCheckpoint.condition(),
+            DatabaseCondition::CheckpointFailed
+        );
+        assert_eq!(
+            DatabaseWriterError::MutationChannelClosed.condition(),
+            DatabaseCondition::Stopped
+        );
+        assert_eq!(
+            DatabaseWriterError::Close {
+                source: sqlx::Error::PoolClosed
+            }
+            .condition(),
+            DatabaseCondition::IoFailure
+        );
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn writer_shutdown_unlocks_a_descriptor_inherited_before_exec() {
@@ -1835,6 +2080,10 @@ mod tests {
             ))
         );
 
+        handle.health.sample().await.unwrap();
+        assert_eq!(handle.health.metrics.queue_depth.get(), 1);
+        assert_eq!(handle.health.metrics.queue_capacity.get(), 1);
+        assert_eq!(handle.health.metrics.writer_up.get(), 1);
         shutdown.cancel();
         release.wait().await;
         first.await.unwrap().unwrap();

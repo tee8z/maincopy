@@ -176,6 +176,8 @@ impl_display!(ShutdownSignal {
 pub enum CriticalTaskName {
     PublicServer,
     AdminServer,
+    MetricsServer,
+    MetricsCollector,
     ContentSync,
     PublicationCoordinator,
     DatabaseWriter,
@@ -187,6 +189,8 @@ pub enum CriticalTaskName {
 impl_display!(CriticalTaskName {
     Self::PublicServer => "public server",
     Self::AdminServer => "admin server",
+    Self::MetricsServer => "metrics server",
+    Self::MetricsCollector => "metrics collector",
     Self::ContentSync => "content sync",
     Self::PublicationCoordinator => "publication coordinator",
     Self::DatabaseWriter => "database writer",
@@ -362,6 +366,8 @@ mod tests {
             ShutdownSignal::Terminate => "terminate",
             CriticalTaskName::PublicServer => "public server",
             CriticalTaskName::AdminServer => "admin server",
+            CriticalTaskName::MetricsServer => "metrics server",
+            CriticalTaskName::MetricsCollector => "metrics collector",
             CriticalTaskName::ContentSync => "content sync",
             CriticalTaskName::PublicationCoordinator => "publication coordinator",
             CriticalTaskName::DatabaseWriter => "database writer",

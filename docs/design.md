@@ -156,7 +156,7 @@ flowchart LR
     Artifacts --> Checkpoint
     Checkpoint --> Encryption[rclone crypt on the source server]
     Encryption --> B2[Backblaze B2]
-    Checkpoint --> LocalBackups[Seven-day local encrypted recovery bundles]
+    Encryption --> LocalBackups[Seven-day local encrypted recovery bundles]
 
     Runtime[Tokio runtime and supervised tasks] --> MetricsRegistry[Prometheus registry]
     Process[Linux process collector] --> MetricsRegistry
@@ -877,8 +877,12 @@ article access requires a separate post-V1 entitlement design.
 SQLite stores operational state. It does not store editable Markdown or
 rendered article bodies.
 
-Exactly one Tokio task owns one SQLx write connection. Every runtime mutation
-uses one bounded command channel.
+Exactly one Tokio task owns Maincopy's SQLx write connection. Every runtime
+domain mutation uses one bounded command channel.
+
+Litestream owns separate SQLite connections for replication bookkeeping and WAL
+checkpoint coordination. It does not perform Maincopy domain mutations. The
+[backup decision](decisions/0002-encrypted-checkpoints.md) records this boundary.
 
 Read handlers use a separate bounded, query-only pool. The database uses local
 storage and write-ahead logging.
@@ -940,8 +944,8 @@ Normal startup follows this order:
 1. Validate host configuration and acquire process ownership.
 2. Construct the Prometheus registry and registered metric instruments.
 3. Open and verify SQLite through its instrumented single-writer bootstrap.
-4. If identity is absent, generate and display the owner credential once.
-5. Atomically persist the generated identity, or fail before listener binding.
+4. If identity is absent, apply the configured startup bootstrap policy.
+5. Require an existing owner in production; development can generate one atomically.
 6. Verify instance identity and authentication compatibility.
 7. Reconcile incomplete reloads and releases.
 8. Verify required revision artifacts.
@@ -950,18 +954,19 @@ Normal startup follows this order:
 11. Start the supervised collector, source polling, and release scheduler.
 
 Explicit bootstrap and recovery commands are offline process modes. They bind
-no network listener. Automatic identity bootstrap is part of normal startup,
-but it also completes before a listener binds.
+no network listener. The NixOS service requires prior offline initialization,
+so generated credentials cannot enter its journal. Development bootstrap also
+completes before a listener binds.
 
 Shutdown stops intake before workers. It drains accepted database work before
 it closes SQLite and releases all listener addresses.
 
 ## Backup and restore
 
-V1 targets continuous Litestream replication to Backblaze B2. Encrypt database
-and revision-artifact bytes on the source server before upload. Retain local
-encrypted recovery bundles for seven days. Replication and artifact backup must
-not stop the running publication.
+V1 uses continuous Litestream replication with encrypted checkpoints in Backblaze
+B2. The source server encrypts database replica and revision-artifact bytes before
+upload. It retains local encrypted checkpoints for seven days. Backup failures
+do not stop the running publication.
 
 A usable recovery point includes both the SQLite ledger and every immutable
 revision artifact it references. Uploading the database alone does not establish
@@ -969,14 +974,21 @@ a complete recovery point. Restore must verify a bounded artifact inventory,
 schema compatibility, and reconstructed publication before accepting a candidate.
 A failed backup degrades backup health without blocking public reads.
 
-The deployment target uses the current Litestream file replica and rclone crypt.
-A checkpoint upload pins completed replica files and the required content inputs.
-It publishes an encrypted completion manifest only after those inputs reach B2.
-The initial upload interval is one minute. Off-site recovery also depends on
-transfer time and remote availability; local replication alone does not prove
-that a complete checkpoint reached B2.
+The deployment uses pinned Litestream 0.5.17 and standard rclone crypt. After a
+confirmed native sync, it pins the restore plan and retained content inputs.
+Native replay reconstructs a private database at that exact transaction cutoff.
+Maincopy verifies its schema, identities, and content before creating the manifest.
 
-This composition requires deployment and interruption testing before release.
+The manifest binds replayed database bytes, replica files, artifacts, and the
+exact Maincopy binary. Only replica files and artifacts become encrypted upload
+objects. The publisher sends the encrypted completion manifest after those objects.
+
+The default timer waits one minute after each completed job. Recovery lag also
+includes replay, validation, encryption, upload, and remote availability. Health
+uses the confirmed capture time, published only after the complete upload succeeds.
+Remote retention requires an explicit operator policy; local cleanup never deletes
+B2 objects. See the [deployment](deployment.md) and [restore](backup-restore.md) runbooks.
+
 Current Litestream releases do not provide native age encryption; see the
 [upstream migration guide](https://litestream.io/docs/migration/#age-encryption-migration).
 Use standard client-side encryption instead of an older Litestream release or
@@ -1017,7 +1029,7 @@ One Maincopy daemon owns one site with many articles. Production also runs an
 HTTPS gateway, Litestream, and artifact backup as separate, least-privilege processes.
 
 The Nix flake provides packages, applications, checks, a development shell,
-and a formatter. The NixOS module is a V1 release requirement.
+a formatter, and the `nixosModules.default` production module.
 
 ## Pre-v1 state boundary
 
@@ -1074,9 +1086,9 @@ V1 must prove these properties:
   audit records, or instance configuration.
 - The authentication security review has no unresolved critical or high-risk
   finding.
-- Fresh-state normal startup outputs one instance-unique 256-bit owner password
-  before its atomic identity transaction. It binds no listener until that
-  transaction and the remaining startup checks succeed.
+- Development startup can generate one instance-unique 256-bit owner password.
+  Production requires an existing owner and never journals a generated password.
+  Both policies complete identity checks before binding a listener.
 - Explicit bootstrap and recovery commands create no recovery transport, bind
   no listener, and accept no arbitrary SQL.
 - Known code fences use only static canonical language classes; every code path
@@ -1087,7 +1099,8 @@ V1 must prove these properties:
 - Core V1 creates no subscriber record or email task. The conditional mailing-list
   increment must pass its separate privacy and dispatch gates before collection.
   X, Substack, and Nostr distribution remain outside V1.
-- Every runtime SQLite write uses the shared writer task.
+- Every runtime Maincopy domain mutation uses the shared writer task.
+  Litestream owns its replication bookkeeping and checkpoint coordination.
 - No network call holds a database transaction.
 - Database and revision artifacts restore to one compatible recovery point.
 - The NixOS virtual-machine test proves gateway isolation, service permissions,

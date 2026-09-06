@@ -118,6 +118,11 @@
         };
     in
     {
+      nixosModules.default = { lib, pkgs, ... }: {
+        imports = [ ./nix/modules/maincopy.nix ];
+        services.maincopy.package = lib.mkDefault (projectFor pkgs.stdenv.hostPlatform.system).maincopy;
+      };
+
       packages = forAllSystems (system: {
         default = (projectFor system).maincopy;
         maincopy = (projectFor system).maincopy;
@@ -145,8 +150,32 @@
         system:
         let
           project = projectFor system;
+          moduleEvaluation = import ./nix/tests/module-eval.nix {
+            inherit (project) pkgs;
+            module = ./nix/modules/maincopy.nix;
+            package = project.maincopy;
+          };
         in
         {
+          deployment-module = project.pkgs.runCommand "maincopy-deployment-module" { } ''
+            test ${if moduleEvaluation.passed then "true" else "false"} = true
+            export PYTHONDONTWRITEBYTECODE=1
+            export XDG_DATA_HOME="$TMPDIR/caddy-data"
+            export XDG_CONFIG_HOME="$TMPDIR/caddy-config"
+            ${project.pkgs.caddy}/bin/caddy validate --config ${moduleEvaluation.gatewayConfig} --adapter caddyfile
+            ${project.pkgs.python3}/bin/python3 ${./nix/tests/test-operations.py} \
+              --scripts ${./nix/scripts} \
+              --litestream ${project.pkgs.callPackage ./nix/packages/litestream.nix { }}/bin/litestream \
+              --rclone ${project.pkgs.rclone}/bin/rclone
+            touch "$out"
+          '';
+
+          deployment-vm = import ./nix/tests/deployment-vm.nix {
+            inherit (project) pkgs;
+            module = ./nix/modules/maincopy.nix;
+            package = project.maincopy;
+          };
+
           build = project.maincopy;
 
           package-binaries = project.pkgs.runCommand "maincopy-package-binaries" { } ''
@@ -192,7 +221,15 @@
           );
 
           nix-formatting = project.pkgs.runCommand "maincopy-nix-formatting" { } ''
-            ${project.pkgs.nixfmt}/bin/nixfmt --check ${./flake.nix}
+            ${project.pkgs.nixfmt}/bin/nixfmt --check ${./flake.nix} ${
+              project.pkgs.lib.escapeShellArgs (
+                map (path: "${path}") (
+                  builtins.filter (path: project.pkgs.lib.hasSuffix ".nix" (toString path)) (
+                    project.pkgs.lib.filesystem.listFilesRecursive ./nix
+                  )
+                )
+              )
+            }
             touch "$out"
           '';
 

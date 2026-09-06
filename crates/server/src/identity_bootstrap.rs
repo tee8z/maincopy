@@ -17,7 +17,7 @@ use zeroize::Zeroize as _;
 
 use crate::{
     cli::BootstrapCredential,
-    config::HostConfigurationLoader,
+    config::{HostConfigurationLoader, IdentityStartupBootstrap},
     database::{self, DatabaseStore},
     domain::auth::{
         Argon2idPolicy, CanonicalUsername, MAX_PASSWORD_BYTES, PasswordHashingError,
@@ -61,10 +61,10 @@ impl GeneratedOwnerPassword {
     }
 }
 
-/// Creates the first owner from an instance-unique password when a daemon is
-/// started against fresh state.
-pub(crate) async fn bootstrap_generated_owner<Output>(
+/// Applies the explicit startup policy before any credential generation or output.
+pub(crate) async fn initialize_startup_identity<Output>(
     store: &DatabaseStore,
+    policy: IdentityStartupBootstrap,
     mut output: Output,
 ) -> Result<bool, GeneratedOwnerBootstrapError>
 where
@@ -77,6 +77,13 @@ where
         .map_err(GeneratedOwnerBootstrapError::IdentityState)?;
     if !identity.bootstrap_required {
         return Ok(false);
+    }
+
+    match policy {
+        IdentityStartupBootstrap::GenerateOwner => {}
+        IdentityStartupBootstrap::RequireExisting => {
+            return Err(GeneratedOwnerBootstrapError::ExistingIdentityRequired);
+        }
     }
 
     let password = GeneratedOwnerPassword::generate()?;
@@ -129,6 +136,10 @@ fn write_generated_owner_credential(
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GeneratedOwnerBootstrapError {
+    #[error(
+        "an existing owner identity is required; stop the service and run offline identity bootstrap before starting it"
+    )]
+    ExistingIdentityRequired,
     #[error("the durable identity state could not be read")]
     IdentityState(#[source] AuthLoadError),
     #[error("a secure initial owner password could not be generated")]

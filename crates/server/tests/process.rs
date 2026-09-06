@@ -28,6 +28,8 @@ fn write_offline_host_file(
              runtime_root = \"run\"\n\
              [public]\n\
              bind = \"{}\"\n\
+             [metrics]\n\
+             bind = \"127.0.0.1:0\"\n\
              [admin]\n\
              bind = \"{}\"\n\
              origin = \"https://admin.localhost\"\n",
