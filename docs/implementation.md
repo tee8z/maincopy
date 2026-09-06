@@ -24,20 +24,27 @@ ownership, and trust boundaries. Each change must also follow the
 flowchart LR
     Product[1. Product closure] --> Operations[2. Deployment and recovery]
     Operations --> Review[3. Security and system evidence]
-    Review --> Release[4. Release candidate]
+    Review --> Mail[4. Conditional mailing list]
+    Review --> Release[5. Release candidate]
+    Mail --> Release
 ```
 
 1. Complete real-signer acceptance for the browser and human CLI.
 2. Finish public-listener lifecycle and restore evidence.
 3. Add metrics, NixOS, Caddy, encrypted Backblaze B2 backups, and restore support.
 4. Complete the security review, system matrix, documentation, and release dry run.
+5. After core V1 passes, implement the conditional mailing-list increment if its
+   full privacy and dispatch gates can pass before the first release.
 
 Run independent product-closure workstreams in isolated checkouts. Review shared
 API and router changes during integration. Remove completed backlog items after
 the integrated batch passes its final quality checks.
 
-Do not begin automatic provider delivery, subscription capture, multi-site
-hosting, or Git write-back as part of V1.
+Do not begin subscriptions while the existing core V1 work remains incomplete.
+Keep capture and sending disabled until privacy, recovery, dispatch, and
+deliverability acceptance pass together.
+Automatic X, Substack, and Nostr delivery, multi-site hosting, and Git write-back
+remain outside V1.
 
 ## 1. Product closure
 
@@ -209,7 +216,62 @@ and shutdown measurements. Close every critical or high-risk finding.
 - Execute the deployment and restore runbooks without hidden steps.
 - Verify that documentation distinguishes current behavior from target design.
 
-## 4. Release candidate
+## 4. Conditional first-release subscriptions and email
+
+Implement this increment only after the existing core V1 gates pass. The owner
+wants it in the first release if its complete acceptance can be achieved.
+The [mailing-list and dispatch plan](email-delivery.md) defines the design boundary.
+
+### 4.1 Complete privacy and removal before capture
+
+- Treat addresses as PII, with explicit consent, double opt-in, and bounded retention.
+- Select address comparison, storage protection, key recovery, and provider-data policies.
+- Implement visible unsubscribe, mailbox-provider one-click `POST`, and address removal.
+  Scanner `GET` requests must never change consent.
+- Atomically revoke consent and cancel work not admitted for submission.
+  Make repeated requests idempotent.
+- Remove unnecessary address copies from live state, tokens, payloads, exports, and the provider.
+  Expose pending cleanup honestly and keep it retryable without permitting sends.
+- Define minimal pseudonymous suppression evidence, access control, and retention.
+- Implement finite remote backup retention or a reviewed PII storage boundary.
+  Reconcile erasure and suppression before restoring subscriber access or delivery.
+- Prove that older backups cannot resurrect an address, prior consent, or queued email.
+- Keep signup and sending disabled until privacy, recovery, dispatch, and
+  deliverability acceptance all pass.
+
+### 4.2 Build durable dispatch and owner-reviewed campaigns
+
+- Keep consent, campaigns, recipients, attempts, events, and cleanup as typed capabilities.
+- Use transactional outbox writes, bounded claims, leases, fencing, and unique delivery identities.
+- Bind campaigns to reviewed public revisions, email bytes, sender, audience cutoff, and authorization.
+- Recheck current consent before submission. Define the unavoidable in-flight delivery boundary.
+- Model provider acceptance separately from delivery and ambiguous timeout outcomes.
+  Respect provider idempotency windows; never blindly retry an uncertain submission.
+- Handle quotas, backoff, budgets, cancellation, complaints, hard bounces, and event replay.
+- Prioritize control and deletion work. Supervise workers and recover after crashes.
+- Keep provider calls outside transactions and failures independent from public publication.
+
+### 4.3 Choose transport and prove deliverability
+
+- Compare current provider costs against expected subscribers and send frequency.
+  Include minimum charges, data, events, retention, and operating effort.
+- Record the chosen region, production access, sender identity, quotas, and credential permissions.
+- Execute a documented SPF, DKIM, DMARC, and custom return-path setup.
+- Verify signed one-click headers, a visible removal control, bounce and complaint processing,
+  controlled volume ramp-up, and monitoring with real test mailboxes.
+- Record provider and DNS evidence. Domain authentication reduces blocking risk;
+  it cannot guarantee inbox placement.
+
+### Mailing-list inclusion gate
+
+Exercise confirmation expiry and replay, enumeration resistance, removal during
+every dispatch stage, duplicate and reordered events, provider outage, restart,
+and restoration of older backups. Verify PII redaction and full cleanup.
+
+If these checks are incomplete, ship core V1 with subscriptions and email disabled.
+Keep the mailing-list increment as the next release task; do not ship capture alone.
+
+## 5. Release candidate
 
 Prepare a candidate without publishing an artifact until the owner approves it.
 
@@ -257,8 +319,7 @@ The following work remains outside V1:
 
 - browser article editing and Git write-back;
 - multiple sites or tenants;
-- mailing-list capture and email delivery;
-- automatic Nostr or other provider delivery;
+- automatic X, Substack, Nostr, and other non-email provider delivery;
 - X and Substack share kits;
 - paid articles and access entitlements;
 - Obsidian Sync as a managed source;

@@ -2,7 +2,7 @@
 
 Status: target architecture; implementation is incomplete
 
-Last reviewed: 2026-09-05
+Last reviewed: 2026-09-06
 
 Related documents: [project overview](../README.md),
 [remaining implementation work](implementation.md),
@@ -40,7 +40,8 @@ content root. The repository can contain many articles.
 | Operator-managed external checkout | GitHub App, OAuth, and pull-request workflow |
 | Production-faithful draft previews | Multiple publications and tenants |
 | Scheduled initial and update releases | Explicit unpublish and retraction workflow |
-| Canonical website, RSS, sitemap, and robots policy | Mailing-list capture and email delivery |
+| Canonical website, RSS, sitemap, and robots policy | Automatic X, Substack, and Nostr delivery |
+| Conditional privacy-first subscriptions and reviewed article emails | Automated multichannel campaigns |
 | Built-in operator-packaged theme shell and no-JavaScript navigation | General theme replacement and typed article widgets |
 | Semantic code language classes, Mermaid, and sanitized SVG | Token-level code highlighting; X and Substack assisted distribution |
 | Maincopy TOML frontmatter | Obsidian-first source and YAML Properties |
@@ -50,11 +51,14 @@ content root. The repository can contain many articles.
 | Prometheus metrics on a loopback-only `/metrics` endpoint | Public or multi-host metrics exposure |
 | Nix package and NixOS module | Hosted multi-site control plane |
 
-The canonical website and RSS are the only V1 article outputs. V1 captures no
-subscriber data and sends no email.
+The canonical website and RSS are the core V1 article outputs. After core V1
+passes its gates, the first release may include the
+[mailing-list increment](email-delivery.md). Capture and sending stay disabled until
+consent, unsubscribe, erasure, backup recovery, dispatch, and deliverability acceptance
+all pass.
 
-V1 creates no X, Substack, or Nostr article payload. It stores no distribution
-credential, provider job, delivery attempt, or delivery result.
+V1 creates no X, Substack, or Nostr article payload. Conditional email delivery
+does not grant authority to another distribution channel.
 
 ## Terms
 
@@ -843,11 +847,13 @@ and storage boundary, rather than part of the publishing daemon. Canonical
 URLs, semantic HTML, article metadata, RSS, sitemap, and stable public routes
 remain the interoperability surface for external archival systems.
 
-Maincopy does not collect subscriber details or send email in V1. It does not
-prepare or submit X, Substack, or Nostr article content.
+Core V1 collects no subscriber details and sends no email. The conditional
+[mailing-list increment](email-delivery.md) can add reviewed article announcements
+after its separate acceptance. It cannot submit X, Substack, or Nostr content.
 
-No V1 role or agent scope grants distribution authority. The database contains
-no provider credential, delivery job, attempt, lease, or result for an article.
+Existing roles and agent scopes grant no distribution authority implicitly.
+The mailing-list increment requires explicit owner authorization, protected provider
+credentials, and a durable dispatch ledger independent from canonical publication.
 
 ## Static Lightning Address tips
 
@@ -1078,8 +1084,9 @@ V1 must prove these properties:
 - Mermaid uses a deterministic local renderer with bounded resources.
 - Hostile SVG cannot cross the single reviewed sanitization boundary.
 - Static tip rendering makes no LNURL request.
-- No V1 operation creates a subscriber record, email task, share kit, provider
-  payload, distribution job, or delivery result.
+- Core V1 creates no subscriber record or email task. The conditional mailing-list
+  increment must pass its separate privacy and dispatch gates before collection.
+  X, Substack, and Nostr distribution remain outside V1.
 - Every runtime SQLite write uses the shared writer task.
 - No network call holds a database transaction.
 - Database and revision artifacts restore to one compatible recovery point.
@@ -1092,37 +1099,28 @@ acceptance and failure-injection gates. The
 [engineering style guide](quality.md) defines code conventions and the manual
 CRAP score budget.
 
+## Conditional first-release mailing list
+
+The owner requested subscriptions and bulk email after the existing core V1 work
+is complete. The [mailing-list plan](email-delivery.md) defines the required privacy,
+unsubscribe, erasure, durable dispatch, provider selection, and deliverability gates.
+
+Email addresses are PII. Never ship capture before users can unsubscribe and
+request removal. Restoration of an older backup must not resurrect consent,
+addresses, or queued sends. Define finite remote retention or a separately
+reviewed PII storage boundary before collecting addresses.
+
+The initial dispatch type announces one approved, already-public revision.
+Campaign approval is separate from website release. Its durable ledger must
+handle concurrent revocation, leased work, retries, uncertain provider acceptance,
+complaints, cancellation, and recovery without a network call inside a transaction.
+
+If these gates are incomplete, ship core V1 without enabling capture or email.
+
 ## Post-v1 roadmap
 
 Post-v1 work must preserve canonical publication independence. An outbound
 service cannot block, roll back, or change a canonical website release.
-
-### Mailing-list capture and email delivery
-
-The first mailing-list increment can add first-party double opt-in. It must
-also support unsubscribe, scoped export, and deletion.
-
-SQLite will store subscriber consent and lifecycle state. These records contain
-personally identifiable information (PII).
-
-The writer must commit subscriber state and transactional email work together.
-An email worker must perform network delivery outside the database transaction.
-
-SQLite must store confirmation and control token digests only. Logs, metrics,
-audit events, and errors must not contain raw addresses or tokens.
-
-A confirmation or unsubscribe change must use `POST`. A `GET` request can show
-a form without changing state.
-
-Before implementation, select and document these items:
-
-- one email transport for confirmation and control messages;
-- a standards-safe email address comparison rule;
-- retention for pending, unsubscribed, token, audit, and backup records; and
-- secret ownership outside Git, SQLite, logs, and the Nix store.
-
-Bulk newsletter campaigns are a separate increment. Their delivery state and
-privacy review must not reuse transactional-email assumptions without review.
 
 ### Assisted X and Substack distribution
 
