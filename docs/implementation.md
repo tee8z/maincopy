@@ -32,6 +32,10 @@ flowchart LR
 3. Add metrics, NixOS, Caddy, Litestream, backup, and restore support.
 4. Complete the security review, system matrix, documentation, and release dry run.
 
+Run independent product-closure workstreams in isolated checkouts. Review shared
+API and router changes during integration. Remove completed backlog items after
+the integrated batch passes its final quality checks.
+
 Do not begin automatic provider delivery, subscription capture, multi-site
 hosting, or Git write-back as part of V1.
 
@@ -42,26 +46,55 @@ hosting, or Git write-back as part of V1.
 Complete the remaining browser and CLI operations for ordinary administration.
 Preserve the fixed Owner, Administrator, and Publisher scope boundaries.
 
-Deliverables:
+Start with CLI credential work and run agent administration in parallel. Keep
+human CLI sign-in in the CLI workstream. Reuse the identity API and its
+authorization rules.
 
-- Add CLI user creation and login credential commands.
-- Rotate passwords through the CLI without exposing secrets in arguments or
-  diagnostics.
-- Complete Nostr sign-in in the human CLI.
-- Manage agent public-key credentials in the browser and CLI with fresh
-  authentication.
-- Add fingerprint displays to CLI account inspection and agent-grant management.
-  Keep private paths and bytes out of their output.
-- Provide clear empty, conflict, expired-session, and forbidden states.
+1. **CLI user creation and login credentials — next.** Create accounts with
+   configured password or Nostr credentials. Add, replace, and remove login
+   credentials. Read and confirm passwords through protected terminal prompts.
+   Add Nostr fingerprints to CLI account inspection.
+2. **Agent-grant administration.** Add bounded listing, inspection, registration,
+   scope replacement, and revocation in the browser and CLI. Display the owner,
+   public key, fingerprint, requested scopes, effective scopes, expiry, and
+   revocation state. Preserve fresh authentication and explicit grant versions.
+3. **Human CLI Nostr sign-in.** Obtain a challenge and submit the human signer's
+   proof. Protect the resulting session in the operating system credential store.
+   Keep human signing separate from the local agent-key context.
 
-Required evidence:
+Requirements for the next CLI batch:
 
-- Exercise password-only, Nostr-only, and combined-provider configurations.
-- Preserve one usable credential for every enabled user.
-- Reject Publisher access to users, roles, profiles, credentials, and source
-  configuration.
-- Revoke sessions and agent credentials after user disablement.
-- Reject stale role mutations without partial state.
+- Bound password input and zeroize owned secret buffers throughout request
+  construction and failure paths. Keep secrets out of arguments and diagnostics.
+- Use credential versions for credential replacement and removal. Treat the
+  returned account version as a separate value.
+- Retain operation UUIDs in success and failure output. Preserve the authorizing
+  session when replaying an identical command.
+- Provide clear empty, conflict, expired-session, and forbidden states for each
+  new operation.
+
+Required evidence for the remaining operations:
+
+- Exercise new CLI credential commands with password-only, Nostr-only, and
+  combined-provider configurations.
+- Reject cancelled prompts, mismatched confirmation, and invalid passwords
+  without submitting a mutation or exposing secret bytes.
+- Reject stale credential versions without replacing or removing a credential.
+- Preserve one usable configured credential for each enabled user. Verify session
+  revocation after accepted credential replacement or removal.
+- Reject Publisher access and attempts to grant authority beyond the actor's
+  scopes through the new account and agent workflows.
+- Verify agent scope changes, expiry, revocation, and user-disablement effects
+  through the new management surfaces.
+- Recover uncertain mutation outcomes without duplicate changes. After a new
+  sign-in, inspect current state before submitting a new operation.
+
+Manual browser follow-up:
+
+- Verify successful Nostr sign-in and cancelled signing with the owner's real
+  browser extension. Record extension and browser names, versions, and results.
+- Run this check alongside CLI implementation. Test-signer automation does not
+  complete real-extension acceptance.
 
 ### 1.2 Complete managed-source administration
 
@@ -275,6 +308,10 @@ Required evidence:
 - Confirm that ordinary continuous integration cannot access release secrets.
 
 ## Definition of done
+
+Use `cargo check` and Clippy during implementation. Defer full workspace tests
+and CRAP measurement to the final pre-commit gate. Run the canonical Nix gates
+before each code commit and push.
 
 A work item is complete only when all applicable statements are true:
 
