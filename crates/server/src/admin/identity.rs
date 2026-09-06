@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+mod ui;
+pub(super) use ui::browser_router;
+
 use axum::{
     Extension, Json,
     extract::{
@@ -310,45 +313,44 @@ async fn create_user(
     headers: HeaderMap,
     request: Result<Json<CreateUserRequest>, JsonRejection>,
 ) -> Response {
-    if let Err(response) = require_fresh_authentication(&principal, browser.as_deref(), request_id)
-    {
-        return response;
+    match create_user_command(request_id, security, principal, browser, headers, request).await {
+        Ok(result) => private_json((StatusCode::CREATED, Json(result))),
+        Err(response) => *response,
     }
-    let request = match identity_body(request, request_id) {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
+}
+
+async fn create_user_command(
+    request_id: RequestId,
+    security: AdminSecurityState,
+    principal: AdminPrincipal,
+    browser: Option<Extension<BrowserSessionContext>>,
+    headers: HeaderMap,
+    request: Result<Json<CreateUserRequest>, JsonRejection>,
+) -> Result<UserMutationResponse, Box<Response>> {
+    require_fresh_authentication(&principal, browser.as_deref(), request_id)?;
+    let request = identity_body(request, request_id)?;
     if request
         .credentials
         .iter()
         .any(|credential| credential.provider() == HumanLoginProvider::Password)
         && let Err(response) = require_human(&principal, request_id)
     {
-        return response;
+        return Err(response.into());
     }
-    let audit = match mutation_audit(&principal, request_id, &headers) {
-        Ok(audit) => audit,
-        Err(response) => return response,
-    };
-    let roles = match unique_nonempty(request.roles, "roles", request_id) {
-        Ok(roles) => roles,
-        Err(response) => return response,
-    };
+    let audit = mutation_audit(&principal, request_id, &headers)?;
+    let roles = unique_nonempty(request.roles, "roles", request_id)?;
     if roles != BTreeSet::from([UserRole::Publisher])
         && !principal.scopes.contains(&AdminScope::RoleAssign)
     {
-        return problem(
+        return Err(Box::new(problem(
             AdminProblem::forbidden(
                 "role_assignment_required",
                 "creating a non-publisher account requires role-assignment authority",
             ),
             request_id,
-        );
+        )));
     }
-    let credentials = match prepare_credentials(request.credentials, &security, request_id).await {
-        Ok(credentials) => credentials,
-        Err(response) => return response,
-    };
+    let credentials = prepare_credentials(request.credentials, &security, request_id).await?;
     let user_id = UserId::from_uuid(Uuid::new_v4());
     let actor_user_id = principal.user_id;
     let result = security
@@ -365,14 +367,11 @@ async fn create_user(
         })
         .await;
     match result {
-        Ok(result) => private_json((
-            StatusCode::CREATED,
-            Json(UserMutationResponse {
-                user_id: result.user_id,
-                version: result.version,
-            }),
-        )),
-        Err(error) => mutation_problem(error, request_id),
+        Ok(result) => Ok(UserMutationResponse {
+            user_id: result.user_id,
+            version: result.version,
+        }),
+        Err(error) => Err(Box::new(mutation_problem(error, request_id))),
     }
 }
 

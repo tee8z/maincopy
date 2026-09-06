@@ -2,7 +2,7 @@ use maincopy_shared::profile_api::{ACTIVE_TIP_RECIPIENT_PATH, CURRENT_USER_PROFI
 
 use super::*;
 
-async fn browser_request(
+pub(super) async fn browser_request(
     harness: &AdminProcessHarness,
     session: &HumanSession,
     method: Method,
@@ -30,14 +30,18 @@ async fn browser_request(
         .unwrap()
 }
 
-async fn browser_page(harness: &AdminProcessHarness, session: &HumanSession, path: &str) -> String {
+pub(super) async fn browser_page(
+    harness: &AdminProcessHarness,
+    session: &HumanSession,
+    path: &str,
+) -> String {
     let response = browser_request(harness, session, Method::GET, path, &[]).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "private, no-store");
     response.text().await.unwrap()
 }
 
-fn operation_id(page: &str) -> &str {
+pub(super) fn operation_id(page: &str) -> &str {
     page.split("name=\"operation_id\" value=\"")
         .nth(1)
         .unwrap()

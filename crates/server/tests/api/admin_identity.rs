@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 
 use super::process_harness::{CapturedChild, Daemon};
 
+mod account_workflows;
 mod profile_workflows;
 
 use maincopy_shared::{

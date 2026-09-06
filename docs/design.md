@@ -2,7 +2,7 @@
 
 Status: target architecture; implementation is incomplete
 
-Last reviewed: 2026-09-04
+Last reviewed: 2026-09-05
 
 Related documents: [project overview](../README.md),
 [remaining implementation work](implementation.md),
@@ -353,7 +353,8 @@ exclusive process ownership and uses the same domain transaction. It binds no
 listener, exposes no network bootstrap route, and accepts no arbitrary SQL.
 
 V1 does not require the generated password to change on first login. The
-current build has no completed admin UI password-rotation flow.
+admin **Users** screen supports password replacement after fresh authentication.
+Replacing a login credential revokes the user's existing browser sessions.
 
 Managed mode has a separate offline source bootstrap step. It creates these
 records in one transaction:

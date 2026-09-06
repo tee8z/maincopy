@@ -16,7 +16,7 @@ use std::{
 use clap::Parser;
 use maincopy_shared::{
     AdminApiVersion, Capabilities, CapabilityContractVersion,
-    auth_api::{AdminSessionResponse, RevokeAdminSessionResponse, SecretString},
+    auth_api::{AdminSessionResponse, SecretString},
     posts::{ListPostsResponse, PostPublicationState, PostSummary},
     publication::{
         ChangeReleaseRequest, ListReleasesResponse, PreviewDigest, PublicationApprovalState,
@@ -35,7 +35,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    client::{AdminClient, AdminClientError, AdminProblem, PostPreview},
+    client::{AdminClient, AdminClientError, AdminProblem, LogoutOutcome, PostPreview},
     models::{
         AgentKeyCommand, Arguments, Command, ReleaseCommand, ReleaseTarget, SourceCommand,
         SourceSyncDisposition, SourceSyncInvocation,
@@ -60,7 +60,7 @@ const MAX_SOURCE_SYNC_POLLS: usize = 600;
 enum CommandOutput {
     Profile(ProfileOutput),
     Login(AdminSessionResponse),
-    Logout(RevokeAdminSessionResponse),
+    Logout(LogoutOutcome),
     AgentKeyConfigured {
         public_key: Box<str>,
     },
@@ -1136,14 +1136,32 @@ fn write_login(
 
 fn write_logout(
     mut output: impl io::Write,
-    revoked: RevokeAdminSessionResponse,
+    outcome: LogoutOutcome,
     json: bool,
 ) -> Result<(), CliError> {
-    if json {
-        serde_json::to_writer(&mut output, &revoked)?;
-        writeln!(output)?;
-    } else {
-        writeln!(output, "Revoked session: {}", revoked.session_id)?;
+    match outcome {
+        LogoutOutcome::Revoked(revoked) => {
+            if json {
+                serde_json::to_writer(&mut output, &revoked)?;
+                writeln!(output)?;
+            } else {
+                writeln!(output, "Revoked session: {}", revoked.session_id)?;
+            }
+        }
+        LogoutOutcome::NoActiveSession => {
+            if json {
+                serde_json::to_writer(
+                    &mut output,
+                    &json!({"status":"session_not_accepted", "local_credentials_removed":true}),
+                )?;
+                writeln!(output)?;
+            } else {
+                writeln!(
+                    output,
+                    "The server no longer accepts this session. Local credentials removed."
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -2690,10 +2708,12 @@ mod tests {
             )
         );
 
-        let revoked: RevokeAdminSessionResponse = serde_json::from_value(json!({
-            "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-        }))
-        .unwrap();
+        let revoked = LogoutOutcome::Revoked(
+            serde_json::from_value(json!({
+                "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            }))
+            .unwrap(),
+        );
         let mut json_output = Vec::new();
         write_logout(&mut json_output, revoked, true).unwrap();
         assert_eq!(
@@ -2705,6 +2725,19 @@ mod tests {
         assert_eq!(
             String::from_utf8(human_output).unwrap(),
             "Revoked session: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n"
+        );
+
+        let mut expired = Vec::new();
+        write_logout(&mut expired, LogoutOutcome::NoActiveSession, true).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&expired).unwrap(),
+            json!({"status":"session_not_accepted", "local_credentials_removed":true})
+        );
+        let mut expired = Vec::new();
+        write_logout(&mut expired, LogoutOutcome::NoActiveSession, false).unwrap();
+        assert_eq!(
+            String::from_utf8(expired).unwrap(),
+            "The server no longer accepts this session. Local credentials removed.\n"
         );
 
         for json in [false, true] {

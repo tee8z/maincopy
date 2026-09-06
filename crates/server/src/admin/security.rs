@@ -1427,7 +1427,10 @@ mod tests {
     use super::*;
     use crate::{
         admin::{
-            origin::AdminOrigin, request_id::assign, runtime_admin_router,
+            assets::{nostr_login_script_integrity, nostr_login_script_path},
+            origin::AdminOrigin,
+            request_id::assign,
+            runtime_admin_router,
             test_support::AdminTestRuntime,
         },
         config::{
@@ -1758,6 +1761,177 @@ mod tests {
     ) -> Bytes {
         assert!(session.csrf_token_digest.ct_eq(&csrf_token.digest()));
         body
+    }
+
+    #[tokio::test]
+    async fn browser_login_matches_configured_providers_and_pins_the_signer_script_bytes() {
+        let harness = SecurityHarness::start().await;
+        for (password, nostr) in [(true, false), (false, true), (true, true)] {
+            let mut state = harness.state.clone();
+            state.providers = ConfiguredLoginProviders::new(password, nostr).unwrap();
+            let app = runtime_admin_router(
+                harness.runtime.state.publications.clone(),
+                state,
+                harness.runtime.state.profiles.clone(),
+                harness.runtime.state.source.clone(),
+            );
+            let request = Request::builder()
+                .uri("/admin/login")
+                .header(HOST, ADMIN_AUTHORITY)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let policy = response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let page = std::str::from_utf8(&body).unwrap();
+            assert_eq!(page.contains("name=\"username\""), password);
+            assert_eq!(page.contains("id=\"nostr-login\""), nostr);
+            if nostr {
+                let integrity = nostr_login_script_integrity();
+                assert_eq!(
+                    policy,
+                    format!(
+                        "default-src 'self'; script-src '{integrity}'; connect-src 'self'; worker-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+                    )
+                );
+                assert!(page.contains(&format!("integrity=\"{integrity}\"")));
+                assert!(page.contains(&format!("src=\"{}\"", nostr_login_script_path())));
+                assert!(page.contains(&format!("data-challenge-path=\"{LOGIN_CHALLENGES_PATH}\"")));
+                assert!(page.contains(&format!("data-session-path=\"{ADMIN_SESSIONS_PATH}\"")));
+            } else {
+                assert_eq!(policy, ADMIN_CSP.to_str().unwrap());
+                assert!(!page.contains("<script"));
+            }
+            assert!(!policy.contains("unsafe-inline"));
+            assert!(!policy.contains("unsafe-eval"));
+        }
+        let app = harness.router();
+        let request = Request::builder()
+            .uri(nostr_login_script_path())
+            .header(HOST, ADMIN_AUTHORITY)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let expected = format!(
+            "sha256-{}",
+            general_purpose::STANDARD.encode(Sha256::digest(&bytes))
+        );
+        assert_eq!(nostr_login_script_integrity(), expected);
+        let credentials = password_browser_credentials(&app).await;
+        let request = Request::builder()
+            .uri("/admin/users")
+            .header(HOST, ADMIN_AUTHORITY)
+            .header(COOKIE, credentials.header)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-security-policy"], ADMIN_CSP);
+        let page = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        assert!(!std::str::from_utf8(&page).unwrap().contains("<script"));
+        drop(app);
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn account_forms_require_fresh_sign_in_before_any_identity_change() {
+        let mut harness = SecurityHarness::start().await;
+        harness.state.sessions.fresh_lifetime = Duration::ZERO;
+        let app = harness.router();
+        let credentials = password_browser_credentials(&app).await;
+        let before = harness.store.auth.users_page(None, 10).await.unwrap();
+        let owner = before
+            .items
+            .iter()
+            .find(|user| user.roles.contains(&UserRole::Owner))
+            .unwrap();
+        let user_path = format!("/admin/users/{}", owner.user_id);
+        for path in ["/admin/users", &user_path] {
+            let request = Request::builder()
+                .uri(path)
+                .header(HOST, ADMIN_AUTHORITY)
+                .header(COOKIE, &credentials.header)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let page = std::str::from_utf8(&body).unwrap();
+            assert!(page.contains("<fieldset disabled>"));
+            assert!(page.contains("Sign in again"));
+        }
+        for (path, fields) in [
+            (
+                "/admin/users".to_owned(),
+                vec![
+                    ("provider", "password"),
+                    ("role", "publisher"),
+                    ("username", "new-user"),
+                    ("password", OWNER_PASSWORD),
+                    ("confirmation", OWNER_PASSWORD),
+                ],
+            ),
+            (
+                format!("{user_path}/status"),
+                vec![("expected_version", "1"), ("status", "disabled")],
+            ),
+            (
+                format!("{user_path}/roles"),
+                vec![("expected_version", "1"), ("role", "publisher")],
+            ),
+            (
+                format!("{user_path}/password"),
+                vec![
+                    ("expected_version", "1"),
+                    ("username", OWNER_USERNAME),
+                    ("password", OWNER_PASSWORD),
+                    ("confirmation", OWNER_PASSWORD),
+                ],
+            ),
+            (
+                format!("{user_path}/nostr"),
+                vec![("public_key", "invalid-key")],
+            ),
+            (
+                format!("{user_path}/credentials/password/remove"),
+                vec![("expected_version", "1"), ("confirm", "true")],
+            ),
+        ] {
+            let mut form = url::form_urlencoded::Serializer::new(String::new());
+            form.append_pair("_csrf", &credentials.csrf)
+                .append_pair("operation_id", &Uuid::new_v4().to_string())
+                .extend_pairs(fields);
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header(HOST, ADMIN_AUTHORITY)
+                .header(ORIGIN, ADMIN_ORIGIN)
+                .header(COOKIE, &credentials.header)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(form.finish()))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let page = std::str::from_utf8(&body).unwrap();
+            assert!(page.contains("Sign in again"));
+            assert!(!page.contains(OWNER_PASSWORD));
+        }
+        let after = harness.store.auth.users_page(None, 10).await.unwrap();
+        assert_eq!(after.items, before.items);
+        drop(app);
+        harness.stop().await;
     }
 
     async fn accept_browser_form_session(_: BrowserFormSession) -> StatusCode {

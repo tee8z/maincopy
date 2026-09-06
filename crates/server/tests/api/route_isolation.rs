@@ -63,9 +63,12 @@ async fn public_router_does_not_expose_browser_admin_routes() {
     for path in [
         "/admin".to_owned(),
         "/admin/login".to_owned(),
+        "/admin/users".to_owned(),
+        format!("/admin/users/{POST_ID}"),
         format!("/admin/posts/{POST_ID}/review"),
         format!("/admin/posts/{POST_ID}/confirm"),
         format!("/admin/assets/{ASSET_DIGEST}/site.css"),
+        format!("/admin/assets/{ASSET_DIGEST}/nostr-login.js"),
     ] {
         let response = get(app.clone(), &path).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
@@ -78,6 +81,21 @@ async fn public_router_does_not_expose_browser_admin_routes() {
     for path in ["/admin/login", "/admin/logout"] {
         let response = request(app.clone(), Method::POST, path).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    for path in [
+        "/admin/users".to_owned(),
+        format!("/admin/users/{POST_ID}/status"),
+        format!("/admin/users/{POST_ID}/roles"),
+        format!("/admin/users/{POST_ID}/password"),
+        format!("/admin/users/{POST_ID}/nostr"),
+        format!("/admin/users/{POST_ID}/credentials/password/remove"),
+        format!("/admin/users/{POST_ID}/credentials/nostr/remove"),
+    ] {
+        assert_eq!(
+            request(app.clone(), Method::POST, &path).await.status(),
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
     }
 }
 

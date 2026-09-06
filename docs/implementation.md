@@ -39,14 +39,17 @@ hosting, or Git write-back as part of V1.
 
 ### 1.1 Complete account workflows
 
-Complete the browser and CLI operations needed for ordinary administration.
+Complete the remaining browser and CLI operations for ordinary administration.
 Preserve the fixed Owner, Administrator, and Publisher scope boundaries.
 
 Deliverables:
 
-- Rotate a password without exposing it in logs, arguments, or diagnostics.
-- Create, disable, and inspect users under the existing role rules.
-- Manage login and agent public-key credentials with fresh authentication.
+- Add CLI user inspection, creation, status, role, and login credential commands.
+- Rotate passwords through the CLI without exposing secrets in arguments or
+  diagnostics.
+- Complete Nostr sign-in in the human CLI.
+- Manage agent public-key credentials in the browser and CLI with fresh
+  authentication.
 - Show the selected credential public key and fingerprint without exposing its
   private path or bytes.
 - Provide clear empty, conflict, expired-session, and forbidden states.

@@ -87,8 +87,8 @@ prints the username and password once before it persists the identity
 transaction. Copy the password from the launcher output immediately.
 
 Maincopy stores only the Argon2id password hash. It has no shared default
-password, and it does not display this password on later starts. The first
-publication UI does not include password rotation.
+password, and it does not display this password on later starts. Use
+**Users → Manage your account** to replace the password after signing in.
 
 The credential output appears before the readiness output:
 
@@ -248,7 +248,56 @@ If another edit changes the version, reload and review the current values.
 Profile and recipient edits do not approve articles. Ineligible or unconfigured
 recipients leave articles readable without tip links.
 
-### 6. Sign out before a state reset
+### 6. Manage accounts and login credentials
+
+Open **Users** to inspect accounts or create a user with a password or Nostr
+public key. The page offers only the configured login providers.
+For Nostr sign-in, select the account's key in a
+[NIP-07 browser signer](https://github.com/nostr-protocol/nips/blob/master/07.md).
+Open the sign-in page, select **Sign in with Nostr**, and approve the sign-in
+proof. Maincopy receives the signed proof and public key. The private key stays
+with the signer.
+
+If the signer is locked or you cancel its prompt, unlock it and try again.
+If Maincopy cannot confirm the result, select **Open administration** to check
+the session before retrying. Each API request has a 15-second timeout and an
+8 KiB JSON limit. The sign-in page permits only the bundled signer script by
+its content hash, with API connections restricted to the same origin.
+
+To add a Nostr key to an existing account, open that account's **Nostr login
+key** form. Enter the public key as 64 lowercase hexadecimal characters.
+
+New accounts receive the Publisher role by default. Owners can also create
+Administrators and Owners. Publishers cannot open account administration.
+
+Open an account to change its status, replace its assigned role, or manage its
+login credentials. Only Owners can assign roles. Administrators can manage
+accounts whose authority is within their own role.
+
+To replace your password:
+
+1. Open **Users → Manage your account** within 15 minutes of signing in.
+2. Enter the new password in both password fields.
+3. Select **Save password**.
+4. Sign in with the new password.
+
+Use 15 to 128 characters. Replacing or removing a login credential ends all
+existing browser sessions for that user. Maincopy never displays the submitted
+password again.
+
+Disabling a user revokes their sessions and agent credentials. Enabling the user
+does not restore revoked agent credentials. Maincopy preserves one enabled Owner
+and a usable login credential for each enabled account.
+
+Account changes require a recent sign-in and an unchanged resource version.
+If a page is stale, reload and review it before submitting again. Each form
+retains one operation ID for retries of that submission.
+Operation receipts bind to the authorizing session. After signing in again,
+inspect the account and use a newly loaded form for further changes.
+User pages contain at most 100 accounts. Account form bodies are limited to
+16 KiB.
+
+### 7. Sign out before a state reset
 
 Return to the post list and choose `Sign out` before resetting local state.
 The browser returns to the sign-in page and clears the session and CSRF cookies.
@@ -551,11 +600,9 @@ printf 'Preserved prior state at %s\n' "$STATE_ARCHIVE"
 The next launcher run creates new state and prints a new owner password once.
 This reset does not replace the durable development CA.
 
-> [!WARNING]
-> Sign out of the browser and log out of the CLI before resetting state. A
-> successful browser login replaces stale cookies, but an operating-system
-> credential can retain a CLI session for a database that no longer exists and
-> block a later CLI login.
+Sign out of the browser and log out of the CLI before resetting state. If the
+new server rejects a retained CLI session, run `scripts/dev-maincopy.sh logout`
+to clear its local credentials before signing in again.
 
 ## Development evidence and production boundary
 
@@ -587,11 +634,12 @@ the default collection, then repeat the command.
 
 ### A human session is already stored
 
-Use the stored session or restore its original server state. Run
-`scripts/dev-maincopy.sh logout` before a state reset.
+Run `scripts/dev-maincopy.sh logout`, then sign in again. Logout clears local
+credentials after successful revocation or an explicit server response that
+rejects the session. This includes sessions invalidated by password rotation.
 
-If the original state no longer exists, remove only the Maincopy entry through
-the operating system credential manager. Confirm the target before removal.
+If the server cannot be reached, restore its availability before logging out.
+Transport failures and unexpected responses retain the local session.
 
 ### The generated owner password was not saved
 
@@ -599,9 +647,9 @@ If no human session exists, stop the launcher and move the disposable local
 development state aside with the reset procedure above. Restart the launcher,
 then save the new password before the readiness message appears.
 
-If a session exists, log out before the reset. Maincopy does not redisplay the
-initial password, and the current build does not provide a completed browser
-password-rotation flow.
+If a recent browser session exists, open **Users → Manage your account** and
+save a new password. Maincopy does not redisplay the initial password.
+If the session requires another sign-in, use the disposable-state reset procedure.
 
 ### The development CA is missing
 

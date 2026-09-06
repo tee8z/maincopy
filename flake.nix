@@ -171,6 +171,17 @@
             inherit (project) src;
           };
 
+          browser-signin =
+            project.pkgs.runCommand "maincopy-browser-signin"
+              {
+                nativeBuildInputs = [ project.pkgs.nodejs ];
+              }
+              ''
+                node --check ${project.src}/crates/server/frontend/admin/nostr-login.js
+                node --test ${project.src}/crates/server/frontend/admin/nostr-login.test.js
+                touch "$out"
+              '';
+
           tests = project.craneLib.cargoTest (
             project.testEnvironment
             // {

@@ -343,8 +343,8 @@ impl AdminClient {
         .await
     }
 
-    /// Revokes the active human session before deleting its local credentials.
-    pub(crate) async fn logout(&self) -> Result<RevokeAdminSessionResponse, AdminClientError> {
+    /// Clears local credentials after revocation or an explicit session rejection.
+    pub(crate) async fn logout(&self) -> Result<LogoutOutcome, AdminClientError> {
         let PreparedLogout {
             credential_key,
             request,
@@ -714,6 +714,12 @@ struct PreparedLogout {
     request: HttpRequest,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogoutOutcome {
+    Revoked(RevokeAdminSessionResponse),
+    NoActiveSession,
+}
+
 fn prepare_logout<LoadCredential, DeleteCredential>(
     origin: &AdminOrigin,
     authentication: AuthenticationContext,
@@ -747,11 +753,19 @@ fn complete_logout<DeleteCredential>(
     response: HttpResponse,
     credential_key: &CredentialKey,
     delete_credential: DeleteCredential,
-) -> Result<RevokeAdminSessionResponse, AdminClientError>
+) -> Result<LogoutOutcome, AdminClientError>
 where
     DeleteCredential: FnOnce(&CredentialKey) -> Result<(), CredentialStoreError>,
 {
-    let revoked = decode_status_json(response, StatusCode::OK)?;
+    let revoked = match decode_status_json(response, StatusCode::OK) {
+        Ok(revoked) => LogoutOutcome::Revoked(revoked),
+        Err(AdminClientError::HttpStatus {
+            status: StatusCode::UNAUTHORIZED,
+            problem: Some(problem),
+            ..
+        }) if problem.code.as_ref() == "authentication_required" => LogoutOutcome::NoActiveSession,
+        Err(error) => return Err(error),
+    };
     delete_credential(credential_key)?;
     Ok(revoked)
 }
@@ -2304,8 +2318,51 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(completed, revoked);
+        assert_eq!(completed, LogoutOutcome::Revoked(revoked));
         assert_eq!(deletes.get(), 1);
+    }
+
+    #[test]
+    fn logout_clears_rejected_sessions_but_retains_credentials_after_uncertain_failures() {
+        let key = CredentialKey::human("https://admin.example.test");
+        let response = |status, code| {
+            json_response(status, serde_json::to_vec(&json!({
+            "error":{"code":code, "message":"The session is not accepted.", "request_id":REQUEST_ID},
+        })).unwrap())
+        };
+        let deleted = Cell::new(false);
+        let outcome = complete_logout(
+            response(StatusCode::UNAUTHORIZED, "authentication_required"),
+            &key,
+            |actual| {
+                assert_eq!(actual, &key);
+                deleted.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, LogoutOutcome::NoActiveSession);
+        assert!(deleted.get());
+        for rejection in [
+            response(StatusCode::FORBIDDEN, "authentication_required"),
+            response(StatusCode::UNAUTHORIZED, "gateway_authentication_required"),
+            response(StatusCode::SERVICE_UNAVAILABLE, "authentication_required"),
+            json_response(StatusCode::UNAUTHORIZED, b"not a Maincopy problem".to_vec()),
+        ] {
+            let result = complete_logout(rejection, &key, |_| {
+                panic!("uncertain remote state must retain the local session")
+            });
+            assert!(matches!(result, Err(AdminClientError::HttpStatus { .. })));
+        }
+        let failed_delete = complete_logout(
+            response(StatusCode::UNAUTHORIZED, "authentication_required"),
+            &key,
+            |_| Err(CredentialStoreError::Delete(keyring::Error::NoEntry)),
+        );
+        assert!(matches!(
+            failed_delete,
+            Err(AdminClientError::CredentialStore(_))
+        ));
     }
 
     #[test]

@@ -10,7 +10,10 @@ use axum::{
     response::{Html, IntoResponse as _, Response},
     routing::{get, post},
 };
-use maincopy_shared::{auth::HumanLoginProvider, auth_api::SecretString};
+use maincopy_shared::{
+    auth::HumanLoginProvider,
+    auth_api::{ADMIN_SESSIONS_PATH, LOGIN_CHALLENGES_PATH, SecretString},
+};
 use maud::{DOCTYPE, Markup, html};
 use serde::Deserialize;
 
@@ -286,6 +289,7 @@ fn login_response(
 ) -> Response {
     let password_enabled = security.providers.accepts(HumanLoginProvider::Password);
     let nostr_enabled = security.providers.accepts(HumanLoginProvider::Nostr);
+    let script_integrity = assets::nostr_login_script_integrity();
     let content = html! {
         section class="panel" {
             h1 { "Sign in to Maincopy" }
@@ -307,14 +311,31 @@ fn login_response(
                 p { "Password sign-in is not enabled." }
             }
             @if nostr_enabled {
-                p class="muted" {
-                    "Nostr authentication is enabled through the administration API; "
-                    "this first browser screen uses password sign-in."
+                h2 { "Sign in with Nostr" }
+                p { "Select your Maincopy login key in your browser signer extension." }
+                button type="button" id="nostr-login" disabled
+                    data-challenge-path=(LOGIN_CHALLENGES_PATH) data-session-path=(ADMIN_SESSIONS_PATH) {
+                    "Sign in with Nostr"
                 }
+                p id="nostr-login-status" role="status" aria-live="polite" { "Maincopy requests a sign-in proof from your signer." }
+                noscript { p { "Enable JavaScript to use a Nostr browser signer." } }
+                p { a href="/admin" { "Open administration" } }
+                script src=(assets::nostr_login_script_path()) integrity=(&script_integrity) defer {}
             }
         }
     };
-    page_response(status, "Sign in", PageKind::Login, content)
+    let mut response = page_response(status, "Sign in", PageKind::Login, content);
+    if nostr_enabled {
+        let policy = format!(
+            "default-src 'self'; script-src '{script_integrity}'; connect-src 'self'; worker-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        );
+        response.headers_mut().insert(
+            "content-security-policy",
+            HeaderValue::from_str(&policy)
+                .expect("the embedded script integrity value forms a valid policy"),
+        );
+    }
+    response
 }
 
 pub(crate) fn page_response(
@@ -344,6 +365,7 @@ pub(crate) fn page_response(
                                 a href="/admin/source" { "Source" }
                                 a href="/admin/profile" { "Profile" }
                                 a href="/admin/tips" { "Tips" }
+                                a href="/admin/users" { "Users" }
                                 span class="muted" { "Private administration" }
                             }
                         }
