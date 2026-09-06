@@ -9,7 +9,7 @@ an existing signed tag as input. It prepares a candidate, waits for one owner
 approval, publishes missing crate versions, and publishes the complete GitHub
 Release last. It does not change versions, create commits, or replace tags.
 
-Use [system evidence](system-evidence.md#pending-acceptance) for release acceptance.
+Use [the implementation plan](implementation.md#system-and-security-acceptance) for release acceptance.
 Mailing-list and bulk delivery require their own privacy and deliverability
 acceptance before inclusion in a release. A successful package build does not
 satisfy those checks.

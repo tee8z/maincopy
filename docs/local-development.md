@@ -1,793 +1,362 @@
 # Run Maincopy locally
 
-Status: supported development workflow
+Use this runbook on one Linux workstation to publish the included example and
+manage local accounts. For production, use the [deployment runbook](deployment.md).
+See [managed source](managed-source.md) for Git mirroring and
+[content rendering](content-rendering.md#images) for article images.
 
-Last reviewed: 2026-09-06
+## Start the development environment
 
-Related: [project overview](../README.md),
-[managed source runbook](managed-source.md),
-[agent management](agent-management.md),
-[content images](content-images.md),
-[remaining implementation work](implementation.md), and
-[engineering style](quality.md).
+You need Nix, available ports `3000`, `3001`, `3002`, and `8443`, and an unlocked
+Secret Service store for CLI credentials. Use the same `XDG_DATA_HOME` in every terminal.
 
-Use this runbook to publish the included Markdown post through the local HTTPS
-gateway. Start with the browser walkthrough. Use the command-line interface
-(CLI) reference for detailed checks and diagnostics.
+From the repository root, run:
 
-This workflow is for development on one Linux workstation. It is not a
-production deployment or NixOS acceptance test.
+```console
+nix develop -c just start
+```
 
-## Boundaries and durable state
+Keep this terminal open. The launcher builds the daemon, isolated Mermaid renderer,
+and CLI, then starts the daemon and Caddy. Wait for
+`Maincopy development environment is ready` before signing in.
 
-| Surface | Address | Purpose |
-| --- | --- | --- |
-| Public HTTPS origin | `https://maincopy.localhost:8443` | Canonical pages, RSS, and public assets |
-| Administration HTTPS origin | `https://admin.localhost:8443` | Authenticated browser and CLI requests |
-| Public loopback upstream | `127.0.0.1:3000` | Caddy access only |
-| Administration loopback upstream | `127.0.0.1:3001` | Caddy access only |
-| Metrics loopback listener | `127.0.0.1:3002` | Local Prometheus only |
+| Command | Effect |
+| --- | --- |
+| `just start` | Start with existing state and install browser trust. |
+| `just start-cli` | Start with existing state without changing browser trust. |
+| `just quickstart` | **Delete disposable state**, then start with browser trust. |
+| `just reset` | **Delete disposable state** without starting services. |
+| `just untrust-browser` | Remove browser trust after stopping the launcher. |
 
-The development fixture is in `crates/server/examples/development/`. Runtime
-state persists in `target/maincopy-dev/` between launcher restarts.
+These recipes enter the Nix shell automatically. If `just` is unavailable, prefix
+its command with `nix develop -c`.
 
-This fixture uses `external_checkout`, the default source mode. The launcher
-observes its checked-in content tree and performs no Git network operation.
-
-The launcher runs the Rust daemon and Caddy as separate processes. Caddy
-terminates HTTPS and forwards to the two loopback listeners; `maincopyd` does
-not act as its own gateway.
-
-The development certificate authority (CA) persists outside `target/`:
-
-- `$XDG_DATA_HOME/maincopy/dev-ca/`, when `XDG_DATA_HOME` is set.
-- `$HOME/.local/share/maincopy/dev-ca/`, in other supported sessions.
-
-The CA certificate is `rootCA.pem`. The CA private key is `rootCA-key.pem`.
+On fresh state, the daemon creates `owner` and prints its generated password once.
+Save it immediately; later starts cannot redisplay it. Only its password hash is stored.
 
 > [!WARNING]
-> Never share or commit `rootCA-key.pem`. Its holder can issue certificates
-> trusted by each browser store that contains this development CA.
-
-> [!CAUTION]
-> Do not expose either loopback upstream. The development Caddy process is the
-> only supported network path for this workflow.
-
-## Prerequisites
-
-1. Start from a Linux user session that can run Nix.
-2. Use the same `XDG_DATA_HOME` value in each terminal.
-3. Ensure that ports `3000`, `3001`, `3002`, and `8443` are available.
-4. For the CLI workflow, provide an unlocked Secret Service store.
-
-The human CLI stores its session in Secret Service. It does not use a plaintext
-file, process argument, or environment variable for this credential.
-
-## Browser walkthrough
-
-### 1. Start the services
-
-Clear disposable state and start the browser workflow from the repository
-root:
-
-```console
-just quickstart
-```
-
-The recipe enters the project Nix shell before it changes state. It refuses to
-run while `maincopyd` or the gateway owns its lock. It removes only
-`target/maincopy-dev/` and keeps the durable development CA.
-
-If `just` is not installed outside Nix, run `nix develop -c just quickstart`.
-
-The launcher builds `maincopyd`, its isolated `maincopy-mermaid` renderer, and
-`maincopy`. It starts the server and waits for loopback readiness. It then
-starts Caddy and verifies both HTTPS origins. Keep this terminal open.
-
-On fresh state, `maincopyd` generates the `owner` account with an
-instance-unique password from 256 bits of operating-system randomness. It
-prints the username and password once before it persists the identity
-transaction. Copy the password from the launcher output immediately.
-
-Maincopy stores only the Argon2id password hash. It has no shared default
-password, and it does not display this password on later starts. Use
-**Users → Manage your account** to replace the password after signing in.
-
-The credential output appears before the readiness output:
-
-```text
-Maincopy generated the initial owner credential.
-
-  Username: owner
-  Password: COPY_THIS_GENERATED_VALUE
-
-Save this password now. Maincopy will not display it after identity setup.
-```
-
-> [!WARNING]
-> Treat first-start standard output as credential material. Do not copy the
-> generated password into shared terminal logs, issue reports, or shell files.
-
-Wait for this output:
-
-```text
-Maincopy development environment is ready.
-
-  Public: https://maincopy.localhost:8443
-  Admin:  https://admin.localhost:8443/admin/login
-  CLI:    scripts/dev-maincopy.sh login --username owner
-```
-
-### 2. Sign in and inspect the revision
-
-Open `https://admin.localhost:8443/admin/login`. Sign in as `owner` with the
-generated password.
-
-For `Hello, Maincopy`, choose `Review exact preview`. Compare the current public
-revision with the candidate revision. New state displays `Not published`.
-
-### 3. Review the exact preview
-
-Choose `Open exact rendered preview`. Review the complete article before you
-continue. Confirm that the Rust source is escaped plain code and that the
-Mermaid source appears as a diagram. The CLI diagnostics below verify the
-semantic `language-rust` class in the rendered HTML.
-
-### 4. Publish and verify the article
-
-Choose `Continue to publication confirmation`. On the separate confirmation
-page, leave `Scheduled publication time (UTC)` empty. Select
-`I reviewed and accept this exact preview`, then choose `Approve this exact
-revision`.
-
-The browser opens the durable release page. Confirm that its status is
-`Published`. Bookmark this page to check the result again.
-
-The confirmation page identifies the candidate revision and exact preview
-digest. If either value changes, open the new preview before publication.
-
-New state publishes the initial article. If the live post has a newer candidate,
-the same workflow publishes an update. A reload cannot publish that update by
-itself.
-
-Open `https://maincopy.localhost:8443/posts/hello-maincopy`. Confirm that the
-reviewed article is public.
-
-On a repeat run, `Published` and `This exact revision is already public` mean
-that no publication action is needed. The public URL already serves the current
-candidate.
-
-To schedule a publication, enter a future UTC date and time on the confirmation
-page before approval. The release page shows `Scheduled`. Scheduling keeps the
-approved revision private until activation. Later source changes do not replace
-that revision.
-
-Choose `Releases` from the post list to inspect accepted approvals. The list
-shows up to 100 releases per page, ordered by release identifier. Choose
-`Next page` to continue. Release details remain available after activation.
-
-If an approval response is lost, submit the original confirmation form again.
-The same approval returns the same release page. Reusing an operation identifier
-with different inputs is rejected.
-
-On a scheduled release page, enter a future UTC time and choose
-`Change scheduled time` to reschedule. Choose `Cancel this release` to cancel.
-Both operations require the displayed resource version. Refresh the page after
-a version conflict. Changes preserve the original approved revision and preview.
-
-A release becomes `Blocked` if its approved revision is unavailable or its
-rendered preview differs from the approved preview. The previous public snapshot remains available.
-After resolving the cause, choose `Retry this release`. Retry uses the original
-approval. A blocked release can also be cancelled.
-
-Each accepted edit, cancellation, or retry has a durable operation receipt.
-The receipt identifies the accepted version; the page also shows the current
-release state. Repeating the original form recovers that receipt after later
-changes or a restart.
-
-Cancelled releases remain in history. A fresh preview approval can release
-the same cancelled revision again. Cancellation retains route reservations
-and does not remove an existing public revision.
-
-Browser login does not create a CLI session. In a separate terminal, run
-`scripts/dev-maincopy.sh login --username owner` before using authenticated CLI commands.
-The wrapper supplies the local HTTPS origin and development CA for every command.
-
-The CLI can inspect the same durable records:
-
-```console
-scripts/dev-maincopy.sh releases list
-scripts/dev-maincopy.sh releases list --cursor <NEXT_CURSOR>
-scripts/dev-maincopy.sh releases inspect <PUBLICATION_ID>
-scripts/dev-maincopy.sh releases operation <OPERATION_ID>
-```
-
-Add `--json` for structured output. Listing returns at most 100 records and a
-continuation cursor. Operation output reports the immutable accepted result.
-Inspect the release separately for its current state.
-
-These commands use `GET /api/admin/v1/releases`,
-`GET /api/admin/v1/releases/{publication_id}`, and
-`GET /api/admin/v1/release-operations/{operation_id}`. All require `release_manage`.
-Use the displayed release version for each new change:
-
-```console
-scripts/dev-maincopy.sh releases reschedule <PUBLICATION_ID> --expected-version <VERSION> --at <UTC_RFC3339> --idempotency-key <OPERATION_ID>
-scripts/dev-maincopy.sh releases cancel <PUBLICATION_ID> --expected-version <VERSION> --idempotency-key <OPERATION_ID>
-scripts/dev-maincopy.sh releases retry <PUBLICATION_ID> --expected-version <VERSION> --idempotency-key <OPERATION_ID>
-```
-
-The CLI generates an operation UUID when `--idempotency-key` is omitted.
-Success and failure output retain that identifier. If a response is lost, inspect
-the operation or repeat the identical command with the same key. A retry receipt
-can report `activating` after the current release has reached `published`.
-
-These controls use `POST /api/admin/v1/releases/{publication_id}` with an
-`Idempotency-Key` header. The JSON body selects one action:
-
-```json
-{"action":"cancel","expected_version":2}
-```
-
-`retry` also requires `expected_version`. `reschedule` additionally requires
-`scheduled_for`, a future UTC RFC3339 timestamp. Every control preserves the
-approved revision. Cancellation applies to scheduled or blocked releases.
-
-Stale versions return `412 stale_release_version`. Reused keys with different
-inputs return `409 idempotency_conflict`. Refresh the release before starting
-a new operation after a conflict.
-
-### 5. Manage your profile and tips
-
-Open **Profile** to create or replace your public display name and Lightning
-Address. Select whether your profile accepts tips. Empty fields clear their
-stored values.
-
-Open **Tips** to select the active recipient by user ID. The page shows your
-user ID and the selected recipient's eligibility. An empty recipient field
-removes the selection.
-
-Owner and Administrator accounts can use both pages. Publishers cannot access
-these settings. Every form includes the displayed resource version and one
-operation ID.
-
-If another edit changes the version, reload and review the current values.
-Profile and recipient edits do not approve articles. Ineligible or unconfigured
-recipients leave articles readable without tip links.
-
-### 6. Manage accounts and login credentials
-
-Open **Users** to inspect accounts or create a user with a password or Nostr
-public key. The page offers only the configured login providers.
-For Nostr sign-in, select the account's key in a
-[NIP-07 browser signer](https://github.com/nostr-protocol/nips/blob/master/07.md).
-Open the sign-in page, select **Sign in with Nostr**, and approve the sign-in
-proof. Maincopy receives the signed proof and public key. The private key stays
-with the signer.
-
-If the signer is locked or you cancel its prompt, unlock it and try again.
-If Maincopy cannot confirm the result, select **Open administration** to check
-the session before retrying. Each API request has a 15-second timeout and an
-8 KiB JSON limit. The sign-in page permits only the bundled signer script by
-its content hash, with API connections restricted to the same origin.
-
-To add a Nostr key to an existing account, open that account's **Nostr login
-key** form. Enter the public key as 64 lowercase hexadecimal characters.
-The account page displays the saved public key and its SHA-256 fingerprint.
-The fingerprint updates after a replacement is accepted. It uses the same raw-key
-hash and unpadded Base64 format as `maincopy agent-key inspect`.
-
-New accounts receive the Publisher role by default. Owners can also create
-Administrators and Owners. Publishers cannot open account administration.
-
-Open an account to change its status, replace its assigned role, or manage its
-login credentials. Only Owners can assign roles. Administrators can manage
-accounts whose authority is within their own role.
-
-To replace your password:
-
-1. Open **Users → Manage your account** within 15 minutes of signing in.
-2. Enter the new password in both password fields.
-3. Select **Save password**.
-4. Sign in with the new password.
-
-Use 15 to 128 characters. Replacing or removing a login credential ends all
-existing browser sessions for that user. Maincopy never displays the submitted
-password again.
-
-Disabling a user revokes their sessions and agent credentials. Enabling the user
-does not restore revoked agent credentials. Maincopy preserves one enabled Owner
-and a usable login credential for each enabled account.
-
-Account changes require a recent sign-in and an unchanged resource version.
-If a page is stale, reload and review it before submitting again. Each form
-retains one operation ID for retries of that submission.
-Operation receipts bind to the authorizing session. After signing in again,
-inspect the account and use a newly loaded form for further changes.
-User pages contain at most 100 accounts. Account form bodies are limited to
-16 KiB.
-
-Inspect the same account state from the CLI:
-
-```console
-scripts/dev-maincopy.sh users list
-scripts/dev-maincopy.sh users inspect USER_UUID
-scripts/dev-maincopy.sh --json users inspect USER_UUID
-```
-
-Use the same `--admin-origin` and `--admin-ca-file` settings as your login.
-Each list request returns at most 100 accounts. Use the returned cursor with
-`scripts/dev-maincopy.sh users list --cursor NEXT_CURSOR` to request another page.
-Inspection reports status, roles, scopes, and public credential metadata.
-Account versions and individual credential versions are separate preconditions.
-An empty page prints a clear message; JSON output preserves the pagination fields.
-Inspection requires account-management authority. To change an account, inspect
-its current version and sign in again if your authentication is no longer fresh.
-
-```console
-scripts/dev-maincopy.sh users status USER_UUID --expected-version 5 --status disabled
-scripts/dev-maincopy.sh users roles USER_UUID --expected-version 6 --roles publisher
-```
-
-Role replacement requires an Owner. `--roles` replaces the complete role set.
-Each accepted change increments the account version. Disabling an account also
-revokes its sessions and agent grants.
-
-Success and failure output retain the operation UUID. After an uncertain result,
-inspect the account before retrying. Use `--idempotency-key OPERATION_UUID` only
-with the identical command and authorizing session. After signing in again,
-inspect current state and use a new operation UUID for another change.
-
-Create an account with password, Nostr, or both login credentials:
-
-```console
-scripts/dev-maincopy.sh users create --roles publisher password --username publisher
-scripts/dev-maincopy.sh users create --roles publisher nostr --public-key PUBLIC_KEY_HEX
-scripts/dev-maincopy.sh users create --roles publisher both --username publisher --public-key PUBLIC_KEY_HEX
-```
-
-Password commands read and confirm the password from the controlling terminal.
-Input is hidden and limited to 1024 bytes. Use 15 to 128 Unicode characters.
-The CLI rejects cancelled, mismatched, or invalid input before submitting a change.
-Never put passwords or private keys in command arguments or environment variables.
-
-Manage individual login credentials after inspecting their current versions:
-
-```console
-scripts/dev-maincopy.sh users credentials USER_UUID add password --username publisher
-scripts/dev-maincopy.sh users credentials USER_UUID add nostr --public-key PUBLIC_KEY_HEX
-scripts/dev-maincopy.sh users credentials USER_UUID replace --expected-version 2 password --username publisher
-scripts/dev-maincopy.sh users credentials USER_UUID replace --expected-version 3 nostr --public-key PUBLIC_KEY_HEX
-scripts/dev-maincopy.sh users credentials USER_UUID remove --expected-version 4 --provider password
-```
-
-Replacement and removal use the **credential version** from `users inspect`.
-The accepted receipt reports the separate **account version**.
-Account inspection displays Nostr public keys and their SHA-256 fingerprints.
-JSON inspection also includes the public `nostr_keys` comparison records.
-
-The API enforces configured providers, recent authentication, role boundaries,
-and the last usable credential rule. Replacing or removing your credential revokes
-its existing sessions. Sign in again before further account changes.
-After uncertain account creation, list accounts before retrying with the original
-operation UUID and authorizing session.
-
-For human CLI sign-in with an external Nostr signer:
-
-```console
-scripts/dev-maincopy.sh login-nostr
-```
-
-Use the same origin and certificate options as other CLI commands.
-The CLI prints a one-time event to sign. Sign that exact event within 60 seconds.
-Paste the complete signed event JSON as one line at the protected prompt.
-The proof is limited to 16 KiB. Its signature and login intent are checked locally.
-If signing expires or fails, start `login-nostr` again for a new challenge.
-
-Use the human account's signer. Keep its private key in that signer.
-The CLI does not read the local agent key for human sign-in.
-Successful login stores the session in the operating system credential store.
-Sign out with `scripts/dev-maincopy.sh logout` before replacing a stored session.
-With `--json`, signing instructions still use stderr; stdout contains the result.
-
-### 7. Sign out before a state reset
-
-Return to the post list and choose `Sign out` before resetting local state.
-The browser returns to the sign-in page and clears the session and CSRF cookies.
-You may keep the session for an ordinary launcher restart because restarts
-preserve the same state.
-
-## Browser trust lifecycle
-
-The browser walkthrough installs the durable development CA in supported user
-Network Security Services (NSS) browser stores. Restart an open browser if it
-still reports a certificate error.
-
-To run only CLI diagnostics, start the launcher without changing browser trust:
-
-```console
-just start-cli
-```
-
-To preserve publication state during a browser run, use:
-
-```console
-just start
-```
-
-To remove browser trust, first stop the launcher. Then run:
-
-```console
-just untrust-browser
-```
-
-This command removes browser trust and keeps the durable CA files. The CLI can
-continue to trust `rootCA.pem` explicitly on later runs.
+> First-start output contains a credential. Do not share it in terminal logs,
+> issue reports, shell files, or screenshots.
+
+| Surface | Address |
+| --- | --- |
+| Public site | `https://maincopy.localhost:8443` |
+| Administration | `https://admin.localhost:8443/admin/login` |
+| Public/admin upstreams | `127.0.0.1:3000` / `127.0.0.1:3001` |
+| Metrics | `127.0.0.1:3002` |
+
+Caddy terminates HTTPS and forwards to the separate public and admin listeners.
+Do not expose the loopback upstreams. This gateway runs as the developer and is
+not the production service boundary.
+
+The fixture lives in `crates/server/examples/development/`. Its `external_checkout`
+mode reads checked-in content without Git network operations. Runtime state persists
+in `target/maincopy-dev/`; ordinary restarts preserve accounts and publication state.
+
+## Publish through the browser
+
+1. Open the administration URL and sign in as `owner` with the generated password.
+2. For **Hello, Maincopy**, select **Review exact preview**.
+3. Select **Open exact rendered preview** and review the complete article.
+4. Select **Continue to publication confirmation**.
+5. Leave the scheduled time empty for immediate publication.
+6. Select **I reviewed and accept this exact preview**, then **Approve this exact revision**.
+7. Check that the release page reports **Published**.
+
+Open `https://maincopy.localhost:8443/posts/hello-maincopy` to see the result.
+The RSS feed is `/feed.xml`; the fixture alias `/posts/welcome` redirects to the article.
+If the exact revision is already public, no new approval is needed.
+
+Approval binds the candidate revision and preview digest. If either changes,
+review the new preview. Reloading the page cannot approve an update.
+
+For later publication, enter a future UTC time before approval. Later source edits
+do not change that approved revision. Use **Releases** to inspect, reschedule,
+cancel, or retry a blocked release. Refresh after a version conflict.
+
+A blocked release leaves the previous public snapshot available. Resolve its
+reported cause before retrying. Cancellation retains history and does not remove
+an existing public revision.
 
 ## CLI reference and diagnostics
 
-This section preserves the detailed API checks for development and fault
-diagnosis. Browser trust is not required because the CLI uses the CA file
-directly.
-
-If the local environment is not running, start it from the repository root:
-
-```console
-nix develop
-just start-cli
-```
-
-Open a second terminal at the repository root. Enter `nix develop` with the
-same `XDG_DATA_HOME` value.
-
-Set the public origin and CA certificate path:
-
-```bash
-PUBLIC_ORIGIN=https://maincopy.localhost:8443
-DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
-ROOT_CERTIFICATE="$DATA_ROOT/maincopy/dev-ca/rootCA.pem"
-POST_ID=1dd7559b-90a9-4c5b-a13c-70bf6ec01e92
-```
-
-Confirm that the public service is ready:
-
-```console
-curl --noproxy '*' --cacert "$ROOT_CERTIFICATE" --max-time 5 \
-  --fail --silent --show-error \
-  "$PUBLIC_ORIGIN/health/ready"
-```
-
-Expected output:
-
-```json
-{"status":"ready"}
-```
-
-For new state, confirm that the canonical route is not public:
-
-```console
-curl --noproxy '*' --cacert "$ROOT_CERTIFICATE" --max-time 5 \
-  --silent --show-error --output /dev/null \
-  --write-out '%{http_code}\n' \
-  "$PUBLIC_ORIGIN/posts/hello-maincopy"
-```
-
-Expected output:
-
-```text
-404
-```
-
-### 1. Log in
-
-Run the human login command:
+Open another terminal at the repository root with the same `XDG_DATA_HOME`.
+The wrapper supplies the local admin origin and CA certificate:
 
 ```console
 scripts/dev-maincopy.sh login --username owner
-```
-
-Enter the generated initial owner password. A successful command reports the
-session, user, provider, roles, and expiry time.
-
-### 2. Select the loaded revision
-
-Confirm that this fixture uses the operator-maintained checkout:
-
-```console
+scripts/dev-maincopy.sh --help
 scripts/dev-maincopy.sh source status
-```
-
-Expected source mode:
-
-```text
-Source mode: external_checkout
-```
-
-List the loaded posts:
-
-```console
 scripts/dev-maincopy.sh posts
 ```
 
-Find the `Hello, Maincopy` record. Copy its `Revision` value and the top-level
-`Content` value into these variables:
+Browser login does not create a CLI session. The CLI reads passwords from a
+protected terminal and stores sessions in Secret Service. Never put passwords or
+private keys in arguments or environment variables.
+
+Use `--json` for structured results. Lists return at most 100 records; pass the
+returned cursor to the same list command with `--cursor NEXT_CURSOR`.
+Command-specific `--help` lists the supported options.
+
+### Preview and publish
+
+From `posts`, copy the post's `Revision` and the top-level `Content` digest.
+For the included post, prepare a new preview destination:
 
 ```bash
+POST_ID=1dd7559b-90a9-4c5b-a13c-70bf6ec01e92
 REVISION='COPY_THE_POST_REVISION'
 CONTENT_DIGEST='COPY_THE_CONTENT_DIGEST'
-```
-
-For a new state directory, the record has the `unpublished` status.
-
-### 3. Review the exact preview
-
-Create a new preview destination:
-
-```bash
 PREVIEW_DIRECTORY="$(mktemp -d -t maincopy-preview.XXXXXXXX)"
 PREVIEW_PATH="$PREVIEW_DIRECTORY/hello-maincopy.html"
 ```
 
-Download the selected preview:
-
 ```console
 scripts/dev-maincopy.sh preview "$POST_ID" \
   --output "$PREVIEW_PATH" \
-  --revision "$REVISION" \
-  --content-digest "$CONTENT_DIGEST"
+  --revision "$REVISION" --content-digest "$CONTENT_DIGEST"
 ```
 
-Open `PREVIEW_PATH` and review the article. Confirm that the Rust block remains
-escaped plain code inside the canonical `language-rust` wrapper and has no
-token-level highlighting spans. Confirm that the Mermaid source has become a
-diagram rather than remaining source text. Copy the reported `Preview` value:
+Open the downloaded file and review it. The CLI never overwrites an existing file.
+Root-relative styles and protected assets may not load from a `file:` URL;
+use the browser preview when you need those resources.
+
+Copy the reported `Preview` digest, then approve:
 
 ```bash
 PREVIEW_DIGEST='COPY_THE_PREVIEW_DIGEST'
 ```
 
-The CLI never overwrites an existing preview file. Create a new destination
-when you repeat this step.
-
-The file preserves the reviewed HTML bytes. Some root-relative styles and
-protected assets do not load from a `file:` URL in this workflow.
-
-### 4. Publish the reviewed preview
-
-Approve the exact revision and preview:
-
 ```console
 scripts/dev-maincopy.sh publish-now "$POST_ID" \
-  --preview-digest "$PREVIEW_DIGEST" \
-  --revision "$REVISION"
+  --preview-digest "$PREVIEW_DIGEST" --revision "$REVISION"
 ```
 
-Expected status:
+Retain the returned publication and operation IDs. Use the inspected release
+version for subsequent changes; replace uppercase placeholders below:
 
-```text
-Status: published
+```console
+scripts/dev-maincopy.sh releases list
+scripts/dev-maincopy.sh releases inspect PUBLICATION_ID
+scripts/dev-maincopy.sh releases operation OPERATION_ID
+scripts/dev-maincopy.sh releases reschedule PUBLICATION_ID \
+  --expected-version VERSION --at UTC_RFC3339
+scripts/dev-maincopy.sh releases cancel PUBLICATION_ID --expected-version VERSION
+scripts/dev-maincopy.sh releases retry PUBLICATION_ID --expected-version VERSION
 ```
 
-The CLI generates an operation UUID. Keep it with the result.
-After an uncertain response, retry identical inputs with `--idempotency-key UUID`.
-Use a new operation UUID for another reviewed revision.
+### Recover an uncertain mutation
 
-### 5. Verify canonical output, RSS, and the alias
+Resource mutations generate an idempotency UUID when `--idempotency-key` is omitted.
+After a lost response, inspect current state and any available operation receipt.
+Retry only identical inputs with the original `--idempotency-key ORIGINAL_KEY`
+reported by the command. Do not substitute a resource or source-sync identifier.
+Use a new operation for a changed intent; reload after a stale-version error.
 
-Fetch the canonical page:
+A receipt describes the accepted result, which can differ from the current resource.
+Account and agent-grant retries also require the original authorizing session.
+After signing in again, inspect current state before starting a new operation.
+
+### Check public readiness
+
+```bash
+MAINCOPY_DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
+ROOT_CERTIFICATE="$MAINCOPY_DATA_ROOT/maincopy/dev-ca/rootCA.pem"
+```
 
 ```console
 curl --noproxy '*' --cacert "$ROOT_CERTIFICATE" --max-time 5 \
   --fail --silent --show-error \
-  "$PUBLIC_ORIGIN/posts/hello-maincopy" \
-  --output "$PREVIEW_DIRECTORY/published.html"
-grep -F '<h1>Hello, Maincopy</h1>' \
-  "$PREVIEW_DIRECTORY/published.html"
-grep -F 'class="article-code"><code class="language-rust"' \
-  "$PREVIEW_DIRECTORY/published.html"
-grep -F 'class="mermaid-diagram"' \
-  "$PREVIEW_DIRECTORY/published.html"
+  https://maincopy.localhost:8443/health/ready
 ```
 
-The code-language class records the author-declared language. V1 does not
-perform token-level syntax highlighting. These checks and all public
-navigation work without JavaScript.
+Expect `{"status":"ready"}`. A fresh unpublished article returns `404` at its public URL.
+After publication, check the article, feed, and alias in the browser.
 
-Fetch the RSS feed and verify its canonical post URL:
+## Accounts and login credentials
+
+Use **Users** to inspect or create accounts and manage credentials. New accounts
+receive Publisher by default. Only Owners assign roles; Administrators can manage
+accounts within their own authority. Publishers cannot open account administration.
+
+Credential changes require a recent sign-in and the displayed resource version.
+Replacing or removing a credential ends that user's existing sessions.
+Disabling an account also revokes agent grants; enabling it does not restore them.
+Maincopy preserves an enabled Owner and a usable credential for each enabled account.
+
+To replace your password, open **Users → Manage your account** within 15 minutes
+of signing in. Save a password of 15–128 characters, then sign in again.
+
+For Nostr browser login, select the account's key in a
+[NIP-07 signer](https://github.com/nostr-protocol/nips/blob/master/07.md), then choose
+**Sign in with Nostr**. The private key stays in the signer.
+If the result is uncertain, choose **Open administration** before retrying.
+
+The account's **Nostr login key** form accepts a public key as 64 lowercase
+hexadecimal characters. Compare the saved public key and fingerprint after a change.
+
+Common CLI operations:
 
 ```console
-curl --noproxy '*' --cacert "$ROOT_CERTIFICATE" --max-time 5 \
-  --fail --silent --show-error \
-  "$PUBLIC_ORIGIN/feed.xml" \
-  --output "$PREVIEW_DIRECTORY/feed.xml"
-grep -F '<item>' "$PREVIEW_DIRECTORY/feed.xml"
-grep -F '<link>https://maincopy.localhost:8443/posts/hello-maincopy</link>' \
-  "$PREVIEW_DIRECTORY/feed.xml"
+scripts/dev-maincopy.sh users list
+scripts/dev-maincopy.sh users inspect USER_UUID
+scripts/dev-maincopy.sh users create --roles publisher password --username publisher
+scripts/dev-maincopy.sh users create --roles publisher nostr --public-key PUBLIC_KEY_HEX
+scripts/dev-maincopy.sh users status USER_UUID --expected-version VERSION --status disabled
+scripts/dev-maincopy.sh users roles USER_UUID --expected-version VERSION --roles publisher
+scripts/dev-maincopy.sh users credentials USER_UUID --help
 ```
 
-The fixture declares `aliases = ["welcome"]` in the post frontmatter.
-Verify its redirect:
+`users roles` replaces the complete role set. Credential replacement and removal
+require the **credential version** from inspection, not the separate account version.
+Password commands use a hidden confirmation prompt.
+
+Run `scripts/dev-maincopy.sh logout` before replacing a stored CLI session.
+For human CLI login with an external Nostr signer:
 
 ```console
-curl --noproxy '*' --cacert "$ROOT_CERTIFICATE" --max-time 5 \
-  --silent --show-error --output /dev/null \
-  --write-out '%{http_code} %{redirect_url}\n' \
-  "$PUBLIC_ORIGIN/posts/welcome?source=local-development"
+scripts/dev-maincopy.sh login-nostr
 ```
 
-Expected output:
+Sign the exact displayed event within 60 seconds, then paste its signed JSON as
+one line at the protected prompt. Restart the command for an expired challenge.
+This flow uses the human account's signer, not the local agent key.
 
-```text
-308 https://maincopy.localhost:8443/posts/hello-maincopy
-```
+## Profile and tips
 
-If browser trust is installed, open these URLs for the visual demonstration:
-
-- `https://maincopy.localhost:8443/posts/hello-maincopy`
-- `https://maincopy.localhost:8443/feed.xml`
-- `https://maincopy.localhost:8443/posts/welcome`
-
-### 6. Log out
-
-Revoke the session while the server and gateway are still running:
-
-```console
-scripts/dev-maincopy.sh logout
-```
-
-A successful command reports `Revoked session` and its identifier. Stop the
-launcher with `Ctrl+C` after this command succeeds.
-
-### Profile and tip-recipient commands
-
-Use the same origin and certificate options as the other authenticated commands.
-Both human sessions and agents require the corresponding profile or Lightning
-scope.
+Owners and Administrators can use **Profile** to set a display name, Lightning
+Address, and tip eligibility. **Tips** selects the recipient by user ID.
+An empty field clears its value. Ineligible recipients leave articles readable
+without tip links. These edits do not approve articles.
 
 ```console
 scripts/dev-maincopy.sh profile show
-scripts/dev-maincopy.sh profile create --display-name "Alice" --lightning-address alice@example.com --tips-enabled true
-scripts/dev-maincopy.sh profile update --expected-version 1 --display-name "Alice" --lightning-address alice@example.com --tips-enabled false
+scripts/dev-maincopy.sh profile create --display-name Alice \
+  --lightning-address alice@example.com --tips-enabled true
+scripts/dev-maincopy.sh profile update --expected-version VERSION \
+  --display-name Alice --lightning-address alice@example.com --tips-enabled false
 scripts/dev-maincopy.sh tip-recipient show
-scripts/dev-maincopy.sh tip-recipient set USER_UUID --expected-version 1
-scripts/dev-maincopy.sh tip-recipient clear --expected-version 2
+scripts/dev-maincopy.sh tip-recipient set USER_UUID --expected-version VERSION
+scripts/dev-maincopy.sh tip-recipient clear --expected-version VERSION
 ```
 
-`profile create` requires an absent profile. `profile update` replaces all profile
-fields at the specified version. Omitted display-name and Lightning Address
-options clear those fields. `--tips-enabled true|false` is required.
+`profile create` requires an absent profile. Updates replace every field;
+omitted display-name or Lightning Address options clear those values.
+`--tips-enabled` is required. Recipient changes use the setting version from `show`.
 
-Recipient commands require the setting version from `tip-recipient show`.
-Selection requires an existing user. Tip links appear only while that account
-and its profile remain eligible.
+## Agent grants
 
-All mutations accept `--idempotency-key UUID` and generate one when omitted.
-Success output describes the accepted state. Use `show` to read the current
-state, which can differ after later edits.
+Use **Agents** or `agents` commands to delegate administration to a Nostr key.
+Registration requires recent authentication, `credential_manage`, and authority
+over the selected owner account. Its current roles limit the grant's effective scopes.
 
-Failures retain the operation ID in human and `--json` output. Inspect current
-state after an uncertain result. Retry the identical command with its original
-key to recover its accepted result.
-
-### Inspect the local agent key
-
-Use the same `--admin-origin` when configuring, inspecting, and using an agent
-key. Each origin has a separate protected credential entry.
+Configure and inspect the local key for this admin origin:
 
 ```console
 scripts/dev-maincopy.sh agent-key set
 scripts/dev-maincopy.sh agent-key inspect
-scripts/dev-maincopy.sh --json agent-key inspect
 ```
 
-`set` reads the private key from the protected terminal. Both `set` and `inspect`
-report the public key and its fingerprint. Inspection reads only the selected
-local agent credential and requires no human session or API request.
+Skip `set` if the intended key is already configured. It reads the private key from
+the protected terminal. Inspection makes no API request and reports only the public
+key and its fingerprint: `SHA256:` followed by the raw key's hash in unpadded Base64.
+Local inspection does not prove that a server grant exists or remains active.
 
-The fingerprint is SHA-256 of the raw 32-byte Nostr public key. Its text is
-`SHA256:` followed by unpadded Base64. Compare the full public key when
-registering the corresponding agent grant through the identity API.
+Open **Agents → Register an agent**, or register the inspected public key from the CLI:
 
-If no local key exists, JSON output contains `{"configured":false}`. A successful
-local inspection does not indicate whether the server grant is active.
+```console
+scripts/dev-maincopy.sh agents register \
+  --owner-user-id OWNER_UUID --public-key PUBLIC_KEY_HEX \
+  --label publishing-helper --scopes content_read,release_manage
+scripts/dev-maincopy.sh agents list
+scripts/dev-maincopy.sh agents inspect GRANT_UUID
+```
+
+Add `--expires-at UTC_RFC3339` for a future UTC expiry. Requested scopes must be
+nonempty, unique, and within the authenticated authority. Compare the saved public
+key and fingerprint. Inspection shows ownership, requested/effective scopes, expiry,
+last use, revocation, and the version needed for changes.
+
+```console
+scripts/dev-maincopy.sh agents scopes GRANT_UUID \
+  --expected-version VERSION --scopes content_read
+scripts/dev-maincopy.sh agents revoke GRANT_UUID --expected-version VERSION
+scripts/dev-maincopy.sh --auth-context agent posts
+```
+
+Scope replacement replaces the complete requested set. Inspect the new version
+before another change. Expired or revoked grants cannot authenticate.
+Use `--auth-context agent` explicitly; human authentication remains the default.
+
+Each admin origin has a separate protected key entry. Outside development, replace
+the wrapper with `maincopy --admin-origin HTTPS_ORIGIN`.
+For a private CA, also supply `--admin-ca-file CA_PEM_PATH`.
+Use the same origin when configuring, inspecting, and using the key.
+`agent-key remove` deletes only the local key; revoke the server grant separately.
+
+## Browser trust lifecycle
+
+Browser starts install the durable development CA in supported user NSS stores.
+Restart an open browser if it still reports a certificate error.
+The CA lives outside disposable state:
+
+- `$XDG_DATA_HOME/maincopy/dev-ca/`, when `XDG_DATA_HOME` is set;
+- `$HOME/.local/share/maincopy/dev-ca/`, otherwise.
+
+Its certificate is `rootCA.pem`; its private key is `rootCA-key.pem`.
+
+> [!WARNING]
+> Never share or commit `rootCA-key.pem`. Its holder can issue certificates
+> trusted by every browser store where you installed this CA.
+
+Stop the launcher before running `just untrust-browser`. This removes browser
+trust but keeps the CA files. CLI commands can still trust `rootCA.pem` explicitly.
+`just start-cli` creates the CA if needed without installing browser trust.
 
 ## Preserve or reset publication state
 
-Normal launcher restarts preserve the database and retained content candidates
-in `target/maincopy-dev/state/`. They also preserve published visibility.
+Sign out of the browser and run `scripts/dev-maincopy.sh logout` while services
+are available. Stop the launcher with `Ctrl+C` before resetting or moving state.
+Ordinary restarts do not require sign-out.
 
-Run `just quickstart` after stopping the launcher to discard all disposable
-development state and start the first-publication workflow again. The recipe
-does not delete or untrust the durable development CA.
+> [!CAUTION]
+> `just reset` and `just quickstart` delete **all of `target/maincopy-dev/`**,
+> including its database, retained content, gateway data, and leaf certificates.
+> They preserve the durable CA and its browser trust. Reset refuses active locks.
 
-Run `just reset` to discard the same state without starting the services.
-
-To preserve the old state instead, first revoke the human session. In the
-browser, return to the post list and choose `Sign out`. For a CLI session, run
-`scripts/dev-maincopy.sh logout`. Then stop the launcher and move the state
-directory aside:
+To preserve state before starting fresh, move it outside the reset directory:
 
 ```bash
-STATE_ARCHIVE="target/maincopy-dev/state.before-$(date -u +%Y%m%dT%H%M%SZ)"
-mv -- target/maincopy-dev/state "$STATE_ARCHIVE"
+STATE_ARCHIVE="$(mktemp -d "$HOME/maincopy-dev-state.XXXXXXXX")"
+mv -- target/maincopy-dev/state "$STATE_ARCHIVE/state"
 printf 'Preserved prior state at %s\n' "$STATE_ARCHIVE"
 ```
 
-The next launcher run creates new state and prints a new owner password once.
-This reset does not replace the durable development CA.
-
-Sign out of the browser and log out of the CLI before resetting state. If the
-new server rejects a retained CLI session, run `scripts/dev-maincopy.sh logout`
-to clear its local credentials before signing in again.
-
-## Development evidence and production boundary
-
-The `development-gateway` flake check validates the Caddy configuration and
-its launcher scripts. The gateway binds both virtual hosts to loopback. It
-removes untrusted identity headers, disables upstream retries, and blocks
-metrics forwarding.
-
-This evidence applies only to the local development harness. The gateway runs
-with the developer's identity and uses a workstation CA.
-
-The fixture does not test an SSH server, deploy key, or managed mirror. Use the
-[managed source runbook](managed-source.md) for that configuration contract.
-
-The [NixOS deployment runbook](deployment.md) covers the implemented production
-module, service identities, protected credentials, and gateway boundaries.
-Its VM check is separate from this development harness. Configure real DNS,
-firewall rules, and TLS trust on the deployment host, then complete the
-[remaining acceptance](system-evidence.md#pending-acceptance).
+The archive contains private application state; keep it protected.
+The next start creates new state and prints a new owner password.
+If a retained CLI session is rejected, use `logout` to clear it before signing in again.
 
 ## Troubleshooting
 
-### The credential store is unavailable
+| Symptom | Action |
+| --- | --- |
+| Credential store unavailable | Run from the graphical session that owns Secret Service and unlock its default collection. |
+| Human session already stored | Run `scripts/dev-maincopy.sh logout`, then sign in again. |
+| Logout cannot reach the server | Restore server availability. Transport failures retain local credentials; explicit session rejection clears them. |
+| Initial password lost | With a recent browser session, replace it under **Users → Manage your account**. Otherwise preserve or reset disposable state. |
+| CA missing or browser certificate error | Check `XDG_DATA_HOME` in both terminals. Run `just start-cli` if the CA is absent; restart the browser after installing trust. |
+| Nostr signer locked or cancelled | Unlock the signer and start a new sign-in attempt. |
+| Stale resource version | Inspect or reload current state, review the change, and submit a new operation. |
 
-Run the CLI from the graphical login session that owns Secret Service. Unlock
-the default collection, then repeat the command.
+If startup never becomes ready, inspect server and Caddy diagnostics without sharing
+first-start credentials. Check ports `3000`, `3001`, `3002`, and `8443`.
+Stop a conflicting process only when you own it and no longer need it.
 
-### A human session is already stored
+If a retained revision is unavailable, stop the launcher and preserve needed state
+before using `just quickstart` to rebuild from the current example content.
 
-Run `scripts/dev-maincopy.sh logout`, then sign in again. Logout clears local
-credentials after successful revocation or an explicit server response that
-rejects the session. This includes sessions invalidated by password rotation.
+Only one gateway can use the durable CA at a time. Stop an earlier gateway normally;
+do not remove `gateway.lock`. The operating system releases its lock on process exit.
 
-If the server cannot be reached, restore its availability before logging out.
-Transport failures and unexpected responses retain the local session.
-
-### The generated owner password was not saved
-
-If no human session exists, stop the launcher and move the disposable local
-development state aside with the reset procedure above. Restart the launcher,
-then save the new password before the readiness message appears.
-
-If a recent browser session exists, open **Users → Manage your account** and
-save a new password. Maincopy does not redisplay the initial password.
-If the session requires another sign-in, use the disposable-state reset procedure.
-
-### The development CA is missing
-
-Use the same `XDG_DATA_HOME` value in both terminals. If the CA does not exist,
-run `just start-cli` to create it.
-
-The launcher creates a fresh disposable leaf certificate from the durable CA
-on each start. A changed `XDG_DATA_HOME` therefore cannot leave the gateway
-serving a leaf from a different development CA.
-
-### The launcher does not become ready
-
-Read the server and Caddy diagnostics in the launcher terminal. Identify any
-process that owns ports `3000`, `3001`, `3002`, or `8443`.
-
-If `maincopyd` reports that a retained revision is unavailable, stop the
-launcher. Run `just quickstart` to rebuild disposable state from the current
-example content.
-
-Stop that process only when you own it and no longer need it. Then restart the
-launcher.
-
-### Another development gateway owns the lock
-
-Only one gateway can use the durable development CA at a time. Stop the earlier
-gateway normally and retry. Do not remove `gateway.lock`; the operating system
-releases its lock when the owning process exits.
+For production identities, network exposure, and recovery, follow the
+[deployment runbook](deployment.md) and [remaining acceptance](implementation.md).

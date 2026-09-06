@@ -1,132 +1,126 @@
 # Content rendering
 
-Maincopy compiles Markdown into immutable article HTML before publication.
-Preview and public output use the same compiled article bytes for the same bound inputs.
-Public reading needs no highlighting script, browser renderer, or external rendering service.
+Use this reference when authoring Markdown, diagrams, and images.
+Maincopy compiles articles before publication; preview and public pages share the compiled article content.
+Start with the [example post](../crates/server/examples/content/posts/hello-maincopy.md) for required frontmatter.
 
 ## Code fences
 
-The compiler compares the complete decoded fence-info value with a closed alias table.
-Comparison is ASCII-case-insensitive. It does not trim whitespace, split trailing tokens, or infer a language from source.
+Use a language name immediately after the opening fence:
 
-| Canonical language | Accepted aliases |
+````markdown
+```rust
+fn main() {}
+```
+````
+
+Language names are ASCII-case-insensitive. Use one value without extra whitespace or trailing options.
+
+| Language | Accepted names |
 | --- | --- |
-| `bash` | `bash`, `sh`, `shell` |
-| `c` | `c` |
-| `cpp` | `cpp`, `c++` |
-| `csharp` | `csharp`, `cs` |
-| `css` | `css` |
-| `diff` | `diff`, `patch` |
-| `dockerfile` | `dockerfile` |
-| `go` | `go` |
-| `html` | `html` |
-| `java` | `java` |
-| `javascript` | `javascript`, `js` |
-| `json` | `json` |
-| `nix` | `nix` |
-| `python` | `python`, `py` |
-| `ruby` | `ruby`, `rb` |
-| `rust` | `rust`, `rs` |
-| `sql` | `sql` |
-| `toml` | `toml` |
-| `typescript` | `typescript`, `ts` |
-| `tsx` | `tsx` |
-| `xml` | `xml` |
-| `yaml` | `yaml`, `yml` |
+| Bash | `bash`, `sh`, `shell` |
+| C | `c` |
+| C++ | `cpp`, `c++` |
+| C# | `csharp`, `cs` |
+| CSS | `css` |
+| Diff | `diff`, `patch` |
+| Dockerfile | `dockerfile` |
+| Go | `go` |
+| HTML | `html` |
+| Java | `java` |
+| JavaScript | `javascript`, `js` |
+| JSON | `json` |
+| Nix | `nix` |
+| Python | `python`, `py` |
+| Ruby | `ruby`, `rb` |
+| Rust | `rust`, `rs` |
+| SQL | `sql` |
+| TOML | `toml` |
+| TypeScript | `typescript`, `ts` |
+| TSX | `tsx` |
+| XML | `xml` |
+| YAML | `yaml`, `yml` |
 
-Known aliases produce escaped source inside this application-owned structure:
-
-```html
-<pre class="article-code"><code class="language-CANONICAL">ESCAPED SOURCE</code></pre>
-```
-
-Empty, `text`, `ascii`, unknown, non-ASCII, and multi-token values produce plain escaped code:
-
-```html
-<pre><code>ESCAPED SOURCE</code></pre>
-```
-
-V1 emits no token spans, inline styles, syntax grammar corpus, or highlighting JavaScript.
-The language class comes from application code, never directly from authored text.
-Adding an alias changes observable renderer policy and requires updated renderer identity and corpus evidence.
+Recognized names select a language CSS class. V1 does not apply syntax highlighting.
+Empty, `text`, `ascii`, unknown, and multi-token values produce plain escaped code.
 
 ## Mermaid diagrams
 
-Only exact lowercase `mermaid` selects diagram rendering. `Mermaid` remains plain code.
-Maincopy rejects every `%%{...}%%` directive before helper startup; ordinary `%%` comments remain valid syntax.
-Render options remain application-owned.
+Use exact lowercase `mermaid`; `Mermaid` produces plain code.
 
-The packaged `maincopy-mermaid` helper links pinned `mermaid-rs-renderer` 0.3.1 with default features disabled.
-It uses the library's strict renderer with fixed options, not the upstream `mmdr` command.
-Keep the helper beside `maincopyd` when installing the package.
+````markdown
+```mermaid
+flowchart LR
+    Draft --> Preview --> Published
+```
+````
 
-One application-owned content compiler shares one helper admission slot across startup, retained recovery, and live synchronization.
-It verifies the helper protocol once per renderer instance, then starts a fresh process for each diagram.
-The parent owns deadlines, process-group termination, and reaping.
-The child installs resource limits before rendering.
-This is crash and availability isolation, not a separate operating-system privilege sandbox.
+Maincopy renders diagrams before publication. Readers need no Mermaid script or external rendering service.
+Render settings are fixed: `%%{...}%%` directives are rejected; ordinary `%%` comments are allowed.
 
-The parent clears inherited environment and creates private Fontconfig input and cache paths for each job.
-ASCII uses fixed text metrics; Unicode uses the deterministic no-font fallback.
-Host fonts and ambient caches must not change diagram geometry.
+Diagrams cannot include scripts, event handlers, foreign objects, or remote images.
+HTTPS and root-relative navigation links are allowed.
+Invalid diagrams reject the candidate; the active public snapshot remains unchanged.
 
-## SVG trust boundary
+## Images
 
-```text
-validated Mermaid source -> supervised helper -> untrusted SVG -> sanitizer -> inline SVG
-failure -> reject candidate -> preserve active public snapshot
+Put local files below `assets/` in the content root, then reference them from Markdown:
+
+```markdown
+![A hillside at sunset](assets/hillside.webp)
 ```
 
-The renderer can emit unsafe markup. Its output never receives inline delivery directly.
-The sanitizer uses a closed element, attribute, and value policy backed by `quick-xml`.
-It rejects scripts, event attributes, foreign objects, and remote resource references.
-HTTPS and root-relative anchors remain navigation links. Local IDs and references receive a post-and-block-specific namespace.
+Use PNG, JPEG, GIF, WebP, AVIF, or ICO for browser image display.
+Authored SVG and unrecognized file types are served as attachments.
 
-Approved presentation declarations become SVG attributes.
-The sole supported blend mode maps to an application-owned CSS class, preserving the strict content security policy.
-Only the renderer's two digest-pinned C4 person PNGs may appear as embedded images.
-Arbitrary image data URLs remain rejected.
-The pinned renderer includes these byte strings in its MIT-licensed source.
+Configure optional site images and allowed external origins in `publication.toml`:
 
-The dedicated sanitizer must validate element-specific grammars, rewrite references, enforce parsing and emission budgets, and produce canonical bytes.
-A general markup sanitizer would still need these checks.
-Replace this policy only when another maintained implementation can enforce the complete contract and reduce the code requiring review.
+```toml
+[site]
+title = "Example"
+base_url = "https://example.com/"
+description = "An example publication."
+favicon = "assets/favicon.png"
+image = "assets/site-cover.webp"
+
+[author]
+name = "Example Author"
+
+[assets]
+allowed_https_origins = ["https://images.example.com"]
+```
+
+Add an optional cover image to a post's existing TOML frontmatter:
+
+```toml
+image = "assets/article-cover.webp"
+```
+
+An allowed external URL, such as `https://images.example.com/article-cover.webp`, can replace the local path.
+External URLs must use HTTPS and cannot contain credentials or fragments.
+Allowlist entries must be exact origins: no path beyond `/`, query, fragment, credentials, or wildcard.
+These origins permit images and media only. An oversized generated content security policy rejects the candidate.
+
+The site image supplies Open Graph metadata for index, archive, and tag pages.
+The post image supplies article Open Graph and `BlogPosting` metadata.
+Missing images stay absent; the favicon is not a fallback.
+
+Local public URLs identify the active snapshot. Preview-only files stay private, and local preview images omit public metadata URLs until release.
+Remote image bytes can change independently of a release. Use local assets when exact image bytes must remain fixed.
 
 ## Enforced limits
 
-Limits are inclusive. Accepted output bytes and helper address space constrain different stages of rendering.
+Limits are inclusive. Simplify the content when compilation exceeds a limit.
 
 | Boundary | Limit |
 | --- | --- |
-| All code blocks | 256 per post |
+| Code blocks, including Mermaid | 256 per post |
 | Final article HTML | 32 MiB per post |
-| Mermaid source | 256 KiB per block |
-| Mermaid blocks | 64 per post |
-| Raw SVG | 2 MiB per block |
-| Sanitized SVG | 2 MiB per block; 16 MiB per post |
-| SVG structure | 20,000 elements; depth 64; 200,000 attributes; 32 attributes per element |
-| SVG references | 20,000 IDs; 100,000 local references |
-| SVG text | 1 MiB total; 256 KiB per text node |
-| SVG values | 256-byte IDs; 256 KiB paths; 16 KiB embedded PNGs; 2 KiB navigation URLs |
-| Absolute coordinates | 10,000,000 |
-| Helper output file | 2 MiB |
-| Helper address space | 512 MiB |
-| Helper stack | 16 MiB |
-| Helper CPU | 5 seconds |
-| Helper wall time | 10 seconds |
-| Helper core dumps | Disabled |
-| Concurrent helpers | One per application-owned compiler |
+| Mermaid source | 256 KiB per block; 64 blocks per post |
+| Rendered SVG | 2 MiB per block; 16 MiB sanitized SVG per post |
+| SVG structure | 20,000 elements; depth 64 |
+| Diagram rendering | 5 CPU seconds; 10 seconds wall time per block |
+| Generated content security policy | 16 KiB |
 
-The parent classifies timeout, signal, protocol, renderer, and sanitizer failures without parsing diagnostic prose.
-The renderer identity binds the engine, protocol, options, font policy, limits, and sanitizer policy.
-Sanitized SVG bytes also participate in the post revision.
-Output-affecting changes require updated identity tags and corpus evidence.
-
-The [renderer tests](../crates/diagram-renderer/tests) cover native protocol and concurrent submissions.
-The [Markdown renderer](../crates/server/src/render/markdown.rs) and
-[SVG sanitizer](../crates/server/src/render/svg.rs) keep their boundary tests beside the policy.
-Corpus checks fix output bytes; separate supervisor checks exercise deadlines and reaping.
-Passing a small corpus does not establish production throughput or the full release acceptance matrix.
-
-Related: [content images](content-images.md), [system design](design.md#rendering-and-assets),
-and [system evidence](system-evidence.md).
+Detailed SVG budgets are defined in the [sanitizer](../crates/server/src/render/svg.rs).
+Operators can inspect [renderer resource limits](../crates/diagram-renderer/src/protocol.rs).

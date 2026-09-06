@@ -214,29 +214,15 @@ It shares neither the public nor the administration router.
 
 ## Documentation
 
-- [System design](docs/design.md) defines architecture, data ownership, and
-  trust boundaries.
-- [Managed Git runbook](docs/managed-source.md) covers setup, synchronization,
-  status, and failure recovery.
-- [Local development runbook](docs/local-development.md) covers the included
-  HTTPS environment and browser workflow.
-- [Content rendering](docs/content-rendering.md) defines code-language classes,
-  Mermaid rendering, sanitization, and limits.
-- [Content images](docs/content-images.md) covers site and article images.
-- [Agent grants](docs/agent-management.md) covers delegated access and revocation.
-- [NixOS deployment](docs/deployment.md) covers the gateway, service boundaries,
-  credentials, and initialization.
-- [Backup and restore](docs/backup-restore.md) covers encrypted Litestream
-  checkpoints, key recovery, and offline acceptance.
-- [Observability](docs/observability.md) covers metrics and the Grafana dashboard.
-- [Public serving](docs/public-serving.md) covers request limits and shutdown.
-- [System evidence](docs/system-evidence.md) separates automated checks from
-  remaining owner acceptance.
-- [Release preparation](docs/release.md) covers candidate artifacts and approval.
-- [Remaining implementation work](docs/implementation.md) lists unfinished
-  product, operations, and release work.
-- [Engineering style](docs/quality.md) defines code, test, and documentation
-  conventions.
+| Task | Read |
+| --- | --- |
+| Run locally, use the CLI, or manage agent grants | [Local development](docs/local-development.md) |
+| Author articles, diagrams, and images | [Content rendering](docs/content-rendering.md) |
+| Connect and troubleshoot a Git source | [Managed Git](docs/managed-source.md) |
+| Operate a home-server deployment | [Deployment](docs/deployment.md), [backup and restore](docs/backup-restore.md), [metrics](docs/observability.md) |
+| Publish packages or install a release | [Releases](docs/release.md) |
+| Develop Maincopy | [Design](docs/design.md), [engineering quality](docs/quality.md), [remaining work](docs/implementation.md) |
+| Follow the unfinished mailing-list feature | [Email privacy and delivery plan](docs/email-delivery.md) |
 
 ## Development
 

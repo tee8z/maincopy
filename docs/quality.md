@@ -133,6 +133,10 @@ not precedent. Reviews must approve and document exceptions.
   Do not restate syntax.
 - Use `#[expect(lint, reason = "...")]` for a narrow lint exception.
 - Do not leave unowned placeholders. Label target and implemented behavior.
+- Keep one maintained explanation per topic. Link to it instead of repeating
+  architecture, procedures, or acceptance lists across documents.
+- Record batch-by-batch test history in commits and CI. Keep only the current
+  validation baseline and remaining acceptance in the implementation plan.
 
 ## Dependencies and checks
 
@@ -168,3 +172,7 @@ tests or unnecessary function splits.
 A pull request must explain each project trait, trivial getter, unsafe block,
 lint exception, dependency, or public item. State the production need and why
 an existing simpler pattern cannot satisfy it.
+
+The Git polling fixture has one approved test-only visibility exception:
+`SourcePollArm` and `observe_poll_arms`, both under `cfg(test)`, provide a bounded
+cross-module handoff for timer coordination. They do not expand the production API.
