@@ -2,6 +2,12 @@
 
 use std::{sync::Arc, time::Duration};
 
+#[cfg(test)]
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::Instant,
+};
+
 use maincopy_shared::source::{
     BeginSourceSyncResponse, ListSourceSyncsResponse, ReconfigureSourceRequest,
     SourceDeployKeyResponse, SourceStatusResponse, SourceSyncAdmission, SourceSyncFailureCode,
@@ -384,6 +390,8 @@ impl ManagedSourceEngine {
         ManagedSourceSync {
             engine: self,
             publications,
+            #[cfg(test)]
+            poll_arms: None,
         }
     }
 
@@ -694,24 +702,67 @@ enum PreparedOperation {
 pub(crate) struct ManagedSourceSync {
     engine: ManagedSourceEngine,
     publications: PublicationCoordinatorHandle,
+    #[cfg(test)]
+    poll_arms: Option<mpsc::Sender<SourcePollArm>>,
+}
+
+/// Test-owned handoff between reading the persisted deadline and constructing
+/// its Tokio timer. The returned Instant is the actual timer deadline, rather
+/// than a wall-clock estimate made by a separately scheduled task.
+#[cfg(test)]
+pub(crate) struct SourcePollArm {
+    pub(crate) next_poll_at: Option<OffsetDateTime>,
+    pub(crate) release: oneshot::Sender<()>,
+    pub(crate) armed: oneshot::Receiver<Instant>,
 }
 
 impl ManagedSourceSync {
+    #[cfg(test)]
+    pub(crate) fn observe_poll_arms(&mut self) -> mpsc::Receiver<SourcePollArm> {
+        let (sender, receiver) = mpsc::channel(1);
+        self.poll_arms = Some(sender);
+        receiver
+    }
+
+    #[cfg(test)]
+    async fn wait_for_poll_release(
+        &self,
+        next_poll_at: Option<OffsetDateTime>,
+    ) -> Option<oneshot::Sender<Instant>> {
+        let observer = self.poll_arms.as_ref()?;
+        let (release, released) = oneshot::channel();
+        let (armed, deadline) = oneshot::channel();
+        observer
+            .send(SourcePollArm {
+                next_poll_at,
+                release,
+                armed: deadline,
+            })
+            .await
+            .ok()?;
+        released.await.ok()?;
+        Some(armed)
+    }
+
     pub(crate) async fn run(self) -> Result<(), ManagedSourceSyncError> {
         loop {
-            let poll_delay = match self.engine.handle.store.configuration().await? {
-                Some(configuration) => configuration
-                    .next_poll_at
-                    .map(|deadline| delay_until(deadline, OffsetDateTime::now_utc()))
-                    .unwrap_or_else(|| {
-                        Duration::from_secs(
-                            configuration.configuration.poll_interval_seconds.seconds(),
-                        )
-                    }),
-                None => return Err(ManagedSourceSyncError::ConfigurationUnavailable),
+            let Some(configuration) = self.engine.handle.store.configuration().await? else {
+                return Err(ManagedSourceSyncError::ConfigurationUnavailable);
             };
+            let poll_delay = configuration
+                .next_poll_at
+                .map(|deadline| delay_until(deadline, OffsetDateTime::now_utc()))
+                .unwrap_or_else(|| {
+                    Duration::from_secs(configuration.configuration.poll_interval_seconds.seconds())
+                });
+            #[cfg(test)]
+            let armed = self.wait_for_poll_release(configuration.next_poll_at).await;
             let poll = tokio::time::sleep(poll_delay);
             tokio::pin!(poll);
+            #[cfg(test)]
+            if let Some(armed) = armed {
+                let _ = armed.send(poll.deadline());
+            }
             tokio::select! {
                 biased;
                 () = self.engine.cancellation.cancelled() => {

@@ -22,27 +22,28 @@ ownership, and trust boundaries. Each change must also follow the
 
 ```mermaid
 flowchart LR
-    Product[1. Product closure] --> Operations[2. Deployment and recovery]
-    Operations --> Review[3. Security and system evidence]
-    Review --> Mail[4. Conditional mailing list]
-    Review --> Release[5. Release candidate]
-    Mail --> Release
+    Mail[Email implementation and privacy] --> Home[Home-server preparation]
+    Automation[Release configuration] --> Home
+    Home --> Acceptance[Provider and deployed-system acceptance]
+    Acceptance --> Release[First public release]
 ```
 
-1. Complete real-signer acceptance for the browser and human CLI.
-2. Complete deployed-host acceptance and actual encrypted Backblaze B2 recovery.
-3. Record representative production limits, backup lag, and recovery measurements.
-4. Complete the security review, system matrix, documentation, and release dry run.
-5. After core V1 passes, implement the conditional mailing-list increment if its
-   full privacy and dispatch gates can pass before the first release.
+1. Complete the email implementation, including privacy, removal, dispatch, and recovery protection.
+2. Configure GitHub Actions publishing for all workspace crates and versioned Nix flake use.
+   The release workflow is implemented and locally validated; account and runner setup remain.
+   Release configuration can proceed independently of email implementation.
+3. Prepare the home server, network boundaries, storage, and protected credentials.
+4. Connect the provider, DNS, signers, monitoring, and encrypted Backblaze B2 recovery.
+5. Complete deployed-system, privacy, deliverability, security, and release acceptance before going live.
 
 Run independent product-closure workstreams in isolated checkouts. Review shared
 API and router changes during integration. Remove completed backlog items after
 the integrated batch passes its final quality checks.
 
-Do not begin subscriptions while the existing core V1 work remains incomplete.
+Implement email before deployment as requested by the owner.
 Keep capture and sending disabled until privacy, recovery, dispatch, and
-deliverability acceptance pass together.
+deliverability acceptance pass together. Provider and DNS verification belongs
+to the later connection and deployment work; local fixtures do not complete it.
 Automatic X, Substack, and Nostr delivery, multi-site hosting, and Git write-back
 remain outside V1.
 
@@ -151,33 +152,34 @@ audit and package preparation rehearsal. Fixture results do not close these exte
 
 ## 4. Conditional first-release subscriptions and email
 
-Implement this increment only after the existing core V1 gates pass. The owner
-wants it in the first release if its complete acceptance can be achieved.
+Implement this increment now, before home-server deployment.
+The owner wants its complete privacy and dispatch behavior in the first release.
 The [mailing-list and dispatch plan](email-delivery.md) defines the design boundary.
+Use a specialist newsletter service, such as Mailchimp, for subscriber data and delivery.
+AWS email services and DynamoDB are excluded. Keep subscriber addresses out of site backups.
 
 ### 4.1 Complete privacy and removal before capture
 
 - Treat addresses as PII, with explicit consent, double opt-in, and bounded retention.
-- Select address comparison, storage protection, key recovery, and provider-data policies.
+- Select the provider, hosted consent flow, deletion behavior, and retention policy.
 - Implement visible unsubscribe, mailbox-provider one-click `POST`, and address removal.
   Scanner `GET` requests must never change consent.
-- Atomically revoke consent and cancel work not admitted for submission.
-  Make repeated requests idempotent.
-- Remove unnecessary address copies from live state, tokens, payloads, exports, and the provider.
-  Expose pending cleanup honestly and keep it retryable without permitting sends.
-- Define minimal pseudonymous suppression evidence, access control, and retention.
-- Implement finite remote backup retention or a reviewed PII storage boundary.
-  Reconcile erasure and suppression before restoring subscriber access or delivery.
+- Use the provider's current consent and suppression state; Maincopy must not recreate it from local copies.
+- Complete permanent removal through the provider, with honest pending states.
+  Resolve delayed deletion versus fresh re-consent before enabling the combined control.
+- Keep addresses, contact hashes, control tokens, and recipient exports out of Maincopy and its checkpoints.
+- Document provider retention, suppression, re-enrollment, and tracking limits.
 - Prove that older backups cannot resurrect an address, prior consent, or queued email.
 - Keep signup and sending disabled until privacy, recovery, dispatch, and
   deliverability acceptance all pass.
 
 ### 4.2 Build durable dispatch and owner-reviewed campaigns
 
-- Keep consent, campaigns, recipients, attempts, events, and cleanup as typed capabilities.
+- Keep reviewed campaigns, provider campaign identities, attempts, and status as typed local capabilities.
+  The provider owns subscribers and individual recipient dispatch.
 - Use transactional outbox writes, bounded claims, leases, fencing, and unique delivery identities.
 - Bind campaigns to reviewed public revisions, email bytes, sender, audience cutoff, and authorization.
-- Recheck current consent before submission. Define the unavoidable in-flight delivery boundary.
+- Verify provider audience selection and current suppression enforcement. Define the in-flight delivery boundary.
 - Model provider acceptance separately from delivery and ambiguous timeout outcomes.
   Respect provider idempotency windows; never blindly retry an uncertain submission.
 - Handle quotas, backoff, budgets, cancellation, complaints, hard bounces, and event replay.
@@ -188,7 +190,7 @@ The [mailing-list and dispatch plan](email-delivery.md) defines the design bound
 
 - Compare current provider costs against expected subscribers and send frequency.
   Include minimum charges, data, events, retention, and operating effort.
-- Record the chosen region, production access, sender identity, quotas, and credential permissions.
+- Record the chosen account and plan, sender identity, quotas, and credential permissions.
 - Execute a documented SPF, DKIM, DMARC, and custom return-path setup.
 - Verify signed one-click headers, a visible removal control, bounce and complaint processing,
   controlled volume ramp-up, and monitoring with real test mailboxes.
@@ -206,19 +208,23 @@ Keep the mailing-list increment as the next release task; do not ship capture al
 
 ## 5. Release candidate
 
-Prepare a candidate without publishing an artifact until the owner approves it.
+The [release workflow](../.github/workflows/release.yml) prepares all five crates
+from the same reviewed version and signed tag. It verifies signatures and
+checksums before publishing through one protected environment.
+The [release runbook](release.md) covers version-pinned GitHub flake use and retries.
+Complete the following configuration and acceptance before the first publication.
 
 Deliverables:
 
 - Select a semantic version and finalize the [Unreleased changelog](../CHANGELOG.md#unreleased).
-- Select distribution channels, advertised platforms, registry package names, and the authorized publishing identity.
+- Configure the authorized crates.io publisher, trusted signer, protected release environment, and immutable releases.
+- Provision a dedicated ARM64 release runner with working KVM, then execute both Linux architecture gates. Local x86_64 checks do not establish arm64 acceptance.
 - Update workspace and dependency versions together; refresh development-version text in crate READMEs.
 - Repeat the clean source, Nix, and package checks for the selected release version and platforms.
 - Generate final checksums and dependency inventory for those exact artifacts.
 - Review dependency licenses and include required third-party notices in the selected distribution.
-- Record the approved signing fingerprints under the [signed tag policy](release.md#sign-the-tag-and-stage-a-draft).
-- Protect publishing credentials behind owner approval. If publishing is automated, pin each release action to an immutable commit.
-- Test idempotent recovery after each publication step.
+- Record the approved signing fingerprint under the [signed tag policy](release.md#prepare-and-sign-the-candidate).
+- Verify the protected environment's owner approval and branch restrictions before dispatch.
 
 Required evidence:
 

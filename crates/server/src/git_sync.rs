@@ -2754,7 +2754,19 @@ mod tests {
             fixture.compiler.clone(),
             fixture.cancellation.clone(),
         );
-        let source_task = tokio::spawn(engine.into_live(publications.clone()).run());
+        let mut live_source = engine.into_live(publications.clone());
+        let mut poll_arms = live_source.observe_poll_arms();
+        let source_task = tokio::spawn(live_source.run());
+        let initial_arm =
+            tokio::time::timeout(std::time::Duration::from_secs(10), poll_arms.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        initial_arm.release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), initial_arm.armed)
+            .await
+            .unwrap()
+            .unwrap();
         let armed = source
             .begin_manual(mutation_audit(fixture.owner, 30))
             .await
@@ -2765,9 +2777,6 @@ mod tests {
         })
         .await;
         assert_eq!(armed.outcome, Some(SourceSyncOutcome::NoChange));
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
         fixture.commit_valid_revision();
         let pushed_commit = fixture_commit(&fixture.work);
         let next_poll_at = fixture
@@ -2782,8 +2791,37 @@ mod tests {
         let wall_delay = (next_poll_at - OffsetDateTime::now_utc())
             .try_into()
             .unwrap_or(std::time::Duration::ZERO);
+        let mut pending_arm =
+            tokio::time::timeout(std::time::Duration::from_secs(10), poll_arms.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(pending_arm.next_poll_at, Some(next_poll_at));
+        assert!(matches!(
+            pending_arm.armed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        // Force the interleaving that two yield_now calls did not exclude:
+        // the durable manual result is visible while the actor has not yet
+        // constructed its next timer. Advancing before that arm is insufficient.
         tokio::time::pause();
         tokio::time::advance(wall_delay + std::time::Duration::from_secs(1)).await;
+        assert!(matches!(
+            pending_arm.armed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        pending_arm.release.send(()).unwrap();
+        let armed_deadline =
+            tokio::time::timeout(std::time::Duration::from_secs(10), pending_arm.armed)
+                .await
+                .unwrap()
+                .unwrap();
+        let remaining = armed_deadline - tokio::time::Instant::now();
+        assert!(!remaining.is_zero());
+        // This deadline belongs to the observed re-arm, even when actor/SQLite
+        // scheduling delayed it past the test's earlier virtual-clock advance.
+        drop(poll_arms);
+        tokio::time::advance(remaining + std::time::Duration::from_secs(1)).await;
         tokio::time::resume();
 
         let polled = wait_for_terminal_source_sync(&fixture.store.source, |sync| {

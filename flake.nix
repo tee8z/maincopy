@@ -298,6 +298,7 @@
               project.pkgs.caddy
               project.pkgs.curl
               project.pkgs.git
+              project.pkgs.gnupg
               project.pkgs.jq
               project.pkgs.just
               project.pkgs.litestream
@@ -305,6 +306,7 @@
               project.pkgs.nixfmt-tree
               project.pkgs.nssTools
               project.pkgs.openssh
+              project.pkgs.python3
               project.pkgs.shellcheck
               project.pkgs.sqlite
               project.pkgs.util-linux

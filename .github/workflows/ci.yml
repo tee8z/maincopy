@@ -54,6 +54,9 @@ jobs:
       - name: Run flake checks
         run: nix flake check --print-build-logs
 
+      - name: Verify release signatures, checksums, and interrupted publication
+        run: nix develop --no-update-lock-file --command python3 scripts/release_test.py
+
       - name: Build Maincopy
         run: nix build --print-build-logs
 

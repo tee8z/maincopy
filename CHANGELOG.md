@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-Changes prepared for the first release. The release version, distribution channels,
-and production acceptance remain pending.
+Changes prepared for the first release. The release version and production
+acceptance remain pending. Distribution uses crates.io and a tagged GitHub Nix flake.
 
 ### Added
 
@@ -28,6 +28,9 @@ and production acceptance remain pending.
   schema and artifact validation, and revocation of restored sessions and agents.
 - Deployment, backup, observability, lifecycle evidence, and release preparation
   runbooks.
+- A signed-tag release workflow for all five crates, source archives, dependency
+  inventories, and versioned GitHub flake use. One protected approval gates
+  publication; checksum checks support interrupted uploads without replacing assets.
 
 ### Fixed
 
@@ -51,3 +54,7 @@ and production acceptance remain pending.
   checkpoint after startup or restore.
 - Retain test port reservations through listener shutdown and rebind assertions
   so concurrent ephemeral allocations cannot make lifecycle checks fail.
+- Coordinate the Git polling fixture with the actor's constructed timer before
+  advancing virtual time, including a deliberately delayed re-arm.
+- Isolate the metrics lifecycle fixture from loopback addresses retained by other
+  concurrent tests while preserving its connection-drain and listener-release checks.

@@ -1,285 +1,262 @@
-# Release candidate preparation
+# Releases
 
-Prepare reviewable artifacts from one signed commit before publishing a release.
-The owner has not selected the first release version or distribution channels.
-The current workspace version is development metadata, not an announced release.
+Maincopy releases publish all five workspace crates to crates.io and expose the
+same signed GitHub tag as a Nix flake. The owner selects the release version.
+The development version in Cargo.toml does not announce a release.
 
-This runbook defines manual preparation. The [CI workflow](../.github/workflows/ci.yml)
-runs checks; it does not publish tags, GitHub Releases, or crates.
-Use [system evidence](system-evidence.md) to track acceptance separately from packaging.
+The [release workflow](../.github/workflows/release.yml) runs from `master` with
+an existing signed tag as input. It prepares a candidate, waits for one owner
+approval, publishes missing crate versions, and publishes the complete GitHub
+Release last. It does not change versions, create commits, or replace tags.
 
-Mailing-list and bulk delivery remain conditional first-release work.
-Require separate privacy and deliverability acceptance before including them in release notes or artifacts.
+Use [system evidence](system-evidence.md#pending-acceptance) for release acceptance.
+Mailing-list and bulk delivery require their own privacy and deliverability
+acceptance before inclusion in a release. A successful package build does not
+satisfy those checks.
 
-## Distribution pieces
+## Configure the release boundary
 
-The Nix package builds the workspace and installs all five executables together.
-The NixOS module adds the gateway, service boundaries, metrics, and encrypted backup jobs.
-The module obtains Litestream and rclone independently from the Rust package.
+Complete this setup before dispatching the first release. These are repository
+and registry settings; the workflow does not configure them.
 
-| Piece | Current output | Distribution requirement |
-| --- | --- | --- |
-| Human and agent CLI | `maincopy` from `maincopy-cli` | Validate HTTPS sign-in and credential storage on each advertised operating system. |
-| Server | `maincopyd` and `maincopy-ssh` from `maincopy-server` | Install the renderer beside the server; make Git and OpenSSH available. |
-| Renderer | `maincopy-mermaid` from `maincopy-diagram-renderer` | Keep the helper and server versions aligned. |
-| Content validator | `markdowncompiler` from `markdown-compiler` | Validates one Markdown file; does not render or publish a site. |
-| Libraries | `maincopy-shared`, `markdown-compiler`, and the renderer library | Registry dependencies for a crates.io distribution; no separate running services. |
-| NixOS deployment | `nixosModules.default` | Pin the reviewed source revision and supply protected host credentials. |
-| Operator assets | Runbooks and `deploy/grafana/maincopy.json` | Include these in the source archive. |
+| Setting | Required value or action |
+| --- | --- |
+| Protected source | Protect `master` and review changes to the workflow and `scripts/release*`. Require signed release commits. |
+| Tag rules | Restrict creation of `v*` tags to release maintainers. Prohibit updates and deletion of release tags. |
+| Repository variable `RELEASE_GPG_PUBLIC_KEY` | ASCII-armored public key for the approved release signer. Never provide the private key. |
+| Repository variable `RELEASE_GPG_FINGERPRINT` | Full uppercase primary-key fingerprint, checked through an independent trusted channel. |
+| Environment `release` | Require an owner review and restrict deployments to the `master` branch. Do not leave an automatically created, unprotected environment in place. |
+| Environment secret `CARGO_REGISTRY_TOKEN` | A crates.io token authorized to create or publish all five package names. Keep it in this environment, not in repository files or command arguments. |
+| GitHub Release setting | Enable immutable releases before publication. The job verifies immutability after publishing. |
+| Actions permissions | Allow the publication job's `contents: write` permission. Preparation jobs have read access only. |
+| Builders | Use hosted `ubuntu-24.04` for x86_64. Provision the ARM64 KVM runner described below. Both Nix checks must pass; neither architecture is an optional gate. |
 
-The initial prepared distribution is the source archive and its Nix outputs.
-This preparation does not select the public release channels or version.
-Registry publishing remains conditional on the checks below.
+The owner must verify crate namespace availability or existing ownership before
+approval. The first upload claims a previously unused name. A matching registry
+checksum does not prove that a maintainer controls that package.
 
-## Select and freeze the candidate
+The workflow intentionally has no tag-push trigger. A workflow loaded from an
+unverified tag cannot establish its own trust by calling a verifier from that
+same tag. Each job instead checks out the dispatched `master` revision under
+`automation/`, then checks out the candidate under `candidate/`. The trusted
+helper verifies the tag and commit before running candidate build commands.
+Only dispatches from `master` run these jobs. The protected environment provides
+the separate authorization to publish.
 
-The owner selects the version, supported platforms, distribution channels, and
-trusted signing key fingerprints. Record those decisions with the candidate.
-Version and packaging changes require their own review and appropriate checks.
-Use signed Conventional Commits, such as
-`git commit -S -m "chore(release): prepare candidate metadata"`.
-Stop if signing fails.
+Signature verification uses a temporary GPG keyring with the configured public
+key. Both the annotated tag and its target commit must match the approved
+primary fingerprint. The tag must match the workspace version, point to the
+checked-out commit, and target a commit reachable from `origin/master`.
+The verifier also checks the tag object's internal name. SSH signatures are
+not accepted by this workflow; the current release signing policy uses GPG.
 
-Keep the workspace version, inherited package versions, internal dependency
-requirements, lockfile, and Maincopy derivation versions consistent.
-The [flake](../flake.nix) reads its Maincopy version from the workspace manifest.
-Do not change the independently pinned Litestream version to match Maincopy.
-Review package contents, README links, license files, and the
-[Unreleased changelog](../CHANGELOG.md#unreleased).
+See GitHub's [deployment environment rules](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+and [immutable release guarantees](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
+With an administrator's authenticated GitHub CLI, confirm immutability before
+approving a release:
 
-Run the following in one Bash session from the clean candidate checkout.
-The operator environment needs Git, Nix, Cargo, Python 3.11 or later, jq,
-GNU tar, gzip, and SHA-256 tools.
-GitHub staging later also needs authenticated GitHub CLI access.
-Prepare artifacts on Linux with a checkout and extraction tool that preserve symbolic links.
-Each crate's `LICENSE` links to the root license; Cargo includes its resolved bytes.
-A Windows checkout with `core.symlinks=false` contains link text and cannot prepare these packages correctly.
+~~~bash
+gh api repos/tee8z/maincopy/immutable-releases | jq -e '.enabled == true'
+~~~
+
+A permission error does not prove that immutability is enabled. Resolve it or
+confirm the setting in the repository UI before approval.
+
+## Provision the ARM64 release runner
+
+The ARM matrix entry requires all four labels:
+`[self-hosted, linux, ARM64, maincopy-release-kvm]`. Provisioning and the first
+successful ARM release check remain external acceptance work. This repository
+does not create or register the runner.
+
+Use a dedicated Ubuntu 24.04 ARM64 host with hardware KVM, or an ARM64 virtual
+machine with verified nested KVM support. GitHub's hosted ARM64 fleet does not
+expose the KVM device required by the current NixOS VM gate. This is a host
+limitation; adding a label, container privilege, or a Nix feature flag does not
+provide virtualization. See the [GitHub runner limitation](https://github.com/actions/runner-images/issues/14062#issuecomment-5352403358).
+
+Provision Git, Python 3, GPG, and passwordless sudo for the existing Nix and
+AppArmor setup steps. Make `/dev/kvm` usable by the runner account and Nix build
+users. The Nix builder must advertise real `kvm` and `nixos-test` capabilities.
+Allow capacity for the configured 3 GiB guest and the concurrent Rust/Nix builds.
+The workflow first checks native architecture and opens `/dev/kvm` to query its
+API version, then checks Nix's declared features. The complete VM test remains
+the proof that the builder can run Maincopy's deployment checks.
+
+Use a fresh, ephemeral runner environment for each trusted release run. Restrict
+runner access to the approved release workflow; never use it for untrusted pull
+requests or keep production credentials on it. Labels select runners and do not
+provide access control. Apply repository or runner-group access controls before
+registration. See [GitHub runner routing](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/use-in-a-workflow).
+
+Both architectures still execute the full `nix flake check`, including
+`deployment-vm`, and build the package. Missing runner capacity leaves that gate
+pending; it does not permit publication. The workflow does not substitute
+software emulation or extend the VM's existing 60-second readiness deadlines.
+
+## Prepare and sign the candidate
+
+Select the version and review the [changelog](../CHANGELOG.md#unreleased).
+Keep the workspace version, all five inherited package versions, internal
+exact dependency requirements, and Cargo.lock consistent. The Maincopy Nix
+version comes from the workspace manifest. Litestream has its own version.
+
+Use signed Conventional Commits for the reviewed version changes. Complete the
+[quality gates](quality.md#crap-risk-check), Windows client checks, and applicable
+owner acceptance for that exact commit. Record the evidence with the release
+review. The workflow repeats the Nix checks; it does not calculate the manual
+CRAP score or verify real signer, keychain, B2, or production acceptance.
+
+Ordinary CI and release preparation also run the release helper tests through
+`nix develop`. The development shell supplies Python, GPG, and the pinned Cargo
+toolchain; tests use temporary keys, repositories, and a loopback registry.
+
+Prepare on Linux with symlinks preserved. Each crate's LICENSE and README.md
+links to repository documentation; Cargo packages their resolved contents.
+A checkout with `core.symlinks=false` does not provide those bytes.
+
+From the clean, reviewed `master` checkout, create the signed annotated tag.
+These commands publish the tag and start preparation; the protected job later
+waits for approval before any crate or GitHub Release upload.
 
 ~~~bash
 set -euo pipefail
+test "$(git branch --show-current)" = master
 test -z "$(git status --porcelain)"
-release_checkout="$PWD"
-release_revision="$(git rev-parse HEAD)"
-git verify-commit "$release_revision"
 release_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
 release_tag="v$release_version"
-git check-ref-format "refs/tags/$release_tag"
-release_system="$(nix eval --impure --raw --expr builtins.currentSystem)"
-release_root="$(mktemp -d /tmp/maincopy-release.XXXXXX)"
-release_artifacts="$release_root/artifacts"
-mkdir "$release_artifacts"
-for release_license in crates/*/LICENSE; do
-  test -L "$release_license"
-  cmp -- LICENSE "$release_license"
-done
-cargo metadata --locked --no-deps --format-version 1 > "$release_root/workspace.json"
-jq -e --arg version "$release_version" 'all(.packages[]; .version == $version)' "$release_root/workspace.json"
-test "$(nix eval --raw --no-update-lock-file ".#packages.$release_system.default.version")" = "$release_version"
-~~~
-
-Check the reported commit signer against the owner's trusted fingerprints.
-A valid signature alone does not establish an approved signer.
-Configure the verifier's trusted keyring or SSH allowed-signers file before verification.
-Retain the complete commit ID and tool versions with the evidence.
-
-## Build the committed source archive
-
-The archive contains committed files only. Keep generated evidence outside the
-checkout so a retry cannot silently include local state.
-
-~~~bash
-git archive --format=tar --prefix="maincopy-$release_version/" "$release_revision" |
-  gzip -n > "$release_artifacts/maincopy-$release_version-source.tar.gz"
-mkdir "$release_root/source"
-tar -xzf "$release_artifacts/maincopy-$release_version-source.tar.gz" -C "$release_root/source"
-release_source="$release_root/source/maincopy-$release_version"
-tar -tzf "$release_artifacts/maincopy-$release_version-source.tar.gz" > "$release_root/source-files.txt"
-nix flake check --no-update-lock-file --print-build-logs "path:$release_source"
-nix build --no-update-lock-file --no-link --print-out-paths --print-build-logs \
-  "path:$release_source#packages.$release_system.default" > "$release_root/output-path.txt"
-release_output="$(cat "$release_root/output-path.txt")"
-"$release_output/bin/maincopyd" --version
-"$release_output/bin/maincopy" --version
-~~~
-
-Inspect the archive listing for required templates, frontend files, migrations,
-helpers, licenses, and fixtures. Compare binary versions with the selected version.
-The flake defines `x86_64-linux` and `aarch64-linux` outputs.
-Run the checks for every advertised platform on a capable native or remote builder.
-One host's flake check does not prove another architecture passed.
-
-Complete the manual CRAP gate from [quality.md](quality.md#crap-risk-check).
-Record the configured tool versions and results for the same source revision.
-Do not infer CRAP success from Nix or CI.
-
-## Record dependencies and artifact identity
-
-Generate the Rust inventory from the extracted source, including enabled features.
-This inventory and the Nix closure record are not a vulnerability or license audit.
-
-~~~bash
-(
-  cd "$release_source"
-  cargo metadata --locked --all-features --format-version 1 |
-    jq '(.resolve.nodes | map({key: .id, value: .features}) | from_entries) as $features |
-      [.packages[] | {name, version, source, license, features: $features[.id]}] |
-      sort_by(.name, .version)' \
-      > "$release_artifacts/rust-dependencies.json"
-)
-cp "$release_source/Cargo.lock" "$release_artifacts/Cargo.lock"
-cp "$release_source/flake.lock" "$release_artifacts/flake.lock"
-nix flake metadata --json --no-update-lock-file "path:$release_source" \
-  > "$release_root/nix-metadata.json"
-nix path-info --recursive --json "$release_output" \
-  > "$release_artifacts/nix-closure-$release_system.json"
-~~~
-
-Keep the raw Nix metadata with private preparation logs; it contains local source paths.
-The copied `flake.lock` records the pinned inputs for the public dependency inventory.
-Review the dependency inventory before staging it.
-
-If the owner selects downloadable Nix closures, export the complete runtime closure:
-
-~~~bash
-nix-store --query --requisites "$release_output" > "$release_root/closure-paths.txt"
-mapfile -t release_closure < "$release_root/closure-paths.txt"
-nix-store --export "${release_closure[@]}" |
-  gzip -n > "$release_artifacts/maincopy-$release_version-$release_system.nix-export.gz"
-~~~
-
-Verify import and startup in an isolated Nix environment before offering that asset.
-Do not treat copied executables as a standalone Nix distribution.
-If registry packages are selected, finish their preparation below before finalizing checksums.
-
-~~~bash
-(
-  cd "$release_artifacts"
-  for release_artifact in *; do
-    if [[ "$release_artifact" != SHA256SUMS ]]; then
-      sha256sum -- "$release_artifact"
-    fi
-  done > "$release_root/SHA256SUMS"
-  cp "$release_root/SHA256SUMS" SHA256SUMS
-  sha256sum --check SHA256SUMS
-)
-~~~
-
-Generate this manifest once the artifact set is complete. On retry, verify it first.
-If an artifact changes, prepare a new reviewed manifest before creating or publishing a tag.
-
-## Conditional crates.io preparation
-
-Registry distribution remains undecided. Metadata and package contents must pass
-verification for the exact candidate before a crate can be approved for publication.
-
-Before a registry dry run, the owner approves the package set and verifies namespace
-availability or existing ownership. Match internal dependency requirements to the selected version.
-Review each package's description, repository, README, license, and included files.
-Verify a fresh installation can locate the server's renderer and SSH helper.
-Keep these changes in the reviewed candidate commit.
-
-The current dependency order is:
-
-| Packages | Workspace dependency prerequisite |
-| --- | --- |
-| `maincopy-shared`, `maincopy-diagram-renderer`, `markdown-compiler` | None |
-| `maincopy-cli` | `maincopy-shared` |
-| `maincopy-server` | All three prerequisite packages |
-
-Use Cargo with workspace publishing support and record its exact version.
-Cargo stages the selected workspace dependencies together, so unpublished
-prerequisites do not require a preliminary upload.
-See the [Cargo packaging reference](https://doc.rust-lang.org/cargo/commands/cargo-package.html).
-
-If all five packages are selected, run this from the clean extracted source:
-
-~~~bash
-cd "$release_source"
-cargo package --locked --list --workspace
-cargo publish --dry-run --locked --workspace --target-dir "$release_root/cargo-target"
-~~~
-
-The [publish dry run](https://doc.rust-lang.org/cargo/commands/cargo-publish.html)
-builds the packages and performs registry checks without uploading.
-It requires network access even when all dependencies are cached.
-Record the toolchain version, output, and paths of the newly generated crate archives.
-The verified Cargo version stages publish archives in `package/tmp-crate/` below the target directory.
-Do not substitute older archives left by a previous `cargo package` invocation.
-
-For a smaller approved package set, replace `--workspace` with explicit `--package` selections.
-Include each unpublished prerequisite in that selection.
-Copy only approved archives into the artifact directory before finalizing checksums.
-Verify each archive contains its README and a regular `LICENSE` with the root license bytes.
-Review normalized manifests for registry versions and absent local dependency paths.
-
-Package verification builds runtime targets. It does not run the complete workspace tests.
-Some test fixtures reference files outside their crate; use the source archive for the canonical test gate.
-
-Do not bypass verification with `--allow-dirty` or `--no-verify`.
-Actual publication requires the approved version, package set, and publication sequence.
-After an interrupted upload, inspect the registry version and checksum before retrying.
-An existing version with different bytes requires investigation, not a replacement upload.
-
-## Sign the tag and stage a draft
-
-Complete the owner signer, actual B2 recovery, VM, and production checks listed in
-[system evidence](system-evidence.md#pending-acceptance) before declaring release acceptance.
-Keep unresolved checks visible in the draft notes.
-Prepare the exact release notes as `$release_root/release-notes.md`.
-Include the commit, platforms, artifacts, checksums, dependency inventory, and acceptance results.
-
-After the owner approves the candidate version and artifact identities, create a
-signed annotated tag that binds the checksum manifest:
-
-~~~bash
-cd "$release_checkout"
-release_checksums="$(sha256sum "$release_artifacts/SHA256SUMS" | cut -d ' ' -f 1)"
-git tag -s "$release_tag" "$release_revision" \
-  -m "Maincopy $release_version; SHA256SUMS $release_checksums"
+release_commit="$(git rev-parse HEAD)"
+git verify-commit "$release_commit"
+git tag -s "$release_tag" "$release_commit" -m "Maincopy $release_version"
 git verify-tag "$release_tag"
-test "$(git cat-file -t "$release_tag")" = tag
-test "$(git rev-parse "$release_tag^{commit}")" = "$release_revision"
+git push origin "$release_tag"
+gh workflow run release.yml --repo tee8z/maincopy --ref master -f tag="$release_tag"
 ~~~
 
-Reject an unsigned tag, unexpected signer, version mismatch, or different commit.
-If the tag already exists, verify its signature, target, and checksum annotation.
-Reuse a matching tag; do not delete or force-move it.
+Check the displayed signer against the approved fingerprint. Stop if signing
+or verification fails. If the tag already exists, verify it and dispatch that
+same tag; do not run the tag-creation command again or force an update.
+The signed tag binds the source commit. The generated checksum manifest is a
+release asset, not part of the tag annotation.
 
-Remote staging is a separate action. Pushing a tag exposes it publicly.
-Run these commands only after authorization to push the tag and create the draft:
+## Review the prepared candidate
+
+| Stage | Evidence and behavior |
+| --- | --- |
+| Signature and metadata | Approved GPG signer, signed commit, exact tag, five package identities, matching version pins and license bytes. |
+| Cargo preparation | `cargo publish --dry-run --locked --workspace --registry crates-io` using the toolchain pinned by flake.lock. Cargo verifies the extracted packages and their dependency graph without uploading. |
+| Nix validation | Both `x86_64-linux` and `aarch64-linux` run `nix flake check` and build the committed source archive. |
+| Candidate sealing | The `release-candidate` Actions artifact contains the source archive, five `.crate` files, lockfiles, Rust dependency inventory, both Nix closure inventories, release identity, notes, and SHA256SUMS. |
+| Owner approval | Review that artifact, the job results, the intended version, ownership/settings, and the external acceptance record. Approve the `release` environment once. |
+| Publication | Reverify signed identity and artifact checksums, publish missing crate versions, upload missing matching draft assets, then publish the GitHub Release. |
+
+The source archive uses `git archive` and a gzip stream with a fixed timestamp.
+Cargo archives come from a fresh publish dry run's `package/tmp-crate/` directory;
+stale package output is not accepted. The helper checks packaged README, license,
+and clean Git identity. Nix inventories omit machine-specific registration times.
+Dependency inventories describe the build inputs; they are not a license or
+vulnerability audit.
+
+Download `release-candidate` from the workflow run before approval. In its
+extracted directory, verify the manifest:
 
 ~~~bash
-git push origin "refs/tags/$release_tag:refs/tags/$release_tag"
-gh release view "$release_tag" --json tagName,isDraft,targetCommitish,assets
+sha256sum --check SHA256SUMS
 ~~~
 
-If a draft already exists, verify its tag and continue with its missing assets.
-If lookup fails from authentication or network errors, stop.
-Create a draft only after an authenticated lookup confirms that no release exists:
+Read release.json and release-notes.md. SHA256SUMS covers the complete expected
+asset set, including both files. Changes to any prepared asset stop publication.
+Actions artifacts are retained for 30 days; keep the approved evidence with the
+release record. Package verification builds runtime targets, so it does not
+replace the complete source test gate.
+
+## Publication order and retries
+
+| Crate | Workspace prerequisites |
+| --- | --- |
+| `maincopy-shared` | None |
+| `maincopy-diagram-renderer` | None |
+| `markdown-compiler` | None |
+| `maincopy-cli` | `maincopy-shared` |
+| `maincopy-server` | The first three crates |
+
+The helper checks every existing version before uploading. It rejects a yanked
+version or a checksum mismatch. It then gives Cargo the remaining package set;
+Cargo orders dependencies and waits for registry visibility.
+The release-only [credential provider](../scripts/release_credential.py) checks
+Cargo's actual archive checksum immediately before each upload. It returns an
+uncached credential only for the prepared package/version/checksum. There is no
+fallback token provider for publication. See Cargo's
+[publish behavior](https://doc.rust-lang.org/cargo/commands/cargo-publish.html),
+[credential protocol](https://doc.rust-lang.org/cargo/reference/credential-provider-protocol.html),
+and [registry checksum contract](https://doc.rust-lang.org/cargo/reference/registry-index.html).
+
+A five-crate release is not an atomic registry transaction. After an interrupted
+upload, some immutable versions can already exist. Retry the failed publication
+job to reuse the same candidate artifact, or dispatch a new run for the same
+signed tag. A new run prepares and checks the candidate again. Cargo can finish
+an upload before its visibility wait times out; the helper checks registry
+state before proceeding. It never treats a network or authorization error as
+proof that a version is absent.
+
+Do not rerun every successful job inside the same workflow run: the artifact
+names are immutable within that run. Use a new dispatch for full preparation.
+If the toolchain, archive bytes, or tag identity differ on retry, stop and
+investigate. Do not edit the checksum manifest to authorize a replacement.
+
+GitHub publication starts with a draft. Existing assets must have the expected
+name, size, uploaded state, and GitHub SHA-256 digest. The helper checks all
+existing assets before uploading missing ones and never overwrites them.
+It publishes only after every crate is visible and every asset is complete.
+A completed matching release makes a retry read-only.
+An incomplete GitHub asset or an unexpected asset requires owner inspection;
+automation does not delete it. A missing asset on an already published release
+also stops the run. See the [release assets API](https://docs.github.com/en/rest/releases/assets).
+
+## Install the released version
+
+Replace `vX.Y.Z` with the published immutable tag. Nix needs the `nix-command`
+and `flakes` experimental features enabled. The tagged flake supports Linux
+x86_64 and arm64. Its package installs `maincopy`, `maincopyd`, `maincopy-ssh`,
+`maincopy-mermaid`, and `markdowncompiler` together.
 
 ~~~bash
-gh release create "$release_tag" --verify-tag --draft \
-  --title "Maincopy $release_version" --notes-file "$release_root/release-notes.md"
+release_tag=vX.Y.Z
+nix run "github:tee8z/maincopy/$release_tag#maincopy" -- --help
+nix run "github:tee8z/maincopy/$release_tag#maincopyd" -- --version
+nix profile add "github:tee8z/maincopy/$release_tag#maincopy"
 ~~~
 
-Before each upload, confirm the release remains a draft.
-For each artifact filename, inspect the existing asset inventory.
-Upload a missing asset with
-`gh release upload "$release_tag" "$release_artifacts/$release_asset_name"`.
-Set `release_asset_name` to the reviewed filename, including `SHA256SUMS`.
-For an existing asset, download into a fresh directory and compare exact bytes:
+The default flake app runs the daemon, so select `#maincopy`
+for the operator CLI. These commands consume the tagged source; there is no
+separate Nix registry publication or claim of portable standalone binaries.
+See the [Nix flake reference](https://nix.dev/manual/nix/stable/command-ref/new-cli/nix3-flake.html).
+
+For a NixOS host, add the immutable tag to the host flake and commit its lockfile:
+
+~~~nix
+inputs.maincopy.url = "github:tee8z/maincopy/vX.Y.Z";
+# Include this in the host's nixosSystem modules list:
+# inputs.maincopy.nixosModules.default
+~~~
+
+Follow [deployment.md](deployment.md) for host configuration, credentials,
+bootstrap, and backups. Keep the input lockfile's resolved commit consistent
+with release.json. Nix fetches the tag and content hashes; it does not perform
+the workflow's GPG signer verification for the consumer.
+
+For Cargo installation, use the same exact version for the executable crates:
 
 ~~~bash
-release_download="$(mktemp -d /tmp/maincopy-release-asset.XXXXXX)"
-gh release download "$release_tag" --pattern "$release_asset_name" --dir "$release_download"
-cmp -- "$release_artifacts/$release_asset_name" "$release_download/$release_asset_name"
+release_version=X.Y.Z
+cargo install --locked --version "=$release_version" maincopy-cli
+cargo install --locked --version "=$release_version" maincopy-diagram-renderer
+cargo install --locked --version "=$release_version" maincopy-server
+cargo install --locked --version "=$release_version" markdown-compiler
 ~~~
 
-Skip matching assets. Stop on a mismatch; do not use `--clobber`.
-After interruption, repeat inventory and checksum checks before uploading anything else.
-Download the complete draft asset set and verify `SHA256SUMS` before final review.
-
-The owner approves the concrete draft and any registry publication before artifacts
-become public. No release-publishing workflow is configured.
-Any future workflow must use immutable action commits, trusted tag verification,
-and an owner-controlled publication gate.
+`maincopy-shared` is a library dependency and has no executable to install.
+The server needs the matching renderer and SSH helper, plus Git and OpenSSH.
+Validate the installed process layout and platform credential storage before
+using a Cargo installation in production; the NixOS module supplies the
+supported service layout and protected host paths.

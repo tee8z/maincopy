@@ -107,6 +107,60 @@ An earlier instrumented run hit the fixture's 10-second login deadline during ov
 The unchanged 16-thread rerun passed after those builds finished.
 No deadline or authentication behavior was changed for that rerun.
 
+## Polling fixture coordination exception
+
+Review approves a narrow exception to the test-only visibility rule in
+[quality.md](quality.md#modules-and-imports).
+`SourcePollArm` and `observe_poll_arms` exist only under `cfg(test)`.
+They provide a bounded handoff for the cross-module Git polling fixture.
+Production API and polling behavior remain unchanged.
+
+The fixture holds re-arming after the durable manual result, then advances virtual time.
+It releases the actor and waits for the constructed timer's actual deadline before advancing again.
+This forces the interleaving that two scheduler yields could not exclude.
+The focused test passed once, followed by 16 successful repetitions across four
+concurrent processes restricted to two CPUs. Clippy passed with warnings denied.
+
+The prior remote run for `443a2c8` failed at this polling fixture's 10-second wait.
+That remote failure does not invalidate the recorded local results, but it required this repair.
+Hosted validation of the repaired source remains separate evidence.
+
+A later local Nix run failed the metrics fixture's final listener rebind with
+`AddrInUse`. Its non-listening reservation did not prevent competing explicit binds
+to addresses retained by other fixtures. The test now uses a dedicated loopback
+address and retains its negative control, drain checks, and fresh final bind.
+
+A targeted socket control reproduced this collision class. It did not identify
+the competing socket from the earlier Nix failure. Both the baseline and revised
+fixtures passed 480 executions across four concurrent processes.
+
+## Release automation validation record
+
+The release-automation source passed the final local gates on 2026-09-06.
+The retained record identifies the frozen source archive and its Nix package.
+Ongoing email implementation was excluded from this release-automation batch.
+
+| Check | Result |
+| --- | --- |
+| Canonical `nix flake check` and `nix build` | Passed from a clean source archive on `x86_64-linux`. ARM64 was not executed. |
+| Concurrent instrumented Rust suite | 994 passed; one existing ignored test; 16 test threads. |
+| Manual CRAP check | Zero violations; maximum 19.662785; 93.69% line coverage (66,803/71,300). |
+| CRAP measurement scope | 3,763 measured functions; 379 functions had no instrumented lines. |
+| Nix Rust suite | 994 passed; one existing ignored test. The package build also passed its documentation test. |
+| Rust formatting and Clippy | Passed with warnings denied. |
+| Packaged deployment VM | Passed; test script completed in 68.47 seconds. |
+| Release helper boundaries | 13 tests passed with the flake-locked Cargo toolchain, real GPG signatures, and a loopback registry. |
+| Workflow and helper lint | Actionlint and Python Ruff checks passed. |
+
+Both Nix Rust suites passed the repaired polling and metrics lifecycle fixtures.
+The release helper tests exercised checksum rejection, dependency ordering, interrupted
+publication, matching retries, and credential-provider configuration overrides.
+They created no public tags, registry uploads, or GitHub Releases.
+
+These results do not complete ARM64 runner, protected release environment, signer,
+publisher account, provider integration, or deployed-system acceptance.
+The CRAP report measures Rust functions; it does not score the Python release helpers.
+
 ## Documentation and packaging rehearsal
 
 The release-readiness audit on 2026-09-06 used a clean, private operator fixture
@@ -146,4 +200,6 @@ It does not complete browser, TLS, or owner-signer acceptance.
 - Measure representative request and compilation latency, queue depth, WAL size, checkpoint age, runtime use, and shutdown duration.
 - Retain final Rust, CRAP, Nix, and runbook execution results for the exact candidate. This index does not replace those results.
 
-Release distribution and publishing remain separate owner decisions.
+The selected distribution uses all five crates.io packages, GitHub release
+artifacts, and the tagged GitHub flake. The first version, publisher configuration,
+and actual publication remain pending.

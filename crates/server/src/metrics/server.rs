@@ -154,12 +154,15 @@ mod tests {
             ));
         }
         let cancellation = CancellationToken::new();
-        // A bound, non-listening socket keeps this port out of concurrent
-        // ephemeral allocations. SO_REUSEADDR permits the real listener to
-        // share the reservation, but not another live listener.
+        // Other fixtures retain 127.0.0.1 addresses after closing temporary
+        // listeners. A separate loopback address prevents their later explicit
+        // binds from competing with this fixture's final rebind. The bound,
+        // non-listening reservation also excludes ephemeral allocations by
+        // concurrent copies of this test. SO_REUSEADDR permits the real listener
+        // to share the reservation, but not another live listener.
         let reservation = TcpSocket::new_v4().unwrap();
         reservation.set_reuseaddr(true).unwrap();
-        reservation.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        reservation.bind("127.0.0.2:0".parse().unwrap()).unwrap();
         let address = reservation.local_addr().unwrap();
         let server = MetricsServer::bind(address, metrics()).await.unwrap();
         assert_eq!(server.local_addr, address);
