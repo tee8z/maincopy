@@ -154,6 +154,21 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     import json
 
+    def wait_for_replication():
+        # Type=simple admits the restore-marker wrapper before native startup.
+        # A live HTTP listener or active unit does not establish replica
+        # readiness. Native sync waits for a completed file-replica cutoff.
+        confirmation = json.loads(machine.wait_until_succeeds(
+            "timeout 15s litestream sync -wait -json -timeout 10 "
+            "-socket /run/maincopy-litestream/private/control.sock "
+            "/var/lib/maincopy/database/maincopy.db",
+            timeout=60,
+        ))
+        assert confirmation["db_path"] == "/var/lib/maincopy/database/maincopy.db"
+        assert type(confirmation["txid"]) is int
+        assert type(confirmation["replica_txid"]) is int
+        assert 0 < confirmation["txid"] <= confirmation["replica_txid"]
+
     def assert_late_created_secret_paths_are_hidden():
         # These known, harmless bytes exercise mount visibility without reading
         # a credential. Create the files only after both peer namespaces exist,
@@ -197,7 +212,7 @@ pkgs.testers.runNixOSTest {
     assert machine.succeed(spoofed + " -o /dev/null -w '%{http_code}'").strip() == "401"
     machine.succeed("test $(stat -c %a /var/lib/maincopy/database/maincopy.db) = 600")
     machine.fail("su -s /bin/sh maincopy-gateway -c 'cat /var/lib/maincopy/database/maincopy.db'")
-    machine.wait_until_succeeds("find /var/lib/maincopy-litestream/replica -name '*.ltx' | grep .")
+    wait_for_replication()
     assert_late_created_secret_paths_are_hidden()
     machine.succeed("systemctl start maincopy-backup.service")
     assert_late_created_secret_paths_are_hidden()
@@ -232,6 +247,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("maincopy-backup.timer")
     machine.succeed("test ! -e /var/lib/maincopy/database/maincopy.db.restore.json; test -f /var/lib/maincopy/database/maincopy.db.restore-consumed")
     machine.succeed("curl -fsS http://127.0.0.1:3000/health/ready")
+    wait_for_replication()
     machine.succeed("systemctl start maincopy-backup.service")
     machine.succeed("systemctl stop maincopy.service maincopy-litestream.service maincopy-backup.timer")
     machine.succeed("chmod 0644 /var/lib/maincopy/database/maincopy.db")

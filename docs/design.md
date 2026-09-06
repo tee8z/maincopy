@@ -730,6 +730,8 @@ fetches, proxies, or checks that asset.
 
 Code-language projection and Mermaid rendering happen during compilation.
 Mermaid output crosses a strict SVG sanitization boundary.
+The maintained [content rendering contract](content-rendering.md) records the
+language aliases, helper isolation, sanitizer policy, and enforced resource limits.
 
 Valid Mermaid blocks render through the selected local renderer. An invalid or
 oversized diagram rejects the candidate and preserves the last good snapshot.
@@ -882,7 +884,8 @@ domain mutation uses one bounded command channel.
 
 Litestream owns separate SQLite connections for replication bookkeeping and WAL
 checkpoint coordination. It does not perform Maincopy domain mutations. The
-[backup decision](decisions/0002-encrypted-checkpoints.md) records this boundary.
+[deployment runbook](deployment.md#service-identities-and-filesystem-boundaries)
+records this boundary and its service-isolation exceptions.
 
 Read handlers use a separate bounded, query-only pool. The database uses local
 storage and write-ahead logging.
@@ -1173,8 +1176,8 @@ structure](https://docs.ghost.org/themes/structure) and
 [page contexts](https://docs.ghost.org/themes/contexts): a default layout,
 page-context templates, reusable partials, and one compiled-content slot. This
 decision does not select Handlebars or any other engine, library, or syntax.
-That selection requires a future architecture decision record and is not a V1
-dependency.
+Record the selected engine and its reviewed constraints in this design before
+implementation. It is not a V1 dependency.
 
 A theme can provide a base or default layout; post, index, archive, tag, and
 error context templates; reusable partials; and its own CSS and JavaScript
@@ -1244,7 +1247,7 @@ extension of typed widgets or operator themes. Maincopy must not place it in
 the trusted article slot, execute it in the top-level canonical page, or grant
 it the operator theme's authority.
 
-A future architecture decision record must select code provenance and review,
+Before implementation, this design must specify code provenance and review,
 an isolation origin, iframe and process sandboxing, Content Security Policy,
 cookie and storage access, network capability, navigation, typed cross-boundary
 messages, resource limits, preview, audit, failure isolation, and revocation.

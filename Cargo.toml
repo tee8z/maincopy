@@ -19,6 +19,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/tee8z/maincopy"
 
 [workspace.metadata.crane]
 name = "maincopy-workspace"
@@ -35,9 +36,9 @@ clap = { version = "4.6.6", features = ["derive"] }
 getrandom = { version = "=0.4.3", default-features = false }
 lightningcss = { version = "=1.0.0-alpha.72", default-features = false }
 libsqlite3-sys = { version = "=0.37.0", default-features = false, features = ["bundled"] }
-maincopy-shared = { path = "crates/shared" }
-maincopy-diagram-renderer = { path = "crates/diagram-renderer", default-features = false }
-markdown-compiler = { path = "crates/markdown-compiler" }
+maincopy-shared = { version = "=0.1.0", path = "crates/shared" }
+maincopy-diagram-renderer = { version = "=0.1.0", path = "crates/diagram-renderer", default-features = false }
+markdown-compiler = { version = "=0.1.0", path = "crates/markdown-compiler" }
 maud = { version = "=0.27.0", default-features = false }
 mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
 k256 = { version = "=0.13.4", default-features = false, features = ["schnorr"] }

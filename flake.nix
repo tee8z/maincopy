@@ -20,6 +20,7 @@
       ...
     }:
     let
+      workspaceVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
@@ -58,7 +59,7 @@
           cargoArtifacts = craneLib.buildDepsOnly {
             inherit src;
             pname = "maincopy-dependencies";
-            version = "0.1.0";
+            version = workspaceVersion;
             cargoExtraArgs = "--locked";
             strictDeps = true;
           };
@@ -92,7 +93,7 @@
             // {
               inherit cargoArtifacts src;
               pname = "maincopy-workspace";
-              version = "0.1.0";
+              version = workspaceVersion;
               cargoExtraArgs = "--locked";
               nativeBuildInputs = [ pkgs.makeWrapper ];
               strictDeps = true;
@@ -183,6 +184,7 @@
             test -x ${project.maincopy}/bin/maincopyd
             test -x ${project.maincopy}/bin/maincopy-mermaid
             test -x ${project.maincopy}/bin/maincopy-ssh
+            test -x ${project.maincopy}/bin/markdowncompiler
             test -r ${project.maincopy}/share/licenses/maincopy/LICENSE
             cmp \
               ${project.src}/LICENSE \

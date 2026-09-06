@@ -103,8 +103,8 @@ error bodies, and provider correlation tags. Keep raw addresses out of URLs.
 Purpose-bound confirmation and unsubscribe links may contain opaque tokens.
 Request logging must retain route templates, never those token values.
 
-PII storage protection needs its own architecture decision before collection.
-Document keys, rotation, host access, deletion, and recovery together. Use standard
+Document the selected PII storage design here before collection.
+Cover keys, rotation, host access, deletion, and recovery together. Use standard
 cryptographic libraries if field encryption is selected; do not invent a format.
 
 Only an owner with fresh authentication may export subscriber data, inspect PII,
@@ -142,7 +142,7 @@ provider retention explicitly. Seven-day local retention does not establish remo
 or provider retention.
 
 Keep deletion and suppression evidence durably recoverable independently of an old
-site checkpoint. The architecture decision must select a current external authority
+site checkpoint. The recovery design must select a current external authority
 or an independently anchored monotonic epoch. A timestamp, `latest.json`, or valid
 older signature cannot prove that no later deletion occurred.
 

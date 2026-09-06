@@ -41,3 +41,13 @@ and production acceptance remain pending.
   backup health, and interrupted local retention from leaking pending directories.
 - Exercise shared Mermaid rendering concurrently within the application's
   renderer admission and process resource limits.
+- Validate invalid Nix module settings without recursively evaluating generated
+  script derivations.
+- Correct operator command examples and prepare crate metadata, README files,
+  and resolved license contents for package verification.
+- Describe session, NIP-98, CSRF, and route authority requirements in generated
+  OpenAPI metadata from the registered authentication boundaries.
+- Wait for confirmed native replication before the deployment drill requests a
+  checkpoint after startup or restore.
+- Retain test port reservations through listener shutdown and rebind assertions
+  so concurrent ephemeral allocations cannot make lifecycle checks fail.

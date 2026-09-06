@@ -35,7 +35,7 @@ impl PublicServer {
 mod tests {
     use std::{net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 
-    use tokio::time::timeout;
+    use tokio::{net::TcpSocket, time::timeout};
 
     use super::*;
     use crate::{
@@ -96,10 +96,14 @@ mod tests {
     #[tokio::test]
     async fn cancellation_stops_the_server_and_releases_its_address() {
         let cancellation = CancellationToken::new();
-        let server = PublicServer::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), public_state())
-            .await
-            .unwrap();
-        let address = server.local_addr;
+        // Retain the port across shutdown so another test's port-zero bind
+        // cannot claim it before the release assertion.
+        let reservation = TcpSocket::new_v4().unwrap();
+        reservation.set_reuseaddr(true).unwrap();
+        reservation.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let address = reservation.local_addr().unwrap();
+        let server = PublicServer::bind(address, public_state()).await.unwrap();
+        assert_eq!(server.local_addr, address);
         let serving = tokio::spawn(server.serve(cancellation.clone()));
         tokio::task::yield_now().await;
 
@@ -112,5 +116,7 @@ mod tests {
 
         let rebound = TcpListener::bind(address).await.unwrap();
         assert_eq!(rebound.local_addr().unwrap(), address);
+        drop(rebound);
+        drop(reservation);
     }
 }

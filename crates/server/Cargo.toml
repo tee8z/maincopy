@@ -3,6 +3,9 @@ name = "maincopy-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Self-hosted publishing server with exact previews and explicit release approval"
+readme = "README.md"
 autobins = false
 
 [[bin]]

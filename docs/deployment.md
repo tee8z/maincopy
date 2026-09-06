@@ -10,7 +10,11 @@ See [backup and restore](backup-restore.md) for the manifest and acceptance rule
 
 ## Configure the host
 
+Pin Maincopy in the host flake's inputs. Make those inputs available to the host
+module, for example through `nixpkgs.lib.nixosSystem` with `specialArgs = { inherit inputs; };`.
+
 ```nix
+{ inputs, ... }:
 {
   imports = [ inputs.maincopy.nixosModules.default ];
 
@@ -74,10 +78,12 @@ A fresh database causes a clear startup failure before credential generation or
 listener binding. It cannot print a generated owner password into the journal.
 Development configurations retain the existing generated-owner default.
 
+Omit backup unit names from the stop commands when backups are disabled.
 When `initialOwnerPublicKey` is configured, initialize it explicitly:
 
 ```sh
-sudo systemctl stop maincopy.service maincopy-litestream.service
+sudo systemctl stop maincopy-backup.timer maincopy-backup.service \
+  maincopy.service maincopy-litestream.service
 sudo systemctl start maincopy-initialize.service
 sudo systemctl reset-failed maincopy.service
 sudo systemctl start maincopy.service
@@ -91,15 +97,16 @@ For a password owner, stop the daemon and run the existing offline command from
 a protected interactive terminal as the database owner:
 
 ```sh
-sudo systemctl stop maincopy.service maincopy-litestream.service
+sudo systemctl stop maincopy-backup.timer maincopy-backup.service \
+  maincopy.service maincopy-litestream.service
 sudo -u maincopy maincopyd --config /etc/maincopy/maincopy.toml \
   identity bootstrap password --username owner
 sudo systemctl reset-failed maincopy.service
 sudo systemctl start maincopy.service
 ```
 
-The terminal prompts for and confirms the password. Do not place the password in
-an argument, environment variable, Nix expression, or journaled service command.
+The terminal prompts for and confirms the password. Do not place the password
+in an argument, environment variable, Nix expression, or journaled service command.
 
 ## Provision encrypted B2 backups
 
@@ -181,8 +188,21 @@ seconds in its journal entry; measure replay, content compilation, and upload co
 with production-sized data before accepting an RPO. A success older than 300 seconds is stale
 by default; adjust `backup.staleAfterSeconds` only to an accepted operational RPO.
 
+Before an immediate manual backup after startup or restore, confirm native replication readiness:
+
 ```sh
 sudo systemctl status maincopy-litestream.service
+sudo timeout 15s litestream sync -wait -json -timeout 10 \
+  -socket /run/maincopy-litestream/private/control.sock \
+  /var/lib/maincopy/database/maincopy.db
+```
+
+Continue only after synchronization succeeds. Confirm `db_path` matches the database above,
+`txid` is positive, and `replica_txid` is at least `txid`.
+An active wrapper or ready HTTP listener does not prove that the replica exists.
+If native startup is pending, inspect the Litestream journal and repeat synchronization before starting the uploader.
+
+```sh
 sudo systemctl start maincopy-backup.service
 sudo systemctl status maincopy-backup.service
 sudo cat /var/lib/maincopy-backup-status/backup-status.json
@@ -191,8 +211,12 @@ sudo cat /var/lib/maincopy-backup-status/backup-status.json
 `last_success_at` records the confirmed live-capture time and advances only after
 every remote object and the selected complete manifest succeed. A slow upload
 therefore cannot make an old cutoff look newly fresh. A stopped, stalled, or
-unconfirmed local replica fails before publication. Failures report `degraded` and preserve the preceding successful
-timestamp. A healthy local Litestream replica alone cannot report an off-site
+unconfirmed local replica fails before publication. Publisher failures report
+`degraded` and preserve the preceding successful timestamp.
+Unit setup failures, such as an unavailable replica mount, occur before the publisher can update its status file.
+Inspect the failed unit and journal; the preceding capture becomes stale at the configured freshness limit.
+The timer retries failed jobs after `backup.intervalSeconds`.
+A healthy local Litestream replica alone cannot report an off-site
 success. Public reads continue during replication, encryption, and upload failure.
 
 ## Recover a complete checkpoint
@@ -243,8 +267,8 @@ interrupted or rejected acceptance leaves a `maincopy.db.restore-pending` guard,
 which also blocks replication. The gate installs a directory notification watch
 before inspecting either path, so it cannot miss a concurrent removal. An
 invalid marker, including a broken symlink, causes a visible timeout. The active
-wrapper alone is not evidence of replication;
-confirm native synchronization and a successful complete checkpoint afterward.
+wrapper alone is not evidence of replication. Use the synchronization check above
+before requesting an immediate checkpoint, then confirm successful complete publication.
 
 Before relying on production backups, upload to the actual B2 account and run a
 recovery on a protected host. Automated fixtures exercise standard cryptography,
@@ -261,6 +285,10 @@ The live database is `/var/lib/maincopy/database/maincopy.db`, mode 0600.
 Litestream and the checkpoint publisher deliberately share the dedicated database
 owner's UID. This is a reviewed exception to one UID per service: Maincopy requires
 owner access and database mode 0600, and that invariant remains enforced.
+Litestream also owns separate SQLite connections for its two pinned bookkeeping
+tables and WAL checkpoint coordination. These native operations cannot use
+Maincopy's typed mutation channel. Application domain writes retain their sole
+SQLx writer; restore accepts only the exact pinned bookkeeping schema.
 Litestream runs separately with access only to the SQLite directory and its own
 metadata/replica state. It needs WAL and shared-memory writes for safe checkpoint
 coordination. It has no network address family except Unix sockets.
@@ -290,6 +318,16 @@ mode 0600 files. Systemd removes that directory when the unit stops; the daemon
 and Litestream cannot see it. This preserves the tools' owner-only file checks
 when systemd uses a service-UID ACL to grant credential access. See the
 [pinned credential implementation](https://github.com/systemd/systemd/blob/v261.2/src/core/exec-credential.c#L406).
+
+The short-lived Python backup adapters use stock rclone configuration and command
+interfaces. Python cannot guarantee zeroization of immutable secret buffers.
+This reviewed exception requires bounded credential reads, protected runtime
+files, suppressed child diagnostics, and no secret arguments. Rust daemon and CLI
+credentials retain their dedicated zeroizing types.
+
+The Rust operations dependencies use default features disabled: `prometheus`
+provides isolated registries and `tar` provides portable recovery streams.
+Their pinned licenses are Apache-2.0 and MIT OR Apache-2.0, respectively.
 
 Maincopy, its offline initializer, and the checkpoint validator set
 `RestrictSUIDSGID=false`. The pinned systemd implementation otherwise returns

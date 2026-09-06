@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use super::{
     AdminRuntimeState,
+    openapi::{RouteAuthentication, describe_authentication},
     origin::AdminOrigin,
     principal::{AdminAuthentication, AdminPrincipal},
     problem::{AdminProblem, AdminProblemEnvelope, problem_response},
@@ -310,15 +311,26 @@ where
 }
 
 pub(super) fn login_challenge_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
-    routes!(create_login_challenge).layer(DefaultBodyLimit::max(AUTH_REQUEST_BODY_LIMIT))
+    describe_authentication(
+        routes!(create_login_challenge),
+        RouteAuthentication::PublicLogin,
+    )
+    .layer(DefaultBodyLimit::max(AUTH_REQUEST_BODY_LIMIT))
 }
 
 pub(super) fn login_session_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
-    routes!(create_admin_session).layer(DefaultBodyLimit::max(AUTH_REQUEST_BODY_LIMIT))
+    describe_authentication(
+        routes!(create_admin_session),
+        RouteAuthentication::PublicLogin,
+    )
+    .layer(DefaultBodyLimit::max(AUTH_REQUEST_BODY_LIMIT))
 }
 
 pub(super) fn current_session_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
-    routes!(get_current_admin_session, revoke_current_admin_session)
+    describe_authentication(
+        routes!(get_current_admin_session, revoke_current_admin_session),
+        RouteAuthentication::BrowserSession,
+    )
 }
 
 pub(super) fn authenticate_layer(
@@ -336,7 +348,7 @@ pub(super) fn scoped_layer(
     security: &AdminSecurityState,
     scope: AdminScope,
 ) -> UtoipaMethodRouter<AdminRuntimeState> {
-    routes
+    describe_authentication(routes, RouteAuthentication::Scoped(scope))
         .layer(axum::middleware::from_fn_with_state(scope, authorize_scope))
         .layer(axum::middleware::from_fn_with_state(
             security.clone(),
@@ -1183,7 +1195,7 @@ fn absolute_request_url(origin: &AdminOrigin, uri: &Uri) -> String {
     )
 }
 
-fn is_mutation(method: &Method) -> bool {
+pub(super) fn is_mutation(method: &Method) -> bool {
     !matches!(method, &Method::GET | &Method::HEAD | &Method::OPTIONS)
 }
 

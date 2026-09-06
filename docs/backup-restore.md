@@ -191,19 +191,31 @@ Backup degradation does not change public readiness or terminate the server.
 
 A separate manual export pairs a consistent SQLite snapshot with exact retained archives.
 Provision an operator-owned age recipient file for this manual workflow and retain its private recovery key offline.
-The rclone crypt deployment does not create age credentials:
+The rclone crypt deployment does not create age credentials or install the optional SQLite CLI and age tools.
+Provide those tools before starting this workflow.
+Run these commands in Bash as the dedicated database owner on the daemon host:
 
-```console
+```bash
+set -euo pipefail
+umask 077
+BACKUP_STAGE="$(mktemp -d /var/lib/maincopy-backup/manual.XXXXXXXX)"
+sqlite3 'file:/var/lib/maincopy/database/maincopy.db?mode=ro' \
+  ".backup '$BACKUP_STAGE/database.sqlite3'"
 maincopyd --config /etc/maincopy/maincopy.toml export-backup \
-  --database-file /var/lib/maincopy-backup/staging/database.sqlite3 \
+  --database-file "$BACKUP_STAGE/database.sqlite3" \
   | age -R /run/maincopy-manual-backup/age-recipients \
-      -o /var/lib/maincopy-backup/recovery.tar.age.partial
+      -o "$BACKUP_STAGE/recovery.tar.age.partial"
+mv -- "$BACKUP_STAGE/recovery.tar.age.partial" "$BACKUP_STAGE/recovery.tar.age"
 ```
 
-Use pipeline failure propagation. Retain ciphertext only after every stage succeeds.
+SQLite's online backup produces a consistent snapshot while the daemon can remain running.
+The read-only source URI prevents this command from creating a missing live database.
+Only promote ciphertext after both export and encryption succeed.
 The tar stream contains `database.sqlite3`, `manifest.json`, and `content-candidates/*.candidate`, with mode `0600`.
 The `maincopy-backup-v1` manifest also binds the original snapshot bytes.
 Never substitute a copy of the live SQLite main file for a consistent online snapshot.
+After validating the encrypted backup, remove its temporary plaintext SQLite snapshot.
+Remove failed staging directories explicitly; the continuous checkpoint cleanup does not manage manual exports.
 
 Decrypt and extract the trusted bundle into protected staging.
 Use `restore --database-file ... --artifact-root ... --manifest-file ...` for this paired format.

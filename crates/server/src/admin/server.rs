@@ -66,7 +66,7 @@ mod tests {
     use std::{net::Ipv4Addr, time::Duration};
 
     use axum::{Router, routing::get};
-    use tokio::time::timeout;
+    use tokio::{net::TcpSocket, time::timeout};
 
     use super::*;
 
@@ -111,8 +111,16 @@ mod tests {
     #[tokio::test]
     async fn cancellation_releases_the_listener() {
         let cancellation = CancellationToken::new();
-        let server = test_server(Router::new()).await;
-        let address = server.local_addr;
+        // Retain the port across shutdown so another test's port-zero bind
+        // cannot claim it before the release assertion.
+        let reservation = TcpSocket::new_v4().unwrap();
+        reservation.set_reuseaddr(true).unwrap();
+        reservation.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let address = reservation.local_addr().unwrap();
+        let server = AdminServer::bind(AdminBind::new(address).unwrap(), Router::new())
+            .await
+            .unwrap();
+        assert_eq!(server.local_addr, address);
         let serving = tokio::spawn(server.serve(cancellation.clone()));
 
         cancellation.cancel();
@@ -124,5 +132,7 @@ mod tests {
 
         let rebound = TcpListener::bind(address).await.unwrap();
         assert_eq!(rebound.local_addr().unwrap(), address);
+        drop(rebound);
+        drop(reservation);
     }
 }

@@ -59,10 +59,11 @@ let
   };
   rejected = settings: !(lib.all (entry: entry.assertion) (evaluate settings).assertions);
   typedRejected =
-    settings:
-    !(builtins.tryEval (
-      builtins.deepSeq (evaluate settings).systemd.services.maincopy.serviceConfig true
-    )).success;
+    optionPath: settings:
+    # Force the invalid scalar itself. Deep evaluation of serviceConfig also
+    # walks script derivations and nixpkgs internals, so rejection can otherwise
+    # depend on traversal order or fail at the evaluator's call-depth limit.
+    !(builtins.tryEval (lib.getAttrFromPath optionPath (evaluate settings).services.maincopy)).success;
 in
 assert lib.all (entry: entry.assertion) minimal.assertions;
 assert lib.all (entry: entry.assertion) complete.assertions;
@@ -145,8 +146,8 @@ assert
   ];
 assert complete.systemd.timers.maincopy-backup.timerConfig.OnUnitInactiveSec == "60s";
 assert complete.services.maincopy.backup.staleAfterSeconds == 300;
-assert typedRejected { public.bind = "999.0.0.1"; };
-assert typedRejected {
+assert typedRejected [ "public" "bind" ] { public.bind = "999.0.0.1"; };
+assert typedRejected [ "source" "credentials" "deploy" "privateKeyFile" ] {
   source = {
     managed = true;
     credentials.deploy = {
@@ -155,8 +156,8 @@ assert typedRejected {
     };
   };
 };
-assert typedRejected { stateDirectory = "../shared"; };
-assert typedRejected {
+assert typedRejected [ "stateDirectory" ] { stateDirectory = "../shared"; };
+assert typedRejected [ "source" "credentials" "deploy" "privateKeyFile" ] {
   source = {
     managed = true;
     credentials.deploy = {

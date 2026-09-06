@@ -160,8 +160,9 @@ the file identity and path again immediately before each transport command.
 
 ## Store source settings
 
-SQLite must contain an enabled owner before source setup. On new state, create
-the owner through normal startup or the offline identity bootstrap command.
+SQLite must contain an enabled owner before source setup. In managed mode,
+bootstrap the owner offline before configuring the initial source. Normal managed
+startup requires source settings and a successful initial synchronization.
 
 For controlled new-state provisioning, run:
 
@@ -208,22 +209,28 @@ Managed mode completes its startup synchronization before it binds listeners.
 An invalid source or failed initial compilation prevents the service from
 becoming ready.
 
-Log in with `maincopy`, then inspect the redacted source status:
+Select the same HTTPS administration origin for login and every later command.
+Replace the example origin below with the deployed origin. For a private CA,
+add `--admin-ca-file /path/to/trusted-ca.pem` to each command.
+The CLI does not persist origin or CA options from a prior invocation.
+
+Log in, then inspect the redacted source status:
 
 ```console
-maincopy source status
+maincopy --admin-origin https://admin.example.com login --username owner
+maincopy --admin-origin https://admin.example.com source status
 ```
 
 Request a synchronization and wait for its durable terminal state:
 
 ```console
-maincopy source sync --wait
+maincopy --admin-origin https://admin.example.com source sync --wait
 ```
 
 Return after admission when another process will inspect the operation:
 
 ```console
-maincopy source sync --async
+maincopy --admin-origin https://admin.example.com source sync --async
 ```
 
 Use `--json` for machine-readable output. Add `--idempotency-key UUID` when a
@@ -255,8 +262,8 @@ interval. The credential name must identify a host-registered credential.
 For the CLI, inspect the installed version and deploy identity first:
 
 ```console
-maincopy source status
-maincopy source deploy-key
+maincopy --admin-origin https://admin.example.com source status
+maincopy --admin-origin https://admin.example.com source deploy-key
 ```
 
 The deploy-key command prints the selected Ed25519 public key and SHA-256
@@ -266,7 +273,7 @@ not return a private-key path or a `known_hosts` path.
 Submit all proposed settings with the installed version:
 
 ```console
-maincopy source configure \
+maincopy --admin-origin https://admin.example.com source configure \
   --user git --host git.example.test --port 22 \
   --repository-path publisher/site.git --branch main \
   --content-subdirectory publication --credential-name deploy \

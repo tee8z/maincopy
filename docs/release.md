@@ -11,6 +11,26 @@ Use [system evidence](system-evidence.md) to track acceptance separately from pa
 Mailing-list and bulk delivery remain conditional first-release work.
 Require separate privacy and deliverability acceptance before including them in release notes or artifacts.
 
+## Distribution pieces
+
+The Nix package builds the workspace and installs all five executables together.
+The NixOS module adds the gateway, service boundaries, metrics, and encrypted backup jobs.
+The module obtains Litestream and rclone independently from the Rust package.
+
+| Piece | Current output | Distribution requirement |
+| --- | --- | --- |
+| Human and agent CLI | `maincopy` from `maincopy-cli` | Validate HTTPS sign-in and credential storage on each advertised operating system. |
+| Server | `maincopyd` and `maincopy-ssh` from `maincopy-server` | Install the renderer beside the server; make Git and OpenSSH available. |
+| Renderer | `maincopy-mermaid` from `maincopy-diagram-renderer` | Keep the helper and server versions aligned. |
+| Content validator | `markdowncompiler` from `markdown-compiler` | Validates one Markdown file; does not render or publish a site. |
+| Libraries | `maincopy-shared`, `markdown-compiler`, and the renderer library | Registry dependencies for a crates.io distribution; no separate running services. |
+| NixOS deployment | `nixosModules.default` | Pin the reviewed source revision and supply protected host credentials. |
+| Operator assets | Runbooks and `deploy/grafana/maincopy.json` | Include these in the source archive. |
+
+The initial prepared distribution is the source archive and its Nix outputs.
+This preparation does not select the public release channels or version.
+Registry publishing remains conditional on the checks below.
+
 ## Select and freeze the candidate
 
 The owner selects the version, supported platforms, distribution channels, and
@@ -20,8 +40,9 @@ Use signed Conventional Commits, such as
 `git commit -S -m "chore(release): prepare candidate metadata"`.
 Stop if signing fails.
 
-Keep the workspace version, inherited package versions, lockfile, and Maincopy
-derivation versions in [flake.nix](../flake.nix) consistent.
+Keep the workspace version, inherited package versions, internal dependency
+requirements, lockfile, and Maincopy derivation versions consistent.
+The [flake](../flake.nix) reads its Maincopy version from the workspace manifest.
 Do not change the independently pinned Litestream version to match Maincopy.
 Review package contents, README links, license files, and the
 [Unreleased changelog](../CHANGELOG.md#unreleased).
@@ -30,6 +51,9 @@ Run the following in one Bash session from the clean candidate checkout.
 The operator environment needs Git, Nix, Cargo, Python 3.11 or later, jq,
 GNU tar, gzip, and SHA-256 tools.
 GitHub staging later also needs authenticated GitHub CLI access.
+Prepare artifacts on Linux with a checkout and extraction tool that preserve symbolic links.
+Each crate's `LICENSE` links to the root license; Cargo includes its resolved bytes.
+A Windows checkout with `core.symlinks=false` contains link text and cannot prepare these packages correctly.
 
 ~~~bash
 set -euo pipefail
@@ -44,6 +68,10 @@ release_system="$(nix eval --impure --raw --expr builtins.currentSystem)"
 release_root="$(mktemp -d /tmp/maincopy-release.XXXXXX)"
 release_artifacts="$release_root/artifacts"
 mkdir "$release_artifacts"
+for release_license in crates/*/LICENSE; do
+  test -L "$release_license"
+  cmp -- LICENSE "$release_license"
+done
 cargo metadata --locked --no-deps --format-version 1 > "$release_root/workspace.json"
 jq -e --arg version "$release_version" 'all(.packages[]; .version == $version)' "$release_root/workspace.json"
 test "$(nix eval --raw --no-update-lock-file ".#packages.$release_system.default.version")" = "$release_version"
@@ -126,7 +154,11 @@ If registry packages are selected, finish their preparation below before finaliz
 ~~~bash
 (
   cd "$release_artifacts"
-  sha256sum -- * > "$release_root/SHA256SUMS"
+  for release_artifact in *; do
+    if [[ "$release_artifact" != SHA256SUMS ]]; then
+      sha256sum -- "$release_artifact"
+    fi
+  done > "$release_root/SHA256SUMS"
   cp "$release_root/SHA256SUMS" SHA256SUMS
   sha256sum --check SHA256SUMS
 )
@@ -137,12 +169,11 @@ If an artifact changes, prepare a new reviewed manifest before creating or publi
 
 ## Conditional crates.io preparation
 
-Registry distribution remains undecided. Current internal dependencies use local
-paths without registry versions. Package repository and README metadata also need review.
-These manifests are not yet a completed registry candidate.
+Registry distribution remains undecided. Metadata and package contents must pass
+verification for the exact candidate before a crate can be approved for publication.
 
 Before a registry dry run, the owner approves the package set and verifies namespace
-availability or existing ownership. Add explicit versions to internal path dependencies.
+availability or existing ownership. Match internal dependency requirements to the selected version.
 Review each package's description, repository, README, license, and included files.
 Verify a fresh installation can locate the server's renderer and SSH helper.
 Keep these changes in the reviewed candidate commit.
@@ -155,23 +186,37 @@ The current dependency order is:
 | `maincopy-cli` | `maincopy-shared` |
 | `maincopy-server` | All three prerequisite packages |
 
-For each approved package, set `release_crate` to its exact package name and run:
+Use Cargo with workspace publishing support and record its exact version.
+Cargo stages the selected workspace dependencies together, so unpublished
+prerequisites do not require a preliminary upload.
+See the [Cargo packaging reference](https://doc.rust-lang.org/cargo/commands/cargo-package.html).
+
+If all five packages are selected, run this from the clean extracted source:
 
 ~~~bash
-cd "$release_checkout"
-cargo package --locked --list --package "$release_crate"
-cargo publish --dry-run --locked --package "$release_crate"
+cd "$release_source"
+cargo package --locked --list --workspace
+cargo publish --dry-run --locked --workspace --target-dir "$release_root/cargo-target"
 ~~~
 
-The dry run performs packaging checks without uploading.
-Record its output and the resulting `target/package/*.crate` identity.
-Copy only approved crate archives into the artifact directory before finalizing checksums.
-Dependent dry runs can fail while required versions are absent from the registry.
-Do not publish prerequisite crates merely to turn a preparation failure green.
-Record that dependency-index gate and obtain the owner's approved publication sequence.
+The [publish dry run](https://doc.rust-lang.org/cargo/commands/cargo-publish.html)
+builds the packages and performs registry checks without uploading.
+It requires network access even when all dependencies are cached.
+Record the toolchain version, output, and paths of the newly generated crate archives.
+The verified Cargo version stages publish archives in `package/tmp-crate/` below the target directory.
+Do not substitute older archives left by a previous `cargo package` invocation.
+
+For a smaller approved package set, replace `--workspace` with explicit `--package` selections.
+Include each unpublished prerequisite in that selection.
+Copy only approved archives into the artifact directory before finalizing checksums.
+Verify each archive contains its README and a regular `LICENSE` with the root license bytes.
+Review normalized manifests for registry versions and absent local dependency paths.
+
+Package verification builds runtime targets. It does not run the complete workspace tests.
+Some test fixtures reference files outside their crate; use the source archive for the canonical test gate.
 
 Do not bypass verification with `--allow-dirty` or `--no-verify`.
-Actual `cargo publish --locked --package "$release_crate"` requires publication approval.
+Actual publication requires the approved version, package set, and publication sequence.
 After an interrupted upload, inspect the registry version and checksum before retrying.
 An existing version with different bytes requires investigation, not a replacement upload.
 

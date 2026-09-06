@@ -3,6 +3,9 @@ name = "maincopy-diagram-renderer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Supervised Mermaid rendering helper and client for Maincopy"
+readme = "README.md"
 autobins = false
 
 [features]

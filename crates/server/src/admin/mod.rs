@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use axum::{Extension, Router, extract::FromRef, middleware};
-use utoipa::OpenApi;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::domain::{
@@ -30,7 +29,7 @@ mod server;
 pub(crate) mod test_support;
 pub(crate) mod ui;
 
-use openapi::AdminApi;
+use openapi::{AdminApi, RouteAuthentication, describe_authentication};
 pub(crate) use security::{
     AdminSecurityState, AdminSessionPolicy, BrowserFormSession, BrowserSessionContext,
     RequiredBrowserSession, browser_scoped_router,
@@ -94,7 +93,7 @@ pub(crate) fn runtime_admin_router(
 fn registered_router(
     security: &AdminSecurityState,
 ) -> (Router<AdminRuntimeState>, utoipa::openapi::OpenApi) {
-    let (api, document) = OpenApiRouter::<AdminRuntimeState>::with_openapi(AdminApi::openapi())
+    let (api, document) = OpenApiRouter::<AdminRuntimeState>::with_openapi(AdminApi::document())
         .routes(scoped_routes(
             routes!(capabilities::get_admin_capabilities),
             security,
@@ -222,7 +221,10 @@ fn registered_router(
             AdminScope::StatusRead,
         ))
         .routes(scoped_routes(
-            source_admin::configuration_routes(),
+            describe_authentication(
+                source_admin::configuration_routes(),
+                RouteAuthentication::HumanMutations,
+            ),
             security,
             AdminScope::SourceManage,
         ))
@@ -280,6 +282,11 @@ mod tests {
 
     use maincopy_shared::{
         ADMIN_CAPABILITIES_PATH, CAPABILITIES_PATH,
+        auth::AdminScope,
+        auth_api::{
+            ADMIN_SESSIONS_PATH, CSRF_COOKIE_NAME, CSRF_HEADER_NAME, CURRENT_ADMIN_SESSION_PATH,
+            LOGIN_CHALLENGES_PATH, SESSION_COOKIE_NAME,
+        },
         posts::POSTS_PATH,
         profile_api::{ACTIVE_TIP_RECIPIENT_PATH, CURRENT_USER_PROFILE_PATH},
         publication::PUBLICATIONS_PATH,
@@ -550,6 +557,7 @@ mod tests {
     fn assert_openapi_contract(document: &Value) {
         assert_eq!(document["openapi"], "3.1.0");
         assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_openapi_authentication(document);
         let encoded = serde_json::to_string(document).unwrap();
         for removed_contract in [
             "publication_jobs",
@@ -691,6 +699,96 @@ mod tests {
                 ["schema"]["$ref"],
             "#/components/schemas/PublishNowRequest"
         );
+    }
+
+    fn assert_openapi_authentication(document: &Value) {
+        let schemes = document["components"]["securitySchemes"]
+            .as_object()
+            .unwrap();
+        assert_eq!(schemes.len(), 4);
+        for (scheme, location, name) in [
+            ("SessionCookie", "cookie", SESSION_COOKIE_NAME),
+            ("Nip98Authorization", "header", "Authorization"),
+            ("CsrfCookie", "cookie", CSRF_COOKIE_NAME),
+            ("CsrfHeader", "header", CSRF_HEADER_NAME),
+        ] {
+            assert_eq!(schemes[scheme]["type"], "apiKey");
+            assert_eq!(schemes[scheme]["in"], location);
+            assert_eq!(schemes[scheme]["name"], name);
+        }
+        assert!(
+            schemes["Nip98Authorization"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Nostr <base64-encoded signed event JSON>")
+        );
+        let cookie_read = json!({ "SessionCookie": [] });
+        let cookie_mutation = json!({ "SessionCookie": [], "CsrfCookie": [], "CsrfHeader": [] });
+        let agent = json!({ "Nip98Authorization": [] });
+        for (path, operations) in document["paths"].as_object().unwrap() {
+            for (method, operation) in operations.as_object().unwrap() {
+                let login = matches!(path.as_str(), LOGIN_CHALLENGES_PATH | ADMIN_SESSIONS_PATH);
+                let session_only = path == CURRENT_ADMIN_SESSION_PATH
+                    || path == "/api/admin/v1/source/configuration";
+                let mutation = !matches!(method.as_str(), "get" | "head" | "options");
+                let cookie = if mutation {
+                    &cookie_mutation
+                } else {
+                    &cookie_read
+                };
+                let expected = if login {
+                    json!([])
+                } else if session_only {
+                    json!([cookie])
+                } else {
+                    json!([cookie, agent])
+                };
+                assert_eq!(operation["security"], expected, "{method} {path}");
+                if login || path == CURRENT_ADMIN_SESSION_PATH {
+                    assert!(operation["x-maincopy-required-scope"].is_null());
+                } else {
+                    let authority = operation["x-maincopy-required-scope"].as_str().unwrap();
+                    assert!(AdminScope::parse(authority).is_some(), "{method} {path}");
+                }
+                if mutation {
+                    let origins: Vec<_> = operation["parameters"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|parameter| parameter["name"] == "Origin")
+                        .collect();
+                    assert_eq!(origins.len(), 1, "{method} {path}");
+                    assert_eq!(origins[0]["in"], "header");
+                    assert_eq!(origins[0]["required"], login || session_only);
+                    assert_eq!(origins[0]["schema"]["type"], "string");
+                    assert!(
+                        origins[0]["description"]
+                            .as_str()
+                            .unwrap()
+                            .contains("bound to the session")
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            document["paths"]["/api/admin/v1/openapi.json"]["get"]["x-maincopy-required-scope"],
+            "status_read"
+        );
+        assert_eq!(
+            document["paths"]["/api/admin/v1/source/configuration"]["put"]["x-maincopy-required-scope"],
+            "source_manage"
+        );
+        assert!(
+            document["paths"]["/api/admin/v1/source/configuration"]["put"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Requires recent human sign-in")
+        );
+        let description = document["info"]["description"].as_str().unwrap();
+        assert!(
+            description.contains("password credential, always require recent human authentication")
+        );
+        assert!(description.contains("Role and grant authorities are separate"));
     }
 
     async fn assert_problem(response: axum::response::Response, expected_code: &str) {

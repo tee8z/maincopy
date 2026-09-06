@@ -1688,7 +1688,7 @@ mod tests {
     use serde::{Serialize, de::DeserializeOwned};
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
-        net::TcpStream,
+        net::{TcpSocket, TcpStream},
         sync::oneshot,
     };
 
@@ -1733,6 +1733,15 @@ description = \"A publication restored from SQLite.\"\n\
 +++\n\
 # Durable publication\n\n\
 Durable article body.\n";
+
+    fn reserve_loopback_port() -> TcpSocket {
+        // Keep the port out of other tests' ephemeral allocations between
+        // listener failure/shutdown and rebinding the same address.
+        let reservation = TcpSocket::new_v4().unwrap();
+        reservation.set_reuseaddr(true).unwrap();
+        reservation.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        reservation
+    }
 
     fn startup_host_source(extra: &str, public_bind: &str) -> String {
         startup_host_source_with_admin(extra, public_bind, "127.0.0.1:0")
@@ -2223,9 +2232,8 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
     async fn unbootstrapped_identity_generates_owner_and_starts_the_application() {
         let (root, _, _) = startup_fixture("", VALID_PUBLICATION);
         let config_path = root.path().join("maincopy.toml");
-        let public_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let public_addr = public_probe.local_addr().unwrap();
-        drop(public_probe);
+        let reservation = reserve_loopback_port();
+        let public_addr = reservation.local_addr().unwrap();
         fs::write(
             &config_path,
             startup_host_source("", &public_addr.to_string()),
@@ -2279,6 +2287,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         );
 
         stop_built_application(application).await;
+        drop(reservation);
     }
 
     #[tokio::test]
@@ -3268,8 +3277,9 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
     async fn listener_failure_releases_the_public_port_and_database_ownership() {
         let (root, _, _) = startup_fixture("", VALID_PUBLICATION);
         let config_path = root.path().join("maincopy.toml");
-        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let public_addr = reserved.local_addr().unwrap();
+        let reservation = reserve_loopback_port();
+        let public_addr = reservation.local_addr().unwrap();
+        let occupied = tokio::net::TcpListener::bind(public_addr).await.unwrap();
         let public_bind = public_addr.to_string();
         fs::write(&config_path, startup_host_source("", &public_bind)).unwrap();
         let arguments = config_path.clone();
@@ -3287,7 +3297,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                 ..
             })
         ));
-        drop(reserved);
+        drop(occupied);
         let arguments = config_path;
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
@@ -3295,6 +3305,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         assert_eq!(application.public_addr, public_addr);
 
         stop_built_application(application).await;
+        drop(reservation);
     }
 
     #[tokio::test]
@@ -3302,8 +3313,9 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
     async fn admin_listener_failure_releases_public_listener_and_database_ownership() {
         let (root, _, _) = startup_fixture("", VALID_PUBLICATION);
         let config_path = root.path().join("maincopy.toml");
-        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let admin_addr = reserved.local_addr().unwrap();
+        let reservation = reserve_loopback_port();
+        let admin_addr = reservation.local_addr().unwrap();
+        let occupied = tokio::net::TcpListener::bind(admin_addr).await.unwrap();
         fs::write(
             &config_path,
             startup_host_source_with_admin("", "127.0.0.1:0", &admin_addr.to_string()),
@@ -3324,7 +3336,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                 ..
             })
         ));
-        drop(reserved);
+        drop(occupied);
         let arguments = config_path;
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
@@ -3332,6 +3344,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         assert_eq!(application.admin_addr, admin_addr);
 
         stop_built_application(application).await;
+        drop(reservation);
     }
 
     #[tokio::test]
@@ -3414,10 +3427,13 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
     #[tokio::test]
     async fn shutdown_finishes_an_accepted_public_request_before_closing_the_real_writer() {
         let (_root, config, _) = startup_fixture("", VALID_PUBLICATION);
+        let reservation = reserve_loopback_port();
+        let address = reservation.local_addr().unwrap();
+        fs::write(&config, startup_host_source("", &address.to_string())).unwrap();
         let startup =
             StartupConfiguration::load_with_discovery(config, discover_content_tree).unwrap();
         let mut application = build_test_application(startup).await.unwrap();
-        let address = application.public_addr;
+        assert_eq!(application.public_addr, address);
         let readiness = application.runtime.readiness.clone();
         let cancellation = application.runtime.cancellation.clone();
         let database_shutdown = application.runtime.database_shutdown.clone();
@@ -3445,7 +3461,9 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             .unwrap();
         assert!(database_shutdown.is_cancelled());
         let rebound = tokio::net::TcpListener::bind(address).await.unwrap();
+        assert_eq!(rebound.local_addr().unwrap(), address);
         drop(rebound);
+        drop(reservation);
     }
 
     #[tokio::test]

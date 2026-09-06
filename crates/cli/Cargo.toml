@@ -3,10 +3,13 @@ name = "maincopy-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Operator command-line client for the Maincopy administration API"
+readme = "README.md"
 autobins = false
 
 [dependencies]
-maincopy-shared = { path = "../shared" }
+maincopy-shared.workspace = true
 base64.workspace = true
 bytes.workspace = true
 clap.workspace = true

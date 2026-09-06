@@ -3,6 +3,9 @@ name = "markdown-compiler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Strict Markdown content validation, asset resolution, and revision identities for Maincopy"
+readme = "README.md"
 autobins = false
 
 [lib]

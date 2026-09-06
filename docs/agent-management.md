@@ -7,21 +7,25 @@ The owner account's current roles limit its effective scopes.
 ## Register a grant
 
 1. Sign in with an account that has `credential_manage` authority.
-2. Run `maincopy agent-key inspect` with the target administration origin.
-3. Open **Agents** and select **Register an agent**.
-4. Copy the inspected public key into the form.
-5. Set the owner account UUID, label, and requested scopes.
-6. Set an optional future expiry in UTC.
-7. Submit the form, then inspect the saved grant and compare its fingerprint.
+2. Configure the target origin with `maincopy agent-key set` if no local agent key exists.
+3. Run `maincopy agent-key inspect` with that same origin.
+4. Open **Agents** and select **Register an agent**.
+5. Copy the inspected public key into the form.
+6. Set the owner account UUID, label, and requested scopes.
+7. Set an optional future expiry in UTC.
+8. Submit the form, then inspect the saved grant and compare its fingerprint.
 
 The local inspection reads the selected origin's protected agent credential.
 It does not confirm registration or authorization on the server.
 The server stores public metadata for the grant; the protected private key stays local.
 
-To register from the CLI, replace the example values:
+To register from the CLI, replace the example values. Skip `agent-key set` if
+the intended key is already configured. It reads private material only from the
+protected terminal. Add `--admin-ca-file` to every command when using a private CA:
 
 ```console
 maincopy --admin-origin https://admin.example.test login --username first-owner
+maincopy --admin-origin https://admin.example.test agent-key set
 maincopy --admin-origin https://admin.example.test agent-key inspect
 maincopy --admin-origin https://admin.example.test agents register \
   --owner-user-id OWNER_UUID \

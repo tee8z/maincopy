@@ -2,7 +2,7 @@
 
 Status: supported development workflow
 
-Last reviewed: 2026-09-05
+Last reviewed: 2026-09-06
 
 Related: [project overview](../README.md),
 [managed source runbook](managed-source.md),
@@ -26,6 +26,7 @@ production deployment or NixOS acceptance test.
 | Administration HTTPS origin | `https://admin.localhost:8443` | Authenticated browser and CLI requests |
 | Public loopback upstream | `127.0.0.1:3000` | Caddy access only |
 | Administration loopback upstream | `127.0.0.1:3001` | Caddy access only |
+| Metrics loopback listener | `127.0.0.1:3002` | Local Prometheus only |
 
 The development fixture is in `crates/server/examples/development/`. Runtime
 state persists in `target/maincopy-dev/` between launcher restarts.
@@ -56,7 +57,7 @@ The CA certificate is `rootCA.pem`. The CA private key is `rootCA-key.pem`.
 
 1. Start from a Linux user session that can run Nix.
 2. Use the same `XDG_DATA_HOME` value in each terminal.
-3. Ensure that ports `3000`, `3001`, and `8443` are available.
+3. Ensure that ports `3000`, `3001`, `3002`, and `8443` are available.
 4. For the CLI workflow, provide an unlocked Secret Service store.
 
 The human CLI stores its session in Secret Service. It does not use a plaintext
@@ -188,13 +189,17 @@ Cancelled releases remain in history. A fresh preview approval can release
 the same cancelled revision again. Cancellation retains route reservations
 and does not remove an existing public revision.
 
-The CLI can inspect the same durable records after login:
+Browser login does not create a CLI session. In a separate terminal, run
+`scripts/dev-maincopy.sh login --username owner` before using authenticated CLI commands.
+The wrapper supplies the local HTTPS origin and development CA for every command.
+
+The CLI can inspect the same durable records:
 
 ```console
-maincopy releases list
-maincopy releases list --cursor <NEXT_CURSOR>
-maincopy releases inspect <PUBLICATION_ID>
-maincopy releases operation <OPERATION_ID>
+scripts/dev-maincopy.sh releases list
+scripts/dev-maincopy.sh releases list --cursor <NEXT_CURSOR>
+scripts/dev-maincopy.sh releases inspect <PUBLICATION_ID>
+scripts/dev-maincopy.sh releases operation <OPERATION_ID>
 ```
 
 Add `--json` for structured output. Listing returns at most 100 records and a
@@ -207,9 +212,9 @@ These commands use `GET /api/admin/v1/releases`,
 Use the displayed release version for each new change:
 
 ```console
-maincopy releases reschedule <PUBLICATION_ID> --expected-version <VERSION> --at <UTC_RFC3339> --idempotency-key <OPERATION_ID>
-maincopy releases cancel <PUBLICATION_ID> --expected-version <VERSION> --idempotency-key <OPERATION_ID>
-maincopy releases retry <PUBLICATION_ID> --expected-version <VERSION> --idempotency-key <OPERATION_ID>
+scripts/dev-maincopy.sh releases reschedule <PUBLICATION_ID> --expected-version <VERSION> --at <UTC_RFC3339> --idempotency-key <OPERATION_ID>
+scripts/dev-maincopy.sh releases cancel <PUBLICATION_ID> --expected-version <VERSION> --idempotency-key <OPERATION_ID>
+scripts/dev-maincopy.sh releases retry <PUBLICATION_ID> --expected-version <VERSION> --idempotency-key <OPERATION_ID>
 ```
 
 The CLI generates an operation UUID when `--idempotency-key` is omitted.
@@ -305,14 +310,14 @@ User pages contain at most 100 accounts. Account form bodies are limited to
 Inspect the same account state from the CLI:
 
 ```console
-maincopy users list
-maincopy users inspect USER_UUID
-maincopy --json users inspect USER_UUID
+scripts/dev-maincopy.sh users list
+scripts/dev-maincopy.sh users inspect USER_UUID
+scripts/dev-maincopy.sh --json users inspect USER_UUID
 ```
 
 Use the same `--admin-origin` and `--admin-ca-file` settings as your login.
 Each list request returns at most 100 accounts. Use the returned cursor with
-`maincopy users list --cursor NEXT_CURSOR` to request another page.
+`scripts/dev-maincopy.sh users list --cursor NEXT_CURSOR` to request another page.
 Inspection reports status, roles, scopes, and public credential metadata.
 Account versions and individual credential versions are separate preconditions.
 An empty page prints a clear message; JSON output preserves the pagination fields.
@@ -320,8 +325,8 @@ Inspection requires account-management authority. To change an account, inspect
 its current version and sign in again if your authentication is no longer fresh.
 
 ```console
-maincopy users status USER_UUID --expected-version 5 --status disabled
-maincopy users roles USER_UUID --expected-version 6 --roles publisher
+scripts/dev-maincopy.sh users status USER_UUID --expected-version 5 --status disabled
+scripts/dev-maincopy.sh users roles USER_UUID --expected-version 6 --roles publisher
 ```
 
 Role replacement requires an Owner. `--roles` replaces the complete role set.
@@ -336,9 +341,9 @@ inspect current state and use a new operation UUID for another change.
 Create an account with password, Nostr, or both login credentials:
 
 ```console
-maincopy users create --roles publisher password --username publisher
-maincopy users create --roles publisher nostr --public-key PUBLIC_KEY_HEX
-maincopy users create --roles publisher both --username publisher --public-key PUBLIC_KEY_HEX
+scripts/dev-maincopy.sh users create --roles publisher password --username publisher
+scripts/dev-maincopy.sh users create --roles publisher nostr --public-key PUBLIC_KEY_HEX
+scripts/dev-maincopy.sh users create --roles publisher both --username publisher --public-key PUBLIC_KEY_HEX
 ```
 
 Password commands read and confirm the password from the controlling terminal.
@@ -349,11 +354,11 @@ Never put passwords or private keys in command arguments or environment variable
 Manage individual login credentials after inspecting their current versions:
 
 ```console
-maincopy users credentials USER_UUID add password --username publisher
-maincopy users credentials USER_UUID add nostr --public-key PUBLIC_KEY_HEX
-maincopy users credentials USER_UUID replace --expected-version 2 password --username publisher
-maincopy users credentials USER_UUID replace --expected-version 3 nostr --public-key PUBLIC_KEY_HEX
-maincopy users credentials USER_UUID remove --expected-version 4 --provider password
+scripts/dev-maincopy.sh users credentials USER_UUID add password --username publisher
+scripts/dev-maincopy.sh users credentials USER_UUID add nostr --public-key PUBLIC_KEY_HEX
+scripts/dev-maincopy.sh users credentials USER_UUID replace --expected-version 2 password --username publisher
+scripts/dev-maincopy.sh users credentials USER_UUID replace --expected-version 3 nostr --public-key PUBLIC_KEY_HEX
+scripts/dev-maincopy.sh users credentials USER_UUID remove --expected-version 4 --provider password
 ```
 
 Replacement and removal use the **credential version** from `users inspect`.
@@ -370,7 +375,7 @@ operation UUID and authorizing session.
 For human CLI sign-in with an external Nostr signer:
 
 ```console
-maincopy login-nostr
+scripts/dev-maincopy.sh login-nostr
 ```
 
 Use the same origin and certificate options as other CLI commands.
@@ -382,7 +387,7 @@ If signing expires or fails, start `login-nostr` again for a new challenge.
 Use the human account's signer. Keep its private key in that signer.
 The CLI does not read the local agent key for human sign-in.
 Successful login stores the session in the operating system credential store.
-Sign out with `maincopy logout` before replacing a stored session.
+Sign out with `scripts/dev-maincopy.sh logout` before replacing a stored session.
 With `--json`, signing instructions still use stderr; stdout contains the result.
 
 ### 7. Sign out before a state reset
@@ -554,8 +559,7 @@ Approve the exact revision and preview:
 ```console
 scripts/dev-maincopy.sh publish-now "$POST_ID" \
   --preview-digest "$PREVIEW_DIGEST" \
-  --revision "$REVISION" \
-  --idempotency-key aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+  --revision "$REVISION"
 ```
 
 Expected status:
@@ -564,7 +568,9 @@ Expected status:
 Status: published
 ```
 
-Do not reuse this idempotency key for a different publication command.
+The CLI generates an operation UUID. Keep it with the result.
+After an uncertain response, retry identical inputs with `--idempotency-key UUID`.
+Use a new operation UUID for another reviewed revision.
 
 ### 5. Verify canonical output, RSS, and the alias
 
@@ -639,12 +645,12 @@ Both human sessions and agents require the corresponding profile or Lightning
 scope.
 
 ```console
-maincopy profile show
-maincopy profile create --display-name "Alice" --lightning-address alice@example.com --tips-enabled true
-maincopy profile update --expected-version 1 --display-name "Alice" --lightning-address alice@example.com --tips-enabled false
-maincopy tip-recipient show
-maincopy tip-recipient set USER_UUID --expected-version 1
-maincopy tip-recipient clear --expected-version 2
+scripts/dev-maincopy.sh profile show
+scripts/dev-maincopy.sh profile create --display-name "Alice" --lightning-address alice@example.com --tips-enabled true
+scripts/dev-maincopy.sh profile update --expected-version 1 --display-name "Alice" --lightning-address alice@example.com --tips-enabled false
+scripts/dev-maincopy.sh tip-recipient show
+scripts/dev-maincopy.sh tip-recipient set USER_UUID --expected-version 1
+scripts/dev-maincopy.sh tip-recipient clear --expected-version 2
 ```
 
 `profile create` requires an absent profile. `profile update` replaces all profile
@@ -669,9 +675,9 @@ Use the same `--admin-origin` when configuring, inspecting, and using an agent
 key. Each origin has a separate protected credential entry.
 
 ```console
-maincopy --admin-origin https://admin.example.com agent-key set
-maincopy --admin-origin https://admin.example.com agent-key inspect
-maincopy --admin-origin https://admin.example.com --json agent-key inspect
+scripts/dev-maincopy.sh agent-key set
+scripts/dev-maincopy.sh agent-key inspect
+scripts/dev-maincopy.sh --json agent-key inspect
 ```
 
 `set` reads the private key from the protected terminal. Both `set` and `inspect`
@@ -727,13 +733,11 @@ with the developer's identity and uses a workstation CA.
 The fixture does not test an SSH server, deploy key, or managed mirror. Use the
 [managed source runbook](managed-source.md) for that configuration contract.
 
-The [remaining implementation work](implementation.md) still requires the
-complete production gateway contract. It includes remote exposure policy,
-browser routes, logging evidence, and security tests.
-
-The remaining deployment work also requires the NixOS module. It includes
-separate service identities, firewall enforcement, protected credentials, and
-virtual-machine evidence.
+The [NixOS deployment runbook](deployment.md) covers the implemented production
+module, service identities, protected credentials, and gateway boundaries.
+Its VM check is separate from this development harness. Configure real DNS,
+firewall rules, and TLS trust on the deployment host, then complete the
+[remaining acceptance](system-evidence.md#pending-acceptance).
 
 ## Troubleshooting
 
@@ -773,7 +777,7 @@ serving a leaf from a different development CA.
 ### The launcher does not become ready
 
 Read the server and Caddy diagnostics in the launcher terminal. Identify any
-process that owns ports `3000`, `3001`, or `8443`.
+process that owns ports `3000`, `3001`, `3002`, or `8443`.
 
 If `maincopyd` reports that a retained revision is unavailable, stop the
 launcher. Run `just quickstart` to rebuild disposable state from the current

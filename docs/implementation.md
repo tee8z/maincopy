@@ -139,11 +139,15 @@ and shutdown measurements. Close every critical or high-risk finding.
 
 ### 3.3 Verify operator documentation
 
-- Run every documented command from a clean environment.
-- Validate each TOML and frontmatter example.
-- Check internal Markdown links and generated OpenAPI output.
-- Execute the deployment and restore runbooks without hidden steps.
-- Verify that documentation distinguishes current behavior from target design.
+- Execute remaining documented CLI examples against an isolated authenticated fixture; help parsing alone does not complete this check.
+- Complete browser trust, authenticated CLI credential storage, and real-signer examples on the owner's systems.
+- Execute managed Git commands against the intended remote and host-key policy.
+- Execute the deployment and B2 restore runbooks on the selected host without hidden steps.
+- Execute the release runbook with the selected version, signing identity, and publisher account.
+- Recheck examples and internal links after the final release metadata is frozen.
+
+The [system evidence](system-evidence.md) records the completed local documentation
+audit and package preparation rehearsal. Fixture results do not close these external checks.
 
 ## 4. Conditional first-release subscriptions and email
 
@@ -207,17 +211,18 @@ Prepare a candidate without publishing an artifact until the owner approves it.
 Deliverables:
 
 - Select a semantic version and finalize the [Unreleased changelog](../CHANGELOG.md#unreleased).
-- Verify crate metadata, included files, README, and license.
-- Build the source archive and Nix outputs from clean inputs.
-- Generate checksums and a dependency inventory.
-- Define a signed annotated tag policy and trusted signing keys.
-- Pin each third-party release action to an immutable commit.
-- Protect crates.io and release credentials behind owner approval.
+- Select distribution channels, advertised platforms, registry package names, and the authorized publishing identity.
+- Update workspace and dependency versions together; refresh development-version text in crate READMEs.
+- Repeat the clean source, Nix, and package checks for the selected release version and platforms.
+- Generate final checksums and dependency inventory for those exact artifacts.
+- Review dependency licenses and include required third-party notices in the selected distribution.
+- Record the approved signing fingerprints under the [signed tag policy](release.md#sign-the-tag-and-stage-a-draft).
+- Protect publishing credentials behind owner approval. If publishing is automated, pin each release action to an immutable commit.
 - Test idempotent recovery after each publication step.
 
 Required evidence:
 
-- Run `cargo publish --dry-run --locked` on the exact candidate.
+- Run `cargo publish --dry-run --locked --workspace` on the exact candidate, or select the approved package subset explicitly.
 - Run `nix flake check` and `nix build` from the release archive.
 - Reject an unsigned tag, version mismatch, or untrusted signing key.
 - Create a draft GitHub Release without making it public.

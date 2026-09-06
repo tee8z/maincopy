@@ -89,7 +89,7 @@ mod tests {
     use std::{future::Future as _, task::Poll, time::Duration};
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
-        net::TcpStream,
+        net::{TcpSocket, TcpStream},
     };
     use tower::ServiceExt as _;
 
@@ -154,10 +154,20 @@ mod tests {
             ));
         }
         let cancellation = CancellationToken::new();
-        let server = MetricsServer::bind("127.0.0.1:0".parse().unwrap(), metrics())
-            .await
-            .unwrap();
-        let address = server.local_addr;
+        // A bound, non-listening socket keeps this port out of concurrent
+        // ephemeral allocations. SO_REUSEADDR permits the real listener to
+        // share the reservation, but not another live listener.
+        let reservation = TcpSocket::new_v4().unwrap();
+        reservation.set_reuseaddr(true).unwrap();
+        reservation.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = reservation.local_addr().unwrap();
+        let server = MetricsServer::bind(address, metrics()).await.unwrap();
+        assert_eq!(server.local_addr, address);
+        assert_eq!(
+            TcpListener::bind(address).await.unwrap_err().kind(),
+            io::ErrorKind::AddrInUse,
+            "the reservation must not permit two live listeners"
+        );
         let mut serving = Box::pin(server.serve(cancellation.clone()));
         let clients = async {
             let mut idle_scraper = TcpStream::connect(address).await.unwrap();
@@ -215,7 +225,12 @@ mod tests {
             final_bytes.len() <= 4096,
             "the incomplete request must close without an unbounded response"
         );
-        assert!(TcpListener::bind(address).await.is_ok());
+        let rebound = TcpListener::bind(address)
+            .await
+            .expect("the drained metrics server must release its reserved listener address");
+        assert_eq!(rebound.local_addr().unwrap(), address);
+        drop(rebound);
+        drop(reservation);
     }
 
     #[tokio::test]

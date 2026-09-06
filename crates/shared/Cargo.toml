@@ -3,6 +3,9 @@ name = "maincopy-shared"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Versioned wire contracts shared by Maincopy servers and operator clients"
+readme = "README.md"
 
 [features]
 schema = ["dep:utoipa", "utoipa/time", "utoipa/uuid"]

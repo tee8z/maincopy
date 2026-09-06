@@ -65,8 +65,8 @@ Then publish the included article:
 2. Sign in as `owner` with the generated password.
 3. Select **Review exact preview** for **Hello, Maincopy**.
 4. Open and inspect the rendered preview.
-5. Continue to confirmation and accept that exact preview.
-6. Select **Publish this exact revision**.
+5. Continue to confirmation and select **I reviewed and accept this exact preview**.
+6. Select **Approve this exact revision**.
 7. Open `https://maincopy.localhost:8443/posts/hello-maincopy`.
 
 The included article is also a technical design document. It demonstrates
@@ -147,8 +147,9 @@ Keep `id` stable when you rename or move an article. Maincopy binds approved
 slugs and aliases to that identity. A conflicting article cannot claim them.
 
 The compiler supports CommonMark, declared code-language classes, Mermaid
-diagrams, and sanitized Scalable Vector Graphics (SVG). Public pages remain
-usable without JavaScript.
+diagrams, and sanitized Scalable Vector Graphics (SVG). See
+[content rendering](docs/content-rendering.md) for supported languages and limits.
+Public pages remain usable without JavaScript.
 
 ## Connect a Git repository
 
@@ -178,11 +179,12 @@ After setup, article changes need no server restart:
 4. Review the exact rendered candidate.
 5. Publish the selected revision after confirmation.
 
-Use the command-line interface (CLI) for the same source operations:
+Use the command-line interface (CLI) for the same source operations.
+Replace the example origin with the HTTPS origin used at login:
 
 ```console
-maincopy source status
-maincopy source sync --wait
+maincopy --admin-origin https://admin.example.com source status
+maincopy --admin-origin https://admin.example.com source sync --wait
 ```
 
 Use `--json` for automation. Add `--idempotency-key UUID` when a caller must
@@ -192,7 +194,7 @@ If a fetch or compile fails, Maincopy keeps the previous private candidate and
 public snapshot. Inspect the stable failure code with:
 
 ```console
-maincopy --json source status
+maincopy --admin-origin https://admin.example.com --json source status
 ```
 
 ## Security boundaries
@@ -218,10 +220,19 @@ It shares neither the public nor the administration router.
   status, and failure recovery.
 - [Local development runbook](docs/local-development.md) covers the included
   HTTPS environment and browser workflow.
+- [Content rendering](docs/content-rendering.md) defines code-language classes,
+  Mermaid rendering, sanitization, and limits.
+- [Content images](docs/content-images.md) covers site and article images.
+- [Agent grants](docs/agent-management.md) covers delegated access and revocation.
 - [NixOS deployment](docs/deployment.md) covers the gateway, service boundaries,
   credentials, and initialization.
 - [Backup and restore](docs/backup-restore.md) covers encrypted Litestream
   checkpoints, key recovery, and offline acceptance.
+- [Observability](docs/observability.md) covers metrics and the Grafana dashboard.
+- [Public serving](docs/public-serving.md) covers request limits and shutdown.
+- [System evidence](docs/system-evidence.md) separates automated checks from
+  remaining owner acceptance.
+- [Release preparation](docs/release.md) covers candidate artifacts and approval.
 - [Remaining implementation work](docs/implementation.md) lists unfinished
   product, operations, and release work.
 - [Engineering style](docs/quality.md) defines code, test, and documentation

@@ -33,6 +33,12 @@ jobs:
           use-gha-cache: enabled
           diagnostic-endpoint: ""
 
+      - name: Report Nix evaluation settings
+        run: |
+          nix --version
+          nix config show eval-cores
+          nix config show max-call-depth
+
       - name: Allow the Nix test sandbox to create user namespaces
         run: |
           # Ubuntu's packaged profiles do not cover Bubblewrap in the Nix store.

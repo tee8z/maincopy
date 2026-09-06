@@ -13,22 +13,22 @@ The deployment VM uses the packaged Rust commands. Its passing canonical run is 
 
 | Case | Existing test evidence | Scope |
 | --- | --- | --- |
-| Startup | [production_identity_policy_refuses_credential_output_and_accepts_offline_nostr_bootstrap](../crates/server/src/startup.rs#L2129); [application_build_serves_public_site_and_protected_admin_backend](../crates/server/src/startup.rs#L2286) | Application fixtures check explicit bootstrap, listeners, and protected administration. |
-| Browser login | [protected_router_enforces_host_origin_cookie_csrf_and_logout](../crates/server/src/admin/security.rs#L2317); [nostr_login_consumes_one_signed_challenge_exactly_once](../crates/server/src/admin/security.rs#L2514) | Router fixtures exercise password sessions and signed challenge replay. Signing keys are test fixtures. |
+| Startup | [production_identity_policy_refuses_credential_output_and_accepts_offline_nostr_bootstrap](../crates/server/src/startup.rs#L2138); [application_build_serves_public_site_and_protected_admin_backend](../crates/server/src/startup.rs#L2295) | Application fixtures check explicit bootstrap, listeners, and protected administration. |
+| Browser login | [protected_router_enforces_host_origin_cookie_csrf_and_logout](../crates/server/src/admin/security.rs#L2329); [nostr_login_consumes_one_signed_challenge_exactly_once](../crates/server/src/admin/security.rs#L2526) | Router fixtures exercise password sessions and signed challenge replay. Signing keys are test fixtures. |
 | Human CLI login | [external_human_signing_request_binds_the_exact_origin_and_creates_the_human_wire_proof](../crates/cli/src/client/nostr_login.rs#L373); [cancelled_signing_and_output_failure_return_before_a_proof_is_submitted](../crates/cli/src/startup/nostr_login.rs#L67) | Client and prompt fixtures check proof binding and cancellation. No owner signer participates. |
-| Agent API authentication | [agent_proofs_are_exact_replay_protected_scoped_and_restore_the_body](../crates/server/src/admin/security.rs#L2563); [browser_agents_register_replay_replace_scopes_and_revoke_access](../crates/server/tests/api/admin_identity/agent_workflows.rs#L7) | Router proofs and a daemon process exercise scopes, replay, registration, and revocation. |
+| Agent API authentication | [agent_proofs_are_exact_replay_protected_scoped_and_restore_the_body](../crates/server/src/admin/security.rs#L2575); [browser_agents_register_replay_replace_scopes_and_revoke_access](../crates/server/tests/api/admin_identity/agent_workflows.rs#L7) | Router proofs and a daemon process exercise scopes, replay, registration, and revocation. |
 | Managed Git sync | [real_managed_git_poll_updates_only_the_private_preview_without_a_restart](../crates/server/tests/api/managed_source.rs#L60) | A daemon, Git repository, and constrained SSH fixture update the private candidate while public bytes remain pinned. |
-| Preview | [edited_markdown_updates_private_preview_until_explicit_publication_approval](../crates/server/src/startup.rs#L2431); [preview_selection_validates_server_identity_before_creating_the_file](../crates/cli/src/startup.rs#L2780) | Application and CLI fixtures check private preview updates and output identity validation. |
-| Immediate release | [admin_publication_route_activates_the_public_site_and_replays_success](../crates/server/src/startup.rs#L2335) | Application HTTP requests activate the public snapshot and replay the accepted result. |
+| Preview | [edited_markdown_updates_private_preview_until_explicit_publication_approval](../crates/server/src/startup.rs#L2440); [preview_selection_validates_server_identity_before_creating_the_file](../crates/cli/src/startup.rs#L2780) | Application and CLI fixtures check private preview updates and output identity validation. |
+| Immediate release | [admin_publication_route_activates_the_public_site_and_replays_success](../crates/server/src/startup.rs#L2344) | Application HTTP requests activate the public snapshot and replay the accepted result. |
 | Scheduled release | [browser_schedule_preserves_reviewed_revision_and_recovers_lost_response](../crates/server/src/domain/publication/ui.rs#L1749); [due_publication_activation_updates_the_snapshot_projection_and_durable_ledger](../crates/server/src/domain/publication/scheduler.rs#L467) | Browser-form and scheduler fixtures preserve the reviewed revision, then activate the due release. |
 | Published update | [update_supersedes_one_release_and_startup_selects_only_the_new_digest](../crates/server/src/domain/publication/activation.rs#L4305) | Coordinator and SQLite assertions cover supersession, updated output, replay, and startup selection. |
 | Cancellation | [browser_edits_and_cancels_exact_release_versions_with_durable_replay](../crates/server/src/domain/publication/ui.rs#L2084); [browser_cancels_a_blocked_release_without_publishing_it](../crates/server/src/domain/publication/ui.rs#L2018) | Router fixtures check versioned changes, durable replay, and cancellation without publication. |
 | Blocked retry | [browser_retries_the_original_blocked_release_and_replays_its_receipt](../crates/server/src/domain/publication/ui.rs#L1946) | The router retries the same release and pinned revision, then replays its receipt. |
 | Tips | [browser_profiles_and_tip_selection_preserve_versions_replay_and_restart](../crates/server/tests/api/admin_identity/profile_workflows.rs#L54) | Daemon restarts preserve selection. Stale edits fail; disabling the profile removes recipient eligibility. |
-| Metrics | [application_registries_are_isolated_and_expose_only_bounded_metric_labels](../crates/server/src/metrics/mod.rs#L173); [metrics_connections_obey_the_shared_capacity_and_lifetime](../crates/server/src/metrics/server.rs#L222) | Registry and TCP fixtures check label bounds, registry isolation, socket capacity, and expiration. |
+| Metrics | [application_registries_are_isolated_and_expose_only_bounded_metric_labels](../crates/server/src/metrics/mod.rs#L173); [metrics_connections_obey_the_shared_capacity_and_lifetime](../crates/server/src/metrics/server.rs#L237) | Registry and TCP fixtures check label bounds, registry isolation, socket capacity, and expiration. |
 | Encrypted backup | [test_native_checkpoint_is_encrypted_offsite_and_replays](../nix/tests/test-operations.py#L287); [test_interrupted_upload_keeps_previous_complete_recovery_and_health_time](../nix/tests/test-operations.py#L301) | Native-tool fixtures check ciphertext, replay, interrupted upload, and preservation of the preceding recovery point. |
 | Restore | [an_exported_backup_restores_released_pages_feed_profiles_tips_and_revokes_old_sessions](../crates/server/tests/api/managed_source/restore.rs#L9) | A daemon process restores a portable bundle and compares pages, feed, sitemap, profile, tips, and rejected old sessions. |
-| Shutdown | [shutdown_finishes_an_accepted_public_request_before_closing_the_real_writer](../crates/server/src/startup.rs#L3415); [shutdown_drains_producers_before_stopping_the_database_writer](../crates/server/src/startup.rs#L3583) | Application fixtures complete accepted requests and drain producers before writer shutdown. |
+| Shutdown | [shutdown_finishes_an_accepted_public_request_before_closing_the_real_writer](../crates/server/src/startup.rs#L3428); [shutdown_drains_producers_before_stopping_the_database_writer](../crates/server/src/startup.rs#L3601) | Application fixtures complete accepted requests and drain producers before writer shutdown. |
 
 ## Failure coverage
 
@@ -36,7 +36,7 @@ These are representative failure assertions, not an exhaustive injection record 
 
 | Boundary | Existing test evidence | Observable assertion |
 | --- | --- | --- |
-| Startup stages | [host_configuration_failure_prevents_content_discovery](../crates/server/src/startup.rs#L2051); [admin_listener_failure_releases_public_listener_and_database_ownership](../crates/server/src/startup.rs#L3302) | Selected configuration and listener failures stop startup and release owned resources. |
+| Startup stages | [host_configuration_failure_prevents_content_discovery](../crates/server/src/startup.rs#L2060); [admin_listener_failure_releases_public_listener_and_database_ownership](../crates/server/src/startup.rs#L3313) | Selected configuration and listener failures stop startup and release owned resources. |
 | Writer boundary | [begin_publication_recovers_at_both_crash_boundaries](../crates/server/src/database/writer.rs#L1765); [bounded_queue_rejects_full_then_drains_accepted_commands_on_shutdown](../crates/server/src/database/writer.rs#L2049) | Child-process crashes and queue saturation exercise recovery and accepted-write draining. |
 | Activation boundary | [activation_conflict_fails_closed_and_retry_resumes_the_durable_intent](../crates/server/src/domain/publication/activation.rs#L3979) | A conflicting snapshot blocks activation; retry resumes the durable intent. |
 | Git phases | [managed_source_engine_applies_changes_handles_no_change_and_preserves_last_good](../crates/server/src/git_sync.rs#L2608); [managed_git_wall_time_covers_output_held_open_by_descendants](../crates/server/tests/api/managed_source.rs#L394) | Invalid content preserves the installation. Descendant-held output remains deadline-bound. |
@@ -44,7 +44,7 @@ These are representative failure assertions, not an exhaustive injection record 
 | Gateway routes | [deployment-vm testScript](../nix/tests/deployment-vm.nix) | The passing VM checks route isolation, host mismatch, origin rejection, spoofed identity headers, and credential isolation across repeated backup cycles. |
 | Restore gates | [checkpoint_publication_refuses_missing_or_corrupt_required_candidates](../crates/server/tests/api/managed_source/restore.rs#L197); [acceptance_rejects_changed_database_artifacts_schema_binary_and_sidecars](../crates/server/src/restore.rs#L1059) | Rust fixtures reject missing content and altered acceptance inputs. The checkpoint publication fixture uses opaque LTX bytes. |
 | Backup freshness and retention | [test_stopped_replica_cannot_refresh_an_old_complete_checkpoint](../nix/tests/test-operations.py#L355); [test_interrupted_local_retention_is_cleaned_under_the_backup_lock](../nix/tests/test-operations.py#L376) | Native-tool fixtures reject stopped replication and reclaim interrupted local retention. |
-| Critical metrics failure | [metrics_collector_storage_failure_marks_unready_and_drains_the_writer](../crates/server/src/startup.rs#L3684) | A collector failure makes readiness unavailable and drains the writer. |
+| Critical metrics failure | [metrics_collector_storage_failure_marks_unready_and_drains_the_writer](../crates/server/src/startup.rs#L3702) | A collector failure makes readiness unavailable and drains the writer. |
 
 ## Recorded measurements
 
@@ -83,6 +83,57 @@ They assert unchanged database bytes, acceptance records, and rejected filesyste
 
 These results establish fixture behavior. They do not complete actual B2, owner-signer,
 other-platform, or production performance acceptance.
+
+## Release-readiness validation record
+
+The release-readiness source passed the canonical Linux checks on 2026-09-06.
+The retained preparation record identifies the tested tree, package, and committed archive.
+
+| Check | Result |
+| --- | --- |
+| Canonical `nix flake check` and `nix build` | Passed from a clean source archive on `x86_64-linux`; other architectures were not executed. |
+| Concurrent instrumented Rust suite | 994 passed; one existing ignored test; 16 test threads. |
+| Manual CRAP check | Zero violations; maximum 19.662785; 93.69% line coverage (66,744/71,242). |
+| CRAP measurement scope | 3,761 measured functions; 379 functions had no instrumented lines. |
+| Nix Rust suite | 994 tests passed; one existing ignored test. The package build also passed its documentation test. |
+| Rust formatting and Clippy | Passed with warnings denied. |
+| Packaged deployment VM | Passed; test script completed in 62.82 seconds. |
+
+The VM now waits for a confirmed native replica cutoff before requesting each checkpoint.
+An active Litestream wrapper alone does not establish replication readiness.
+See the [deployment procedure](deployment.md#provision-encrypted-b2-backups) for the same operator check.
+
+An earlier instrumented run hit the fixture's 10-second login deadline during overlapping builds.
+The unchanged 16-thread rerun passed after those builds finished.
+No deadline or authentication behavior was changed for that rerun.
+
+## Documentation and packaging rehearsal
+
+The release-readiness audit on 2026-09-06 used a clean, private operator fixture
+and the packaged operations build. It completed these checks:
+
+| Check | Result and scope |
+| --- | --- |
+| Executed operator checks | 24 passed: frontmatter, bootstrap, startup, metrics, route isolation, portable export/recovery, source setup, and local encryption/decryption. |
+| Documented CLI options | 63 packaged `--help` invocations passed with fixture substitutions. Execution and required-argument completeness need separate checks. |
+| Configuration examples | Seven TOML blocks parsed; the README article passed the packaged content validator. |
+| Documentation links | Local Markdown file, heading, and source-line targets resolved across the repository. |
+| Documented shell syntax | 76 shell and console blocks parsed with fixture substitutions; ten are release Bash blocks. |
+| Crate contents | All five packages passed clean workspace publish dry runs without upload. Each contains its README and exact MIT license bytes; normalized dependencies use registry versions. |
+| Packaged OpenAPI and authentication | 152 checks passed across 38 operations, four authentication schemes, and 298 local schema references. Login, cookie protection, CSRF, logout, and listener isolation passed. |
+| Concurrent listener lifecycle | Nine focused tests passed, followed by 32 repetitions across four concurrent processes: 297 successful test executions. |
+| Checksum retry | Initial generation, identical retry, changed-artifact rejection, and deliberate manifest regeneration passed. |
+
+Rendering constraints now live in [content rendering](content-rendering.md).
+The [deployment runbook](deployment.md#service-identities-and-filesystem-boundaries)
+retains backup writer, process-isolation, and secret-buffer exceptions.
+Historical decision files were removed.
+
+The fixture encryption checks used generated local keys. They did not contact B2.
+The CLI grammar checks did not use the owner's signer or operating-system keychain.
+The [release runbook](release.md) distinguishes preparation from publication.
+The packaged authentication fixture used fresh local credentials and loopback HTTP.
+It does not complete browser, TLS, or owner-signer acceptance.
 
 ## Pending acceptance
 
