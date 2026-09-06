@@ -155,19 +155,21 @@ audit and package preparation rehearsal. Fixture results do not close these exte
 Implement this increment now, before home-server deployment.
 The owner wants its complete privacy and dispatch behavior in the first release.
 The [mailing-list and dispatch plan](email-delivery.md) defines the design boundary.
-Use a specialist newsletter service, such as Mailchimp, for subscriber data and delivery.
-AWS email services and DynamoDB are excluded. Keep subscriber addresses out of site backups.
+Use SES for email delivery, as selected by the owner. DynamoDB remains excluded.
+Keep subscriber addresses out of the existing site backups. Resolve the separate
+subscriber authority and its backup policy before enabling capture.
 
 ### 4.1 Complete privacy and removal before capture
 
 - Treat addresses as PII, with explicit consent, double opt-in, and bounded retention.
-- Select the provider, hosted consent flow, deletion behavior, and retention policy.
+- Complete Maincopy's double opt-in, deletion behavior, and retention policy around SES delivery.
+- Finalize separate subscriber storage and recovery. Local SQLite outside site checkpoints is proposed; owner direction remains pending.
 - Implement visible unsubscribe, mailbox-provider one-click `POST`, and address removal.
   Scanner `GET` requests must never change consent.
-- Use the provider's current consent and suppression state; Maincopy must not recreate it from local copies.
-- Complete permanent removal through the provider, with honest pending states.
+- Enforce current consent in the subscriber authority and respect SES suppression state.
+- Complete removal across the subscriber authority and applicable provider data, with honest pending states.
   Resolve delayed deletion versus fresh re-consent before enabling the combined control.
-- Keep addresses, contact hashes, control tokens, and recipient exports out of Maincopy and its checkpoints.
+- Keep addresses, contact hashes, control tokens, and recipient exports out of the site database and its checkpoints.
 - Document provider retention, suppression, re-enrollment, and tracking limits.
 - Prove that older backups cannot resurrect an address, prior consent, or queued email.
 - Keep signup and sending disabled until privacy, recovery, dispatch, and
@@ -175,11 +177,12 @@ AWS email services and DynamoDB are excluded. Keep subscriber addresses out of s
 
 ### 4.2 Build durable dispatch and owner-reviewed campaigns
 
-- Keep reviewed campaigns, provider campaign identities, attempts, and status as typed local capabilities.
-  The provider owns subscribers and individual recipient dispatch.
+- Keep reviewed campaigns, attempts, provider outcomes, and status as typed local capabilities.
+  Keep individual recipient progress in the subscriber authority; SES does not own a durable campaign resource.
+- Implement one concrete SES adapter. Add selectable alternatives with their first working implementations; never reroute an uncertain send automatically.
 - Use transactional outbox writes, bounded claims, leases, fencing, and unique delivery identities.
 - Bind campaigns to reviewed public revisions, email bytes, sender, audience cutoff, and authorization.
-- Verify provider audience selection and current suppression enforcement. Define the in-flight delivery boundary.
+- Define audience selection, current consent and suppression checks, and the in-flight delivery boundary.
 - Model provider acceptance separately from delivery and ambiguous timeout outcomes.
   Respect provider idempotency windows; never blindly retry an uncertain submission.
 - Handle quotas, backoff, budgets, cancellation, complaints, hard bounces, and event replay.
@@ -188,8 +191,8 @@ AWS email services and DynamoDB are excluded. Keep subscriber addresses out of s
 
 ### 4.3 Choose transport and prove deliverability
 
-- Compare current provider costs against expected subscribers and send frequency.
-  Include minimum charges, data, events, retention, and operating effort.
+- Apply the selected SES usage-based pricing to expected volume, data, feedback events, and retention.
+  Enforce sending budgets and record optional service costs.
 - Record the chosen account and plan, sender identity, quotas, and credential permissions.
 - Execute a documented SPF, DKIM, DMARC, and custom return-path setup.
 - Verify signed one-click headers, a visible removal control, bounce and complaint processing,

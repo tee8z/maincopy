@@ -125,6 +125,9 @@ The prior remote run for `443a2c8` failed at this polling fixture's 10-second wa
 That remote failure does not invalidate the recorded local results, but it required this repair.
 Hosted validation of the repaired source remains separate evidence.
 
+[Hosted CI for `459573a`](https://github.com/tee8z/maincopy/actions/runs/34059358517)
+passed on 2026-09-06. Both the Linux Nix job and Windows client job completed successfully.
+
 A later local Nix run failed the metrics fixture's final listener rebind with
 `AddrInUse`. Its non-listening reservation did not prevent competing explicit binds
 to addresses retained by other fixtures. The test now uses a dedicated loopback
