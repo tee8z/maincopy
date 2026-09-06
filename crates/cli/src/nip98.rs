@@ -16,6 +16,13 @@ pub(crate) struct AgentPrivateKey {
     signing_key: SigningKey,
 }
 
+/// Public values used to compare the local agent key with a server grant.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct AgentPublicIdentity {
+    pub(crate) public_key: Box<str>,
+    pub(crate) fingerprint: Box<str>,
+}
+
 impl AgentPrivateKey {
     pub(crate) fn parse(encoded: &str) -> Result<Self, AgentPrivateKeyError> {
         let bytes = Zeroizing::new(
@@ -29,6 +36,18 @@ impl AgentPrivateKey {
 
     pub(crate) fn public_key_hex(&self) -> String {
         encode_lower_hex(&self.signing_key.verifying_key().to_bytes())
+    }
+
+    pub(crate) fn public_identity(&self) -> AgentPublicIdentity {
+        let bytes = self.signing_key.verifying_key().to_bytes();
+        AgentPublicIdentity {
+            public_key: encode_lower_hex(&bytes).into_boxed_str(),
+            fingerprint: format!(
+                "SHA256:{}",
+                general_purpose::STANDARD_NO_PAD.encode(Sha256::digest(bytes))
+            )
+            .into_boxed_str(),
+        }
     }
 }
 
@@ -150,6 +169,25 @@ mod tests {
     use super::*;
 
     const KEY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+
+    #[test]
+    fn public_identity_fingerprints_the_x_only_public_key_bytes() {
+        // The first BIP-340 test vector uses private scalar 3.
+        let key = AgentPrivateKey::parse(
+            "0000000000000000000000000000000000000000000000000000000000000003",
+        )
+        .unwrap();
+        let identity = key.public_identity();
+        assert_eq!(
+            identity.public_key.as_ref(),
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+        );
+        assert_eq!(
+            identity.fingerprint.as_ref(),
+            "SHA256:fHnzBx4oNE6BU79sc8KU6+N1SuxOLLjLRHGy9Ey18i0"
+        );
+        assert_eq!(key.public_key_hex(), identity.public_key.as_ref());
+    }
 
     fn decoded_event(proof: &str) -> Value {
         let bytes = general_purpose::STANDARD_NO_PAD.decode(proof).unwrap();

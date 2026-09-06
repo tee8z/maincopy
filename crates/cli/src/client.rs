@@ -39,7 +39,10 @@ use zeroize::Zeroizing;
 use crate::{
     credentials::{CredentialKey, CredentialStoreError, PlatformCredentialStore, SecretValue},
     models::AuthenticationContext,
-    nip98::{AgentPrivateKey, AgentPrivateKeyError, Nip98SigningError, authorization_proof},
+    nip98::{
+        AgentPrivateKey, AgentPrivateKeyError, AgentPublicIdentity, Nip98SigningError,
+        authorization_proof,
+    },
     transport::{
         AdditionalRootCertificateError, AdditionalRootCertificates, HttpRequest, HttpResponse,
         RequestBody, ReqwestExecutor, TransportError,
@@ -364,14 +367,21 @@ impl AdminClient {
     pub(crate) fn configure_agent_private_key(
         &self,
         key: SecretString,
-    ) -> Result<Box<str>, AdminClientError> {
+    ) -> Result<AgentPublicIdentity, AdminClientError> {
         let parsed = AgentPrivateKey::parse(key.expose_secret())?;
-        let public_key = parsed.public_key_hex().into_boxed_str();
+        let identity = parsed.public_identity();
         self.credentials.save(
             &CredentialKey::agent(self.origin.as_str()),
             &SecretValue::new(key.expose_secret()),
         )?;
-        Ok(public_key)
+        Ok(identity)
+    }
+
+    /// Derives public comparison values without contacting or changing the server.
+    pub(crate) fn agent_public_identity(
+        &self,
+    ) -> Result<Option<AgentPublicIdentity>, AdminClientError> {
+        inspect_agent_key(&self.origin, |key| self.credentials.load(key))
     }
 
     /// Removes the local agent private key without changing its server grant.
@@ -712,6 +722,20 @@ fn revoke_session_request(
 struct PreparedLogout {
     credential_key: CredentialKey,
     request: HttpRequest,
+}
+
+fn inspect_agent_key<LoadCredential>(
+    origin: &AdminOrigin,
+    load_credential: LoadCredential,
+) -> Result<Option<AgentPublicIdentity>, AdminClientError>
+where
+    LoadCredential: FnOnce(&CredentialKey) -> Result<Option<SecretValue>, CredentialStoreError>,
+{
+    let Some(secret) = load_credential(&CredentialKey::agent(origin.as_str()))? else {
+        return Ok(None);
+    };
+    let key = AgentPrivateKey::parse(secret.expose_secret())?;
+    Ok(Some(key.public_identity()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2056,6 +2080,46 @@ mod tests {
 
     const SESSION_TOKEN: &str =
         "mcs1_1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn agent_key_inspection_reads_only_the_selected_agent_credential_and_returns_public_values() {
+        let origin = AdminOrigin::parse("https://admin.example.test:8443").unwrap();
+        let loaded = Cell::new(false);
+        let identity = inspect_agent_key(&origin, |actual| {
+            assert_eq!(
+                actual,
+                &CredentialKey::agent("https://admin.example.test:8443")
+            );
+            loaded.set(true);
+            Ok(Some(SecretValue::new(AGENT_KEY)))
+        })
+        .unwrap()
+        .unwrap();
+        assert!(loaded.get());
+        let expected = AgentPrivateKey::parse(AGENT_KEY).unwrap().public_identity();
+        assert_eq!(identity, expected);
+        assert!(
+            !serde_json::to_string(&identity)
+                .unwrap()
+                .contains(AGENT_KEY)
+        );
+        assert!(!format!("{identity:?}").contains(AGENT_KEY));
+
+        assert_eq!(inspect_agent_key(&origin, |_| Ok(None)).unwrap(), None);
+        let malformed = inspect_agent_key(&origin, |_| {
+            Ok(Some(SecretValue::new("invalid private scalar")))
+        })
+        .unwrap_err();
+        assert!(matches!(malformed, AdminClientError::AgentPrivateKey(_)));
+        assert!(!format!("{malformed:?}").contains("invalid private scalar"));
+        let unavailable = inspect_agent_key(&origin, |_| {
+            Err(CredentialStoreError::Load(keyring::Error::NoEntry))
+        });
+        assert!(matches!(
+            unavailable,
+            Err(AdminClientError::CredentialStore(_))
+        ));
+    }
     const CSRF_TOKEN: &str =
         "mcc1_2222222222222222222222222222222222222222222222222222222222222222";
     const AGENT_KEY: &str = "0303030303030303030303030303030303030303030303030303030303030303";

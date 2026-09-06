@@ -575,6 +575,28 @@ Failures retain the operation ID in human and `--json` output. Inspect current
 state after an uncertain result. Retry the identical command with its original
 key to recover its accepted result.
 
+### Inspect the local agent key
+
+Use the same `--admin-origin` when configuring, inspecting, and using an agent
+key. Each origin has a separate protected credential entry.
+
+```console
+maincopy --admin-origin https://admin.example.com agent-key set
+maincopy --admin-origin https://admin.example.com agent-key inspect
+maincopy --admin-origin https://admin.example.com --json agent-key inspect
+```
+
+`set` reads the private key from the protected terminal. Both `set` and `inspect`
+report the public key and its fingerprint. Inspection reads only the selected
+local agent credential and requires no human session or API request.
+
+The fingerprint is SHA-256 of the raw 32-byte Nostr public key. Its text is
+`SHA256:` followed by unpadded Base64. Compare the full public key when
+registering the corresponding agent grant through the identity API.
+
+If no local key exists, JSON output contains `{"configured":false}`. A successful
+local inspection does not indicate whether the server grant is active.
+
 ## Preserve or reset publication state
 
 Normal launcher restarts preserve the database and retained content candidates

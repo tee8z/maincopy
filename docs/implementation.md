@@ -50,8 +50,8 @@ Deliverables:
 - Complete Nostr sign-in in the human CLI.
 - Manage agent public-key credentials in the browser and CLI with fresh
   authentication.
-- Show the selected credential public key and fingerprint without exposing its
-  private path or bytes.
+- Add fingerprint displays to browser credential pages and the remaining CLI
+  account commands. Keep private paths and bytes out of their output.
 - Provide clear empty, conflict, expired-session, and forbidden states.
 
 Required evidence:

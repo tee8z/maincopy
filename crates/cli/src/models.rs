@@ -196,6 +196,8 @@ pub(crate) enum AuthenticationContext {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum AgentKeyCommand {
+    /// Show the selected local agent public key and its SHA-256 fingerprint.
+    Inspect,
     /// Read a lowercase-hex Nostr private key from the terminal and protect it locally.
     Set,
     /// Delete the protected local agent key.
@@ -436,6 +438,13 @@ mod tests {
             Arguments::try_parse_from(["maincopy", "agent-key", "set", "--private-key", "secret"])
                 .is_err()
         );
+        let inspect = Arguments::try_parse_from(["maincopy", "agent-key", "inspect"]).unwrap();
+        assert!(matches!(
+            inspect.command,
+            Command::AgentKey {
+                command: AgentKeyCommand::Inspect
+            }
+        ));
     }
 
     #[test]

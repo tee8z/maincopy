@@ -40,6 +40,7 @@ use crate::{
         AgentKeyCommand, Arguments, Command, ReleaseCommand, ReleaseTarget, SourceCommand,
         SourceSyncDisposition, SourceSyncInvocation,
     },
+    nip98::AgentPublicIdentity,
     transport::AdditionalRootCertificateError,
 };
 
@@ -61,9 +62,7 @@ enum CommandOutput {
     Profile(ProfileOutput),
     Login(AdminSessionResponse),
     Logout(LogoutOutcome),
-    AgentKeyConfigured {
-        public_key: Box<str>,
-    },
+    AgentKeyIdentity(Option<AgentPublicIdentity>),
     AgentKeyRemoved,
     Capabilities(Capabilities),
     Posts(ListPostsResponse),
@@ -384,6 +383,12 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
             .map(CommandOutput::Logout)
             .map_err(CliError::from),
         Command::AgentKey {
+            command: AgentKeyCommand::Inspect,
+        } => client
+            .agent_public_identity()
+            .map(CommandOutput::AgentKeyIdentity)
+            .map_err(CliError::from),
+        Command::AgentKey {
             command: AgentKeyCommand::Set,
         } => configure_agent_key(&client),
         Command::AgentKey {
@@ -639,7 +644,7 @@ fn configure_agent_key(client: &AdminClient) -> Result<CommandOutput, CliError> 
         .map_err(CliError::SecretInput)?;
     client
         .configure_agent_private_key(SecretString::new(key.into_boxed_str()))
-        .map(|public_key| CommandOutput::AgentKeyConfigured { public_key })
+        .map(|identity| CommandOutput::AgentKeyIdentity(Some(identity)))
         .map_err(CliError::from)
 }
 
@@ -824,8 +829,8 @@ fn write_output(
         CommandOutput::Profile(result) => profile::write_output(output, result, json),
         CommandOutput::Login(session) => write_login(output, session, json),
         CommandOutput::Logout(revoked) => write_logout(output, revoked, json),
-        CommandOutput::AgentKeyConfigured { public_key } => {
-            write_agent_key_configured(output, &public_key, json)
+        CommandOutput::AgentKeyIdentity(identity) => {
+            write_agent_key_identity(output, identity.as_ref(), json)
         }
         CommandOutput::AgentKeyRemoved => write_agent_key_removed(output, json),
         CommandOutput::Capabilities(capabilities) => write_capabilities(output, capabilities, json),
@@ -1166,19 +1171,30 @@ fn write_logout(
     Ok(())
 }
 
-fn write_agent_key_configured(
+fn write_agent_key_identity(
     mut output: impl io::Write,
-    public_key: &str,
+    identity: Option<&AgentPublicIdentity>,
     json: bool,
 ) -> Result<(), CliError> {
     if json {
+        let value = match identity {
+            Some(identity) => json!({
+                "public_key": identity.public_key,
+                "fingerprint": identity.fingerprint,
+                "configured": true,
+            }),
+            None => json!({"configured": false}),
+        };
+        writeln!(output, "{value}")?;
+    } else if let Some(identity) = identity {
+        writeln!(output, "Agent public key: {}", identity.public_key)?;
+        writeln!(output, "Fingerprint: {}", identity.fingerprint)?;
+    } else {
         writeln!(
             output,
-            "{}",
-            json!({ "public_key": public_key, "configured": true })
+            "No local agent key is configured for this admin origin."
         )?;
-    } else {
-        writeln!(output, "Agent public key: {public_key}")?;
+        writeln!(output, "Configure a key: maincopy agent-key set")?;
     }
     Ok(())
 }
@@ -2740,17 +2756,38 @@ mod tests {
             "The server no longer accepts this session. Local credentials removed.\n"
         );
 
+        let identity = AgentPublicIdentity {
+            public_key: "public-key".into(),
+            fingerprint: "SHA256:fingerprint".into(),
+        };
         for json in [false, true] {
             let mut configured = Vec::new();
-            write_agent_key_configured(&mut configured, "public-key", json).unwrap();
+            write_agent_key_identity(&mut configured, Some(&identity), json).unwrap();
             let configured = String::from_utf8(configured).unwrap();
             if json {
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&configured).unwrap(),
-                    json!({"public_key": "public-key", "configured": true})
+                    json!({"public_key": "public-key", "fingerprint":"SHA256:fingerprint", "configured": true})
                 );
             } else {
-                assert_eq!(configured, "Agent public key: public-key\n");
+                assert_eq!(
+                    configured,
+                    "Agent public key: public-key\nFingerprint: SHA256:fingerprint\n"
+                );
+            }
+
+            let mut absent = Vec::new();
+            write_agent_key_identity(&mut absent, None, json).unwrap();
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&absent).unwrap(),
+                    json!({"configured":false})
+                );
+            } else {
+                assert_eq!(
+                    String::from_utf8(absent).unwrap(),
+                    "No local agent key is configured for this admin origin.\nConfigure a key: maincopy agent-key set\n"
+                );
             }
 
             let mut removed = Vec::new();
