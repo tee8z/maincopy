@@ -67,7 +67,13 @@ async fn browser_accounts_preserve_role_versions_and_revoke_disabled_user_access
         "scopes":["content_read"], "expires_at":null,
     })).await;
     assert_eq!(registered.status(), StatusCode::CREATED);
-    for path in ["/admin/users", &user_path, "/admin/profile", "/admin/tips"] {
+    for path in [
+        "/admin/agents",
+        "/admin/users",
+        &user_path,
+        "/admin/profile",
+        "/admin/tips",
+    ] {
         assert_eq!(
             browser_request(&harness, &publisher, Method::GET, path, &[])
                 .await

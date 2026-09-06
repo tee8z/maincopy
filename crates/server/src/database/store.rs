@@ -20,9 +20,9 @@ use crate::domain::publication::store::{
     ReleaseCommandError, SchedulePublication, SchedulePublicationResult,
 };
 use crate::domain::source::store::{
-    AdvanceSourceSync, ApplyManagedSourceCatalog, BeginSourceSync, BeginSourceSyncResult,
-    FinishSourceSync, PutSourceConfiguration, SourceStore, StoredSourceConfiguration,
-    StoredSourceSync,
+    AdvanceSourceSync, ApplyManagedSourceCatalog, BeginSourceReconfiguration, BeginSourceSync,
+    BeginSourceSyncResult, FinishSourceSync, PutSourceConfiguration, SourceStore,
+    StoredSourceConfiguration, StoredSourceSync,
 };
 
 /// The server-facing database capability.
@@ -185,6 +185,10 @@ pub(crate) enum Mutation {
     PutSourceConfiguration {
         command: PutSourceConfiguration,
         respond_to: oneshot::Sender<Result<StoredSourceConfiguration, DatabaseCommandError>>,
+    },
+    BeginSourceReconfiguration {
+        command: BeginSourceReconfiguration,
+        respond_to: oneshot::Sender<Result<BeginSourceSyncResult, DatabaseCommandError>>,
     },
     BeginSourceSync {
         command: BeginSourceSync,

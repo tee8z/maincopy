@@ -1,11 +1,18 @@
 //! Command-line input models.
 
+mod agents;
+pub(crate) use agents::AgentCommand;
 mod profile;
+mod source;
+pub(crate) use source::SourceConfigurationArguments;
 mod users;
 pub(crate) use profile::{
     ProfileCommand, ProfileInvocation, TipRecipientCommand, TipRecipientInvocation,
 };
-pub(crate) use users::{UserCommand, UserTarget};
+pub(crate) use users::{
+    CreateUserArguments, InitialCredentials, LoginCredentialArguments, UserCommand,
+    UserCredentialCommand,
+};
 
 use std::path::PathBuf;
 
@@ -48,6 +55,11 @@ pub(crate) struct Arguments {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Register, inspect, update, and revoke agent grants.
+    Agents {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Inspect accounts and replace their status or roles.
     Users {
         #[command(subcommand)]
@@ -69,6 +81,9 @@ pub(crate) enum Command {
         #[arg(long, value_name = "USERNAME")]
         username: Box<str>,
     },
+
+    /// Create a human session using a challenge signed by your external Nostr signer.
+    LoginNostr,
 
     /// Revoke the active human session and delete its protected local credentials.
     Logout,
@@ -213,6 +228,10 @@ pub(crate) enum AgentKeyCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SourceCommand {
+    /// Show the selected deploy public key and its fingerprint.
+    DeployKey,
+    /// Validate proposed settings and install them after successful compilation.
+    Configure(SourceConfigurationArguments),
     /// Report the configured source and its installed state.
     Status,
 

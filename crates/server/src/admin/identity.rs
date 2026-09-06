@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+mod agents_ui;
 mod ui;
 pub(super) use ui::browser_router;
 

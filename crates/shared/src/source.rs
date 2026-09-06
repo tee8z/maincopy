@@ -712,6 +712,63 @@ pub struct ListSourceSyncsResponse {
     pub next_cursor: Option<SourceSyncId>,
 }
 
+/// Public SSH identity derived from the selected protected deploy key.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[serde(try_from = "SourceDeployKeyWire")]
+pub struct SourceDeployKeyResponse {
+    pub credential_name: SshCredentialName,
+    pub public_key: Box<str>,
+    pub fingerprint: Box<str>,
+}
+
+#[derive(Deserialize)]
+struct SourceDeployKeyWire {
+    credential_name: SshCredentialName,
+    public_key: Box<str>,
+    fingerprint: Box<str>,
+}
+
+impl TryFrom<SourceDeployKeyWire> for SourceDeployKeyResponse {
+    type Error = SourceWireDecodeError;
+    fn try_from(wire: SourceDeployKeyWire) -> Result<Self, Self::Error> {
+        let public_key = wire.public_key.strip_prefix("ssh-ed25519 ");
+        let fingerprint = wire.fingerprint.strip_prefix("SHA256:");
+        if !public_key.is_some_and(|value| valid_unpadded_base64(value, 68))
+            || !fingerprint.is_some_and(|value| valid_unpadded_base64(value, 43))
+        {
+            return Err(SourceWireDecodeError(
+                "deploy public identity has invalid encoding",
+            ));
+        }
+        Ok(Self {
+            credential_name: wire.credential_name,
+            public_key: wire.public_key,
+            fingerprint: wire.fingerprint,
+        })
+    }
+}
+
+fn valid_unpadded_base64(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+}
+
+/// Proposed online settings. The expected version identifies the installed head.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ReconfigureSourceRequest {
+    pub remote: SshRemote,
+    pub branch: GitBranchName,
+    pub content_subdirectory: RepositoryContentSubdirectory,
+    pub credential_name: SshCredentialName,
+    pub poll_interval_seconds: SourcePollInterval,
+    pub expected_version: SourceConfigurationVersion,
+}
+
 /// Current source mode and its non-secret runtime state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]

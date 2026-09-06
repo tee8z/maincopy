@@ -189,6 +189,7 @@ pub(in crate::admin) fn browser_router(security: &AdminSecurityState) -> Router<
         security,
         AdminScope::CredentialManage,
     ))
+    .merge(super::agents_ui::browser_router(security))
     .layer(DefaultBodyLimit::max(FORM_LIMIT))
     .layer(middleware::from_fn(adapt_security_response))
 }
@@ -409,7 +410,10 @@ async fn show_user(
     )
 }
 
-fn mutation_fields(browser: &BrowserFormSession, expected_version: Option<u64>) -> Markup {
+pub(super) fn mutation_fields(
+    browser: &BrowserFormSession,
+    expected_version: Option<u64>,
+) -> Markup {
     html! {
         input type="hidden" name="_csrf" value=(browser.csrf_token.expose_secret());
         input type="hidden" name="operation_id" value=(Uuid::new_v4());
@@ -495,7 +499,7 @@ fn password_inputs(prefix: &str, username: &str) -> Markup {
     }
 }
 
-fn registered_nostr_key(public_key: &str) -> Markup {
+pub(super) fn registered_nostr_key(public_key: &str) -> Markup {
     let Ok(key) = NostrPublicKey::parse(public_key) else {
         return html! { p { "Registered key metadata is unavailable." } };
     };
@@ -520,7 +524,7 @@ fn nostr_input(id: &str, public_key: &str) -> Markup {
     }
 }
 
-fn operation_headers(operation_id: Uuid) -> HeaderMap {
+pub(super) fn operation_headers(operation_id: Uuid) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         IDEMPOTENCY_KEY_HEADER,
@@ -533,7 +537,11 @@ fn invalid_form(error: FormRejection, request_id: RequestId) -> Response {
     mutation_error_response(error.status(), "/admin/users", request_id)
 }
 
-fn mutation_response(response: Response, location: &str, request_id: RequestId) -> Response {
+pub(super) fn mutation_response(
+    response: Response,
+    location: &str,
+    request_id: RequestId,
+) -> Response {
     if response.status().is_success() {
         return redirect(location);
     }

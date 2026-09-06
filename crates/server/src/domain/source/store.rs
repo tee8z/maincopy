@@ -22,7 +22,7 @@ use crate::{
         auth::store::{
             AdminMutationKey, AuditPrincipalReference, AuthApplyError, AuthCommandError,
             MutationAuditContext, append_success_audit, decode_audit_principal,
-            require_principal_scope,
+            require_fresh_browser_scope, require_principal_scope,
         },
         publication::{
             SourceCommit,
@@ -178,6 +178,34 @@ impl SourceStore {
         Ok(SourceSyncPage { syncs, next_cursor })
     }
 
+    pub(crate) async fn configuration_revision(
+        &self,
+        version: SourceConfigurationVersion,
+    ) -> Result<Option<StoredSourceConfiguration>, SourceLoadError> {
+        let row = sqlx::query_as::<_, SourceConfigurationRow>(
+            "SELECT ssh_user, ssh_host, ssh_port, repository_path, branch, content_subdirectory, \
+                    credential_name, poll_interval_seconds, version, updated_at_ns, NULL AS next_poll_at_ns \
+             FROM source_configuration_revisions WHERE version = ?",
+        ).bind(i64::try_from(version.get()).map_err(|_| SourceLoadError::Corrupt { field: "configuration version" })?)
+            .fetch_optional(&self.readers).await?;
+        row.map(decode_configuration).transpose()
+    }
+
+    pub(crate) async fn begin_reconfiguration(
+        &self,
+        command: BeginSourceReconfiguration,
+    ) -> Result<BeginSourceSyncResult, DatabaseMutationError> {
+        self.mutations
+            .send(
+                |respond_to| Mutation::BeginSourceReconfiguration {
+                    command,
+                    respond_to,
+                },
+                DatabaseCommandError::OutcomeUnknown,
+            )
+            .await
+    }
+
     pub(crate) async fn put_configuration(
         &self,
         command: PutSourceConfiguration,
@@ -321,6 +349,13 @@ pub(crate) struct StoredSourceStatus {
 pub(crate) struct PutSourceConfiguration {
     pub(crate) request: ManagedSourceConfigurationInput,
     pub(crate) occurred_at: OffsetDateTime,
+    pub(crate) audit: MutationAuditContext,
+}
+
+pub(crate) struct BeginSourceReconfiguration {
+    pub(crate) proposed_source_sync_id: SourceSyncId,
+    pub(crate) request: ManagedSourceConfigurationInput,
+    pub(crate) requested_at: OffsetDateTime,
     pub(crate) audit: MutationAuditContext,
 }
 
@@ -767,67 +802,18 @@ pub(crate) async fn put_configuration(
         (None, None) => SourceConfigurationVersion::new(1)
             .expect("the initial source configuration version is valid"),
         (Some(current), Some(expected)) if current.configuration.version == expected => {
-            SourceConfigurationVersion::new(
-                expected
-                    .get()
-                    .checked_add(1)
-                    .ok_or(DatabaseCommandError::InvalidValue)?,
-            )
-            .ok_or(DatabaseCommandError::InvalidValue)?
+            next_configuration_version(transaction).await?
         }
         _ => return Err(DatabaseCommandError::Rejected.into()),
     };
+    if load_active_sync(transaction).await?.is_some() {
+        return Err(DatabaseCommandError::Rejected.into());
+    }
     let updated_at_ns = command_timestamp(command.occurred_at)?;
     let request = command.request;
     let version_i64 = version_i64(next_version.get())?;
-    sqlx::query(
-        "INSERT INTO source_configuration_revisions (\
-            version, ssh_user, ssh_host, ssh_port, repository_path, branch, \
-            content_subdirectory, credential_name, poll_interval_seconds, updated_at_ns\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(version_i64)
-    .bind(request.remote.user.as_str())
-    .bind(request.remote.host.as_str())
-    .bind(i64::from(request.remote.port.get()))
-    .bind(request.remote.repository_path.as_str())
-    .bind(request.branch.as_str())
-    .bind(request.content_subdirectory.as_str())
-    .bind(request.credential_name.as_str())
-    .bind(version_i64_from_u64(
-        request.poll_interval_seconds.seconds(),
-    )?)
-    .bind(updated_at_ns)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query(
-        "INSERT INTO source_configuration (\
-            singleton, ssh_user, ssh_host, ssh_port, repository_path, branch, \
-            content_subdirectory, credential_name, poll_interval_seconds, version, \
-            updated_at_ns, next_poll_at_ns\
-         ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) \
-         ON CONFLICT(singleton) DO UPDATE SET \
-            ssh_user = excluded.ssh_user, ssh_host = excluded.ssh_host, \
-            ssh_port = excluded.ssh_port, repository_path = excluded.repository_path, \
-            branch = excluded.branch, content_subdirectory = excluded.content_subdirectory, \
-            credential_name = excluded.credential_name, \
-            poll_interval_seconds = excluded.poll_interval_seconds, version = excluded.version, \
-            updated_at_ns = excluded.updated_at_ns, next_poll_at_ns = NULL",
-    )
-    .bind(request.remote.user.as_str())
-    .bind(request.remote.host.as_str())
-    .bind(i64::from(request.remote.port.get()))
-    .bind(request.remote.repository_path.as_str())
-    .bind(request.branch.as_str())
-    .bind(request.content_subdirectory.as_str())
-    .bind(request.credential_name.as_str())
-    .bind(version_i64_from_u64(
-        request.poll_interval_seconds.seconds(),
-    )?)
-    .bind(version_i64)
-    .bind(updated_at_ns)
-    .execute(&mut **transaction)
-    .await?;
+    insert_configuration_revision(transaction, &request, next_version, updated_at_ns).await?;
+    install_configuration_revision(transaction, next_version).await?;
     map_auth_result(
         append_success_audit(
             transaction,
@@ -864,6 +850,160 @@ pub(crate) async fn put_configuration(
     })
 }
 
+const RECONFIGURE_ACTION: &str = "source.configuration.propose";
+
+async fn insert_configuration_revision(
+    transaction: &mut Transaction<'_, Sqlite>,
+    request: &ManagedSourceConfigurationInput,
+    version: SourceConfigurationVersion,
+    updated_at_ns: i64,
+) -> Result<(), SourceApplyError> {
+    sqlx::query(
+        "INSERT INTO source_configuration_revisions (\
+            version, ssh_user, ssh_host, ssh_port, repository_path, branch, \
+            content_subdirectory, credential_name, poll_interval_seconds, updated_at_ns\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(version_i64(version.get())?)
+    .bind(request.remote.user.as_str())
+    .bind(request.remote.host.as_str())
+    .bind(i64::from(request.remote.port.get()))
+    .bind(request.remote.repository_path.as_str())
+    .bind(request.branch.as_str())
+    .bind(request.content_subdirectory.as_str())
+    .bind(request.credential_name.as_str())
+    .bind(version_i64_from_u64(
+        request.poll_interval_seconds.seconds(),
+    )?)
+    .bind(updated_at_ns)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn next_configuration_version(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<SourceConfigurationVersion, SourceApplyError> {
+    let maximum: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM source_configuration_revisions")
+            .fetch_one(&mut **transaction)
+            .await?;
+    let next = maximum
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .and_then(SourceConfigurationVersion::new)
+        .ok_or(DatabaseCommandError::InvalidValue)?;
+    Ok(next)
+}
+
+async fn install_configuration_revision(
+    transaction: &mut Transaction<'_, Sqlite>,
+    version: SourceConfigurationVersion,
+) -> Result<(), SourceApplyError> {
+    let changed = sqlx::query(
+        "INSERT INTO source_configuration (singleton, ssh_user, ssh_host, ssh_port, repository_path, branch, \
+            content_subdirectory, credential_name, poll_interval_seconds, version, updated_at_ns, next_poll_at_ns) \
+         SELECT 1, ssh_user, ssh_host, ssh_port, repository_path, branch, content_subdirectory, credential_name, \
+            poll_interval_seconds, version, updated_at_ns, NULL FROM source_configuration_revisions WHERE version = ? \
+         ON CONFLICT(singleton) DO UPDATE SET ssh_user = excluded.ssh_user, ssh_host = excluded.ssh_host, \
+            ssh_port = excluded.ssh_port, repository_path = excluded.repository_path, branch = excluded.branch, \
+            content_subdirectory = excluded.content_subdirectory, credential_name = excluded.credential_name, \
+            poll_interval_seconds = excluded.poll_interval_seconds, version = excluded.version, \
+            updated_at_ns = excluded.updated_at_ns, next_poll_at_ns = NULL"
+    ).bind(version_i64(version.get())?).execute(&mut **transaction).await?;
+    require_one_row(changed.rows_affected())
+}
+
+pub(crate) async fn begin_reconfiguration(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: BeginSourceReconfiguration,
+) -> Result<BeginSourceSyncResult, SourceApplyError> {
+    let fingerprint = configuration_fingerprint(&command.request);
+    if let Some(sync) =
+        replay_manual_sync(transaction, &command.audit, fingerprint, RECONFIGURE_ACTION).await?
+    {
+        return Ok(BeginSourceSyncResult {
+            admission: SourceSyncAdmission::Replayed,
+            sync,
+        });
+    }
+    map_auth_result(
+        require_fresh_browser_scope(
+            transaction,
+            &command.audit.principal,
+            AdminScope::SourceManage,
+            command.requested_at,
+        )
+        .await,
+    )?;
+    let expected = command
+        .request
+        .expected_version
+        .ok_or(DatabaseCommandError::InvalidValue)?;
+    require_current_configuration_version(transaction, expected).await?;
+    if load_active_sync(transaction).await?.is_some() {
+        return Err(DatabaseCommandError::Rejected.into());
+    }
+    let current = load_configuration(transaction)
+        .await?
+        .ok_or(DatabaseCommandError::Rejected)?;
+    if command.requested_at < current.configuration.updated_at {
+        return Err(DatabaseCommandError::Rejected.into());
+    }
+    let version = next_configuration_version(transaction).await?;
+    insert_configuration_revision(
+        transaction,
+        &command.request,
+        version,
+        command_timestamp(command.requested_at)?,
+    )
+    .await?;
+    let sync = insert_sync(
+        transaction,
+        command.proposed_source_sync_id,
+        version,
+        SourceSyncRequestOrigin::Manual,
+        command.requested_at,
+    )
+    .await?;
+    sqlx::query("INSERT INTO source_reconfigurations (source_sync_id, expected_configuration_version) VALUES (?, ?)")
+        .bind(sync.source_sync_id.as_uuid().as_bytes().as_slice()).bind(version_i64(expected.get())?)
+        .execute(&mut **transaction).await?;
+    record_sync_alias(
+        transaction,
+        &command.audit,
+        fingerprint,
+        &sync,
+        command.requested_at,
+        RECONFIGURE_ACTION,
+    )
+    .await?;
+    Ok(BeginSourceSyncResult {
+        admission: SourceSyncAdmission::Created,
+        sync,
+    })
+}
+
+async fn activate_sync_configuration(
+    transaction: &mut Transaction<'_, Sqlite>,
+    sync: &StoredSourceSync,
+) -> Result<(), SourceApplyError> {
+    let expected: Option<i64> = sqlx::query_scalar(
+        "SELECT expected_configuration_version FROM source_reconfigurations WHERE source_sync_id = ?"
+    ).bind(sync.source_sync_id.as_uuid().as_bytes().as_slice()).fetch_optional(&mut **transaction).await?;
+    match expected {
+        Some(expected) => {
+            let expected = configuration_version(expected)
+                .map_err(|_| SourceApplyError::CorruptStoredState)?;
+            require_current_configuration_version(transaction, expected).await?;
+            install_configuration_revision(transaction, sync.configuration_version).await
+        }
+        None => {
+            require_current_configuration_version(transaction, sync.configuration_version).await
+        }
+    }
+}
+
 pub(crate) async fn begin_sync(
     transaction: &mut Transaction<'_, Sqlite>,
     command: BeginSourceSync,
@@ -897,85 +1037,105 @@ pub(crate) async fn begin_sync(
         }
         (SourceSyncAdmission::Coalesced, sync)
     } else {
-        let requested_at = command.requested_at.to_offset(UtcOffset::UTC);
-        let requested_at_ns = command_timestamp(requested_at)?;
-        let identifier_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(\
-                SELECT 1 FROM source_sync_operations WHERE source_sync_id = ?\
-             )",
-        )
-        .bind(
-            command
-                .proposed_source_sync_id
-                .as_uuid()
-                .as_bytes()
-                .as_slice(),
-        )
-        .fetch_one(&mut **transaction)
-        .await?;
-        if identifier_exists {
-            return Err(DatabaseCommandError::Rejected.into());
-        }
-        sqlx::query(
-            "INSERT INTO source_sync_operations (\
-                source_sync_id, configuration_version, request_origin, stage, outcome, \
-                source_commit, content_digest, failure_code, version, \
-                requested_at_ns, updated_at_ns, finished_at_ns\
-             ) VALUES (?, ?, ?, 'queued', NULL, NULL, NULL, NULL, 1, ?, ?, NULL)",
-        )
-        .bind(
-            command
-                .proposed_source_sync_id
-                .as_uuid()
-                .as_bytes()
-                .as_slice(),
-        )
-        .bind(version_i64(command.expected_configuration_version.get())?)
-        .bind(request_origin.as_str())
-        .bind(requested_at_ns)
-        .bind(requested_at_ns)
-        .execute(&mut **transaction)
-        .await?;
         (
             SourceSyncAdmission::Created,
-            StoredSourceSync {
-                source_sync_id: command.proposed_source_sync_id,
-                configuration_version: command.expected_configuration_version,
+            insert_sync(
+                transaction,
+                command.proposed_source_sync_id,
+                command.expected_configuration_version,
                 request_origin,
-                stage: SourceSyncStage::Queued,
-                outcome: None,
-                source_commit: None,
-                content_digest: None,
-                failure_code: None,
-                version: 1,
-                requested_at,
-                updated_at: requested_at,
-                finished_at: None,
-            },
+                command.requested_at,
+            )
+            .await?,
         )
     };
 
     if let Some((audit, fingerprint)) = manual_fingerprint {
-        map_auth_result(
-            append_success_audit(transaction, audit, command.requested_at, MANUAL_SYNC_ACTION)
-                .await,
-        )?;
-        sqlx::query(
-            "INSERT INTO source_sync_idempotency_aliases (\
+        record_sync_alias(
+            transaction,
+            audit,
+            fingerprint,
+            &sync,
+            command.requested_at,
+            MANUAL_SYNC_ACTION,
+        )
+        .await?;
+    }
+    Ok(BeginSourceSyncResult { admission, sync })
+}
+
+async fn insert_sync(
+    transaction: &mut Transaction<'_, Sqlite>,
+    source_sync_id: SourceSyncId,
+    configuration_version: SourceConfigurationVersion,
+    request_origin: SourceSyncRequestOrigin,
+    requested_at: OffsetDateTime,
+) -> Result<StoredSourceSync, SourceApplyError> {
+    let requested_at = requested_at.to_offset(UtcOffset::UTC);
+    let requested_at_ns = command_timestamp(requested_at)?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM source_sync_operations WHERE source_sync_id = ?)",
+    )
+    .bind(source_sync_id.as_uuid().as_bytes().as_slice())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if exists {
+        return Err(DatabaseCommandError::Rejected.into());
+    }
+    sqlx::query(
+        "INSERT INTO source_sync_operations (\
+                source_sync_id, configuration_version, request_origin, stage, outcome, \
+                source_commit, content_digest, failure_code, version, \
+                requested_at_ns, updated_at_ns, finished_at_ns\
+             ) VALUES (?, ?, ?, 'queued', NULL, NULL, NULL, NULL, 1, ?, ?, NULL)",
+    )
+    .bind(source_sync_id.as_uuid().as_bytes().as_slice())
+    .bind(version_i64(configuration_version.get())?)
+    .bind(request_origin.as_str())
+    .bind(requested_at_ns)
+    .bind(requested_at_ns)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(StoredSourceSync {
+        source_sync_id,
+        configuration_version,
+        request_origin,
+        stage: SourceSyncStage::Queued,
+        outcome: None,
+        source_commit: None,
+        content_digest: None,
+        failure_code: None,
+        version: 1,
+        requested_at,
+        updated_at: requested_at,
+        finished_at: None,
+    })
+}
+
+async fn record_sync_alias(
+    transaction: &mut Transaction<'_, Sqlite>,
+    audit: &MutationAuditContext,
+    fingerprint: [u8; 32],
+    sync: &StoredSourceSync,
+    requested_at: OffsetDateTime,
+    action: &'static str,
+) -> Result<(), SourceApplyError> {
+    map_auth_result(append_success_audit(transaction, audit, requested_at, action).await)?;
+    sqlx::query(
+        "INSERT INTO source_sync_idempotency_aliases (\
                 idempotency_key, audit_event_id, command_fingerprint, source_sync_id, \
                 requested_at_ns\
              ) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(audit.idempotency_key.0.as_bytes().as_slice())
-        .bind(audit.audit_event_id.as_uuid().as_bytes().as_slice())
-        .bind(fingerprint.as_slice())
-        .bind(sync.source_sync_id.as_uuid().as_bytes().as_slice())
-        .bind(command_timestamp(command.requested_at)?)
-        .execute(&mut **transaction)
-        .await?;
-        prune_source_sync_aliases(transaction, MAX_RETAINED_SOURCE_SYNC_ALIASES).await?;
-    }
-    Ok(BeginSourceSyncResult { admission, sync })
+    )
+    .bind(audit.idempotency_key.0.as_bytes().as_slice())
+    .bind(audit.audit_event_id.as_uuid().as_bytes().as_slice())
+    .bind(fingerprint.as_slice())
+    .bind(sync.source_sync_id.as_uuid().as_bytes().as_slice())
+    .bind(command_timestamp(requested_at)?)
+    .execute(&mut **transaction)
+    .await?;
+    prune_source_sync_aliases(transaction, MAX_RETAINED_SOURCE_SYNC_ALIASES).await?;
+    Ok(())
 }
 
 enum PreparedSyncRequest<'a> {
@@ -999,7 +1159,9 @@ async fn prepare_sync_request<'a>(
     };
 
     let fingerprint = manual_sync_fingerprint(command.expected_configuration_version);
-    if let Some(sync) = replay_manual_sync(transaction, audit, fingerprint).await? {
+    if let Some(sync) =
+        replay_manual_sync(transaction, audit, fingerprint, MANUAL_SYNC_ACTION).await?
+    {
         return Ok(PreparedSyncRequest::Replayed(sync));
     }
     map_auth_result(
@@ -1088,7 +1250,7 @@ pub(crate) async fn apply_catalog(
     {
         return Err(DatabaseCommandError::Rejected.into());
     }
-    require_current_configuration_version(transaction, current.configuration_version).await?;
+    activate_sync_configuration(transaction, &current).await?;
     index_content_catalog(
         transaction,
         IndexContentCatalog {
@@ -1509,6 +1671,7 @@ async fn replay_manual_sync(
     transaction: &mut Transaction<'_, Sqlite>,
     audit: &MutationAuditContext,
     fingerprint: [u8; 32],
+    action: &'static str,
 ) -> Result<Option<StoredSourceSync>, SourceApplyError> {
     let row = sqlx::query_as::<_, MutationReceiptRow>(
         "SELECT alias.command_fingerprint, NULL AS result_version, alias.source_sync_id, \
@@ -1525,8 +1688,7 @@ async fn replay_manual_sync(
         reject_claimed_idempotency_key(transaction, audit.idempotency_key).await?;
         return Ok(None);
     };
-    if row.command_fingerprint.as_slice() != fingerprint
-        || row.action != MANUAL_SYNC_ACTION
+    if row.action != action
         || !stored_principal_matches(&row, &audit.principal)
         || row.result_version.is_some()
     {
@@ -1539,7 +1701,16 @@ async fn replay_manual_sync(
         .and_then(|value| {
             decode_source_sync_id(value).map_err(|_| SourceApplyError::CorruptStoredState)
         })?;
-    required_sync(transaction, identifier).await.map(Some)
+    let sync = required_sync(transaction, identifier).await?;
+    let expected_fingerprint = if action == MANUAL_SYNC_ACTION {
+        manual_sync_fingerprint(sync.configuration_version)
+    } else {
+        fingerprint
+    };
+    if row.command_fingerprint.as_slice() != expected_fingerprint {
+        return Err(DatabaseCommandError::IdempotencyConflict.into());
+    }
+    Ok(Some(sync))
 }
 
 async fn reject_claimed_idempotency_key(
@@ -1652,7 +1823,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use maincopy_shared::auth::{
-        AdminAuditEventId, AdminSessionId, AgentCredentialId, InstanceId, UserId,
+        AdminAuditEventId, AdminSessionId, AgentCredentialId, HumanLoginProvider, InstanceId,
+        LoginChallengeId, UserId,
     };
     use markdown_compiler::{DraftStatus, PostId, PostRevisionDigest, PostSlug};
     use sqlx::{Connection as _, SqliteConnection, sqlite::SqliteConnectOptions};
@@ -1667,8 +1839,13 @@ mod tests {
         },
         database::{self, store::DatabaseStore},
         domain::auth::{
-            NostrPublicKey,
-            store::{BootstrapIdentity, ConfiguredLoginProviders, NewHumanCredential},
+            CsrfTokenDigest, LoginChallengeDigest, Nip98EventId, NostrPublicKey,
+            SessionTokenDigest,
+            store::{
+                BootstrapIdentity, ConfiguredLoginProviders, CreateBrowserSession,
+                CreateLoginChallenge, NewHumanCredential, SessionAuditContext,
+                SessionAuthenticationEvidence,
+            },
         },
     };
 
@@ -1735,6 +1912,369 @@ mod tests {
             writer.await.unwrap();
             (root, path)
         }
+    }
+
+    async fn owner_session(harness: &Harness) -> AdminSessionId {
+        let challenge_id = LoginChallengeId::from_uuid(Uuid::from_u128(600));
+        let challenge_digest = LoginChallengeDigest::from_bytes([1; 32]);
+        harness
+            .store
+            .auth
+            .create_login_challenge(CreateLoginChallenge {
+                challenge_id,
+                provider: HumanLoginProvider::Nostr,
+                challenge_digest,
+                created_at: at(2),
+                expires_at: at(10),
+            })
+            .await
+            .unwrap();
+        let session_id = AdminSessionId::from_uuid(Uuid::from_u128(601));
+        harness
+            .store
+            .auth
+            .create_browser_session(CreateBrowserSession {
+                session_id,
+                user_id: harness.owner,
+                expected_user_version: 1,
+                session_token_digest: SessionTokenDigest::from_bytes([2; 32]),
+                csrf_token_digest: CsrfTokenDigest::from_bytes([3; 32]),
+                evidence: SessionAuthenticationEvidence::Nostr {
+                    expected_credential_version: 1,
+                    challenge_id,
+                    challenge_digest,
+                    event_id: Nip98EventId::from_bytes([4; 32]),
+                    proof_created_at: at(3),
+                },
+                authenticated_at: at(3),
+                fresh_until: at(1000),
+                expires_at: at(2000),
+                audit: SessionAuditContext {
+                    audit_event_id: AdminAuditEventId::from_uuid(Uuid::from_u128(602)),
+                    request_id: None,
+                },
+            })
+            .await
+            .unwrap();
+        session_id
+    }
+
+    fn proposal(
+        owner: UserId,
+        session_id: AdminSessionId,
+        key: u128,
+        expected: SourceConfigurationVersion,
+        second: i64,
+    ) -> BeginSourceReconfiguration {
+        let mut context = audit(owner, key);
+        context.principal = AuditPrincipalReference::BrowserSession {
+            user_id: owner,
+            session_id,
+        };
+        let mut request = configuration_request(Some(expected), "next");
+        request.poll_interval_seconds = SourcePollInterval::from_seconds(300).unwrap();
+        BeginSourceReconfiguration {
+            proposed_source_sync_id: SourceSyncId::from_uuid(Uuid::from_u128(key)),
+            request,
+            requested_at: at(second),
+            audit: context,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_proposals_preserve_installed_state_until_atomic_catalog_installation() {
+        let harness = Harness::start().await;
+        let session = owner_session(&harness).await;
+        let initial = harness
+            .store
+            .source
+            .put_configuration(PutSourceConfiguration {
+                request: configuration_request(None, "main"),
+                occurred_at: at(10),
+                audit: audit(harness.owner, 1),
+            })
+            .await
+            .unwrap();
+        let installed =
+            install_sync(&harness.store.source, 10, initial.configuration.version, 20).await;
+        let before = harness.store.source.status().await.unwrap();
+        let command = proposal(
+            harness.owner,
+            session,
+            20,
+            initial.configuration.version,
+            30,
+        );
+        let first = harness
+            .store
+            .source
+            .begin_reconfiguration(command)
+            .await
+            .unwrap();
+        assert_eq!(first.sync.configuration_version.get(), 2);
+        let during = harness.store.source.status().await.unwrap();
+        assert_eq!(during.configuration, before.configuration);
+        assert_eq!(during.installation, before.installation);
+        assert!(
+            harness
+                .store
+                .source
+                .begin_reconfiguration(proposal(
+                    harness.owner,
+                    session,
+                    21,
+                    initial.configuration.version,
+                    31
+                ))
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .store
+                .source
+                .begin_sync(begin(
+                    22,
+                    initial.configuration.version,
+                    31,
+                    SourceSyncRequest::Manual {
+                        audit: audit(harness.owner, 22)
+                    }
+                ))
+                .await
+                .is_err()
+        );
+        let replayed = harness
+            .store
+            .source
+            .begin_reconfiguration(proposal(
+                harness.owner,
+                session,
+                20,
+                initial.configuration.version,
+                32,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replayed.admission, SourceSyncAdmission::Replayed);
+        assert_eq!(replayed.sync, first.sync);
+        let failed = harness
+            .store
+            .source
+            .finish_sync(FinishSourceSync {
+                source_sync_id: first.sync.source_sync_id,
+                expected_version: first.sync.version,
+                completion: SourceSyncCompletion::Failed {
+                    code: SourceSyncFailureCode::ValidationFailed,
+                },
+                completed_at: at(35),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            harness
+                .store
+                .source
+                .installation()
+                .await
+                .unwrap()
+                .unwrap()
+                .source_sync_id,
+            installed.source_sync_id
+        );
+        let next = harness
+            .store
+            .source
+            .begin_reconfiguration(proposal(
+                harness.owner,
+                session,
+                30,
+                initial.configuration.version,
+                40,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next.sync.configuration_version.get(), 3);
+        let applied = complete_installation(&harness.store.source, next.sync, 40).await;
+        let current = harness.store.source.configuration().await.unwrap().unwrap();
+        assert_eq!(current.configuration.version.get(), 3);
+        assert_eq!(current.configuration.branch.as_str(), "next");
+        assert_eq!(current.configuration.poll_interval_seconds.seconds(), 300);
+        assert_eq!(current.next_poll_at, Some(at(346)));
+        assert!(
+            harness
+                .store
+                .source
+                .begin_reconfiguration(proposal(
+                    harness.owner,
+                    session,
+                    40,
+                    initial.configuration.version,
+                    50
+                ))
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .store
+                .source
+                .begin_reconfiguration(proposal(
+                    harness.owner,
+                    session,
+                    41,
+                    current.configuration.version,
+                    1001
+                ))
+                .await
+                .is_err()
+        );
+        let owner = harness.owner;
+        let (root, path) = harness.stop().await;
+        let database = database::bootstrap(database_configuration(&path))
+            .await
+            .unwrap();
+        let (store, writer) = database.into_store(32);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(writer.run(shutdown.clone()));
+        let replay = store
+            .source
+            .begin_reconfiguration(proposal(
+                owner,
+                session,
+                30,
+                initial.configuration.version,
+                51,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.sync, applied);
+        assert_eq!(replay.admission, SourceSyncAdmission::Replayed);
+        let failed_replay = store
+            .source
+            .begin_reconfiguration(proposal(
+                owner,
+                session,
+                20,
+                initial.configuration.version,
+                52,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(failed_replay.sync, failed);
+        drop(store);
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+        drop(root);
+    }
+
+    #[tokio::test]
+    async fn interrupted_source_proposals_recover_one_terminal_receipt_without_changing_settings() {
+        let harness = Harness::start().await;
+        let session = owner_session(&harness).await;
+        let initial = harness
+            .store
+            .source
+            .put_configuration(PutSourceConfiguration {
+                request: configuration_request(None, "main"),
+                occurred_at: at(10),
+                audit: audit(harness.owner, 1),
+            })
+            .await
+            .unwrap();
+        let active = harness
+            .store
+            .source
+            .begin_sync(begin(
+                10,
+                initial.configuration.version,
+                20,
+                SourceSyncRequest::Poll,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .store
+                .source
+                .begin_reconfiguration(proposal(
+                    harness.owner,
+                    session,
+                    20,
+                    initial.configuration.version,
+                    21
+                ))
+                .await
+                .is_err()
+        );
+        harness
+            .store
+            .source
+            .finish_sync(FinishSourceSync {
+                source_sync_id: active.sync.source_sync_id,
+                expected_version: active.sync.version,
+                completion: SourceSyncCompletion::Cancelled,
+                completed_at: at(22),
+            })
+            .await
+            .unwrap();
+        let pending = harness
+            .store
+            .source
+            .begin_reconfiguration(proposal(
+                harness.owner,
+                session,
+                20,
+                initial.configuration.version,
+                30,
+            ))
+            .await
+            .unwrap();
+        let fetching = advance(
+            &harness.store.source,
+            pending.sync,
+            SourceSyncProgress::Fetching,
+            31,
+        )
+        .await;
+        let owner = harness.owner;
+        let (root, path) = harness.stop().await;
+        let database = database::bootstrap(database_configuration(&path))
+            .await
+            .unwrap();
+        let (store, writer) = database.into_store(32);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(writer.run(shutdown.clone()));
+        let interrupted = store.source.active_sync().await.unwrap().unwrap();
+        assert_eq!(interrupted, fetching);
+        store
+            .source
+            .fail_interrupted_sync(interrupted.source_sync_id, interrupted.version, at(40))
+            .await
+            .unwrap();
+        assert!(store.source.active_sync().await.unwrap().is_none());
+        let replay = store
+            .source
+            .begin_reconfiguration(proposal(
+                owner,
+                session,
+                20,
+                initial.configuration.version,
+                41,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.sync.outcome, Some(SourceSyncOutcome::Failed));
+        assert_eq!(
+            replay.sync.failure_code,
+            Some(SourceSyncFailureCode::Interrupted)
+        );
+        let current = store.source.configuration().await.unwrap().unwrap();
+        assert_eq!(current.configuration, initial.configuration);
+        drop(store);
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+        drop(root);
     }
 
     fn database_configuration(path: &Path) -> DatabaseConfigurationView<'_> {
@@ -1832,7 +2372,7 @@ mod tests {
         configuration_version: SourceConfigurationVersion,
         requested_at: i64,
     ) -> StoredSourceSync {
-        let mut sync = store
+        let sync = store
             .begin_sync(begin(
                 id,
                 configuration_version,
@@ -1842,6 +2382,14 @@ mod tests {
             .await
             .unwrap()
             .sync;
+        complete_installation(store, sync, requested_at).await
+    }
+
+    async fn complete_installation(
+        store: &SourceStore,
+        mut sync: StoredSourceSync,
+        requested_at: i64,
+    ) -> StoredSourceSync {
         sync = advance(store, sync, SourceSyncProgress::Fetching, requested_at + 1).await;
         sync = advance(
             store,

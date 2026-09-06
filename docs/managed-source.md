@@ -2,7 +2,7 @@
 
 Status: supported operator workflow
 
-Last reviewed: 2026-09-04
+Last reviewed: 2026-09-06
 
 Related: [system design](design.md),
 [remaining implementation work](implementation.md),
@@ -30,7 +30,8 @@ Maincopy separates host controls from mutable source settings.
 | SQLite | SSH user, host, port, repository path, branch, content subdirectory, credential name, poll interval | No |
 
 The host configuration selects `managed_git` and registers each credential by
-name. The offline source command selects one registered name for SQLite.
+name. The offline setup command selects one registered name for SQLite. Online changes
+select from the same host-owned registry.
 
 ```toml
 [paths]
@@ -112,8 +113,8 @@ branch, or edit Markdown.
 The candidate store has a fixed safety ceiling of 4,096 archive or staging
 entries and 1 GiB of archive bytes. At capacity, synchronization fails closed
 and keeps every retained revision; Maincopy does not guess which publication
-artifact is safe to delete. Reachability-aware garbage collection is later
-retention work.
+artifact is safe to delete. Automatic candidate collection is disabled. The retention contract below defines
+the evidence required before collection can be enabled.
 
 Maincopy resolves the full commit before it reads the configured content
 subdirectory. It rejects symbolic links, gitlinks, unsafe paths, and limit
@@ -245,10 +246,59 @@ The poll, browser action, and CLI action all enter the same durable
 coordinator. None of them publishes directly. A failed fetch or compile keeps
 both the previous private candidate and the public site unchanged.
 
-Changing the configured repository, branch, subdirectory, or credential is a
-separate operator action. The current foundation performs that reconfiguration
-offline while `maincopyd` is stopped; this does not affect the normal
-push-to-preview loop.
+## Change source settings online
+
+Sign in recently as an Owner, then open **Source settings** on `/admin/source`.
+The form can change the remote, branch, subdirectory, credential name, and poll
+interval. The credential name must identify a host-registered credential.
+
+For the CLI, inspect the installed version and deploy identity first:
+
+```console
+maincopy source status
+maincopy source deploy-key
+```
+
+The deploy-key command prints the selected Ed25519 public key and SHA-256
+fingerprint. It derives that identity from the protected private key. It does
+not return a private-key path or a `known_hosts` path.
+
+Submit all proposed settings with the installed version:
+
+```console
+maincopy source configure \
+  --user git --host git.example.test --port 22 \
+  --repository-path publisher/site.git --branch main \
+  --content-subdirectory publication --credential-name deploy \
+  --poll-interval-seconds 300 --expected-version 1 --wait
+```
+
+Replace `1` with the installed version from `source status`. Use `--async`
+instead of `--wait` to return after admission. Add `--idempotency-key UUID`
+to repeat an identical request after an uncertain response.
+
+Each proposal reserves an immutable configuration version and one durable sync
+operation. Installed settings, their poll interval, and the private catalog
+remain authoritative while Maincopy fetches, validates, and compiles the
+proposal. Successful catalog installation activates the proposed settings in
+the same database transaction. It does not publish a post.
+
+A failed or cancelled proposal preserves the installed settings and candidate.
+Failed proposals can leave gaps between installed configuration versions. Use
+the displayed version instead of assuming that each successful change adds one.
+
+A proposal conflicts with an active synchronization. An ordinary sync request
+also conflicts with an active proposal. Wait for the active operation to finish,
+then reload source status before submitting new settings.
+
+If Maincopy restarts during a proposal, startup records `failed` with the
+`interrupted` failure code. It then synchronizes the previously installed
+settings. The proposal's operation resource and retry identity retain that
+terminal result. Resubmit corrected settings with a new identity.
+
+Both browser and API changes require a recent human Owner session. Scoped agent
+credentials can inspect permitted resources or request ordinary synchronization;
+they cannot replace the Owner confirmation for source settings.
 
 ## Operation behavior
 
@@ -343,6 +393,34 @@ Fix the cause, then run `maincopy source sync --wait` again.
 Maincopy excludes SSH process output, private-key paths, and `known_hosts`
 paths from source resources, API responses, and CLI output. Use the stable
 failure code and operation ID to correlate safe server logs.
+
+## Candidate retention contract
+
+Automatic candidate collection is disabled. The capacity ceiling rejects new
+candidates without deleting retained artifacts.
+
+A future collector must preserve every candidate reachable from these roots:
+
+| Root | Required artifacts |
+| --- | --- |
+| Installed source and current private catalog | The installed candidate and every previewable revision |
+| Current public revisions | Exact Markdown, assets, renderer identities, and compiled output |
+| Non-terminal releases | Every revision and candidate required to complete or recover the release |
+| Active sync or configuration proposal | Any materialized candidate until its terminal result is durable |
+| Compatible backup recovery points | Every digest named by a retained backup's artifact manifest |
+
+Resolve these roots from a consistent database snapshot. Coordinate collection
+with the sole writer and candidate admission so new references cannot race with
+deletion. A candidate created after the snapshot remains protected for that pass.
+
+Only unreferenced artifacts can become collection candidates. Recheck their
+references before deletion and keep a recoverable quarantine until the recovery
+point no longer needs them. Directory age and sync-history pruning alone never
+prove that a candidate is unreachable.
+
+An expired operation cursor or idempotency alias does not release a public,
+preview, release, or backup reference. Mirror pruning remains independent because
+the mirror is a transport cache.
 
 ## External checkout mode
 

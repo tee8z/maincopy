@@ -33,8 +33,8 @@ use crate::domain::publication::store::{
     schedule_publication,
 };
 use crate::domain::source::store::{
-    SourceApplyError, SourceStore, advance_sync, apply_catalog, begin_sync, finish_sync,
-    put_configuration,
+    SourceApplyError, SourceStore, advance_sync, apply_catalog, begin_reconfiguration, begin_sync,
+    finish_sync, put_configuration,
 };
 
 pub(crate) struct DatabaseWriter {
@@ -389,6 +389,16 @@ async fn apply_mutation(
         } => database_response(
             respond_to,
             put_configuration(transaction, command)
+                .await
+                .map_err(ApplyError::source),
+            true,
+        ),
+        Mutation::BeginSourceReconfiguration {
+            command,
+            respond_to,
+        } => database_response(
+            respond_to,
+            begin_reconfiguration(transaction, command)
                 .await
                 .map_err(ApplyError::source),
             true,

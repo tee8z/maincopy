@@ -325,6 +325,7 @@ mod tests {
                 base_url: PublicationBaseUrl::parse("https://example.com/").unwrap(),
                 description: SiteDescription::new("Notes, diagrams & careful prose.").unwrap(),
                 favicon: None,
+                image: None,
             },
             author: AuthorSettings {
                 name: AuthorName::new("Example Author").unwrap(),

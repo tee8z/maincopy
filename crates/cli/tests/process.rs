@@ -35,6 +35,30 @@ fn process_rejects_secret_bearing_arguments_without_echoing_the_secret() {
         ),
         (
             [
+                "users",
+                "create",
+                "--roles",
+                "publisher",
+                "password",
+                "--username",
+                "fixture",
+                "--password",
+                "raw-account-password-must-not-print",
+            ]
+            .as_slice(),
+            "raw-account-password-must-not-print",
+        ),
+        (
+            [
+                "login-nostr",
+                "--private-key",
+                "raw-human-private-key-must-not-print",
+            ]
+            .as_slice(),
+            "raw-human-private-key-must-not-print",
+        ),
+        (
+            [
                 "agent-key",
                 "set",
                 "--private-key",

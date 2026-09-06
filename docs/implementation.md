@@ -27,9 +27,9 @@ flowchart LR
     Review --> Release[4. Release candidate]
 ```
 
-1. Complete account and managed-source administration workflows.
-2. Add public-response metadata, Content Security Policy, and lifecycle polish.
-3. Add metrics, NixOS, Caddy, Litestream, backup, and restore support.
+1. Complete real-signer acceptance for the browser and human CLI.
+2. Finish public-listener lifecycle and restore evidence.
+3. Add metrics, NixOS, Caddy, encrypted Backblaze B2 backups, and restore support.
 4. Complete the security review, system matrix, documentation, and release dry run.
 
 Run independent product-closure workstreams in isolated checkouts. Review shared
@@ -41,107 +41,17 @@ hosting, or Git write-back as part of V1.
 
 ## 1. Product closure
 
-### 1.1 Complete account workflows
+### 1.1 Complete real-signer acceptance
 
-Complete the remaining browser and CLI operations for ordinary administration.
-Preserve the fixed Owner, Administrator, and Publisher scope boundaries.
+Verify the implemented account workflows with the owner's real signing tools.
+Test-signer automation does not complete this acceptance.
 
-Start with CLI credential work and run agent administration in parallel. Keep
-human CLI sign-in in the CLI workstream. Reuse the identity API and its
-authorization rules.
+- Verify successful Nostr sign-in and cancelled signing with the owner's browser
+  extension. Record extension and browser names, versions, and results.
+- Complete human CLI Nostr sign-in with an external signer and confirm protected
+  session storage. Record the signer and operating system used.
 
-1. **CLI user creation and login credentials — next.** Create accounts with
-   configured password or Nostr credentials. Add, replace, and remove login
-   credentials. Read and confirm passwords through protected terminal prompts.
-   Add Nostr fingerprints to CLI account inspection.
-2. **Agent-grant administration.** Add bounded listing, inspection, registration,
-   scope replacement, and revocation in the browser and CLI. Display the owner,
-   public key, fingerprint, requested scopes, effective scopes, expiry, and
-   revocation state. Preserve fresh authentication and explicit grant versions.
-3. **Human CLI Nostr sign-in.** Obtain a challenge and submit the human signer's
-   proof. Protect the resulting session in the operating system credential store.
-   Keep human signing separate from the local agent-key context.
-
-Requirements for the next CLI batch:
-
-- Bound password input and zeroize owned secret buffers throughout request
-  construction and failure paths. Keep secrets out of arguments and diagnostics.
-- Use credential versions for credential replacement and removal. Treat the
-  returned account version as a separate value.
-- Retain operation UUIDs in success and failure output. Preserve the authorizing
-  session when replaying an identical command.
-- Provide clear empty, conflict, expired-session, and forbidden states for each
-  new operation.
-
-Required evidence for the remaining operations:
-
-- Exercise new CLI credential commands with password-only, Nostr-only, and
-  combined-provider configurations.
-- Reject cancelled prompts, mismatched confirmation, and invalid passwords
-  without submitting a mutation or exposing secret bytes.
-- Reject stale credential versions without replacing or removing a credential.
-- Preserve one usable configured credential for each enabled user. Verify session
-  revocation after accepted credential replacement or removal.
-- Reject Publisher access and attempts to grant authority beyond the actor's
-  scopes through the new account and agent workflows.
-- Verify agent scope changes, expiry, revocation, and user-disablement effects
-  through the new management surfaces.
-- Recover uncertain mutation outcomes without duplicate changes. After a new
-  sign-in, inspect current state before submitting a new operation.
-
-Manual browser follow-up:
-
-- Verify successful Nostr sign-in and cancelled signing with the owner's real
-  browser extension. Record extension and browser names, versions, and results.
-- Run this check alongside CLI implementation. Test-signer automation does not
-  complete real-extension acceptance.
-
-### 1.2 Complete managed-source administration
-
-The normal push-to-preview loop is complete. Add safe online operations for
-the source settings that still require daemon shutdown.
-
-Deliverables:
-
-- Reconfigure the remote, branch, subdirectory, credential, and poll interval
-  through an Owner-only, fresh-authenticated operation.
-- Preserve the last installed candidate until new settings fetch, validate,
-  compile, and commit successfully.
-- Display the selected deploy public key and fingerprint.
-- Define reachability-aware candidate retention before automatic garbage
-  collection removes any retained artifact.
-
-Required evidence:
-
-- Reject stale versions and unknown credential names before network access.
-- Keep the current private catalog and public snapshot after any failed change.
-- Restart during reconfiguration and recover one durable terminal result.
-- Prove that no source response exposes a private-key or `known_hosts` path.
-
-### 1.3 Add image metadata and response policy
-
-Complete public image output and apply one least-privilege response policy.
-
-Deliverables:
-
-- Render local or allowlisted external favicons.
-- Render site and article image metadata.
-- Emit canonical image URLs in Open Graph and `BlogPosting` JSON-LD.
-- Derive Content Security Policy (CSP) origins from validated configuration.
-- Disallow scripts, objects, frames, and unconfigured connections by default.
-- Add `Referrer-Policy: no-referrer` to public responses.
-- Keep `unsafe-inline` and `unsafe-eval` out of the CSP.
-- Document that external asset bytes can change independently.
-
-Required evidence:
-
-- Test local and external favicon and article-image fixtures.
-- Reject an unconfigured asset origin and CSP directive injection.
-- Snapshot the exact CSP and referrer headers.
-- Serve local files with safe content types and disposition rules.
-- Keep preview-only assets unreachable from public routes.
-
-### 1.4 Finish listener and tip administration
+### 1.2 Finish listener and tip administration
 
 Complete the remaining lifecycle behavior on the public and profile surfaces.
 
@@ -196,15 +106,17 @@ Add a NixOS module that owns the complete service boundary.
 
 Deliverables:
 
-- Package `maincopyd`, `maincopy`, `maincopy-mermaid`, Caddy, and Litestream.
-- Run each service under a dedicated identity with protected state paths.
+- Package `maincopyd`, `maincopy`, `maincopy-mermaid`, Caddy, Litestream, and standard client-side encryption tools.
+- Isolate service identities and state paths. Run backup processes under
+  restricted identities that preserve database mode `0600`.
 - Bind public traffic according to configuration.
 - Keep admin and metrics upstreams on loopback.
 - Make private-network admin exposure the default.
 - Require explicit configuration for an Internet-reachable admin origin.
 - Remove untrusted identity and forwarding headers at the gateway.
 - Disable automatic retries for admin mutations.
-- Keep SSH, TLS, and replica credentials outside Git and the Nix store.
+- Keep SSH, TLS, B2 credentials, and backup encryption keys outside Git
+  and the Nix store.
 
 Required evidence:
 
@@ -213,13 +125,24 @@ Required evidence:
 - Prove route and origin isolation through Caddy.
 - Reject unsafe ownership, permissions, paths, and listener addresses.
 
-### 2.3 Add Litestream backup and offline restore
+### 2.3 Add encrypted B2 backups and offline restore
 
 Back up the operational SQLite ledger and retain compatible revision artifacts.
 
 Deliverables:
 
-- Configure a local development replica and secret-backed production replica.
+- Replicate SQLite continuously with Litestream to Backblaze B2.
+- Pin and validate the current Litestream file replica with rclone crypt uploads.
+  Encrypt on the source server with protected server-supplied keys.
+- Upload complete recovery checkpoints every minute. Publish the checkpoint
+  manifest only after its required replica files and artifacts reach B2.
+- Keep seven days of local encrypted recovery bundles.
+- Back up immutable revision artifacts and identify complete recovery points
+  whose required artifacts are already available off-site.
+- Recover after replication or artifact-upload interruption without stopping
+  the running publication.
+- Reject missing or invalid keys and failed exports before upload. Never upload plaintext.
+- Document key recovery and retain the keys needed for older backups.
 - Expose degraded backup health without blocking public reads.
 - Document recovery point objective and recovery time objective measurements.
 - Restore into an empty destination only.
@@ -230,15 +153,17 @@ Deliverables:
 
 Required evidence:
 
-- Interrupt replication and recover without corrupting the live database.
+- Interrupt backup and upload, then retry without corrupting the live database.
 - Restore after removing every local SQLite sidecar file.
+- Prove encrypted off-site backup and successful recovery with the correct key.
+  Reject missing and incorrect keys without accepting a restore candidate.
 - Reject a marker for different bytes, schema, artifacts, or binary.
 - Reproduce released pages, RSS, routes, profiles, and tip projection.
 - Measure the documented recovery targets.
 
 ### Operations gate
 
-- The NixOS virtual machine runs Maincopy, Caddy, and Litestream.
+- The NixOS virtual machine runs Maincopy, Caddy, and encrypted continuous replication.
 - Local Prometheus can scrape the loopback metrics listener.
 - The live database remains on local storage.
 - The restore drill preserves the operational ledger and required artifacts.

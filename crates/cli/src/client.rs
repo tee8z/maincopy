@@ -1,4 +1,9 @@
+mod agents;
+pub(crate) use agents::AgentMutation;
 mod identity;
+mod nostr_login;
+pub(crate) use identity::UserMutation;
+pub(crate) use nostr_login::HumanNostrLogin;
 
 use std::{fmt, future::Future, path::Path};
 
@@ -21,7 +26,8 @@ use maincopy_shared::{
         ReleaseOperationResource, ReleaseResource, ReleaseState,
     },
     source::{
-        BeginSourceSyncResponse, SOURCE_PATH, SOURCE_SYNCS_PATH, SourceStatusResponse,
+        BeginSourceSyncResponse, ReconfigureSourceRequest, SOURCE_PATH, SOURCE_SYNCS_PATH,
+        SourceConfigurationVersion, SourceDeployKeyResponse, SourceStatusResponse,
         SourceSyncAdmission, SourceSyncId, SourceSyncResource,
     },
 };
@@ -223,6 +229,29 @@ impl AdminClient {
         decode_recipient_change(response, request)
     }
 
+    pub(crate) async fn source_deploy_key(
+        &self,
+    ) -> Result<SourceDeployKeyResponse, AdminClientError> {
+        self.get_json(self.origin.request_url("/api/admin/v1/source/deploy-key")?)
+            .await
+    }
+
+    pub(crate) async fn reconfigure_source(
+        &self,
+        request: &ReconfigureSourceRequest,
+        operation_id: Uuid,
+    ) -> Result<BeginSourceSyncResponse, AdminClientError> {
+        let response = self
+            .json_mutation(
+                Method::PUT,
+                "/api/admin/v1/source/configuration",
+                request,
+                operation_id,
+            )
+            .await?;
+        decode_source_reconfiguration_response(response, request.expected_version)
+    }
+
     /// Starts or replays one durable managed-source synchronization.
     pub(crate) async fn begin_source_sync(
         &self,
@@ -331,14 +360,14 @@ impl AdminClient {
         username: Box<str>,
         password: SecretString,
     ) -> Result<AdminSessionResponse, AdminClientError> {
-        let PreparedPasswordLogin {
+        let PreparedHumanLogin {
             credential_key,
             request,
         } = prepare_password_login(&self.origin, username, password, |key| {
             self.credentials.load(key)
         })?;
         let response = self.execute(request, MAX_JSON_RESPONSE_BYTES).await?;
-        complete_password_login(
+        complete_human_login(
             &self.origin,
             response,
             credential_key,
@@ -407,7 +436,7 @@ impl AdminClient {
         request: &Value,
         idempotency_key: Uuid,
     ) -> Result<HttpResponse, AdminClientError> {
-        let body = serde_json::to_vec(request).map_err(AdminClientError::RequestEncoding)?;
+        let body = RequestBody::json(request).map_err(AdminClientError::RequestEncoding)?;
         self.authenticated_request(method, path, body, Some(idempotency_key))
             .await
     }
@@ -416,7 +445,7 @@ impl AdminClient {
         &self,
         method: Method,
         path: &str,
-        body: Vec<u8>,
+        body: impl Into<RequestBody>,
         idempotency_key: Option<Uuid>,
     ) -> Result<HttpResponse, AdminClientError> {
         let url = self.origin.request_url(path)?;
@@ -428,7 +457,7 @@ impl AdminClient {
         &self,
         method: Method,
         url: Url,
-        body: Vec<u8>,
+        body: impl Into<RequestBody>,
         idempotency_key: Option<Uuid>,
     ) -> Result<HttpResponse, AdminClientError> {
         self.authenticated_request_url_with_limit(
@@ -445,7 +474,7 @@ impl AdminClient {
         &self,
         method: Method,
         url: Url,
-        body: Vec<u8>,
+        body: impl Into<RequestBody>,
         idempotency_key: Option<Uuid>,
         maximum_response_bytes: usize,
     ) -> Result<HttpResponse, AdminClientError> {
@@ -539,6 +568,22 @@ fn decode_publication_http_response(
     decode_publication_response(&response.body, expected_preview)
 }
 
+/// Validates that the server receipt identifies this newer configuration proposal.
+fn decode_source_reconfiguration_response(
+    response: HttpResponse,
+    expected_version: SourceConfigurationVersion,
+) -> Result<BeginSourceSyncResponse, AdminClientError> {
+    let accepted = decode_begin_source_sync_http_response(response)?;
+    if accepted.admission == SourceSyncAdmission::Coalesced
+        || accepted.sync.configuration_version.get() <= expected_version.get()
+    {
+        return Err(AdminClientError::InvalidSourceSyncResponse {
+            message: "configuration admission does not identify a newer proposal",
+        });
+    }
+    Ok(accepted)
+}
+
 fn decode_begin_source_sync_http_response(
     response: HttpResponse,
 ) -> Result<BeginSourceSyncResponse, AdminClientError> {
@@ -567,14 +612,15 @@ fn build_authorized_request<LoadCredential>(
     authentication: AuthenticationContext,
     method: Method,
     url: Url,
-    body: Vec<u8>,
+    body: impl Into<RequestBody>,
     idempotency_key: Option<Uuid>,
     load_credential: LoadCredential,
 ) -> Result<HttpRequest, AdminClientError>
 where
     LoadCredential: FnOnce(&CredentialKey) -> Result<Option<SecretValue>, CredentialStoreError>,
 {
-    if body.len() > MAX_REQUEST_BODY_BYTES {
+    let body = body.into();
+    if body.as_ref().len() > MAX_REQUEST_BODY_BYTES {
         return Err(AdminClientError::RequestBodyTooLarge);
     }
     if url.origin().ascii_serialization() != origin.as_str()
@@ -586,7 +632,7 @@ where
     }
 
     let mutation = !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
-    let mut headers = standard_headers(!body.is_empty());
+    let mut headers = standard_headers(!body.as_ref().is_empty());
     match authentication {
         AuthenticationContext::Human => {
             let key = CredentialKey::human(origin.as_str());
@@ -613,7 +659,7 @@ where
                 OffsetDateTime::now_utc().unix_timestamp(),
                 &url,
                 &method,
-                &body,
+                body.as_ref(),
                 idempotency_key.unwrap_or_else(Uuid::new_v4),
             )?;
         }
@@ -622,7 +668,7 @@ where
         method,
         url,
         headers,
-        body: body.into(),
+        body,
     })
 }
 
@@ -630,7 +676,7 @@ fn origin_header(origin: &AdminOrigin) -> Result<HeaderValue, AdminClientError> 
     HeaderValue::from_str(origin.as_str()).map_err(|_| AdminClientError::InvalidAdminOrigin)
 }
 
-struct PreparedPasswordLogin {
+struct PreparedHumanLogin {
     credential_key: CredentialKey,
     request: HttpRequest,
 }
@@ -640,7 +686,7 @@ fn prepare_password_login<LoadCredential>(
     username: Box<str>,
     password: SecretString,
     load_credential: LoadCredential,
-) -> Result<PreparedPasswordLogin, AdminClientError>
+) -> Result<PreparedHumanLogin, AdminClientError>
 where
     LoadCredential: FnOnce(&CredentialKey) -> Result<Option<SecretValue>, CredentialStoreError>,
 {
@@ -652,10 +698,9 @@ where
     let mut headers = standard_headers(true);
     headers.insert(ORIGIN, origin_header(origin)?);
     let body: RequestBody =
-        serde_json::to_vec(&CreateAdminSessionRequest::Password { username, password })
-            .map_err(AdminClientError::RequestEncoding)?
-            .into();
-    Ok(PreparedPasswordLogin {
+        RequestBody::json(&CreateAdminSessionRequest::Password { username, password })
+            .map_err(AdminClientError::RequestEncoding)?;
+    Ok(PreparedHumanLogin {
         credential_key,
         request: HttpRequest {
             method: Method::POST,
@@ -666,7 +711,7 @@ where
     })
 }
 
-async fn complete_password_login<SaveCredential, SendRequest, SendFuture>(
+async fn complete_human_login<SaveCredential, SendRequest, SendFuture>(
     origin: &AdminOrigin,
     response: HttpResponse,
     credential_key: CredentialKey,
@@ -1394,6 +1439,9 @@ pub(crate) enum AdminClientError {
     #[error("the Nostr private key is invalid")]
     AgentPrivateKey(#[source] AgentPrivateKeyError),
 
+    #[error("{message}")]
+    NostrLoginProof { message: &'static str },
+
     #[error("the NIP-98 proof could not be created")]
     Nip98Signing(#[source] Nip98SigningError),
 
@@ -2071,6 +2119,45 @@ mod tests {
     }
 
     #[test]
+    fn source_configuration_receipts_reject_coalescing_and_non_newer_versions() {
+        for (admission, status, version, accepted) in [
+            (SourceSyncAdmission::Created, StatusCode::ACCEPTED, 1, true),
+            (SourceSyncAdmission::Replayed, StatusCode::OK, 2, true),
+            (
+                SourceSyncAdmission::Coalesced,
+                StatusCode::ACCEPTED,
+                1,
+                false,
+            ),
+            (SourceSyncAdmission::Created, StatusCode::ACCEPTED, 3, false),
+            (SourceSyncAdmission::Replayed, StatusCode::OK, 4, false),
+        ] {
+            let receipt = begin_source_sync_response(admission);
+            let response = json_response(status, serde_json::to_vec(&receipt).unwrap());
+            let result = decode_source_reconfiguration_response(
+                response,
+                SourceConfigurationVersion::new(version).unwrap(),
+            );
+            if accepted {
+                assert_eq!(result.unwrap(), receipt);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AdminClientError::InvalidSourceSyncResponse { .. })
+                ));
+            }
+        }
+        let wrong_status = json_response(StatusCode::CREATED, b"{}".to_vec());
+        assert!(matches!(
+            decode_source_reconfiguration_response(
+                wrong_status,
+                SourceConfigurationVersion::new(1).unwrap()
+            ),
+            Err(AdminClientError::UnexpectedSuccessStatus { .. })
+        ));
+    }
+
+    #[test]
     fn source_sync_http_decode_rejects_invalid_lifecycle_before_orchestration() {
         let mut body =
             serde_json::to_value(begin_source_sync_response(SourceSyncAdmission::Created)).unwrap();
@@ -2211,7 +2298,7 @@ mod tests {
         let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
         let expected_key = CredentialKey::human(origin.as_str());
         let events = RefCell::new(Vec::new());
-        let result = complete_password_login(
+        let result = complete_human_login(
             &origin,
             password_login_response(),
             expected_key,
@@ -2255,7 +2342,7 @@ mod tests {
         assert_eq!(events.into_inner(), ["save", "revoke"]);
 
         let revoke_called = Cell::new(false);
-        let session = complete_password_login(
+        let session = complete_human_login(
             &origin,
             password_login_response(),
             CredentialKey::human(origin.as_str()),
@@ -2488,6 +2575,37 @@ mod tests {
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         );
         assert_eq!(mutation.headers[CONTENT_TYPE], "application/json");
+    }
+
+    #[test]
+    fn secret_account_request_buffers_remain_owned_during_authorization_and_failure() {
+        let origin = AdminOrigin::parse("https://admin.example.test").unwrap();
+        let url = origin.request_url("/api/admin/v1/identity/users").unwrap();
+        let password = "protected fixture password";
+        for configured in [true, false] {
+            let body = RequestBody::json(&serde_json::json!({"password": password})).unwrap();
+            let result = build_authorized_request(
+                &origin,
+                AuthenticationContext::Human,
+                Method::POST,
+                url.clone(),
+                body,
+                Some(Uuid::from_u128(1)),
+                |_| Ok(configured.then(stored_human_credentials)),
+            );
+            if configured {
+                let request = result.unwrap();
+                assert!(request.headers[COOKIE].is_sensitive());
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(request.body.as_ref()).unwrap()["password"],
+                    password
+                );
+            } else {
+                let error = result.err().unwrap();
+                assert!(matches!(error, AdminClientError::HumanCredentialsMissing));
+                assert!(!format!("{error:?}").contains(password));
+            }
+        }
     }
 
     fn decode_authorization(headers: &HeaderMap) -> serde_json::Value {

@@ -3210,6 +3210,30 @@ pub(crate) async fn require_user_scope(
     Ok(())
 }
 
+pub(crate) async fn require_fresh_browser_scope(
+    transaction: &mut Transaction<'_, Sqlite>,
+    principal: &AuditPrincipalReference,
+    scope: AdminScope,
+    now: OffsetDateTime,
+) -> Result<(), AuthApplyError> {
+    require_principal_scope(transaction, principal, scope, now).await?;
+    let AuditPrincipalReference::BrowserSession { session_id, .. } = principal else {
+        return Err(AuthCommandError::ScopeEscalation.into());
+    };
+    let fresh: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM browser_sessions WHERE session_id = ? AND fresh_until_ns > ?)",
+    )
+    .bind(session_id.as_uuid().as_bytes().as_slice())
+    .bind(command_timestamp(now)?)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if fresh {
+        Ok(())
+    } else {
+        Err(AuthCommandError::ScopeEscalation.into())
+    }
+}
+
 pub(crate) async fn require_principal_scope(
     transaction: &mut Transaction<'_, Sqlite>,
     principal: &AuditPrincipalReference,

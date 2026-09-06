@@ -339,6 +339,7 @@ pub struct SiteSettings {
     pub base_url: PublicationBaseUrl,
     pub description: SiteDescription,
     pub favicon: Option<UnresolvedAssetReference>,
+    pub image: Option<UnresolvedAssetReference>,
 }
 
 impl SiteSettings {
@@ -347,12 +348,14 @@ impl SiteSettings {
         base_url: PublicationBaseUrl,
         description: SiteDescription,
         favicon: Option<UnresolvedAssetReference>,
+        image: Option<UnresolvedAssetReference>,
     ) -> Self {
         Self {
             title,
             base_url,
             description,
             favicon,
+            image,
         }
     }
 }

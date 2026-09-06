@@ -403,3 +403,50 @@ async fn malformed_public_path_parameters_are_not_found() {
         assert_eq!(get(app.clone(), path).await.status(), StatusCode::NOT_FOUND);
     }
 }
+
+#[tokio::test]
+async fn every_public_route_preserves_security_headers_for_get_head_and_revalidation() {
+    let app = public_router(public_state(Readiness::new(false)));
+    let script = embedded_manifest().javascript.as_ref().unwrap();
+    let baseline = get(app.clone(), "/").await;
+    let expected_csp = baseline.headers()[header::CONTENT_SECURITY_POLICY].clone();
+    for path in [
+        "/",
+        "/archive",
+        "/feed.xml",
+        "/robots.txt",
+        "/sitemap.xml",
+        "/health/live",
+        "/health/ready",
+        "/missing",
+        "/posts/%FF",
+        script.public_path,
+    ] {
+        for method in [Method::GET, Method::HEAD, Method::POST] {
+            let response = request(app.clone(), method, path).await;
+            assert_eq!(
+                response.headers()[header::CONTENT_SECURITY_POLICY],
+                expected_csp,
+                "{path}"
+            );
+            assert_eq!(
+                response.headers()[header::REFERRER_POLICY],
+                "no-referrer",
+                "{path}"
+            );
+            assert_eq!(
+                response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                "nosniff",
+                "{path}"
+            );
+        }
+    }
+    let etag = baseline.headers()[header::ETAG].to_str().unwrap();
+    let response = request_with_headers(app, Method::GET, "/", if_none_match(etag)).await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        response.headers()[header::CONTENT_SECURITY_POLICY],
+        expected_csp
+    );
+    assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+}

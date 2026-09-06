@@ -222,6 +222,11 @@ fn registered_router(
             AdminScope::StatusRead,
         ))
         .routes(scoped_routes(
+            source_admin::configuration_routes(),
+            security,
+            AdminScope::SourceManage,
+        ))
+        .routes(scoped_routes(
             source_admin::sync_list_routes(),
             security,
             AdminScope::StatusRead,

@@ -1,16 +1,20 @@
+mod credentials;
+pub(super) use credentials::CredentialInputError;
+use credentials::{prepare_change, prepare_create};
 use std::{future::Future, io};
 use uuid::Uuid;
 
 use maincopy_shared::auth_api::{
-    HumanCredentialResponse, ListUsersResponse, ReplaceUserRolesRequest, SetUserStatusRequest,
-    UserMutationResponse, UserResponse,
+    HumanCredentialResponse, ListUsersResponse, ReplaceUserRolesRequest, SecretString,
+    SetUserStatusRequest, UserMutationResponse, UserResponse,
 };
 use serde_json::json;
 
 use super::CliError;
 use crate::{
-    client::AdminClientError,
-    models::{UserCommand, UserTarget},
+    client::{AdminClientError, UserMutation},
+    models::UserCommand,
+    nip98::inspect_public_key,
 };
 
 pub(super) enum UserOutput {
@@ -22,60 +26,80 @@ pub(super) enum UserOutput {
     },
 }
 
-pub(super) async fn execute<ListFuture, InspectFuture, StatusFuture, RolesFuture>(
+pub(super) async fn execute<ListFuture, InspectFuture, ChangeFuture>(
     command: UserCommand,
     list: impl FnOnce(Option<Uuid>) -> ListFuture,
     inspect: impl FnOnce(Uuid) -> InspectFuture,
-    status: impl FnOnce(Uuid, Uuid, SetUserStatusRequest) -> StatusFuture,
-    roles: impl FnOnce(Uuid, Uuid, ReplaceUserRolesRequest) -> RolesFuture,
+    send: impl FnOnce(Uuid, UserMutation) -> ChangeFuture,
+    prompt: impl FnMut(&str) -> io::Result<SecretString>,
 ) -> Result<UserOutput, CliError>
 where
     ListFuture: Future<Output = Result<ListUsersResponse, AdminClientError>>,
     InspectFuture: Future<Output = Result<UserResponse, AdminClientError>>,
-    StatusFuture: Future<Output = Result<UserMutationResponse, AdminClientError>>,
-    RolesFuture: Future<Output = Result<UserMutationResponse, AdminClientError>>,
+    ChangeFuture: Future<Output = Result<UserMutationResponse, AdminClientError>>,
 {
     match command {
         UserCommand::List { cursor } => Ok(UserOutput::List(list(cursor).await?)),
         UserCommand::Inspect { user_id } => Ok(UserOutput::Inspect(inspect(user_id).await?)),
-        UserCommand::Status {
-            target,
-            status: selected_status,
-        } => {
-            let user_id = target.user_id;
+        UserCommand::Status { target, status } => {
             let request = SetUserStatusRequest {
                 expected_version: target.expected_version,
-                status: selected_status,
+                status,
             };
-            change(target, |operation| status(user_id, operation, request)).await
+            let operation = target.idempotency_key.unwrap_or_else(Uuid::new_v4);
+            change(Some(target.user_id), operation, || {
+                send(
+                    operation,
+                    UserMutation::Status {
+                        user_id: target.user_id,
+                        request,
+                    },
+                )
+            })
+            .await
         }
-        UserCommand::Roles {
-            target,
-            roles: selected_roles,
-        } => {
-            let user_id = target.user_id;
+        UserCommand::Roles { target, roles } => {
             let request = ReplaceUserRolesRequest {
                 expected_version: target.expected_version,
-                roles: selected_roles,
+                roles,
             };
-            change(target, |operation| roles(user_id, operation, request)).await
+            let operation = target.idempotency_key.unwrap_or_else(Uuid::new_v4);
+            change(Some(target.user_id), operation, || {
+                send(
+                    operation,
+                    UserMutation::Roles {
+                        user_id: target.user_id,
+                        request,
+                    },
+                )
+            })
+            .await
+        }
+        UserCommand::Create(arguments) => {
+            let (operation, request) = prepare_create(arguments, prompt)?;
+            change(None, operation, || send(operation, request)).await
+        }
+        UserCommand::Credentials { user_id, command } => {
+            let (operation, request) = prepare_change(user_id, command, prompt)?;
+            change(Some(user_id), operation, || send(operation, request)).await
         }
     }
 }
 
-async fn change<Send, SendFuture>(target: UserTarget, send: Send) -> Result<UserOutput, CliError>
+async fn change<Send, SendFuture>(
+    user_id: Option<Uuid>,
+    idempotency_key: Uuid,
+    send: Send,
+) -> Result<UserOutput, CliError>
 where
-    Send: FnOnce(Uuid) -> SendFuture,
+    Send: FnOnce() -> SendFuture,
     SendFuture: Future<Output = Result<UserMutationResponse, AdminClientError>>,
 {
-    let idempotency_key = target.idempotency_key.unwrap_or_else(Uuid::new_v4);
-    let receipt = send(idempotency_key)
-        .await
-        .map_err(|source| CliError::UserChange {
-            user_id: target.user_id,
-            idempotency_key,
-            source,
-        })?;
+    let receipt = send().await.map_err(|source| CliError::UserChange {
+        user_id,
+        idempotency_key,
+        source,
+    })?;
     Ok(UserOutput::Changed {
         idempotency_key,
         receipt,
@@ -90,7 +114,19 @@ pub(super) fn write_output(
     if json_output {
         let value = match result {
             UserOutput::List(page) => serde_json::to_value(page),
-            UserOutput::Inspect(user) => Ok(json!({"user": user})),
+            UserOutput::Inspect(user) => {
+                let fingerprints: Vec<_> = user
+                    .credentials
+                    .iter()
+                    .filter_map(|credential| match credential {
+                        HumanCredentialResponse::Nostr { public_key, .. } => {
+                            inspect_public_key(public_key).ok()
+                        }
+                        HumanCredentialResponse::Password { .. } => None,
+                    })
+                    .collect();
+                Ok(json!({"user": user, "nostr_keys": fingerprints}))
+            }
             UserOutput::Changed {
                 idempotency_key,
                 receipt,
@@ -184,6 +220,9 @@ fn write_user(mut output: impl io::Write, user: UserResponse) -> io::Result<()> 
                     "Nostr public key: {} (credential version {version})",
                     public_key.escape_default()
                 )?;
+                if let Ok(identity) = inspect_public_key(&public_key) {
+                    writeln!(output, "Nostr fingerprint: {}", identity.fingerprint)?;
+                }
             }
         }
     }
@@ -199,10 +238,7 @@ mod tests {
         startup::{error_exit, write_error},
     };
     use clap::Parser;
-    use maincopy_shared::{
-        auth::{UserRole, UserStatus},
-        auth_api::UserSummaryResponse,
-    };
+    use maincopy_shared::auth_api::UserSummaryResponse;
     use reqwest::StatusCode;
     use std::{cell::Cell, future::ready};
     use uuid::Uuid;
@@ -372,25 +408,19 @@ mod tests {
         let user_id = Uuid::from_u128(1);
         for supplied in [None, Some(Uuid::from_u128(2))] {
             let calls = Cell::new(0);
-            let result = change(
-                UserTarget {
-                    user_id,
-                    expected_version: 4,
-                    idempotency_key: supplied,
-                },
-                |operation| {
-                    calls.set(calls.get() + 1);
-                    if let Some(expected) = supplied {
-                        assert_eq!(operation, expected);
-                    } else {
-                        assert_eq!(operation.get_version_num(), 4);
-                    }
-                    ready(Ok(UserMutationResponse {
-                        user_id: user_id.into(),
-                        version: 5,
-                    }))
-                },
-            )
+            let operation = supplied.unwrap_or_else(Uuid::new_v4);
+            let result = change(Some(user_id), operation, || {
+                calls.set(calls.get() + 1);
+                if let Some(expected) = supplied {
+                    assert_eq!(operation, expected);
+                } else {
+                    assert_eq!(operation.get_version_num(), 4);
+                }
+                ready(Ok(UserMutationResponse {
+                    user_id: user_id.into(),
+                    version: 5,
+                }))
+            })
             .await
             .unwrap();
             assert_eq!(calls.get(), 1);
@@ -431,24 +461,16 @@ mod tests {
             (StatusCode::SERVICE_UNAVAILABLE, 69),
         ] {
             let operation = Uuid::from_u128(2);
-            let error = change(
-                UserTarget {
-                    user_id,
-                    expected_version: 4,
-                    idempotency_key: Some(operation),
-                },
-                |actual| {
-                    assert_eq!(actual, operation);
-                    ready(Err(AdminClientError::HttpStatus {
-                        status,
-                        problem: Some(AdminProblem {
-                            code: "account_error".into(),
-                            message: "safe account failure".into(),
-                        }),
-                        request_id: Some(Uuid::from_u128(3)),
-                    }))
-                },
-            )
+            let error = change(Some(user_id), operation, || {
+                ready(Err(AdminClientError::HttpStatus {
+                    status,
+                    problem: Some(AdminProblem {
+                        code: "account_error".into(),
+                        message: "safe account failure".into(),
+                    }),
+                    request_id: Some(Uuid::from_u128(3)),
+                }))
+            })
             .await
             .err()
             .unwrap();
@@ -487,22 +509,31 @@ mod tests {
     async fn account_dispatch_submits_only_the_selected_read_or_versioned_mutation() {
         let id = Uuid::from_u128(1);
         let operation = Uuid::from_u128(2);
-        let target = || UserTarget {
-            user_id: id,
-            expected_version: 4,
-            idempotency_key: Some(operation),
+        let parse_change = |subcommand, flag, value| {
+            let Command::Users { command } = Arguments::try_parse_from([
+                "maincopy",
+                "users",
+                subcommand,
+                &id.to_string(),
+                "--expected-version",
+                "4",
+                "--idempotency-key",
+                &operation.to_string(),
+                flag,
+                value,
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("users")
+            };
+            command
         };
         let commands = [
             UserCommand::List { cursor: Some(id) },
             UserCommand::Inspect { user_id: id },
-            UserCommand::Status {
-                target: target(),
-                status: UserStatus::Disabled,
-            },
-            UserCommand::Roles {
-                target: target(),
-                roles: vec![UserRole::Publisher],
-            },
+            parse_change("status", "--status", "disabled"),
+            parse_change("roles", "--roles", "publisher"),
         ];
         for (selected, command) in commands.into_iter().enumerate() {
             let calls = Cell::new(0);
@@ -523,32 +554,34 @@ mod tests {
                     assert_eq!(user_id, id);
                     ready(Ok(user()))
                 },
-                |user_id, key, request| {
+                |key, request| {
                     calls.set(calls.get() + 1);
-                    assert_eq!(selected, 2);
-                    assert_eq!((user_id, key), (id, operation));
-                    assert_eq!(
-                        serde_json::to_value(request).unwrap(),
-                        json!({"expected_version":4, "status":"disabled"})
-                    );
+                    assert_eq!(key, operation);
+                    match request {
+                        UserMutation::Status { user_id, request } => {
+                            assert_eq!(selected, 2);
+                            assert_eq!(user_id, id);
+                            assert_eq!(
+                                serde_json::to_value(request).unwrap(),
+                                json!({"expected_version":4, "status":"disabled"})
+                            );
+                        }
+                        UserMutation::Roles { user_id, request } => {
+                            assert_eq!(selected, 3);
+                            assert_eq!(user_id, id);
+                            assert_eq!(
+                                serde_json::to_value(request).unwrap(),
+                                json!({"expected_version":4, "roles":["publisher"]})
+                            );
+                        }
+                        _ => panic!("unexpected mutation"),
+                    }
                     ready(Ok(UserMutationResponse {
                         user_id: id.into(),
                         version: 5,
                     }))
                 },
-                |user_id, key, request| {
-                    calls.set(calls.get() + 1);
-                    assert_eq!(selected, 3);
-                    assert_eq!((user_id, key), (id, operation));
-                    assert_eq!(
-                        serde_json::to_value(request).unwrap(),
-                        json!({"expected_version":4, "roles":["publisher"]})
-                    );
-                    ready(Ok(UserMutationResponse {
-                        user_id: id.into(),
-                        version: 5,
-                    }))
-                },
+                |_| panic!("no secret prompt for read/status/role commands"),
             )
             .await
             .unwrap();

@@ -366,6 +366,7 @@ pub(crate) fn page_response(
                                 a href="/admin/profile" { "Profile" }
                                 a href="/admin/tips" { "Tips" }
                                 a href="/admin/users" { "Users" }
+                                a href="/admin/agents" { "Agents" }
                                 span class="muted" { "Private administration" }
                             }
                         }

@@ -9,7 +9,7 @@ pub(crate) mod admin;
 pub(crate) mod store;
 pub(crate) mod ui;
 
-/// Validated non-secret settings accepted by the offline source command.
+/// Validated non-secret settings accepted by offline setup or an online proposal.
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedSourceConfigurationInput {
     pub(crate) remote: SshRemote,

@@ -2,9 +2,11 @@
 
 use std::fmt;
 
+use crate::transport::RequestBody;
 use base64::{Engine as _, engine::general_purpose};
-use k256::schnorr::SigningKey;
-use serde::Serialize;
+use k256::schnorr::{Signature, SigningKey, VerifyingKey, signature::hazmat::PrehashVerifier as _};
+use maincopy_shared::auth_api::SecretString;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -22,6 +24,26 @@ pub(crate) struct AgentPublicIdentity {
     pub(crate) public_key: Box<str>,
     pub(crate) fingerprint: Box<str>,
 }
+
+/// Validates a canonical public key and derives its public comparison fingerprint.
+pub(crate) fn inspect_public_key(value: &str) -> Result<AgentPublicIdentity, NostrPublicKeyError> {
+    let bytes = decode_lower_hex::<32>(value).ok_or(NostrPublicKeyError)?;
+    VerifyingKey::from_bytes(&bytes).map_err(|_| NostrPublicKeyError)?;
+    Ok(AgentPublicIdentity {
+        public_key: value.into(),
+        fingerprint: format!(
+            "SHA256:{}",
+            general_purpose::STANDARD_NO_PAD.encode(Sha256::digest(bytes))
+        )
+        .into_boxed_str(),
+    })
+}
+
+#[derive(Debug, Error)]
+#[error(
+    "the Nostr public key must be a valid x-only secp256k1 key in 64 lowercase hexadecimal characters"
+)]
+pub(crate) struct NostrPublicKeyError;
 
 impl AgentPrivateKey {
     pub(crate) fn parse(encoded: &str) -> Result<Self, AgentPrivateKeyError> {
@@ -130,6 +152,71 @@ pub(crate) enum Nip98SigningError {
     Serialization,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HumanLoginEvent {
+    id: Box<str>,
+    pubkey: Box<str>,
+    created_at: i64,
+    kind: u64,
+    tags: Vec<[SecretString; 2]>,
+    content: SecretString,
+    sig: Box<str>,
+}
+
+pub(crate) fn validate_human_login_proof(
+    json: &str,
+    url: &str,
+    challenge: &str,
+    created_at: i64,
+) -> Result<(), NostrLoginProofError> {
+    if json.len() > 16 * 1024 {
+        return Err(NostrLoginProofError);
+    }
+    let event: HumanLoginEvent = serde_json::from_str(json).map_err(|_| NostrLoginProofError)?;
+    if event.kind != NIP98_EVENT_KIND
+        || event.created_at != created_at
+        || !event.content.expose_secret().is_empty()
+    {
+        return Err(NostrLoginProofError);
+    }
+    let expected = [["u", url], ["method", "POST"], ["challenge", challenge]];
+    if event.tags.len() != expected.len()
+        || !event.tags.iter().zip(expected).all(|(actual, expected)| {
+            actual[0].expose_secret() == expected[0] && actual[1].expose_secret() == expected[1]
+        })
+    {
+        return Err(NostrLoginProofError);
+    }
+    verify_human_login_signature(&event)
+}
+
+fn verify_human_login_signature(event: &HumanLoginEvent) -> Result<(), NostrLoginProofError> {
+    let bytes = decode_lower_hex::<32>(&event.pubkey).ok_or(NostrLoginProofError)?;
+    let key = VerifyingKey::from_bytes(&bytes).map_err(|_| NostrLoginProofError)?;
+    let serialized = RequestBody::json(&(
+        0,
+        &event.pubkey,
+        event.created_at,
+        event.kind,
+        &event.tags,
+        &event.content,
+    ))
+    .map_err(|_| NostrLoginProofError)?;
+    let digest: [u8; 32] = Sha256::digest(serialized.as_ref()).into();
+    if Some(digest) != decode_lower_hex::<32>(&event.id) {
+        return Err(NostrLoginProofError);
+    }
+    let signature = decode_lower_hex::<64>(&event.sig).ok_or(NostrLoginProofError)?;
+    let signature = Signature::try_from(signature.as_slice()).map_err(|_| NostrLoginProofError)?;
+    key.verify_prehash(&digest, &signature)
+        .map_err(|_| NostrLoginProofError)
+}
+
+#[derive(Debug, Error)]
+#[error("the signed event does not prove the requested human login")]
+pub(crate) struct NostrLoginProofError;
+
 fn encode_lower_hex(bytes: &[u8]) -> String {
     const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -163,12 +250,87 @@ const fn lower_hex_nibble(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use k256::schnorr::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier as _};
     use serde_json::Value;
 
     use super::*;
 
     const KEY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+
+    fn human_event() -> serde_json::Value {
+        let signing_key = SigningKey::from_bytes(&[3; 32]).unwrap();
+        let public_key = encode_lower_hex(&signing_key.verifying_key().to_bytes());
+        let tags = [
+            [
+                "u",
+                "https://admin.example.test:8443/api/admin/v1/auth/sessions",
+            ],
+            ["method", "POST"],
+            ["challenge", "mcl1_fixture"],
+        ];
+        let canonical =
+            serde_json::to_vec(&(0, &public_key, 1_800_000_000_i64, 27_235, tags, "")).unwrap();
+        let id: [u8; 32] = Sha256::digest(canonical).into();
+        let signature = signing_key.sign_raw(&id, &[0; 32]).unwrap();
+        serde_json::json!({"id": encode_lower_hex(&id), "pubkey": public_key, "created_at": 1_800_000_000, "kind": 27_235, "tags": tags, "content":"", "sig": encode_lower_hex(&signature.to_bytes())})
+    }
+
+    #[test]
+    fn public_key_inspection_rejects_noncanonical_or_invalid_curve_points() {
+        let identity = AgentPrivateKey::parse(KEY).unwrap().public_identity();
+        assert_eq!(inspect_public_key(&identity.public_key).unwrap(), identity);
+        for value in [
+            "".to_string(),
+            "0".repeat(64),
+            "f".repeat(64),
+            identity.public_key.to_uppercase(),
+        ] {
+            assert!(inspect_public_key(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn human_login_requires_the_requested_intent_and_a_valid_schnorr_signature() {
+        let event = human_event();
+        let validate = |value: &serde_json::Value| {
+            validate_human_login_proof(
+                &value.to_string(),
+                "https://admin.example.test:8443/api/admin/v1/auth/sessions",
+                "mcl1_fixture",
+                1_800_000_000,
+            )
+        };
+        validate(&event).unwrap();
+        for (field, value) in [
+            ("kind", serde_json::json!(1)),
+            ("created_at", serde_json::json!(1_800_000_001)),
+            ("content", serde_json::json!("changed")),
+            ("id", serde_json::json!("0".repeat(64))),
+            ("pubkey", serde_json::json!("f".repeat(64))),
+            ("sig", serde_json::json!("0".repeat(128))),
+            ("extra", serde_json::json!("ignored?")),
+        ] {
+            let mut altered = event.clone();
+            altered[field] = value;
+            assert!(validate(&altered).is_err(), "{field}");
+        }
+        for (index, value) in [
+            (0, "https://other.example.test/api/admin/v1/auth/sessions"),
+            (1, "GET"),
+            (2, "other_challenge"),
+        ] {
+            let mut altered = event.clone();
+            altered["tags"][index][1] = serde_json::json!(value);
+            assert!(validate(&altered).is_err());
+        }
+        let mut altered = event.clone();
+        altered["tags"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(["payload", "0".repeat(64)]));
+        assert!(validate(&altered).is_err());
+        assert!(validate_human_login_proof(&" ".repeat(16 * 1024 + 1), "", "", 0).is_err());
+        assert!(validate_human_login_proof("not JSON", "", "", 0).is_err());
+    }
 
     #[test]
     fn public_identity_fingerprints_the_x_only_public_key_bytes() {

@@ -239,11 +239,17 @@ source and ship under the package's MIT license. The 0.3.1 crate declares no
 separate asset license for those byte strings; their exact digests remain part
 of Maincopy's renderer-version-specific sanitizer policy.
 
-The renderer corpus runs all ten selected diagrams through the supervised
-helper and fixes their raw-output digests. The sanitizer provides the distinct
-sanitized-inline-SVG capability and fixes separately scoped output digests.
-Application-wide admission, preview and public equivalence, structural limits,
-identity mutation, and Nix license closure form the release evidence.
+The renderer corpus checks all ten selected ASCII diagrams against the helper's
+core rendering function and fixes their raw-output digests. This correctness
+check has no wall-clock assertion, so it can run under concurrent coverage
+instrumentation. Separate process tests submit concurrent protocol, Unicode,
+invalid-input, and resource-limit cases through one application-owned renderer.
+The supervisor tests verify deadline enforcement, termination, and reaping.
+
+The sanitizer provides the distinct sanitized-inline-SVG capability and fixes
+separately scoped output digests. Application-wide admission, preview and public
+equivalence, structural limits, identity mutation, and Nix license closure form
+the release evidence.
 
 Reconsider `merman` when it publishes a stable release with the evaluated
 resource, cancellation, sanitizer, and diagram-family contracts.

@@ -13,7 +13,8 @@ use markdown_compiler::{
     AssetDigest, AssetRevisionReference, DefaultPostTipPolicy, DigestedAsset, DraftStatus,
     LogicalAssetPath, PostAlias, PostDescription, PostId, PostRevisionDigest, PostSlug, PostTag,
     PostTipPolicy, PostTitle, PreviewDigest, PublicationSettings, ResolvedLocalAssetStore,
-    ResolvedPostAssets, RevisionIdentityError, SiteShellRendererIdentity, SiteSnapshotDigest,
+    ResolvedPostAssets, ResolvedSiteAssets, RevisionIdentityError, SiteShellRendererIdentity,
+    SiteSnapshotDigest,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use qrcode::{QrCode, types::Color};
@@ -31,6 +32,7 @@ use crate::frontend_assets::FrontendAssetManifest;
 use super::metadata::{
     MetadataRenderError, PostHeadMetadataInput, RenderedPostHeadMetadata, render_post_head_metadata,
 };
+use super::policy::{PublicResponsePolicy, REFERRER_POLICY};
 use super::robots::{RenderedRobots, RobotsRenderError, render_robots};
 use super::rss::{RenderedRssFeed, RssItem, RssRenderError, render_rss};
 use super::sitemap::{RenderedSitemap, SitemapRenderError, render_sitemap};
@@ -76,6 +78,7 @@ struct PublicPostView {
     published_at: OffsetDateTime,
     canonical_url: Arc<CanonicalSiteUrl>,
     tips: PostTipPolicy,
+    image: Option<AssetRevisionReference>,
 }
 
 impl PublicPostView {
@@ -102,6 +105,7 @@ impl PublicPostView {
                 &path,
             )),
             tips: metadata.tips,
+            image: rendered.assets.image.clone(),
         }
     }
 
@@ -170,8 +174,12 @@ pub fn render_site_shell(
 
     let renderer = SiteShellRendererIdentity::new(*frontend.bundle_digest.as_bytes());
     let pre_injection_output = render_pre_injection_shell(
-        &catalog.publication,
-        frontend,
+        &PageRenderer::new(
+            &catalog.publication,
+            frontend,
+            &catalog.site_assets,
+            HeadAssetProjection::Identity,
+        )?,
         PublicPagePlan {
             posts: &posts,
             chronology: &chronology,
@@ -295,6 +303,12 @@ fn render_bound_preview(
         &catalog.publication.site.base_url,
         &PublicPagePath::post(&rendered.document.metadata.slug),
     );
+    let renderer = &PageRenderer::new(
+        &catalog.publication,
+        frontend,
+        &catalog.site_assets,
+        HeadAssetProjection::Preview(preview_asset_endpoint),
+    )?;
     let page = PostPageView::from_rendered(rendered, published_at);
     let tips_enabled = page.tips_enabled(&catalog.publication);
     let tip_handoff = if tips_enabled {
@@ -303,8 +317,7 @@ fn render_bound_preview(
         None
     };
     let html = render_post(
-        &catalog.publication,
-        frontend,
+        renderer,
         page,
         &canonical_url,
         ArticleBody::Projected(&article),
@@ -313,9 +326,14 @@ fn render_bound_preview(
     )?
     .into_string();
     validate_page_size(html.len())?;
-    let pre_injection_shell = render_post(
+    let renderer = &PageRenderer::new(
         &catalog.publication,
         frontend,
+        &catalog.site_assets,
+        HeadAssetProjection::Identity,
+    )?;
+    let pre_injection_shell = render_post(
+        renderer,
         PostPageView::from_rendered(rendered, None),
         &canonical_url,
         ArticleBody::Omitted,
@@ -324,7 +342,7 @@ fn render_bound_preview(
     )?
     .into_string();
     validate_page_size(pre_injection_shell.len())?;
-    let renderer = SiteShellRendererIdentity::new(*frontend.bundle_digest.as_bytes());
+    let site_renderer = SiteShellRendererIdentity::new(*frontend.bundle_digest.as_bytes());
     let profile_projection = if tips_enabled {
         tip_recipient
             .map(TipRecipientProjection::identity_bytes)
@@ -339,8 +357,9 @@ fn render_bound_preview(
         post_revision: &rendered.revision,
         post_renderer: &rendered.renderer,
         article_identity_html: rendered.article.identity_html.as_bytes(),
-        site_renderer: &renderer,
+        site_renderer: &site_renderer,
         pre_injection_post_shell: pre_injection_shell.as_bytes(),
+        response_policy: renderer.policy.content_security_policy.as_bytes(),
         profile_projection: &profile_projection,
         canonical_url: canonical_url.as_str(),
     })
@@ -527,8 +546,7 @@ struct PublicPagePlan<'plan> {
 }
 
 fn render_pre_injection_shell(
-    publication: &PublicationSettings,
-    frontend: &'static FrontendAssetManifest,
+    renderer: &PageRenderer<'_>,
     plan: PublicPagePlan<'_>,
     discovery: DiscoveryDocuments<'_>,
 ) -> Result<SiteShellOutputDigest, SiteSnapshotBuildError> {
@@ -560,20 +578,28 @@ fn render_pre_injection_shell(
     );
 
     let mut retained = RetainedHtmlBudget::new();
-    let mut hasher = SiteShellOutputHasher::new(pages.len());
+    let mut hasher = SiteShellOutputHasher::new(pages.len() + 2);
+    hasher.page(
+        "/maincopy-identity/public-response-policy",
+        renderer.policy.content_security_policy.as_bytes(),
+    );
+    hasher.page(
+        "/maincopy-identity/referrer-policy",
+        REFERRER_POLICY.as_bytes(),
+    );
     for (path, page) in pages {
         match page {
             PreInjectionPage::Index => hash_pre_injection_html(
                 &mut hasher,
                 &mut retained,
                 &path,
-                render_index(publication, frontend, plan.posts, plan.chronology).into_string(),
+                render_index(renderer, plan.posts, plan.chronology).into_string(),
             ),
             PreInjectionPage::Archive => hash_pre_injection_html(
                 &mut hasher,
                 &mut retained,
                 &path,
-                render_archive(publication, frontend, plan.posts, plan.chronology).into_string(),
+                render_archive(renderer, plan.posts, plan.chronology).into_string(),
             ),
             PreInjectionPage::Feed => {
                 hasher.page(path.as_str(), discovery.feed.body.as_bytes());
@@ -592,8 +618,7 @@ fn render_pre_injection_shell(
                 &mut retained,
                 &path,
                 render_post(
-                    publication,
-                    frontend,
+                    renderer,
                     PostPageView::from_public(&plan.posts[index]),
                     &plan.posts[index].canonical_url,
                     ArticleBody::Omitted,
@@ -607,8 +632,7 @@ fn render_pre_injection_shell(
                 &mut retained,
                 &path,
                 render_tag(
-                    publication,
-                    frontend,
+                    renderer,
                     tag,
                     plan.posts,
                     plan.tags.get(tag).map_or(&[], Arc::as_ref),
@@ -623,7 +647,7 @@ fn render_pre_injection_shell(
                 &mut hasher,
                 &mut retained,
                 &path,
-                render_error(publication, frontend, error).into_string(),
+                render_error(renderer, error).into_string(),
             ),
         }?;
     }
@@ -692,19 +716,15 @@ impl RenderedSiteShell {
             .map(TipHandoff::new)
             .transpose()?;
         let pages = render_snapshot_pages(&self, &digest, tip_handoff.as_ref(), &mut retained)?;
-        let publication = &self.catalog.publication;
-        let not_found = rendered_error_page(
-            publication,
+        let renderer = &PageRenderer::new(
+            &self.catalog.publication,
             self.frontend,
-            PublicErrorPage::NotFound,
-            &mut retained,
+            &self.catalog.site_assets,
+            HeadAssetProjection::Snapshot(&digest),
         )?;
-        let method_not_allowed = rendered_error_page(
-            publication,
-            self.frontend,
-            PublicErrorPage::MethodNotAllowed,
-            &mut retained,
-        )?;
+        let not_found = rendered_error_page(renderer, PublicErrorPage::NotFound, &mut retained)?;
+        let method_not_allowed =
+            rendered_error_page(renderer, PublicErrorPage::MethodNotAllowed, &mut retained)?;
         let assets = collect_public_assets(&self, &digest)?;
         let feed = self.feed;
         let robots = self.robots;
@@ -720,6 +740,7 @@ impl RenderedSiteShell {
             &sitemap,
         );
 
+        let response_policy = renderer.policy.clone();
         Ok(SiteSnapshot {
             digest,
             presentation_digest,
@@ -731,6 +752,7 @@ impl RenderedSiteShell {
             not_found,
             method_not_allowed,
             assets,
+            response_policy,
             frontend: self.frontend,
             retained_html_bytes: retained.used,
         })
@@ -744,19 +766,25 @@ fn render_snapshot_pages(
     retained: &mut RetainedHtmlBudget,
 ) -> Result<BTreeMap<PageRoute, RenderedPage>, SiteSnapshotBuildError> {
     let publication = &shell.catalog.publication;
+    let renderer = &PageRenderer::new(
+        publication,
+        shell.frontend,
+        &shell.catalog.site_assets,
+        HeadAssetProjection::Snapshot(digest),
+    )?;
     let mut pages = BTreeMap::new();
 
     insert_page(
         &mut pages,
         PageRoute::Index,
-        render_index(publication, shell.frontend, &shell.posts, &shell.chronology).into_string(),
+        render_index(renderer, &shell.posts, &shell.chronology).into_string(),
         publication,
         retained,
     )?;
     insert_page(
         &mut pages,
         PageRoute::Archive,
-        render_archive(publication, shell.frontend, &shell.posts, &shell.chronology).into_string(),
+        render_archive(renderer, &shell.posts, &shell.chronology).into_string(),
         publication,
         retained,
     )?;
@@ -786,8 +814,7 @@ fn render_snapshot_pages(
             &mut pages,
             PageRoute::Post(post.slug.clone()),
             render_post(
-                publication,
-                shell.frontend,
+                renderer,
                 PostPageView::from_public(post),
                 &post.canonical_url,
                 ArticleBody::Projected(&article),
@@ -803,7 +830,7 @@ fn render_snapshot_pages(
         insert_page(
             &mut pages,
             PageRoute::Tag(tag.clone()),
-            render_tag(publication, shell.frontend, tag, &shell.posts, indexes).into_string(),
+            render_tag(renderer, tag, &shell.posts, indexes).into_string(),
             publication,
             retained,
         )?;
@@ -836,12 +863,12 @@ fn insert_page(
 }
 
 fn rendered_error_page(
-    publication: &PublicationSettings,
-    frontend: &'static FrontendAssetManifest,
+    renderer: &PageRenderer<'_>,
     error: PublicErrorPage,
     retained: &mut RetainedHtmlBudget,
 ) -> Result<RenderedPage, SiteSnapshotBuildError> {
-    let html = render_error(publication, frontend, error).into_string();
+    let publication = renderer.publication;
+    let html = render_error(renderer, error).into_string();
     validate_page_size(html.len())?;
     retained.add(html.len())?;
     Ok(RenderedPage {
@@ -915,13 +942,13 @@ fn collect_public_assets(
 
 fn collect_site_global_assets(
     selected: &mut SelectedAssets,
-    site_assets: &markdown_compiler::ResolvedSiteAssets,
+    site_assets: &ResolvedSiteAssets,
     local_assets: &ResolvedLocalAssetStore,
 ) -> Result<(), SiteSnapshotBuildError> {
     if let Some(AssetRevisionReference::Local(asset)) = &site_assets.favicon {
         insert_authored_asset(selected, asset, local_assets)?;
     }
-    for reference in &site_assets.references {
+    for reference in site_assets.image.iter().chain(&site_assets.references) {
         if let AssetRevisionReference::Local(asset) = reference {
             insert_authored_asset(selected, asset, local_assets)?;
         }
@@ -1150,6 +1177,7 @@ pub struct SiteSnapshot {
     method_not_allowed: RenderedPage,
     assets: BTreeMap<SnapshotAssetPath, SnapshotPublicAsset>,
     pub(crate) frontend: &'static FrontendAssetManifest,
+    pub(crate) response_policy: PublicResponsePolicy,
     retained_html_bytes: usize,
 }
 
@@ -1298,6 +1326,7 @@ pub(crate) struct SnapshotActivationError {
 #[serde(rename_all = "snake_case")]
 pub enum SiteSnapshotBuildErrorCode {
     FrontendManifestInvalid,
+    ResponsePolicyInvalid,
     RevisionUnavailable,
     DraftSelected,
     RouteCollision,
@@ -1444,12 +1473,112 @@ impl SiteSnapshotBuildError {
     }
 }
 
-fn render_index(
-    publication: &PublicationSettings,
+/// Local URLs use a stable marker while hashing to avoid a snapshot self-reference.
+#[derive(Clone, Copy)]
+enum HeadAssetProjection<'projection> {
+    Identity,
+    Snapshot(&'projection SiteSnapshotDigest),
+    Preview(&'projection str),
+}
+
+struct PageRenderer<'render> {
+    publication: &'render PublicationSettings,
     frontend: &'static FrontendAssetManifest,
+    projection: HeadAssetProjection<'render>,
+    favicon: Option<String>,
+    image: Option<String>,
+    policy: PublicResponsePolicy,
+}
+
+impl<'render> PageRenderer<'render> {
+    fn new(
+        publication: &'render PublicationSettings,
+        frontend: &'static FrontendAssetManifest,
+        assets: &ResolvedSiteAssets,
+        projection: HeadAssetProjection<'render>,
+    ) -> Result<Self, SiteSnapshotBuildError> {
+        let policy =
+            PublicResponsePolicy::new(&assets.allowed_origins, frontend).map_err(|error| {
+                SiteSnapshotBuildError::new(
+                    SiteSnapshotBuildErrorCode::ResponsePolicyInvalid,
+                    None,
+                    error.to_string(),
+                )
+            })?;
+        let mut renderer = Self {
+            publication,
+            frontend,
+            projection,
+            favicon: None,
+            image: None,
+            policy,
+        };
+        renderer.favicon = assets
+            .favicon
+            .as_ref()
+            .map(|asset| renderer.project_asset(asset))
+            .transpose()?;
+        renderer.image = renderer.project_metadata_image(assets.image.as_ref())?;
+        Ok(renderer)
+    }
+
+    fn project_metadata_image(
+        &self,
+        asset: Option<&AssetRevisionReference>,
+    ) -> Result<Option<String>, SiteSnapshotBuildError> {
+        // Private local assets have no canonical public URL before release.
+        // Their exact reference remains bound into the preview identity.
+        match (self.projection, asset) {
+            (HeadAssetProjection::Preview(_), Some(AssetRevisionReference::Local(_))) => Ok(None),
+            (_, asset) => asset.map(|asset| self.project_asset(asset)).transpose(),
+        }
+    }
+
+    fn project_asset(
+        &self,
+        asset: &AssetRevisionReference,
+    ) -> Result<String, SiteSnapshotBuildError> {
+        let asset = match asset {
+            AssetRevisionReference::Local(asset) => asset,
+            AssetRevisionReference::External(url) => return Ok(url.as_str().to_owned()),
+        };
+        let path = match self.projection {
+            HeadAssetProjection::Identity => format!(
+                "/assets/maincopy-snapshot-placeholder/{}",
+                asset.path.as_str()
+            ),
+            HeadAssetProjection::Snapshot(digest) => SnapshotAssetPath::new(digest, &asset.path)
+                .map_err(|error| {
+                    SiteSnapshotBuildError::new(
+                        SiteSnapshotBuildErrorCode::ArticleProjectionFailed,
+                        None,
+                        error.to_string(),
+                    )
+                })?
+                .as_str()
+                .to_owned(),
+            HeadAssetProjection::Preview(endpoint) => {
+                return Ok(format!("{endpoint}?path={}", asset.path.as_str()));
+            }
+        };
+        Ok(format!(
+            "{}{}",
+            self.publication
+                .site
+                .base_url
+                .as_str()
+                .trim_end_matches('/'),
+            path
+        ))
+    }
+}
+
+fn render_index(
+    renderer: &PageRenderer<'_>,
     posts: &[PublicPostView],
     chronology: &[usize],
 ) -> Markup {
+    let publication = renderer.publication;
     let canonical_url =
         CanonicalSiteUrl::for_path(&publication.site.base_url, &PublicPagePath::index());
     let content = html! {
@@ -1463,9 +1592,9 @@ fn render_index(
         }
     };
     render_layout(
-        publication,
-        frontend,
+        renderer,
         PageHead {
+            image: renderer.image.as_deref(),
             context: PageContext::Index,
             title: publication.site.title.as_str(),
             description: publication.site.description.as_str(),
@@ -1479,11 +1608,11 @@ fn render_index(
 }
 
 fn render_archive(
-    publication: &PublicationSettings,
-    frontend: &'static FrontendAssetManifest,
+    renderer: &PageRenderer<'_>,
     posts: &[PublicPostView],
     chronology: &[usize],
 ) -> Markup {
+    let publication = renderer.publication;
     let canonical_url =
         CanonicalSiteUrl::for_path(&publication.site.base_url, &PublicPagePath::archive());
     let description = format!(
@@ -1501,9 +1630,9 @@ fn render_archive(
         }
     };
     render_layout(
-        publication,
-        frontend,
+        renderer,
         PageHead {
+            image: renderer.image.as_deref(),
             context: PageContext::Archive,
             title: "Archive",
             description: &description,
@@ -1517,12 +1646,12 @@ fn render_archive(
 }
 
 fn render_tag(
-    publication: &PublicationSettings,
-    frontend: &'static FrontendAssetManifest,
+    renderer: &PageRenderer<'_>,
     tag: &PostTag,
     posts: &[PublicPostView],
     indexes: &[usize],
 ) -> Markup {
+    let publication = renderer.publication;
     let title = format!("Posts tagged {}", tag.as_str());
     let description = format!(
         "Browse published posts tagged “{}” on {}.",
@@ -1538,9 +1667,9 @@ fn render_tag(
         }
     };
     render_layout(
-        publication,
-        frontend,
+        renderer,
         PageHead {
+            image: renderer.image.as_deref(),
             context: PageContext::Tag,
             title: &title,
             description: &description,
@@ -1569,6 +1698,7 @@ struct PostPageView<'post> {
     updated_at: Option<OffsetDateTime>,
     published_at: Option<OffsetDateTime>,
     tips: PostTipPolicy,
+    image: Option<&'post AssetRevisionReference>,
 }
 
 impl<'post> PostPageView<'post> {
@@ -1582,6 +1712,7 @@ impl<'post> PostPageView<'post> {
             updated_at: post.updated_at,
             published_at: Some(post.published_at),
             tips: post.tips,
+            image: post.image.as_ref(),
         }
     }
 
@@ -1596,6 +1727,7 @@ impl<'post> PostPageView<'post> {
             updated_at: metadata.updated_at,
             published_at,
             tips: metadata.tips,
+            image: rendered.assets.image.as_ref(),
         }
     }
 
@@ -1722,14 +1854,15 @@ fn render_post_navigation(navigation: PostNavigation<'_>) -> Markup {
 }
 
 fn render_post(
-    publication: &PublicationSettings,
-    frontend: &'static FrontendAssetManifest,
+    renderer: &PageRenderer<'_>,
     post: PostPageView<'_>,
     canonical_url: &CanonicalSiteUrl,
     article: ArticleBody<'_>,
     navigation: PostNavigation<'_>,
     tip_handoff: Option<&TipHandoff<'_>>,
 ) -> Result<Markup, SiteSnapshotBuildError> {
+    let publication = renderer.publication;
+    let image = renderer.project_metadata_image(post.image)?;
     let metadata = render_post_head_metadata(PostHeadMetadataInput {
         title: post.title,
         description: post.description,
@@ -1739,6 +1872,7 @@ fn render_post(
         published_at: post.published_at,
         canonical_url,
         author: &publication.author.name,
+        image: image.as_deref(),
     })
     .map_err(|error| SiteSnapshotBuildError::metadata(post.post_id, error))?;
     let tips_enabled = post.tips_enabled(publication);
@@ -1791,9 +1925,9 @@ fn render_post(
         }
     };
     Ok(render_layout(
-        publication,
-        frontend,
+        renderer,
         PageHead {
+            image: image.as_deref(),
             context: PageContext::Post,
             title: post.title.as_str(),
             description: post.description.as_str(),
@@ -1836,11 +1970,7 @@ enum PublicErrorPage {
     MethodNotAllowed,
 }
 
-fn render_error(
-    publication: &PublicationSettings,
-    frontend: &'static FrontendAssetManifest,
-    error: PublicErrorPage,
-) -> Markup {
+fn render_error(renderer: &PageRenderer<'_>, error: PublicErrorPage) -> Markup {
     let (title, explanation) = match error {
         PublicErrorPage::NotFound => ("Page not found", "The requested page does not exist."),
         PublicErrorPage::MethodNotAllowed => (
@@ -1849,9 +1979,9 @@ fn render_error(
         ),
     };
     render_layout(
-        publication,
-        frontend,
+        renderer,
         PageHead {
+            image: None,
             context: PageContext::Error,
             title,
             description: explanation,
@@ -1873,6 +2003,7 @@ struct PageHead<'head> {
     title: &'head str,
     description: &'head str,
     canonical: Option<CanonicalPageHead<'head>>,
+    image: Option<&'head str>,
 }
 
 #[derive(Clone, Copy)]
@@ -1911,12 +2042,9 @@ enum CanonicalPageKind<'head> {
     },
 }
 
-fn render_layout(
-    publication: &PublicationSettings,
-    frontend: &'static FrontendAssetManifest,
-    head: PageHead<'_>,
-    content: Markup,
-) -> Markup {
+fn render_layout(renderer: &PageRenderer<'_>, head: PageHead<'_>, content: Markup) -> Markup {
+    let publication = renderer.publication;
+    let frontend = renderer.frontend;
     let site = &publication.site;
     let feed_url = CanonicalSiteUrl::for_path(&site.base_url, &PublicPagePath::feed());
     let feed_title = format!("{} RSS feed", site.title.as_str());
@@ -1933,6 +2061,9 @@ fn render_layout(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="description" content=(head.description);
                 title { (full_title) }
+                @if let Some(favicon) = &renderer.favicon {
+                    link rel="icon" href=(favicon);
+                }
                 @if let Some(canonical) = head.canonical {
                     link rel="canonical" href=(canonical.url.as_str());
                     meta property="og:title" content=(head.title);
@@ -1943,6 +2074,9 @@ fn render_layout(
                     meta property="og:url" content=(canonical.url.as_str());
                     meta property="og:description" content=(head.description);
                     meta property="og:site_name" content=(site.title.as_str());
+                    @if let Some(image) = head.image {
+                        meta property="og:image" content=(image);
+                    }
                     @if let CanonicalPageKind::Article { metadata, tags } = canonical.kind {
                         @if let Some(published_time) = &metadata.published_time {
                             meta property="article:published_time" content=(published_time);
@@ -1960,7 +2094,7 @@ fn render_layout(
                     title=(feed_title) href=(feed_url.as_str());
                 link rel="stylesheet" href=(frontend.css.public_path);
                 @if let Some(javascript) = &frontend.javascript {
-                    script src=(javascript.public_path) defer {}
+                    script src=(javascript.public_path) integrity=[renderer.policy.script_integrity.as_deref()] defer {}
                 }
             }
             body class=(head.context.body_class()) {
@@ -2295,7 +2429,6 @@ mod tests {
         assert!(page.contains(
             "<meta property=\"og:site_name\" content=\"Site &lt;unsafe&gt; &amp; title\">"
         ));
-        assert!(!page.contains("property=\"og:image\""));
     }
 
     fn post_json_ld(page: &str) -> serde_json::Value {
@@ -2435,7 +2568,22 @@ mod tests {
         let public_post = public
             .post_page(&PostSlug::parse("first-post").unwrap())
             .unwrap();
-        assert_eq!(rendered_head(&published), rendered_head(&public_post));
+        let public_prefix = format!("https://blog.example.com/assets/{}", public.digest);
+        let image_url = format!("{public_prefix}/first-cover.png");
+        assert_eq!(post_json_ld(&public_post)["image"], image_url);
+        assert!(post_json_ld(&published).get("image").is_none());
+        // Only the authenticated favicon projection and unreleased image metadata differ.
+        let public_head = rendered_head(&public_post)
+            .replace(
+                &format!("{public_prefix}/favicon.png"),
+                &format!("{asset_endpoint}?path=assets/favicon.png"),
+            )
+            .replace(
+                &format!("<meta property=\"og:image\" content=\"{image_url}\">"),
+                "",
+            )
+            .replace(&format!(",\"image\":\"{image_url}\""), "");
+        assert_eq!(rendered_head(&published), public_head);
 
         assert!(
             render_post_preview(
@@ -2561,8 +2709,13 @@ mod tests {
         publication.tips = DefaultPostTipPolicy::Disabled;
         page.tips = PostTipPolicy::InheritPublication;
         let inherited_disabled = render_post(
-            &publication,
-            embedded_manifest(),
+            &PageRenderer::new(
+                &publication,
+                embedded_manifest(),
+                &fixture.catalog.site_assets,
+                HeadAssetProjection::Identity,
+            )
+            .unwrap(),
             page,
             &canonical_url,
             ArticleBody::Omitted,
@@ -2575,8 +2728,13 @@ mod tests {
 
         page.tips = PostTipPolicy::Enabled;
         let post_enabled = render_post(
-            &publication,
-            embedded_manifest(),
+            &PageRenderer::new(
+                &publication,
+                embedded_manifest(),
+                &fixture.catalog.site_assets,
+                HeadAssetProjection::Identity,
+            )
+            .unwrap(),
             page,
             &canonical_url,
             ArticleBody::Omitted,
@@ -2590,8 +2748,13 @@ mod tests {
         publication.tips = DefaultPostTipPolicy::Enabled;
         page.tips = PostTipPolicy::Disabled;
         let post_disabled = render_post(
-            &publication,
-            embedded_manifest(),
+            &PageRenderer::new(
+                &publication,
+                embedded_manifest(),
+                &fixture.catalog.site_assets,
+                HeadAssetProjection::Identity,
+            )
+            .unwrap(),
             page,
             &canonical_url,
             ArticleBody::Omitted,
@@ -2746,7 +2909,13 @@ mod tests {
         assert_eq!(document["author"]["@type"], "Person");
         assert_eq!(document["author"]["name"], "Author <unsafe>");
         assert_eq!(document["keywords"], serde_json::json!(["rust"]));
-        assert!(document.get("image").is_none());
+        assert_eq!(
+            document["image"],
+            format!(
+                "https://blog.example.com/assets/{}/first-cover.png",
+                snapshot.digest
+            )
+        );
 
         let second_page = snapshot
             .post_page(&PostSlug::parse("second-post").unwrap())
@@ -2995,6 +3164,7 @@ mod tests {
         let site_assets = ResolvedSiteAssets::new(
             &fixture.catalog.publication,
             Some(AssetRevisionReference::local(favicon.clone())),
+            None,
             Vec::new(),
             vec![AssetRevisionReference::local(shared_reference.clone())],
         );
@@ -3203,8 +3373,13 @@ mod tests {
         let sitemap = render_public_sitemap(&fixture.catalog.publication, &posts, &tags).unwrap();
         let robots = render_public_robots(&fixture.catalog.publication).unwrap();
         let original = render_pre_injection_shell(
-            &fixture.catalog.publication,
-            embedded_manifest(),
+            &PageRenderer::new(
+                &fixture.catalog.publication,
+                embedded_manifest(),
+                &fixture.catalog.site_assets,
+                HeadAssetProjection::Identity,
+            )
+            .unwrap(),
             PublicPagePlan {
                 posts: &posts,
                 chronology: &chronology,
@@ -3222,8 +3397,13 @@ mod tests {
         let mut changed_feed = feed.clone();
         changed_feed.body = format!("{}\n", feed.body).into();
         let feed_changed = render_pre_injection_shell(
-            &fixture.catalog.publication,
-            embedded_manifest(),
+            &PageRenderer::new(
+                &fixture.catalog.publication,
+                embedded_manifest(),
+                &fixture.catalog.site_assets,
+                HeadAssetProjection::Identity,
+            )
+            .unwrap(),
             PublicPagePlan {
                 posts: &posts,
                 chronology: &chronology,
@@ -3241,8 +3421,13 @@ mod tests {
         let mut changed_robots = robots.clone();
         changed_robots.body = format!("{}\n", robots.body).into();
         let robots_changed = render_pre_injection_shell(
-            &fixture.catalog.publication,
-            embedded_manifest(),
+            &PageRenderer::new(
+                &fixture.catalog.publication,
+                embedded_manifest(),
+                &fixture.catalog.site_assets,
+                HeadAssetProjection::Identity,
+            )
+            .unwrap(),
             PublicPagePlan {
                 posts: &posts,
                 chronology: &chronology,
@@ -3260,8 +3445,13 @@ mod tests {
         let mut changed_sitemap = sitemap.clone();
         changed_sitemap.body = format!("{}\n", sitemap.body).into();
         let sitemap_changed = render_pre_injection_shell(
-            &fixture.catalog.publication,
-            embedded_manifest(),
+            &PageRenderer::new(
+                &fixture.catalog.publication,
+                embedded_manifest(),
+                &fixture.catalog.site_assets,
+                HeadAssetProjection::Identity,
+            )
+            .unwrap(),
             PublicPagePlan {
                 posts: &posts,
                 chronology: &chronology,
@@ -3285,8 +3475,13 @@ mod tests {
             )),
         );
         let redirects_changed = render_pre_injection_shell(
-            &fixture.catalog.publication,
-            embedded_manifest(),
+            &PageRenderer::new(
+                &fixture.catalog.publication,
+                embedded_manifest(),
+                &fixture.catalog.site_assets,
+                HeadAssetProjection::Identity,
+            )
+            .unwrap(),
             PublicPagePlan {
                 posts: &posts,
                 chronology: &chronology,
@@ -3448,13 +3643,13 @@ mod tests {
         let snapshot = build_snapshot(&fixture, &ledger).unwrap();
         assert_eq!(
             snapshot.digest.to_string(),
-            "site-b3-v1-a4137f0ba4bbe1a56fa1c5eecf7e54530760f1201e13342abbbd6e447590d58e"
+            "site-b3-v1-d58571601459e2f96420e12d8d9e85b15181c181de9767199f45a8d7138e8b66"
         );
         assert_eq!(
             snapshot.presentation_digest,
             PresentationDigest([
-                188, 168, 166, 21, 39, 106, 219, 180, 145, 10, 46, 246, 109, 59, 28, 240, 233, 21,
-                131, 184, 232, 4, 21, 52, 106, 225, 98, 201, 30, 199, 188, 119,
+                39, 95, 147, 214, 124, 121, 50, 143, 144, 211, 77, 97, 90, 187, 16, 237, 128, 32,
+                116, 127, 146, 53, 247, 251, 54, 131, 33, 62, 98, 255, 165, 144,
             ])
         );
     }
@@ -3692,5 +3887,182 @@ mod tests {
             serde_json::to_value(SnapshotActivationOutcome::AlreadyActive).unwrap(),
             "already_active"
         );
+    }
+    fn image_fixture(favicon: &str, site_image: &str, article_image: &str) -> Fixture {
+        let publication_source = format!(
+            "[site]\ntitle = \"Images\"\nbase_url = \"https://blog.example.com/\"\ndescription = \"Image metadata.\"\nfavicon = {favicon:?}\nimage = {site_image:?}\n[author]\nname = \"Author\"\n[assets]\nallowed_https_origins = [\"https://cdn.example\"]\n"
+        );
+        let source = post_source(
+            FIRST_ID,
+            "Image post",
+            PostRoutes {
+                slug: "image-post",
+                aliases: &[],
+            },
+            &["images"],
+            Some(article_image),
+            "Image metadata.",
+            false,
+        );
+        let tree = content_tree(
+            publication("publication.toml", publication_source),
+            vec![post("posts/image.md", PostCollection::Posts, source)],
+            ["favicon.png", "site.png", "article.png"]
+                .into_iter()
+                .map(|name| {
+                    asset(
+                        LogicalAssetPath::parse(&format!("assets/{name}")).unwrap(),
+                        name.as_bytes().to_vec(),
+                    )
+                })
+                .collect(),
+            0,
+        );
+        let prepared = prepare_content(&tree).unwrap();
+        let catalog = Arc::new(compile_content_catalog(&prepared).unwrap());
+        let revisions = catalog
+            .rendered_posts()
+            .map(|post| (post.document.metadata.id.clone(), post.revision.clone()))
+            .collect();
+        Fixture { catalog, revisions }
+    }
+
+    #[test]
+    fn local_favicon_site_and_article_images_use_canonical_snapshot_urls() {
+        let fixture = image_fixture(
+            "assets/favicon.png",
+            "assets/site.png",
+            "assets/article.png",
+        );
+        let snapshot =
+            build_snapshot(&fixture, &projection([entry(&fixture, FIRST_ID, 2_000)])).unwrap();
+        let prefix = format!("https://blog.example.com/assets/{}/", snapshot.digest);
+        let favicon = format!("<link rel=\"icon\" href=\"{prefix}favicon.png\">");
+        for page in [
+            snapshot.index_page(),
+            snapshot.archive_page(),
+            snapshot
+                .tag_page(&PostTag::parse("images").unwrap())
+                .unwrap(),
+        ] {
+            assert!(page.contains(&favicon));
+            assert!(page.contains(&format!(
+                "<meta property=\"og:image\" content=\"{prefix}site.png\">"
+            )));
+        }
+        let article = snapshot
+            .post_page(&PostSlug::parse("image-post").unwrap())
+            .unwrap();
+        assert!(article.contains(&favicon));
+        assert!(article.contains(&format!(
+            "<meta property=\"og:image\" content=\"{prefix}article.png\">"
+        )));
+        assert_eq!(
+            post_json_ld(&article)["image"],
+            format!("{prefix}article.png")
+        );
+        for name in ["favicon.png", "site.png", "article.png"] {
+            let path =
+                SnapshotAssetPath::parse(&format!("/assets/{}/{name}", snapshot.digest)).unwrap();
+            assert!(snapshot.public_asset(&path).is_some());
+        }
+        let preview = render_post_preview(
+            &fixture.catalog,
+            embedded_manifest(),
+            &PostId::parse(FIRST_ID).unwrap(),
+            "/api/admin/v1/preview-assets/example",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(preview.contains("<link rel=\"icon\" href=\"/api/admin/v1/preview-assets/example?path=assets/favicon.png\">"));
+        assert!(!preview.contains("property=\"og:image\""));
+        assert!(post_json_ld(&preview).get("image").is_none());
+        assert!(!preview.contains(&prefix));
+    }
+
+    #[test]
+    fn external_image_metadata_uses_validated_urls_and_escaped_attributes() {
+        let fixture = image_fixture(
+            "https://cdn.example/icon.png",
+            "https://cdn.example/site.png",
+            "https://cdn.example/article.png?x=1&y=2",
+        );
+        let snapshot =
+            build_snapshot(&fixture, &projection([entry(&fixture, FIRST_ID, 2_000)])).unwrap();
+        assert!(
+            snapshot
+                .index_page()
+                .contains("<link rel=\"icon\" href=\"https://cdn.example/icon.png\">")
+        );
+        assert!(
+            snapshot
+                .index_page()
+                .contains("<meta property=\"og:image\" content=\"https://cdn.example/site.png\">")
+        );
+        let article = snapshot
+            .post_page(&PostSlug::parse("image-post").unwrap())
+            .unwrap();
+        assert!(article.contains(
+            "<meta property=\"og:image\" content=\"https://cdn.example/article.png?x=1&amp;y=2\">"
+        ));
+        assert_eq!(
+            post_json_ld(&article)["image"],
+            "https://cdn.example/article.png?x=1&y=2"
+        );
+        assert!(snapshot.assets.is_empty());
+        let preview = render_post_preview(
+            &fixture.catalog,
+            embedded_manifest(),
+            &PostId::parse(FIRST_ID).unwrap(),
+            "/api/admin/v1/preview-assets/example",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            post_json_ld(&preview)["image"],
+            "https://cdn.example/article.png?x=1&y=2"
+        );
+    }
+
+    #[test]
+    fn site_image_changes_invalidate_snapshot_and_preview_approval_bindings() {
+        let first = image_fixture(
+            "assets/favicon.png",
+            "assets/site.png",
+            "assets/article.png",
+        );
+        let changed = image_fixture(
+            "assets/favicon.png",
+            "assets/favicon.png",
+            "assets/article.png",
+        );
+        let first_snapshot =
+            build_snapshot(&first, &projection([entry(&first, FIRST_ID, 2_000)])).unwrap();
+        let changed_snapshot =
+            build_snapshot(&changed, &projection([entry(&changed, FIRST_ID, 2_000)])).unwrap();
+        assert_ne!(first_snapshot.digest, changed_snapshot.digest);
+        let preview = |fixture: &Fixture| {
+            render_bound_post_preview(
+                &fixture.catalog,
+                embedded_manifest(),
+                &PostId::parse(FIRST_ID).unwrap(),
+                None,
+                "/api/admin/v1/preview-assets/example",
+                None,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_ne!(preview(&first).digest, preview(&changed).digest);
+        assert_eq!(first.revisions, changed.revisions);
+    }
+    #[test]
+    fn absent_site_image_does_not_substitute_the_favicon() {
+        let fixture = fixture();
+        let snapshot = build_snapshot(&fixture, &PublicLedgerProjection::empty()).unwrap();
+        assert!(snapshot.index_page().contains("<link rel=\"icon\""));
+        assert!(!snapshot.index_page().contains("property=\"og:image\""));
     }
 }

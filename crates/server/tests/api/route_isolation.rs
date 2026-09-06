@@ -63,6 +63,8 @@ async fn public_router_does_not_expose_browser_admin_routes() {
     for path in [
         "/admin".to_owned(),
         "/admin/login".to_owned(),
+        "/admin/agents".to_owned(),
+        format!("/admin/agents/{POST_ID}"),
         "/admin/users".to_owned(),
         format!("/admin/users/{POST_ID}"),
         format!("/admin/posts/{POST_ID}/review"),
@@ -84,6 +86,9 @@ async fn public_router_does_not_expose_browser_admin_routes() {
     }
     for path in [
         "/admin/users".to_owned(),
+        "/admin/agents".to_owned(),
+        format!("/admin/agents/{POST_ID}/scopes"),
+        format!("/admin/agents/{POST_ID}/revoke"),
         format!("/admin/users/{POST_ID}/status"),
         format!("/admin/users/{POST_ID}/roles"),
         format!("/admin/users/{POST_ID}/password"),

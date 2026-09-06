@@ -116,6 +116,9 @@ impl ExternalAssetOrigin {
         }
         url.set_path("/");
         let canonical = url.as_str().to_owned();
+        if canonical.contains([';', '\'', '*', ',']) {
+            return Err(ExternalAssetOriginError);
+        }
         Ok(Self { url, canonical })
     }
 
@@ -239,6 +242,11 @@ mod tests {
             "https://example.com/%2e",
             "https://example.com/?query=1",
             "https://example.com/#fragment",
+            "https://example.com;script-src",
+            "https://example.com%3Bscript-src",
+            "https://example.com'",
+            "https://*.example.com",
+            "https://example.com,evil.example",
             "https://example.com\\path",
             "https://exa\nmple.com",
             "https://exa\tmple.com",

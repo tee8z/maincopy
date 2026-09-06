@@ -46,7 +46,7 @@ content root. The repository can contain many articles.
 | Maincopy TOML frontmatter | Obsidian-first source and YAML Properties |
 | Users, roles, profiles, and authenticated administration | Per-author publication identities |
 | Static Lightning Address tip handoff | Paid articles and access entitlements |
-| Local SQLite and Litestream replication | High-availability database failover |
+| Local SQLite and encrypted Litestream replication to B2 | High-availability database failover |
 | Prometheus metrics on a loopback-only `/metrics` endpoint | Public or multi-host metrics exposure |
 | Nix package and NixOS module | Hosted multi-site control plane |
 
@@ -146,8 +146,13 @@ flowchart LR
     Public --> Reader[Reader]
     Public --> RSS[RSS]
 
-    DB --> Litestream[Litestream]
-    Litestream --> Replica[Database replica]
+    DB --> Litestream[Continuous Litestream replication]
+    Litestream --> Replica[Local immutable LTX files]
+    Replica --> Checkpoint[Complete recovery checkpoint]
+    Artifacts --> Checkpoint
+    Checkpoint --> Encryption[rclone crypt on the source server]
+    Encryption --> B2[Backblaze B2]
+    Checkpoint --> LocalBackups[Seven-day local encrypted recovery bundles]
 
     Runtime[Tokio runtime and supervised tasks] --> MetricsRegistry[Prometheus registry]
     Process[Linux process collector] --> MetricsRegistry
@@ -192,11 +197,11 @@ bypass.
 | Nostr login and agent identities | SQLite | Store public keys and scoped metadata only. |
 | Browser session and CSRF records | SQLite | Store fixed-length token digests only. |
 | Runtime paths, listeners, limits, and source mode | Host configuration | Reject unknown configuration fields. |
-| SSH, TLS, and Litestream secrets | Protected host files | Do not place secret bytes in Git, SQLite, or Nix. |
+| SSH, TLS, B2 credentials, and backup encryption keys | Protected host files | Do not place secret bytes in Git, SQLite, or Nix. |
 | Human and agent Nostr private keys | User or agent device | Maincopy never receives an `nsec` in V1. |
 | Current public representation | Immutable memory snapshot | Build it from Git artifacts and SQLite state. |
 | Lightning payment execution and truth | Reader wallet and address service | Maincopy keeps no payment ledger. |
-| Operational database backup | Litestream replica | Git and revision artifacts need separate backups. |
+| Operational database and revision-artifact backup | Encrypted B2 replica and artifact inventory | Back up Git and host secrets independently. |
 
 ## Configuration ownership
 
@@ -416,8 +421,8 @@ Git remains authoritative.
 Write each package once under its content digest. Use an atomic rename after
 the package and manifest reach durable storage.
 
-Litestream does not back up this artifact store. The V1 backup procedure must
-capture it at a recovery point compatible with SQLite.
+The V1 backup procedure captures these artifacts with a compatible SQLite
+snapshot and verifies their manifest before encryption.
 
 ## Article lifecycle
 
@@ -611,12 +616,29 @@ JSON-LD passes through a JSON serializer and one private trusted-script sink.
 That boundary escapes every character that could terminate or reinterpret the
 HTML script text node. Ordinary metadata attributes remain Maud-escaped.
 
-This is deliberately core, non-image Open Graph metadata. The
-[Open Graph protocol](https://ogp.me/) also requires `og:image`, so Maincopy
-does not claim complete Open Graph support yet and does not substitute the
-favicon. The remaining image-metadata work adds Open Graph and JSON-LD image
-fields after it can project validated external images and snapshot-scoped
-local image URLs.
+Optional `site.image` supplies Open Graph images for the index, archive, and
+nonempty tag pages. Post `image` supplies article Open Graph and JSON-LD images.
+Maincopy does not substitute the favicon when an image is absent.
+Local images use absolute URLs under the exact public snapshot digest.
+Allowlisted external images retain their validated HTTPS URLs.
+Private previews omit public metadata URLs for unreleased local images.
+
+Optional `site.favicon` renders a local or allowlisted external icon.
+A private preview uses its authenticated asset endpoint for a local favicon.
+See [content image configuration](content-images.md) for examples and limits.
+External asset bytes can change independently of Maincopy revision identities.
+
+Every public response includes `Referrer-Policy: no-referrer` and `nosniff`.
+The Content Security Policy (CSP) uses the same immutable snapshot as the body.
+Validated HTTPS origins permit image and media loads only.
+The bundled tip-copy script requires its exact SHA-256 hash and matching
+[subresource integrity](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/script-src#allowlisting_external_scripts_using_hashes).
+Other scripts, objects, frames, forms, connections, and inline styles are blocked.
+Sanitized diagram PNGs require `data:` for images; no other directive allows it.
+Authored asset responses retain their stricter sandbox policy and safe download rules.
+Policy changes participate in snapshot identity. Policies exceeding 16 KiB reject
+the candidate before installation.
+
 Feeds use stable post identifiers and absolute canonical URLs.
 
 Request handlers read only the active immutable snapshot. They do not parse
@@ -930,15 +952,36 @@ it closes SQLite and releases all listener addresses.
 
 ## Backup and restore
 
-Litestream replicates the local SQLite database. It does not back up Git,
-revision artifacts, host secrets, or runtime credentials.
+V1 targets continuous Litestream replication to Backblaze B2. Encrypt database
+and revision-artifact bytes on the source server before upload. Retain local
+encrypted recovery bundles for seven days. Replication and artifact backup must
+not stop the running publication.
+
+A usable recovery point includes both the SQLite ledger and every immutable
+revision artifact it references. Uploading the database alone does not establish
+a complete recovery point. Restore must verify a bounded artifact inventory,
+schema compatibility, and reconstructed publication before accepting a candidate.
+A failed backup degrades backup health without blocking public reads.
+
+The deployment target uses the current Litestream file replica and rclone crypt.
+A checkpoint upload pins completed replica files and the required content inputs.
+It publishes an encrypted completion manifest only after those inputs reach B2.
+The initial upload interval is one minute. Off-site recovery also depends on
+transfer time and remote availability; local replication alone does not prove
+that a complete checkpoint reached B2.
+
+This composition requires deployment and interruption testing before release.
+Current Litestream releases do not provide native age encryption; see the
+[upstream migration guide](https://litestream.io/docs/migration/#age-encryption-migration).
+Use standard client-side encryption instead of an older Litestream release or
+provider-side encryption.
 
 Production recovery requires these independent inputs:
 
 - Git repository backup or remote;
-- Litestream database replica;
-- compatible revision-artifact backup; and
-- protected host secret backup.
+- encrypted SQLite replica and compatible revision artifacts;
+- matching decryption keys, including keys retained for older backups; and
+- independently protected host secret backup.
 
 Restore is an offline operation. Never restore over a non-empty live database.
 
@@ -965,7 +1008,7 @@ crates/
 ```
 
 One Maincopy daemon owns one site with many articles. Production also runs an
-HTTPS gateway and Litestream as separate, least-privilege processes.
+HTTPS gateway, Litestream, and artifact backup as separate, least-privilege processes.
 
 The Nix flake provides packages, applications, checks, a development shell,
 and a formatter. The NixOS module is a V1 release requirement.
@@ -1041,7 +1084,7 @@ V1 must prove these properties:
 - No network call holds a database transaction.
 - Database and revision artifacts restore to one compatible recovery point.
 - The NixOS virtual-machine test proves gateway isolation, service permissions,
-  Litestream ordering, restart behavior, and restore behavior.
+  backup encryption, restart behavior, and restore behavior.
 - A clean checkout passes the documented Nix and Rust checks.
 
 The [remaining implementation work](implementation.md) contains unfinished
@@ -1306,7 +1349,8 @@ high availability. Each candidate requires a separate product decision.
 ## References
 
 - [SQLite write-ahead logging](https://sqlite.org/wal.html)
-- [Litestream operation](https://litestream.io/how-it-works/)
+- [SQLite online backup API](https://sqlite.org/backup.html)
+- [age encryption](https://github.com/FiloSottile/age)
 - [Nostr HTTP Authentication, NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md)
 - [Argon2 recommendations, RFC 9106](https://www.rfc-editor.org/rfc/rfc9106.html)
 - [LNURL base specification, LUD-01](https://github.com/lnurl/luds/blob/luds/01.md)

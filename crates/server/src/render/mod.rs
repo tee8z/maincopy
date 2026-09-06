@@ -6,6 +6,7 @@ mod code;
 mod diagram;
 mod markdown;
 mod metadata;
+mod policy;
 mod robots;
 mod rss;
 mod site;
@@ -32,3 +33,5 @@ pub(crate) use site::{
     SiteSnapshotActivator, SnapshotPublicAsset, render_bound_post_preview,
     render_bound_post_revision_preview, snapshot_store,
 };
+
+pub(crate) use policy::REFERRER_POLICY;

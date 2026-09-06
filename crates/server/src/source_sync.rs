@@ -3,8 +3,9 @@
 use std::{sync::Arc, time::Duration};
 
 use maincopy_shared::source::{
-    BeginSourceSyncResponse, ListSourceSyncsResponse, SourceStatusResponse, SourceSyncAdmission,
-    SourceSyncFailureCode, SourceSyncId, SourceSyncOutcome, SourceSyncResource, SourceSyncStage,
+    BeginSourceSyncResponse, ListSourceSyncsResponse, ReconfigureSourceRequest,
+    SourceDeployKeyResponse, SourceStatusResponse, SourceSyncAdmission, SourceSyncFailureCode,
+    SourceSyncId, SourceSyncOutcome, SourceSyncResource, SourceSyncStage,
 };
 use markdown_compiler::{
     ContentCandidateStore, ContentCandidateStoreError, ContentTreeDigest, DiscoveredContentTree,
@@ -31,10 +32,14 @@ use crate::{
                 ContentReloadError, PublicationCoordinatorHandle, observed_post_revisions,
             },
         },
-        source::store::{
-            AdvanceSourceSync, ApplyManagedSourceCatalog, BeginSourceSync, BeginSourceSyncResult,
-            FinishSourceSync, InstalledSource, SourceLoadError, SourceStore, SourceSyncCompletion,
-            SourceSyncProgress, SourceSyncRequest, StoredSourceConfiguration, StoredSourceSync,
+        source::{
+            ManagedSourceConfigurationInput,
+            store::{
+                AdvanceSourceSync, ApplyManagedSourceCatalog, BeginSourceReconfiguration,
+                BeginSourceSync, BeginSourceSyncResult, FinishSourceSync, InstalledSource,
+                SourceLoadError, SourceStore, SourceSyncCompletion, SourceSyncProgress,
+                SourceSyncRequest, StoredSourceSync,
+            },
         },
     },
     git_sync::{GitSync, GitSyncError, GitSyncOutcome},
@@ -54,7 +59,7 @@ enum SourceRuntime {
 }
 
 struct ManagedSourceControl {
-    configuration: StoredSourceConfiguration,
+    git: GitSync,
     cancellation: CancellationToken,
     admission: Mutex<()>,
     wakeup: Notify,
@@ -111,7 +116,13 @@ impl SourceSyncHandle {
             .store
             .begin_sync(BeginSourceSync {
                 proposed_source_sync_id: SourceSyncId::from_uuid(Uuid::new_v4()),
-                expected_configuration_version: managed.configuration.configuration.version,
+                expected_configuration_version: self
+                    .store
+                    .configuration()
+                    .await?
+                    .ok_or(SourceControlError::ConfigurationUnavailable)?
+                    .configuration
+                    .version,
                 requested_at: OffsetDateTime::now_utc(),
                 request: SourceSyncRequest::Manual { audit },
             })
@@ -122,6 +133,63 @@ impl SourceSyncHandle {
         Ok(BeginSourceSyncResponse {
             admission,
             sync: source_sync_resource(sync),
+        })
+    }
+
+    pub(crate) async fn deploy_public_identity(
+        &self,
+    ) -> Result<SourceDeployKeyResponse, SourceControlError> {
+        let managed = match &self.runtime {
+            SourceRuntime::ExternalCheckout => return Err(SourceControlError::Unsupported),
+            SourceRuntime::ManagedGit(managed) => managed,
+        };
+        let configuration = self
+            .store
+            .configuration()
+            .await?
+            .ok_or(SourceControlError::ConfigurationUnavailable)?;
+        managed
+            .git
+            .deploy_public_identity(&configuration.configuration.credential_name)
+            .await
+            .map_err(|_| SourceControlError::CredentialUnavailable)
+    }
+
+    pub(crate) async fn reconfigure(
+        &self,
+        request: ReconfigureSourceRequest,
+        audit: MutationAuditContext,
+    ) -> Result<BeginSourceSyncResponse, SourceControlError> {
+        let managed = match &self.runtime {
+            SourceRuntime::ExternalCheckout => return Err(SourceControlError::Unsupported),
+            SourceRuntime::ManagedGit(managed) => managed,
+        };
+        let _admission = managed.admission.lock().await;
+        if managed.cancellation.is_cancelled() {
+            return Err(SourceControlError::ShuttingDown);
+        }
+        let result = self
+            .store
+            .begin_reconfiguration(BeginSourceReconfiguration {
+                proposed_source_sync_id: SourceSyncId::from_uuid(Uuid::new_v4()),
+                request: ManagedSourceConfigurationInput {
+                    remote: request.remote,
+                    branch: request.branch,
+                    content_subdirectory: request.content_subdirectory,
+                    credential_name: request.credential_name,
+                    poll_interval_seconds: request.poll_interval_seconds,
+                    expected_version: Some(request.expected_version),
+                },
+                requested_at: OffsetDateTime::now_utc(),
+                audit,
+            })
+            .await?;
+        if result.sync.outcome.is_none() {
+            managed.wakeup.notify_one();
+        }
+        Ok(BeginSourceSyncResponse {
+            admission: result.admission,
+            sync: source_sync_resource(result.sync),
         })
     }
 
@@ -178,6 +246,8 @@ pub(crate) enum SourceControlError {
     ShuttingDown,
     #[error("managed source configuration is unavailable")]
     ConfigurationUnavailable,
+    #[error("the selected deploy public identity is unavailable")]
+    CredentialUnavailable,
     #[error("managed source state could not be loaded")]
     Load(#[from] SourceLoadError),
     #[error("managed source state could not be changed")]
@@ -206,14 +276,13 @@ pub(crate) struct ManagedSourceEngine {
 impl ManagedSourceEngine {
     pub(crate) fn new(
         store: SourceStore,
-        configuration: StoredSourceConfiguration,
         git: GitSync,
         candidate_store: ContentCandidateStore,
         compiler: ContentCompiler,
         cancellation: CancellationToken,
     ) -> (Self, SourceSyncHandle) {
         let managed = Arc::new(ManagedSourceControl {
-            configuration,
+            git: git.clone(),
             cancellation: cancellation.clone(),
             admission: Mutex::new(()),
             wakeup: Notify::new(),
@@ -247,13 +316,19 @@ impl ManagedSourceEngine {
                 )
                 .await?;
         }
-        let managed = &self.managed;
         let started = self
             .handle
             .store
             .begin_sync(BeginSourceSync {
                 proposed_source_sync_id: SourceSyncId::from_uuid(Uuid::new_v4()),
-                expected_configuration_version: managed.configuration.configuration.version,
+                expected_configuration_version: self
+                    .handle
+                    .store
+                    .configuration()
+                    .await?
+                    .ok_or(ManagedSourceSyncError::ConfigurationUnavailable)?
+                    .configuration
+                    .version,
                 requested_at: OffsetDateTime::now_utc(),
                 request: SourceSyncRequest::Startup,
             })
@@ -313,12 +388,18 @@ impl ManagedSourceEngine {
     }
 
     async fn begin_poll(&self) -> Result<(), ManagedSourceSyncError> {
-        let managed = &self.managed;
         self.handle
             .store
             .begin_sync(BeginSourceSync {
                 proposed_source_sync_id: SourceSyncId::from_uuid(Uuid::new_v4()),
-                expected_configuration_version: managed.configuration.configuration.version,
+                expected_configuration_version: self
+                    .handle
+                    .store
+                    .configuration()
+                    .await?
+                    .ok_or(ManagedSourceSyncError::ConfigurationUnavailable)?
+                    .configuration
+                    .version,
                 requested_at: OffsetDateTime::now_utc(),
                 request: SourceSyncRequest::Poll,
             })
@@ -336,16 +417,13 @@ impl ManagedSourceEngine {
                 "a terminal source operation cannot execute",
             ));
         }
-        let configuration = &self.managed.configuration.configuration;
-        if sync.configuration_version != configuration.version {
-            return self
-                .fail_operation(
-                    sync,
-                    SourceSyncFailureCode::ConfigurationChanged,
-                    "source configuration changed before synchronization",
-                )
-                .await;
-        }
+        let stored = self
+            .handle
+            .store
+            .configuration_revision(sync.configuration_version)
+            .await?
+            .ok_or(ManagedSourceSyncError::ConfigurationUnavailable)?;
+        let configuration = &stored.configuration;
         let installation = self.handle.store.installation().await?;
         let installed_commit = installation.as_ref().and_then(|installed| {
             (installed.configuration_version == configuration.version)
@@ -372,7 +450,13 @@ impl ManagedSourceEngine {
         sync: StoredSourceSync,
         installed_commit: Option<&SourceCommit>,
     ) -> Result<(StoredSourceSync, GitSyncOutcome), ManagedSourceSyncError> {
-        let configuration = &self.managed.configuration.configuration;
+        let stored = self
+            .handle
+            .store
+            .configuration_revision(sync.configuration_version)
+            .await?
+            .ok_or(ManagedSourceSyncError::ConfigurationUnavailable)?;
+        let configuration = &stored.configuration;
         let sync = self.advance(&sync, SourceSyncProgress::Fetching).await?;
         let outcome = match self
             .git
@@ -453,7 +537,13 @@ impl ManagedSourceEngine {
         {
             return Ok((source_commit.clone(), tree));
         }
-        let configuration = &self.managed.configuration.configuration;
+        let stored = self
+            .handle
+            .store
+            .configuration_revision(sync.configuration_version)
+            .await?
+            .ok_or(ManagedSourceSyncError::ConfigurationUnavailable)?;
+        let configuration = &stored.configuration;
         match self
             .git
             .synchronize(
@@ -578,16 +668,6 @@ impl ManagedSourceEngine {
         Ok(())
     }
 
-    async fn fail_operation(
-        &self,
-        sync: StoredSourceSync,
-        code: SourceSyncFailureCode,
-        context: &'static str,
-    ) -> Result<(StoredSourceSync, PreparedOperation), ManagedSourceSyncError> {
-        self.fail_terminal(&sync, code).await?;
-        Err(ManagedSourceSyncError::OperationFailed { code, context })
-    }
-
     async fn cancel_operation(&self, sync: StoredSourceSync) -> Result<(), ManagedSourceSyncError> {
         self.handle
             .store
@@ -618,21 +698,16 @@ pub(crate) struct ManagedSourceSync {
 
 impl ManagedSourceSync {
     pub(crate) async fn run(self) -> Result<(), ManagedSourceSyncError> {
-        let fallback_poll_interval = Duration::from_secs(
-            self.engine
-                .managed
-                .configuration
-                .configuration
-                .poll_interval_seconds
-                .seconds(),
-        );
-
         loop {
             let poll_delay = match self.engine.handle.store.configuration().await? {
                 Some(configuration) => configuration
                     .next_poll_at
                     .map(|deadline| delay_until(deadline, OffsetDateTime::now_utc()))
-                    .unwrap_or(fallback_poll_interval),
+                    .unwrap_or_else(|| {
+                        Duration::from_secs(
+                            configuration.configuration.poll_interval_seconds.seconds(),
+                        )
+                    }),
                 None => return Err(ManagedSourceSyncError::ConfigurationUnavailable),
             };
             let poll = tokio::time::sleep(poll_delay);
@@ -647,7 +722,10 @@ impl ManagedSourceSync {
                     return Ok(());
                 }
                 () = &mut poll => {
-                    self.engine.begin_poll().await?;
+                    let _admission = self.engine.managed.admission.lock().await;
+                    if self.engine.handle.store.active_sync().await?.is_none() {
+                        self.engine.begin_poll().await?;
+                    }
                 }
                 () = self.engine.managed.wakeup.notified() => {}
             }

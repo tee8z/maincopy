@@ -1857,7 +1857,7 @@ mod tests {
             .find(|user| user.roles.contains(&UserRole::Owner))
             .unwrap();
         let user_path = format!("/admin/users/{}", owner.user_id);
-        for path in ["/admin/users", &user_path] {
+        for path in ["/admin/users", &user_path, "/admin/agents"] {
             let request = Request::builder()
                 .uri(path)
                 .header(HOST, ADMIN_AUTHORITY)
@@ -1872,6 +1872,23 @@ mod tests {
             assert!(page.contains("Sign in again"));
         }
         for (path, fields) in [
+            (
+                "/admin/agents".to_owned(),
+                vec![
+                    ("owner_user_id", "00000000-0000-0000-0000-000000000001"),
+                    ("public_key", "bad-key"),
+                    ("label", "agent"),
+                    ("scope", "content_read"),
+                ],
+            ),
+            (
+                "/admin/agents/00000000-0000-0000-0000-000000000001/scopes".to_owned(),
+                vec![("expected_version", "1"), ("scope", "content_read")],
+            ),
+            (
+                "/admin/agents/00000000-0000-0000-0000-000000000001/revoke".to_owned(),
+                vec![("expected_version", "1"), ("confirm", "true")],
+            ),
             (
                 "/admin/users".to_owned(),
                 vec![

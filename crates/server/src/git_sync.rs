@@ -17,8 +17,8 @@ use std::{
 };
 
 use maincopy_shared::source::{
-    GitBranchName, RepositoryContentSubdirectory, SourceSyncFailureCode, SshCredentialName,
-    SshRemote,
+    GitBranchName, RepositoryContentSubdirectory, SourceDeployKeyResponse, SourceSyncFailureCode,
+    SshCredentialName, SshRemote,
 };
 use markdown_compiler::{
     ContentTreeLimits, ContentValidationErrors, DiscoveredContentTree, discover_content_tree,
@@ -41,6 +41,7 @@ use crate::{
         PRIVATE_KEY_ENV, SSH_EXECUTABLE_ENV,
     },
     process_lock::{ProcessLock, prepare_private_directory, reject_symlink_components},
+    source_key::derive_public_identity,
 };
 
 const GIT_EXECUTABLE_ENV: &str = "MAINCOPY_GIT_EXECUTABLE";
@@ -179,6 +180,26 @@ impl GitSync {
             source_commit: commit,
             tree,
         }))
+    }
+
+    pub(crate) async fn deploy_public_identity(
+        &self,
+        name: &SshCredentialName,
+    ) -> Result<SourceDeployKeyResponse, GitSyncError> {
+        let credential = self.resolve_credential(name).await?;
+        let (public_key, fingerprint) = derive_public_identity(&credential.private_key.path)
+            .await
+            .map_err(|_| GitSyncError::CredentialUnavailable)?;
+        tokio::task::spawn_blocking(move || {
+            verify_credential_file(&credential.private_key, CredentialFileKind::PrivateKey)
+        })
+        .await
+        .map_err(|_| GitSyncError::CredentialValidationWorkerFailed)??;
+        Ok(SourceDeployKeyResponse {
+            credential_name: name.clone(),
+            public_key: public_key.into(),
+            fingerprint: fingerprint.into(),
+        })
     }
 
     async fn resolve_credential(
@@ -1997,7 +2018,6 @@ mod tests {
         async fn prepare(&self) -> Result<PreparedContentCandidate, ManagedSourceSyncError> {
             let (engine, _handle) = ManagedSourceEngine::new(
                 self.store.source.clone(),
-                self.configuration.clone(),
                 self.git.clone(),
                 self.candidates.clone(),
                 self.compiler.clone(),
@@ -2729,7 +2749,6 @@ mod tests {
 
         let (engine, source) = ManagedSourceEngine::new(
             fixture.store.source.clone(),
-            fixture.configuration.clone(),
             fixture.git.clone(),
             fixture.candidates.clone(),
             fixture.compiler.clone(),
@@ -2847,7 +2866,6 @@ mod tests {
         let publication = PublicationFixture::start(&fixture, &candidate).await;
         let (engine, source) = ManagedSourceEngine::new(
             fixture.store.source.clone(),
-            fixture.configuration.clone(),
             fixture.git.clone(),
             fixture.candidates.clone(),
             fixture.compiler.clone(),

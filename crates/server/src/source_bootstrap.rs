@@ -9,11 +9,8 @@ use std::{
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use maincopy_shared::auth::{AdminAuditEventId, UserId, UserRole, UserStatus};
-use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
-use tokio::{io::AsyncReadExt as _, process::Child};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -34,6 +31,7 @@ use crate::{
     process_lock::{
         ProcessLock, ProcessLockError, open_existing_private_file, prepare_private_directory,
     },
+    source_key::{derive_public_identity, parse_public_key},
 };
 
 const OWNER_PAGE_SIZE: u16 = 100;
@@ -217,8 +215,10 @@ impl SourceKeyFiles {
             )
         })?;
         let public_key = read_public_key(&self.public_key)?;
-        let public_identity = parse_public_key(&public_key)?;
-        let derived_public_key = derive_public_key(&self.private_key).await?;
+        let public_identity = parse_public_key(&public_key).map_err(invalid_public_key)?;
+        let (derived_public_key, _) = derive_public_identity(&self.private_key)
+            .await
+            .map_err(invalid_public_key)?;
         if derived_public_key != public_identity.0 {
             return Err(offline_failure(
                 StartupStage::Source,
@@ -279,76 +279,6 @@ async fn wait_for_key_generation(
                 StartupStage::Source,
                 "bound the source-key generator runtime",
                 SourceBootstrapError::KeyGenerationTimedOut,
-            ))
-        }
-    }
-}
-
-async fn derive_public_key(private_key: &Path) -> Result<String, ProcessError> {
-    let mut child = tokio::process::Command::new(ssh_keygen_executable())
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .args(["-y", "-f"])
-        .arg(private_key)
-        .spawn()
-        .map_err(|error| {
-            offline_failure(
-                StartupStage::Source,
-                "start private source-key verification",
-                error,
-            )
-        })?;
-    let output = collect_derived_public_key(&mut child, KEYGEN_TIMEOUT).await?;
-    let source = std::str::from_utf8(&output).map_err(|_| invalid_private_key())?;
-    parse_public_key(source)
-        .map(|(canonical, _)| canonical)
-        .map_err(|_| invalid_private_key())
-}
-
-async fn collect_derived_public_key(
-    child: &mut Child,
-    runtime_limit: Duration,
-) -> Result<Vec<u8>, ProcessError> {
-    let stdout = child.stdout.take().ok_or_else(invalid_private_key)?;
-    let mut output = Vec::new();
-    let completed = tokio::time::timeout(runtime_limit, async {
-        let read_result = {
-            let mut bounded = stdout.take(MAX_PUBLIC_KEY_BYTES + 1);
-            let result = bounded.read_to_end(&mut output).await;
-            drop(bounded);
-            result
-        };
-        (read_result, child.wait().await)
-    })
-    .await;
-
-    match completed {
-        Ok((Ok(_), Ok(status)))
-            if status.success() && output.len() as u64 <= MAX_PUBLIC_KEY_BYTES =>
-        {
-            Ok(output)
-        }
-        Ok((Err(error), _)) => Err(offline_failure(
-            StartupStage::Source,
-            "read the derived public source key",
-            error,
-        )),
-        Ok((_, Err(error))) => Err(offline_failure(
-            StartupStage::Source,
-            "wait for private source-key verification",
-            error,
-        )),
-        Ok((Ok(_), Ok(_))) => Err(invalid_private_key()),
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            Err(offline_failure(
-                StartupStage::Source,
-                "bound private source-key verification runtime",
-                SourceBootstrapError::KeyValidationTimedOut,
             ))
         }
     }
@@ -543,46 +473,11 @@ fn read_public_key(path: &Path) -> Result<String, ProcessError> {
     Ok(source)
 }
 
-fn parse_public_key(source: &str) -> Result<(String, String), ProcessError> {
-    let mut lines = source.lines();
-    let line = lines.next().unwrap_or_default();
-    if lines.any(|line| !line.is_empty()) {
-        return Err(invalid_public_key());
-    }
-    let mut fields = line.split_ascii_whitespace();
-    if fields.next() != Some("ssh-ed25519") {
-        return Err(invalid_public_key());
-    }
-    let encoded = fields.next().ok_or_else(invalid_public_key)?;
-    if fields.any(|field| field.chars().any(char::is_control)) {
-        return Err(invalid_public_key());
-    }
-    let blob = STANDARD_NO_PAD
-        .decode(encoded)
-        .map_err(|_| invalid_public_key())?;
-    if !valid_ed25519_blob(&blob) {
-        return Err(invalid_public_key());
-    }
-    let fingerprint = STANDARD_NO_PAD.encode(Sha256::digest(&blob));
-    Ok((
-        format!("ssh-ed25519 {encoded}"),
-        format!("SHA256:{fingerprint}"),
-    ))
-}
-
-fn valid_ed25519_blob(blob: &[u8]) -> bool {
-    const NAME: &[u8] = b"ssh-ed25519";
-    blob.len() == 4 + NAME.len() + 4 + 32
-        && blob.get(..4) == Some(&(NAME.len() as u32).to_be_bytes())
-        && blob.get(4..4 + NAME.len()) == Some(NAME)
-        && blob.get(4 + NAME.len()..8 + NAME.len()) == Some(&32_u32.to_be_bytes())
-}
-
-fn invalid_public_key() -> ProcessError {
+fn invalid_public_key(error: impl std::error::Error + Send + Sync + 'static) -> ProcessError {
     offline_failure(
         StartupStage::Source,
-        "validate the generated public source key",
-        SourceBootstrapError::PublicKeyInvalid,
+        "validate the deploy public key",
+        error,
     )
 }
 
@@ -624,14 +519,13 @@ enum SourceBootstrapError {
     PublicKeyInvalid,
     #[error("the generated public key does not correspond to the private key")]
     KeyPairMismatch,
-    #[error("private source-key verification exceeded its runtime limit")]
-    KeyValidationTimedOut,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::process_lock::open_private_file;
+    use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
 
     const KEY_GENERATION_FIXTURE_ENV: &str = "MAINCOPY_TEST_KEY_GENERATION_FIXTURE";

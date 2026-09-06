@@ -1,8 +1,12 @@
 //! CLI process startup, command execution, and output handling.
 
+mod agents;
+mod nostr_login;
 mod profile;
+mod terminal;
 mod users;
 use profile::ProfileOutput;
+use terminal::prompt_secret;
 
 use std::{
     collections::HashSet,
@@ -17,7 +21,7 @@ use std::{
 use clap::Parser;
 use maincopy_shared::{
     AdminApiVersion, Capabilities, CapabilityContractVersion,
-    auth_api::{AdminSessionResponse, SecretString},
+    auth_api::AdminSessionResponse,
     posts::{ListPostsResponse, PostPublicationState, PostSummary},
     publication::{
         ChangeReleaseRequest, ListReleasesResponse, PreviewDigest, PublicationApprovalState,
@@ -25,8 +29,9 @@ use maincopy_shared::{
         ReleaseState,
     },
     source::{
-        BeginSourceSyncResponse, SourceStatusResponse, SourceSyncAdmission, SourceSyncFailureCode,
-        SourceSyncId, SourceSyncOutcome, SourceSyncResource,
+        BeginSourceSyncResponse, SourceDeployKeyResponse, SourceStatusResponse,
+        SourceSyncAdmission, SourceSyncFailureCode, SourceSyncId, SourceSyncOutcome,
+        SourceSyncResource,
     },
 };
 use serde::Serialize;
@@ -39,7 +44,7 @@ use crate::{
     client::{AdminClient, AdminClientError, AdminProblem, LogoutOutcome, PostPreview},
     models::{
         AgentKeyCommand, Arguments, Command, ReleaseCommand, ReleaseTarget, SourceCommand,
-        SourceSyncDisposition, SourceSyncInvocation,
+        SourceConfigurationArguments, SourceSyncDisposition, SourceSyncInvocation,
     },
     nip98::AgentPublicIdentity,
     transport::AdditionalRootCertificateError,
@@ -60,6 +65,7 @@ const SOURCE_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_SOURCE_SYNC_POLLS: usize = 600;
 
 enum CommandOutput {
+    Agents(agents::AgentOutput),
     Users(users::UserOutput),
     Profile(ProfileOutput),
     Login(AdminSessionResponse),
@@ -72,6 +78,7 @@ enum CommandOutput {
     Release(ReleaseResource),
     ReleaseOperation(ReleaseOperationResource),
     SourceStatus(Box<SourceStatusResponse>),
+    SourceDeployKey(SourceDeployKeyResponse),
     SourceSync {
         idempotency_key: Uuid,
         admission: SourceSyncAdmission,
@@ -144,12 +151,25 @@ impl PreviewSelection {
 
 #[derive(Debug, Error)]
 enum CliError {
-    #[error("account {user_id} operation {idempotency_key} failed: {source}")]
-    UserChange {
-        user_id: Uuid,
+    #[error("agent operation {idempotency_key} failed: {source}")]
+    AgentChange {
         idempotency_key: Uuid,
         #[source]
         source: AdminClientError,
+    },
+    #[error("account operation {idempotency_key} failed: {source}")]
+    UserChange {
+        user_id: Option<Uuid>,
+        idempotency_key: Uuid,
+        #[source]
+        source: AdminClientError,
+    },
+    #[error("account operation {idempotency_key}: {source}")]
+    AccountInput {
+        user_id: Option<Uuid>,
+        idempotency_key: Uuid,
+        #[source]
+        source: users::CredentialInputError,
     },
     #[error("profile or recipient operation {idempotency_key} failed: {source}")]
     ProfileChange {
@@ -365,22 +385,23 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
         arguments.admin_ca_file.as_deref(),
     )?;
     match arguments.command {
+        Command::Agents { command } => agents::execute(
+            command,
+            |cursor| client.list_agents(cursor),
+            |id| client.inspect_agent(id),
+            |operation, request| {
+                let client = &client;
+                async move { client.change_agent(operation, &request).await }
+            },
+        )
+        .await
+        .map(CommandOutput::Agents),
         Command::Users { command } => users::execute(
             command,
             |cursor| client.list_users(cursor),
             |user_id| client.inspect_user(user_id),
-            |user_id, operation, request| {
-                let client = &client;
-                async move { client.set_user_status(user_id, operation, &request).await }
-            },
-            |user_id, operation, request| {
-                let client = &client;
-                async move {
-                    client
-                        .replace_user_roles(user_id, operation, &request)
-                        .await
-                }
-            },
+            |operation, request| client.change_account(operation, request),
+            prompt_secret,
         )
         .await
         .map(CommandOutput::Users),
@@ -405,6 +426,14 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
         .await
         .map(CommandOutput::Profile),
         Command::Login { username } => login(&client, username).await,
+        Command::LoginNostr => nostr_login::execute(
+            || client.begin_nostr_login(),
+            |login, proof| client.complete_nostr_login(login, proof),
+            |prompt| terminal::prompt_bounded(prompt, 16 * 1024),
+            io::stderr().lock(),
+        )
+        .await
+        .map(CommandOutput::Login),
         Command::Logout => client
             .logout()
             .await
@@ -432,6 +461,16 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
             .map_err(CliError::from),
         Command::Posts => list_all_posts(&client).await.map(CommandOutput::Posts),
         Command::Releases { command } => execute_releases(&client, command).await,
+        Command::Source {
+            command: SourceCommand::DeployKey,
+        } => client
+            .source_deploy_key()
+            .await
+            .map(CommandOutput::SourceDeployKey)
+            .map_err(CliError::from),
+        Command::Source {
+            command: SourceCommand::Configure(arguments),
+        } => configure_source(&client, arguments).await,
         Command::Source {
             command: SourceCommand::Status,
         } => client
@@ -489,6 +528,27 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
             .await
         }
     }
+}
+
+async fn configure_source(
+    client: &AdminClient,
+    arguments: SourceConfigurationArguments,
+) -> Result<CommandOutput, CliError> {
+    let (request, completion) = arguments.into_invocation();
+    let idempotency_key = completion.idempotency_key.unwrap_or_else(Uuid::new_v4);
+    let BeginSourceSyncResponse { admission, sync } = client
+        .reconfigure_source(&request, idempotency_key)
+        .await
+        .map_err(|source| CliError::SourceSyncStart {
+            idempotency_key,
+            source,
+        })?;
+    let sync = complete_source_sync(client, completion.disposition, sync, idempotency_key).await?;
+    Ok(CommandOutput::SourceSync {
+        idempotency_key,
+        admission,
+        sync,
+    })
 }
 
 async fn source_sync(
@@ -659,19 +719,19 @@ const fn invalid_source_sync(
 
 async fn login(client: &AdminClient, username: Box<str>) -> Result<CommandOutput, CliError> {
     client.ensure_human_session_absent()?;
-    let password = rpassword::prompt_password("Password: ").map_err(CliError::SecretInput)?;
+    let password = prompt_secret("Password: ").map_err(CliError::SecretInput)?;
     client
-        .login_with_password(username, SecretString::new(password.into_boxed_str()))
+        .login_with_password(username, password)
         .await
         .map(CommandOutput::Login)
         .map_err(CliError::from)
 }
 
 fn configure_agent_key(client: &AdminClient) -> Result<CommandOutput, CliError> {
-    let key = rpassword::prompt_password("Nostr private key (lowercase hex): ")
-        .map_err(CliError::SecretInput)?;
+    let key =
+        prompt_secret("Nostr private key (lowercase hex): ").map_err(CliError::SecretInput)?;
     client
-        .configure_agent_private_key(SecretString::new(key.into_boxed_str()))
+        .configure_agent_private_key(key)
         .map(|identity| CommandOutput::AgentKeyIdentity(Some(identity)))
         .map_err(CliError::from)
 }
@@ -854,6 +914,7 @@ fn write_output(
     json: bool,
 ) -> Result<(), CliError> {
     match command {
+        CommandOutput::Agents(result) => agents::write_output(output, result, json),
         CommandOutput::Users(result) => users::write_output(output, result, json),
         CommandOutput::Profile(result) => profile::write_output(output, result, json),
         CommandOutput::Login(session) => write_login(output, session, json),
@@ -868,6 +929,9 @@ fn write_output(
         CommandOutput::Release(release) => write_release(output, release, json),
         CommandOutput::ReleaseOperation(operation) => {
             write_release_operation(output, operation, json)
+        }
+        CommandOutput::SourceDeployKey(identity) => {
+            write_source_deploy_key(output, &identity, json)
         }
         CommandOutput::SourceStatus(status) => write_source_status(output, *status, json),
         CommandOutput::SourceSync {
@@ -1060,6 +1124,22 @@ fn write_source_status(
                     .unwrap_or("none")
             )?;
         }
+    }
+    Ok(())
+}
+
+fn write_source_deploy_key(
+    mut output: impl io::Write,
+    identity: &SourceDeployKeyResponse,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        serde_json::to_writer(&mut output, identity)?;
+        writeln!(output)?;
+    } else {
+        writeln!(output, "Deploy credential: {}", identity.credential_name)?;
+        writeln!(output, "Public key: {}", identity.public_key)?;
+        writeln!(output, "Fingerprint: {}", identity.fingerprint)?;
     }
     Ok(())
 }
@@ -1428,7 +1508,9 @@ fn error_exit(error: &CliError) -> u8 {
         | CliError::PreviewRevisionMismatch { .. }
         | CliError::PreviewContentDigestMismatch { .. }
         | CliError::PreviewOutputExists { .. } => return CONFLICT,
-        CliError::InvalidPreviewSelector { .. } => return VALIDATION,
+        CliError::InvalidPreviewSelector { .. } | CliError::AccountInput { .. } => {
+            return VALIDATION;
+        }
         CliError::SecretInput(source) if source.kind() == io::ErrorKind::PermissionDenied => {
             return PERMISSION;
         }
@@ -1450,6 +1532,7 @@ fn error_exit(error: &CliError) -> u8 {
             return UNAVAILABLE;
         }
         CliError::Admin(_)
+        | CliError::AgentChange { .. }
         | CliError::UserChange { .. }
         | CliError::ProfileChange { .. }
         | CliError::Publication { .. }
@@ -1490,7 +1573,8 @@ fn error_exit(error: &CliError) -> u8 {
         AdminClientError::InvalidAdminOrigin
         | AdminClientError::InvalidRequestTarget
         | AdminClientError::RequestBodyTooLarge
-        | AdminClientError::AgentPrivateKey(_) => VALIDATION,
+        | AdminClientError::AgentPrivateKey(_)
+        | AdminClientError::NostrLoginProof { .. } => VALIDATION,
         AdminClientError::HumanCredentialsMissing
         | AdminClientError::AgentCredentialsMissing
         | AdminClientError::StoredCredentialsInvalid
@@ -1536,8 +1620,9 @@ fn report_error(error: &CliError, exit: u8, json_output: bool) -> io::Result<()>
 
 #[derive(Clone, Copy)]
 enum ErrorRecovery {
+    AgentChange(Uuid),
     UserChange {
-        user_id: Uuid,
+        user_id: Option<Uuid>,
         idempotency_key: Uuid,
     },
     ProfileChange(Uuid),
@@ -1592,52 +1677,71 @@ fn write_human_error(
     if let Some(request_id) = request_id {
         writeln!(output, "maincopy: request ID: {request_id}")?;
     }
-    match recovery {
-        ErrorRecovery::UserChange {
-            user_id,
-            idempotency_key,
-        } => {
-            writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
-            writeln!(
-                output,
-                "maincopy: inspect current state: maincopy users inspect {user_id}"
-            )?;
-            writeln!(
-                output,
-                "maincopy: retry only the identical command with this key and authorizing session"
-            )?;
-        }
-        ErrorRecovery::ProfileChange(idempotency_key) => {
-            writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
-            writeln!(
-                output,
-                "maincopy: inspect current state with profile show or tip-recipient show; retry only the identical command with this key"
-            )?;
-        }
-        ErrorRecovery::None | ErrorRecovery::Publication(_) => {}
-        ErrorRecovery::ReleaseChange { operation_id, .. } => {
-            writeln!(
-                output,
-                "maincopy: recover accepted result: maincopy releases operation {operation_id}"
-            )?;
-        }
-        ErrorRecovery::SourceSyncStart(idempotency_key) => {
-            writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
-        }
-        ErrorRecovery::SourceSync {
-            idempotency_key,
-            source_sync_id,
-            failure_code,
-            ..
-        } => {
-            writeln!(output, "maincopy: source sync: {source_sync_id}")?;
-            writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
-            if let Some(failure_code) = failure_code {
-                writeln!(output, "maincopy: failure code: {}", failure_code.as_str())?;
+    recovery.write_guidance(output)
+}
+
+impl ErrorRecovery {
+    fn write_guidance(self, mut output: impl io::Write) -> io::Result<()> {
+        match self {
+            ErrorRecovery::AgentChange(idempotency_key) => {
+                writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
+                writeln!(
+                    output,
+                    "maincopy: inspect current state with agents list or agents inspect; retry only the identical command with this key and authorizing session"
+                )?;
+            }
+            ErrorRecovery::UserChange {
+                user_id,
+                idempotency_key,
+            } => {
+                writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
+                match user_id {
+                    Some(user_id) => writeln!(
+                        output,
+                        "maincopy: inspect current state: maincopy users inspect {user_id}"
+                    )?,
+                    None => writeln!(
+                        output,
+                        "maincopy: inspect current accounts: maincopy users list"
+                    )?,
+                }
+                writeln!(
+                    output,
+                    "maincopy: retry only the identical command with this key and authorizing session"
+                )?;
+            }
+            ErrorRecovery::ProfileChange(idempotency_key) => {
+                writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
+                writeln!(
+                    output,
+                    "maincopy: inspect current state with profile show or tip-recipient show; retry only the identical command with this key"
+                )?;
+            }
+            ErrorRecovery::None | ErrorRecovery::Publication(_) => {}
+            ErrorRecovery::ReleaseChange { operation_id, .. } => {
+                writeln!(
+                    output,
+                    "maincopy: recover accepted result: maincopy releases operation {operation_id}"
+                )?;
+            }
+            ErrorRecovery::SourceSyncStart(idempotency_key) => {
+                writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
+            }
+            ErrorRecovery::SourceSync {
+                idempotency_key,
+                source_sync_id,
+                failure_code,
+                ..
+            } => {
+                writeln!(output, "maincopy: source sync: {source_sync_id}")?;
+                writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
+                if let Some(failure_code) = failure_code {
+                    writeln!(output, "maincopy: failure code: {}", failure_code.as_str())?;
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn write_json_error(
@@ -1668,7 +1772,8 @@ fn write_json_error(
             details.insert("publication_id".into(), json!(publication_id));
             details.insert("operation_id".into(), json!(operation_id));
         }
-        ErrorRecovery::Publication(idempotency_key)
+        ErrorRecovery::AgentChange(idempotency_key)
+        | ErrorRecovery::Publication(idempotency_key)
         | ErrorRecovery::ProfileChange(idempotency_key)
         | ErrorRecovery::SourceSyncStart(idempotency_key) => {
             details.insert("idempotency_key".into(), json!(idempotency_key));
@@ -1701,7 +1806,15 @@ fn write_json_error(
 
 const fn error_recovery(error: &CliError) -> ErrorRecovery {
     match error {
+        CliError::AgentChange {
+            idempotency_key, ..
+        } => ErrorRecovery::AgentChange(*idempotency_key),
         CliError::UserChange {
+            user_id,
+            idempotency_key,
+            ..
+        }
+        | CliError::AccountInput {
             user_id,
             idempotency_key,
             ..
@@ -1792,6 +1905,7 @@ fn error_category(error: &CliError, exit: u8) -> &'static str {
 fn admin_error(error: &CliError) -> Option<&AdminClientError> {
     match error {
         CliError::Admin(error)
+        | CliError::AgentChange { source: error, .. }
         | CliError::UserChange { source: error, .. }
         | CliError::ProfileChange { source: error, .. }
         | CliError::Publication { source: error, .. }
@@ -1799,6 +1913,7 @@ fn admin_error(error: &CliError) -> Option<&AdminClientError> {
         | CliError::SourceSyncStart { source: error, .. }
         | CliError::SourceSyncFollow { source: error, .. } => Some(error),
         CliError::PostsSnapshotChanged { .. }
+        | CliError::AccountInput { .. }
         | CliError::SecretInput(_)
         | CliError::InvalidPostsPagination { .. }
         | CliError::InvalidPublicationResponse { .. }
@@ -2214,6 +2329,51 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "Admin API: v1\nCapabilities contract: v1\n"
         );
+    }
+
+    #[test]
+    fn deploy_key_output_preserves_the_public_identity_in_human_and_json_modes() {
+        let identity = SourceDeployKeyResponse {
+            credential_name: "deploy-key-1".parse().unwrap(),
+            public_key: format!("ssh-ed25519 {}", "A".repeat(68)).into(),
+            fingerprint: format!("SHA256:{}", "A".repeat(43)).into(),
+        };
+        let mut human = Vec::new();
+        write_output(
+            &mut human,
+            CommandOutput::SourceDeployKey(identity.clone()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(human).unwrap(),
+            format!(
+                "Deploy credential: deploy-key-1\nPublic key: {}\nFingerprint: {}\n",
+                identity.public_key, identity.fingerprint
+            )
+        );
+        let mut machine = Vec::new();
+        write_output(
+            &mut machine,
+            CommandOutput::SourceDeployKey(identity.clone()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(machine.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<SourceDeployKeyResponse>(&machine).unwrap(),
+            identity
+        );
+        for json in [false, true] {
+            let mut full = [0; 0];
+            let error = write_output(
+                &mut full[..],
+                CommandOutput::SourceDeployKey(identity.clone()),
+                json,
+            )
+            .unwrap_err();
+            assert!(matches!(error, CliError::Output(_) | CliError::Encode(_)));
+        }
     }
 
     #[test]

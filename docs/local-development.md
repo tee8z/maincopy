@@ -6,6 +6,8 @@ Last reviewed: 2026-09-05
 
 Related: [project overview](../README.md),
 [managed source runbook](managed-source.md),
+[agent management](agent-management.md),
+[content images](content-images.md),
 [remaining implementation work](implementation.md), and
 [engineering style](quality.md).
 
@@ -330,6 +332,58 @@ Success and failure output retain the operation UUID. After an uncertain result,
 inspect the account before retrying. Use `--idempotency-key OPERATION_UUID` only
 with the identical command and authorizing session. After signing in again,
 inspect current state and use a new operation UUID for another change.
+
+Create an account with password, Nostr, or both login credentials:
+
+```console
+maincopy users create --roles publisher password --username publisher
+maincopy users create --roles publisher nostr --public-key PUBLIC_KEY_HEX
+maincopy users create --roles publisher both --username publisher --public-key PUBLIC_KEY_HEX
+```
+
+Password commands read and confirm the password from the controlling terminal.
+Input is hidden and limited to 1024 bytes. Use 15 to 128 Unicode characters.
+The CLI rejects cancelled, mismatched, or invalid input before submitting a change.
+Never put passwords or private keys in command arguments or environment variables.
+
+Manage individual login credentials after inspecting their current versions:
+
+```console
+maincopy users credentials USER_UUID add password --username publisher
+maincopy users credentials USER_UUID add nostr --public-key PUBLIC_KEY_HEX
+maincopy users credentials USER_UUID replace --expected-version 2 password --username publisher
+maincopy users credentials USER_UUID replace --expected-version 3 nostr --public-key PUBLIC_KEY_HEX
+maincopy users credentials USER_UUID remove --expected-version 4 --provider password
+```
+
+Replacement and removal use the **credential version** from `users inspect`.
+The accepted receipt reports the separate **account version**.
+Account inspection displays Nostr public keys and their SHA-256 fingerprints.
+JSON inspection also includes the public `nostr_keys` comparison records.
+
+The API enforces configured providers, recent authentication, role boundaries,
+and the last usable credential rule. Replacing or removing your credential revokes
+its existing sessions. Sign in again before further account changes.
+After uncertain account creation, list accounts before retrying with the original
+operation UUID and authorizing session.
+
+For human CLI sign-in with an external Nostr signer:
+
+```console
+maincopy login-nostr
+```
+
+Use the same origin and certificate options as other CLI commands.
+The CLI prints a one-time event to sign. Sign that exact event within 60 seconds.
+Paste the complete signed event JSON as one line at the protected prompt.
+The proof is limited to 16 KiB. Its signature and login intent are checked locally.
+If signing expires or fails, start `login-nostr` again for a new challenge.
+
+Use the human account's signer. Keep its private key in that signer.
+The CLI does not read the local agent key for human sign-in.
+Successful login stores the session in the operating system credential store.
+Sign out with `maincopy logout` before replacing a stored session.
+With `--json`, signing instructions still use stderr; stdout contains the result.
 
 ### 7. Sign out before a state reset
 

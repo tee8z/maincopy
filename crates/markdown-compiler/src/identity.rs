@@ -299,6 +299,9 @@ pub(super) fn bind_publication_asset_source(
     transcript.optional(publication.site.favicon.as_ref(), |transcript, favicon| {
         transcript.string(favicon.as_str());
     });
+    transcript.optional(publication.site.image.as_ref(), |transcript, image| {
+        transcript.string(image.as_str());
+    });
     let authored_origins = &publication.assets.allowed_https_origins;
     transcript.sequence_len(authored_origins.len());
     for origin in authored_origins {
@@ -437,6 +440,7 @@ pub fn finalize_preview_digest(
     transcript.tag(4);
     transcript.fixed_bytes(&publication_content.0);
     transcript.optional(input.site_assets.favicon.as_ref(), encode_asset_reference);
+    transcript.optional(input.site_assets.image.as_ref(), encode_asset_reference);
     transcript.sequence_len(allowed_origins.len());
     for origin in allowed_origins {
         transcript.string(origin.as_str());
@@ -445,6 +449,7 @@ pub fn finalize_preview_digest(
     transcript.tag(5);
     encode_site_renderer(&mut transcript, input.site_renderer);
     transcript.bytes(input.pre_injection_post_shell);
+    transcript.bytes(input.response_policy);
     transcript.tag(6);
     transcript.tag(LOCAL_PROFILE_KIND_TAG);
     transcript.fixed_bytes(&LOCAL_PROFILE_SCHEMA_VERSION.to_be_bytes());
@@ -464,6 +469,8 @@ pub struct PreviewDigestInput<'input> {
     pub article_identity_html: &'input [u8],
     pub site_renderer: &'input SiteShellRendererIdentity,
     pub pre_injection_post_shell: &'input [u8],
+    /// Exact public response policy approved with the presentation.
+    pub response_policy: &'input [u8],
     /// Opaque, canonical bytes for the SQLite-owned public profile projection.
     ///
     /// The profile domain owns this encoding. The identity layer only frames it
@@ -487,6 +494,7 @@ fn digest_site_snapshot(
     let mut transcript = Transcript::new(SITE_SNAPSHOT_CONTEXT, b"maincopy-site-snapshot", 1);
     transcript.fixed_bytes(&publication_content.0);
     transcript.optional(input.assets.favicon.as_ref(), encode_asset_reference);
+    transcript.optional(input.assets.image.as_ref(), encode_asset_reference);
     transcript.sequence_len(allowed_origins.len());
     for origin in allowed_origins {
         transcript.string(origin.as_str());
@@ -582,7 +590,7 @@ fn encode_publication(transcript: &mut Transcript, publication: &PublicationSett
     transcript.string(site.base_url.as_str());
     transcript.string(site.description.as_str());
     // Asset-valued fields are excluded here. The final site transcript
-    // requires resolver-owned favicon, allowlist, and reference inputs.
+    // requires resolver-owned favicon, image, allowlist, and reference inputs.
     transcript.string(publication.author.name.as_str());
     transcript.tag(match publication.tips {
         DefaultPostTipPolicy::Disabled => 0,
@@ -887,7 +895,7 @@ name = "Example Author"
     #[test]
     fn preview_digest_binds_article_shell_renderer_and_canonical_url() {
         let (publication, post) = validate_post(&frontmatter("2026-08-29T12:00:00Z"), "# Body\n");
-        let site_assets = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
+        let site_assets = ResolvedSiteAssets::new(&publication, None, None, Vec::new(), Vec::new());
         let post_id = post.metadata.id.clone();
         let post_revision = PostRevisionDigest::from_bytes([0x11; 32]);
         let post_renderer = renderer();
@@ -907,6 +915,7 @@ name = "Example Author"
                 article_identity_html: article,
                 site_renderer: renderer,
                 pre_injection_post_shell: shell,
+                response_policy: b"fixture-policy",
                 profile_projection: profile,
                 canonical_url,
             })
@@ -1003,7 +1012,7 @@ name = "Example Author"
     fn every_post_renderer_policy_field_is_identity_bearing() {
         let (publication, post) = validate_post(&frontmatter("2026-08-29T12:00:00Z"), "# Body\n");
         let post_assets = ResolvedPostAssets::new(&post, None, Vec::new());
-        let site_assets = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
+        let site_assets = ResolvedSiteAssets::new(&publication, None, None, Vec::new(), Vec::new());
         let baseline_renderer = renderer();
         let revision = |renderer: &PostRendererIdentity| {
             finalize_post_revision(
@@ -1028,6 +1037,7 @@ name = "Example Author"
                 article_identity_html: b"<h1>Body</h1>",
                 site_renderer: &site_renderer,
                 pre_injection_post_shell: b"<html>Production shell</html>",
+                response_policy: b"fixture-policy",
                 profile_projection: b"",
                 canonical_url: "https://example.com/posts/example-post",
             })
@@ -1408,7 +1418,7 @@ name = "Example Author"
             let posts = published_identity_inputs(posts);
             digest_site_snapshot(&SiteSnapshotInput::new(
                 &publication,
-                &ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new()),
+                &ResolvedSiteAssets::new(&publication, None, None, Vec::new(), Vec::new()),
                 &site_renderer,
                 &shell_output(b"shell"),
                 &posts,
@@ -1418,7 +1428,7 @@ name = "Example Author"
         assert_eq!(digest(&forward), digest(&reverse));
         assert_eq!(
             digest(&forward).as_str(),
-            "site-b3-v1-c57b86a24be37013fe3aaf70231cf98ad6a4ea6eee7ef47603d31ecd8fdcfb6d"
+            "site-b3-v1-bc150d340d0136acf65981bd06e2284c0c88c917261b6f293b1100cd0f0ddf09"
         );
 
         let duplicate = [first.clone(), first];
@@ -1426,7 +1436,7 @@ name = "Example Author"
         assert!(matches!(
             digest_site_snapshot(&SiteSnapshotInput::new(
                 &publication,
-                &ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new()),
+                &ResolvedSiteAssets::new(&publication, None, None, Vec::new(), Vec::new()),
                 &site_renderer,
                 &shell_output(b"shell"),
                 &duplicate,
@@ -1466,7 +1476,7 @@ name = "Example Author"
             let posts = published_identity_inputs(posts);
             digest_site_snapshot(&SiteSnapshotInput::new(
                 &publication,
-                &ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new()),
+                &ResolvedSiteAssets::new(&publication, None, None, Vec::new(), Vec::new()),
                 renderer,
                 &shell_output(shell),
                 &posts,
@@ -1554,7 +1564,7 @@ name = "Example Author"
             .unwrap()
         };
         let baseline_assets =
-            ResolvedSiteAssets::new(&baseline_publication, None, Vec::new(), Vec::new());
+            ResolvedSiteAssets::new(&baseline_publication, None, None, Vec::new(), Vec::new());
         let baseline = digest(&baseline_publication, &baseline_assets);
 
         let variants = [
@@ -1568,7 +1578,7 @@ name = "Example Author"
         ];
         for source in variants {
             let publication = validate_publication(&source);
-            let assets = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
+            let assets = ResolvedSiteAssets::new(&publication, None, None, Vec::new(), Vec::new());
             assert_ne!(baseline, digest(&publication, &assets));
         }
 
@@ -1585,25 +1595,39 @@ name = "Example Author"
         let reference_changed_bytes = local("assets/site/banner.png", b"changed banner");
         let favicon_identity = digest(
             &baseline_publication,
-            &ResolvedSiteAssets::new(&baseline_publication, Some(favicon), Vec::new(), Vec::new()),
+            &ResolvedSiteAssets::new(
+                &baseline_publication,
+                Some(favicon),
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
         );
         let changed_favicon_identity = digest(
             &baseline_publication,
             &ResolvedSiteAssets::new(
                 &baseline_publication,
                 Some(favicon_changed),
+                None,
                 Vec::new(),
                 Vec::new(),
             ),
         );
         let reference_identity = digest(
             &baseline_publication,
-            &ResolvedSiteAssets::new(&baseline_publication, None, Vec::new(), vec![reference]),
+            &ResolvedSiteAssets::new(
+                &baseline_publication,
+                None,
+                None,
+                Vec::new(),
+                vec![reference],
+            ),
         );
         let changed_reference_path_identity = digest(
             &baseline_publication,
             &ResolvedSiteAssets::new(
                 &baseline_publication,
+                None,
                 None,
                 Vec::new(),
                 vec![reference_changed_path],
@@ -1613,6 +1637,7 @@ name = "Example Author"
             &baseline_publication,
             &ResolvedSiteAssets::new(
                 &baseline_publication,
+                None,
                 None,
                 Vec::new(),
                 vec![reference_changed_bytes],
@@ -1676,7 +1701,7 @@ name = "Example Author"
         let changed_publication = validate_publication(
             &PUBLICATION.replace("title = \"Example\"", "title = \"Changed\""),
         );
-        let site_assets = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
+        let site_assets = ResolvedSiteAssets::new(&publication, None, None, Vec::new(), Vec::new());
         let site_renderer = SiteShellRendererIdentity::new(frontend_bundle(0x11));
         assert!(matches!(
             digest_site_snapshot(&SiteSnapshotInput::new(
@@ -1704,6 +1729,7 @@ name = "Example Author"
             Some(AssetRevisionReference::external(
                 ExternalAssetUrl::parse("https://cdn.example/a.png").unwrap(),
             )),
+            None,
             Vec::new(),
             Vec::new(),
         );
@@ -1729,6 +1755,7 @@ name = "Example Author"
         let equivalent_origin_publication = validate_publication(&equivalent_origin_source);
         let origin_assets = ResolvedSiteAssets::new(
             &origin_publication,
+            None,
             None,
             vec![ExternalAssetOrigin::parse("https://a.example/").unwrap()],
             Vec::new(),
@@ -1778,9 +1805,10 @@ name = "Example Author"
             Vec::new(),
             Vec::new(),
         );
-        let approved_site = ResolvedSiteAssets::new(&publication, None, allowed, Vec::new());
-        let expanded_site = ResolvedSiteAssets::new(&publication, None, expanded, Vec::new());
-        let revoked_site = ResolvedSiteAssets::new(&publication, None, Vec::new(), Vec::new());
+        let approved_site = ResolvedSiteAssets::new(&publication, None, None, allowed, Vec::new());
+        let expanded_site = ResolvedSiteAssets::new(&publication, None, None, expanded, Vec::new());
+        let revoked_site =
+            ResolvedSiteAssets::new(&publication, None, None, Vec::new(), Vec::new());
         let renderer = renderer();
         let digest = |assets: &ResolvedPostAssets, site_assets: &ResolvedSiteAssets| {
             digest_post_revision(&PostRevisionInput::new(
@@ -1821,7 +1849,7 @@ name = "Example Author"
         let digest = |publication: &PublicationSettings, origins: Vec<ExternalAssetOrigin>| {
             digest_site_snapshot(&SiteSnapshotInput::new(
                 publication,
-                &ResolvedSiteAssets::new(publication, None, origins, Vec::new()),
+                &ResolvedSiteAssets::new(publication, None, None, origins, Vec::new()),
                 &renderer,
                 &shell_output(b"shell"),
                 &[],
@@ -1853,6 +1881,7 @@ name = "Example Author"
                 &publication,
                 &ResolvedSiteAssets::new(
                     &publication,
+                    None,
                     None,
                     vec![duplicate.clone(), duplicate],
                     Vec::new(),

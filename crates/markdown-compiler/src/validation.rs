@@ -29,6 +29,7 @@ impl FieldPath {
             "site.base_url" => 12,
             "site.description" => 13,
             "site.favicon" => 14,
+            "site.image" => 15,
             "author" => 20,
             "author.name" => 21,
             "assets" => 30,

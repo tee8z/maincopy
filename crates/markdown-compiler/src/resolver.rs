@@ -177,6 +177,7 @@ pub enum AssetReferenceLocation {
         ordinal: AllowedOriginOrdinal,
     },
     PublicationFavicon,
+    PublicationImage,
     PostPreviewImage,
     Markdown {
         ordinal: MarkdownDestinationOrdinal,
@@ -329,9 +330,24 @@ impl<'input> Resolver<'input> {
                 )
             });
 
+        let image = self
+            .content
+            .publication
+            .site
+            .image
+            .clone()
+            .and_then(|image| {
+                self.resolve_reference(
+                    &publication_path,
+                    AssetReferenceLocation::PublicationImage,
+                    image.as_str(),
+                )
+            });
+
         let site = ResolvedSiteAssets::new(
             &self.content.publication,
             favicon,
+            image,
             self.allowed_origins.clone(),
             Vec::new(),
         );

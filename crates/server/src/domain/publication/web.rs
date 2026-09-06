@@ -72,7 +72,7 @@ impl FromRequestParts<SiteSnapshotReader> for PublicRequest {
         snapshots: &SiteSnapshotReader,
     ) -> Result<Self, Self::Rejection> {
         Ok(Self {
-            snapshot: snapshots.load_full(),
+            snapshot: request_snapshot(parts, snapshots),
             headers: parts.headers.clone(),
         })
     }
@@ -95,7 +95,7 @@ where
         parts: &mut Parts,
         snapshots: &SiteSnapshotReader,
     ) -> Result<Self, Self::Rejection> {
-        let snapshot = snapshots.load_full();
+        let snapshot = request_snapshot(parts, snapshots);
         let headers = parts.headers.clone();
         let Path(value) = Path::<T>::from_request_parts(parts, snapshots)
             .await
@@ -106,6 +106,14 @@ where
             value,
         })
     }
+}
+
+fn request_snapshot(parts: &Parts, snapshots: &SiteSnapshotReader) -> Arc<SiteSnapshot> {
+    parts
+        .extensions
+        .get::<Arc<SiteSnapshot>>()
+        .cloned()
+        .unwrap_or_else(|| snapshots.load_full())
 }
 
 async fn index(PublicRequest { snapshot, headers }: PublicRequest) -> Response {

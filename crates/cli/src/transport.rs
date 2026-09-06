@@ -10,13 +10,14 @@ use std::{
 use bytes::Bytes;
 use reqwest::{Method, StatusCode, Url, header::HeaderMap};
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 const MAX_RESPONSE_HEADERS: usize = 64;
 const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_ADDITIONAL_ROOT_BYTES: usize = 64 * 1024;
 const MAX_ADDITIONAL_ROOTS: usize = 16;
+const MAX_JSON_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
 /// A bounded, parsed set of additive certificate authorities.
 #[derive(Default)]
@@ -204,9 +205,56 @@ pub(crate) struct HttpRequest {
 pub(crate) struct RequestBody(Zeroizing<Vec<u8>>);
 
 impl RequestBody {
+    /// Erases partially serialized data on encoding failure as well as completed bodies.
+    pub(crate) fn json(
+        value: &(impl serde::Serialize + ?Sized),
+    ) -> Result<Self, serde_json::Error> {
+        let mut writer = ProtectedJsonWriter(Zeroizing::new(Vec::new()));
+        serde_json::to_writer(&mut writer, value)?;
+        Ok(Self(writer.0))
+    }
+
     fn into_bytes(self) -> Bytes {
         let Self(bytes) = self;
         Bytes::from_owner(bytes)
+    }
+}
+
+/// Growth copies into a new protected allocation and erases the old allocation before release.
+struct ProtectedJsonWriter(Zeroizing<Vec<u8>>);
+
+impl io::Write for ProtectedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let required = self
+            .0
+            .len()
+            .checked_add(bytes.len())
+            .filter(|required| *required <= MAX_JSON_REQUEST_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "JSON request exceeds the byte limit",
+                )
+            })?;
+        if required > self.0.capacity() {
+            let capacity = required.next_power_of_two().min(MAX_JSON_REQUEST_BYTES);
+            let mut replacement = Zeroizing::new(Vec::with_capacity(capacity));
+            replacement.extend_from_slice(&self.0);
+            self.0.zeroize();
+            self.0 = replacement;
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AsRef<[u8]> for RequestBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -718,3 +766,50 @@ mod tests {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod trust_boundary_tests;
+
+#[cfg(test)]
+mod protected_json_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn protected_json_growth_preserves_exact_encoding_and_rejects_bytes_beyond_the_bound() {
+        let mut writer = ProtectedJsonWriter(Zeroizing::new(Vec::new()));
+        writer.write_all(b"private fixture").unwrap();
+        let first_capacity = writer.0.capacity();
+        writer.write_all(&[b'x'; 1024]).unwrap();
+        assert!(writer.0.capacity() > first_capacity);
+        assert_eq!(&writer.0[..15], b"private fixture");
+        assert_eq!(&writer.0[15..], &[b'x'; 1024]);
+        let before = writer.0.len();
+        let error = writer
+            .write_all(&vec![b'x'; MAX_JSON_REQUEST_BYTES])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(writer.0.len(), before);
+        assert!(!error.to_string().contains("private fixture"));
+        let body =
+            RequestBody::json(&serde_json::json!({"password":"quoted \" and unicode é"})).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(body.as_ref()).unwrap()["password"],
+            "quoted \" and unicode é"
+        );
+    }
+
+    #[test]
+    fn serialization_failure_after_a_secret_does_not_return_partial_request_bytes() {
+        struct FailAfterSecret;
+        impl serde::Serialize for FailAfterSecret {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq as _;
+                let mut sequence = serializer.serialize_seq(Some(2))?;
+                sequence.serialize_element("private fixture")?;
+                Err(serde::ser::Error::custom("fixture serializer failed"))
+            }
+        }
+        match RequestBody::json(&FailAfterSecret) {
+            Err(error) => assert!(!error.to_string().contains("private fixture")),
+            Ok(_) => panic!("partial serialization must fail"),
+        }
+    }
+}

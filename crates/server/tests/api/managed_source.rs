@@ -28,9 +28,10 @@ use maincopy_shared::{
         PublishNowRequest, PublishNowResponse,
     },
     source::{
-        BeginSourceSyncResponse, ListSourceSyncsResponse, SOURCE_PATH, SOURCE_SYNCS_PATH,
-        SourceStatusResponse, SourceSyncAdmission, SourceSyncOutcome, SourceSyncRequestOrigin,
-        SourceSyncResource,
+        BeginSourceSyncResponse, ListSourceSyncsResponse, ReconfigureSourceRequest, SOURCE_PATH,
+        SOURCE_SYNCS_PATH, SourceDeployKeyResponse, SourcePollInterval, SourceStatusResponse,
+        SourceSyncAdmission, SourceSyncFailureCode, SourceSyncId, SourceSyncOutcome,
+        SourceSyncRequestOrigin, SourceSyncResource,
     },
 };
 
@@ -116,6 +117,271 @@ async fn real_managed_git_poll_updates_only_the_private_preview_without_a_restar
     assert!(
         fixture.ssh_marker.is_file(),
         "the packaged maincopy-ssh helper never invoked the constrained SSH transport"
+    );
+    fixture.stop();
+}
+
+#[tokio::test]
+async fn online_source_changes_validate_before_installing_and_keep_failed_settings_out_of_the_live_head()
+ {
+    let fixture = ManagedGitFixture::start().await;
+    let status: SourceStatusResponse = response_json(fixture.admin_get(SOURCE_PATH).await).await;
+    let SourceStatusResponse::ManagedGit {
+        configuration,
+        installed_commit,
+        content_digest,
+        ..
+    } = status
+    else {
+        panic!("managed fixture");
+    };
+    let mut request = ReconfigureSourceRequest {
+        remote: configuration.remote.clone(),
+        branch: "missing-branch".parse().unwrap(),
+        content_subdirectory: configuration.content_subdirectory.clone(),
+        credential_name: configuration.credential_name.clone(),
+        poll_interval_seconds: SourcePollInterval::from_seconds(120).unwrap(),
+        expected_version: configuration.version,
+    };
+    let mut unknown = request.clone();
+    unknown.credential_name = "unregistered".parse().unwrap();
+    fs::remove_file(&fixture.ssh_marker).unwrap();
+    let unknown = fixture
+        .admin_json(Method::PUT, "/api/admin/v1/source/configuration", &unknown)
+        .await;
+    assert_eq!(unknown.status(), StatusCode::ACCEPTED);
+    let unknown: BeginSourceSyncResponse = response_json(unknown).await;
+    let unknown = fixture
+        .wait_for_terminal_source_sync(unknown.sync.source_sync_id)
+        .await;
+    assert_eq!(
+        unknown.failure_code,
+        Some(SourceSyncFailureCode::CredentialUnavailable)
+    );
+    assert!(
+        !fixture.ssh_marker.exists(),
+        "unknown credentials must fail before any SSH command"
+    );
+    let failed = fixture
+        .admin_json(Method::PUT, "/api/admin/v1/source/configuration", &request)
+        .await;
+    assert_eq!(failed.status(), StatusCode::ACCEPTED);
+    let failed: BeginSourceSyncResponse = response_json(failed).await;
+    let failed = fixture
+        .wait_for_terminal_source_sync(failed.sync.source_sync_id)
+        .await;
+    assert_eq!(failed.outcome, Some(SourceSyncOutcome::Failed));
+    let after: SourceStatusResponse = response_json(fixture.admin_get(SOURCE_PATH).await).await;
+    let SourceStatusResponse::ManagedGit {
+        configuration: after_config,
+        installed_commit: after_commit,
+        content_digest: after_digest,
+        ..
+    } = after
+    else {
+        panic!("managed fixture");
+    };
+    assert_eq!(after_config, configuration);
+    assert_eq!(after_commit, installed_commit);
+    assert_eq!(after_digest, content_digest);
+    assert_eq!(fixture.only_post().await.title.as_ref(), INITIAL_TITLE);
+
+    run_git(
+        &fixture.work,
+        [OsStr::new("checkout"), OsStr::new("-b"), OsStr::new("next")],
+    );
+    write_site(&fixture.work, UPDATED_TITLE, UPDATED_BODY);
+    commit(&fixture.work, "new source branch");
+    run_git(
+        &fixture.work,
+        [OsStr::new("push"), OsStr::new("origin"), OsStr::new("next")],
+    );
+    request.branch = "next".parse().unwrap();
+    let key = Uuid::new_v4().to_string();
+    let body = serde_json::to_vec(&request).unwrap();
+    let accepted = fixture
+        .admin_raw(
+            Method::PUT,
+            "/api/admin/v1/source/configuration",
+            &body,
+            Some(&key),
+        )
+        .await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let accepted: BeginSourceSyncResponse = response_json(accepted).await;
+    let terminal = fixture
+        .wait_for_terminal_source_sync(accepted.sync.source_sync_id)
+        .await;
+    assert_eq!(terminal.outcome, Some(SourceSyncOutcome::Applied));
+    assert_eq!(fixture.only_post().await.title.as_ref(), UPDATED_TITLE);
+    assert_eq!(
+        fixture.public_get("/posts/managed").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let replayed = fixture
+        .admin_raw(
+            Method::PUT,
+            "/api/admin/v1/source/configuration",
+            &body,
+            Some(&key),
+        )
+        .await;
+    assert_eq!(replayed.status(), StatusCode::OK);
+    let replayed: BeginSourceSyncResponse = response_json(replayed).await;
+    assert_eq!(replayed.sync, terminal);
+    let stale = fixture
+        .admin_json(Method::PUT, "/api/admin/v1/source/configuration", &request)
+        .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let identity: SourceDeployKeyResponse =
+        response_json(fixture.admin_get("/api/admin/v1/source/deploy-key").await).await;
+    assert!(identity.public_key.starts_with("ssh-ed25519 "));
+    assert!(identity.fingerprint.starts_with("SHA256:"));
+    let html = response_text(fixture.admin_get("/admin/source").await).await;
+    assert!(html.contains(identity.public_key.as_ref()));
+    assert!(html.contains(identity.fingerprint.as_ref()));
+    assert!(!html.contains("credentials/source-key"));
+    assert!(!html.contains("known-hosts"));
+    for path in [
+        "/api/admin/v1/source/configuration",
+        "/api/admin/v1/source/deploy-key",
+        "/admin/source/configuration",
+    ] {
+        assert_eq!(
+            fixture.public_get(path).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    fixture.stop();
+}
+
+#[tokio::test]
+async fn browser_source_configuration_keeps_operation_identity_and_checks_submitted_versions() {
+    let fixture = ManagedGitFixture::start().await;
+    let status: SourceStatusResponse = response_json(fixture.admin_get(SOURCE_PATH).await).await;
+    let SourceStatusResponse::ManagedGit { configuration, .. } = status else {
+        panic!("managed fixture");
+    };
+    let operation = Uuid::new_v4().to_string();
+    let form = |key: &str| {
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("_csrf", fixture.session.csrf.as_str())
+            .append_pair("idempotency_key", key)
+            .append_pair("expected_version", &configuration.version.get().to_string())
+            .append_pair("user", configuration.remote.user.as_str())
+            .append_pair("host", configuration.remote.host.as_str())
+            .append_pair("port", &configuration.remote.port.get().to_string())
+            .append_pair(
+                "repository_path",
+                configuration.remote.repository_path.as_str(),
+            )
+            .append_pair("branch", configuration.branch.as_str())
+            .append_pair(
+                "content_subdirectory",
+                configuration.content_subdirectory.as_str(),
+            )
+            .append_pair("credential_name", configuration.credential_name.as_str())
+            .append_pair("poll_interval_seconds", "180")
+            .finish()
+    };
+    let invalid = fixture
+        .admin_form("/admin/source/configuration", form("invalid"))
+        .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response_text(invalid)
+            .await
+            .contains("operation identity was invalid")
+    );
+    let malformed = fixture
+        .admin_form(
+            "/admin/source/configuration",
+            format!("{}&unknown=1", form(&operation)),
+        )
+        .await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    let accepted = fixture
+        .admin_form("/admin/source/configuration", form(&operation))
+        .await;
+    assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+    let location = accepted.headers()[LOCATION].to_str().unwrap().to_owned();
+    let sync = location
+        .strip_prefix("/admin/source?sync=")
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let terminal = fixture
+        .wait_for_terminal_source_sync(SourceSyncId::from_uuid(sync))
+        .await;
+    assert_eq!(terminal.outcome, Some(SourceSyncOutcome::Applied));
+    let replay = fixture
+        .admin_form("/admin/source/configuration", form(&operation))
+        .await;
+    assert_eq!(replay.status(), StatusCode::SEE_OTHER);
+    assert_eq!(replay.headers()[LOCATION], location);
+    let stale = fixture
+        .admin_form(
+            "/admin/source/configuration",
+            form(&Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let status: SourceStatusResponse = response_json(fixture.admin_get(SOURCE_PATH).await).await;
+    let SourceStatusResponse::ManagedGit {
+        configuration: installed,
+        ..
+    } = status
+    else {
+        panic!("managed fixture");
+    };
+    assert_eq!(installed.poll_interval_seconds.seconds(), 180);
+    assert!(installed.version.get() > configuration.version.get());
+    assert_eq!(
+        fixture.public_get("/posts/managed").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    fixture.stop();
+}
+
+#[tokio::test]
+async fn startup_recovers_a_missing_installed_candidate_from_the_same_git_commit() {
+    let fixture = ManagedGitFixture::start().await;
+    let original = fixture.only_post().await;
+    let original_status: SourceStatusResponse =
+        response_json(fixture.admin_get(SOURCE_PATH).await).await;
+    let fixture = fixture.restart_without_retained_candidates().await;
+    let recovered = fixture.only_post().await;
+    assert_eq!(recovered.revision, original.revision);
+    assert_eq!(recovered.title, original.title);
+    let recovered_status: SourceStatusResponse =
+        response_json(fixture.admin_get(SOURCE_PATH).await).await;
+    match (original_status, recovered_status) {
+        (
+            SourceStatusResponse::ManagedGit {
+                installed_commit: before_commit,
+                content_digest: before_digest,
+                ..
+            },
+            SourceStatusResponse::ManagedGit {
+                installed_commit: after_commit,
+                content_digest: after_digest,
+                ..
+            },
+        ) => {
+            assert_eq!(before_commit, after_commit);
+            assert_eq!(before_digest, after_digest);
+        }
+        _ => panic!("managed fixture"),
+    }
+    assert!(
+        fs::read_dir(fixture.root.path().join("state/content-candidates"))
+            .unwrap()
+            .count()
+            > 0
+    );
+    assert_eq!(
+        fixture.public_get("/posts/managed").await.status(),
+        StatusCode::NOT_FOUND
     );
     fixture.stop();
 }
@@ -492,6 +758,27 @@ impl ManagedGitFixture {
         .expect("the pushed commit must be installed by a bounded background poll");
     }
 
+    async fn wait_for_terminal_source_sync(
+        &self,
+        source_sync_id: SourceSyncId,
+    ) -> SourceSyncResource {
+        tokio::time::timeout(REQUEST_LIMIT, async {
+            loop {
+                let sync: SourceSyncResource = response_json(
+                    self.admin_get(&format!("{SOURCE_SYNCS_PATH}/{source_sync_id}"))
+                        .await,
+                )
+                .await;
+                if sync.outcome.is_some() {
+                    return sync;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("source operation must finish within its fixture limit")
+    }
+
     async fn wait_for_manual_no_change(&self, source_sync_id: &str) {
         tokio::time::timeout(REQUEST_LIMIT, async {
             loop {
@@ -509,6 +796,47 @@ impl ManagedGitFixture {
         })
         .await
         .expect("the native admin sync must reach a durable no-change result");
+    }
+
+    async fn restart_without_retained_candidates(self) -> Self {
+        let Self {
+            daemon,
+            root,
+            work,
+            ssh_marker,
+            client,
+            ..
+        } = self;
+        daemon.stop();
+        let candidates = root.path().join("state/content-candidates");
+        let retained: Vec<_> = fs::read_dir(&candidates)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension() == Some(OsStr::new("candidate")))
+            .collect();
+        assert!(!retained.is_empty());
+        for path in retained {
+            fs::remove_file(path).unwrap();
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_maincopyd"));
+        command
+            .args(["--config", "maincopy.toml"])
+            .current_dir(root.path())
+            .env("MAINCOPY_SSH_EXECUTABLE", root.path().join("fixture-ssh"));
+        let (daemon, addresses) = Daemon::start(command);
+        let admin_url = format!("http://{}", addresses.admin);
+        let public_url = format!("http://{}", addresses.public);
+        let session = password_login(&client, &admin_url).await;
+        Self {
+            daemon,
+            root,
+            work,
+            ssh_marker,
+            client,
+            admin_url,
+            public_url,
+            session,
+        }
     }
 
     fn stop(self) {
@@ -713,8 +1041,15 @@ fn write_credentials(root: &Path) {
     let credentials = root.join("credentials");
     fs::create_dir(&credentials).expect("credential fixture directory must be created");
     let private_key = credentials.join("source-key");
-    fs::write(&private_key, "integration fixture private key\n")
-        .expect("private key fixture must be written");
+    let child = Command::new(option_env!("MAINCOPY_SSH_KEYGEN").unwrap_or("ssh-keygen"))
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&private_key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("fixture deploy key generation must start");
+    assert_process_success("fixture deploy key generation", CapturedChild::new(child));
     fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600))
         .expect("private key fixture must be owner-only");
     fs::write(

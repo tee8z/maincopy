@@ -22,10 +22,9 @@ time.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 uuid = { workspace = true, features = ["v4"] }
 zeroize.workspace = true
-rpassword.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-rustix = { workspace = true, features = ["fs", "std"] }
+rustix = { workspace = true, features = ["fs", "std", "termios"] }
 
 [[bin]]
 name = "maincopy"
@@ -35,3 +34,6 @@ path = "src/main.rs"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
 tokio-rustls.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true, features = ["pty", "event"] }

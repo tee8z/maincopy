@@ -1,14 +1,14 @@
 //! Versioned administration resources for managed source synchronization.
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION, request::Parts},
     response::{IntoResponse as _, Response},
 };
 use maincopy_shared::source::{
-    BeginSourceSyncResponse, ListSourceSyncsResponse, SourceStatusResponse, SourceSyncId,
-    SourceSyncResource,
+    BeginSourceSyncResponse, ListSourceSyncsResponse, ReconfigureSourceRequest,
+    SourceDeployKeyResponse, SourceStatusResponse, SourceSyncId, SourceSyncResource,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
@@ -20,9 +20,9 @@ use uuid::Uuid;
 
 use crate::{
     admin::{
-        AdminRuntimeState,
+        AdminRuntimeState, BrowserSessionContext,
         idempotency::{IdempotencyKeyError, parse_idempotency_key},
-        principal::AdminPrincipal,
+        principal::{AdminAuthentication, AdminPrincipal},
         problem::{AdminProblem, AdminProblemEnvelope, problem_response},
         request_id::RequestId,
     },
@@ -41,6 +41,11 @@ const RETRY_AFTER_ONE_SECOND: HeaderValue = HeaderValue::from_static("1");
 
 pub(crate) fn status_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_source_status)
+}
+
+pub(crate) fn configuration_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
+    routes!(reconfigure_source, get_deploy_key)
+        .layer(DefaultBodyLimit::max(MAX_SOURCE_SYNC_REQUEST_BYTES))
 }
 
 pub(crate) fn sync_list_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
@@ -332,6 +337,97 @@ async fn begin_source_sync(command: SourceSyncCommand) -> Response {
     }
 }
 
+#[utoipa::path(
+    get, path = "/api/admin/v1/source/deploy-key",
+    responses((status = OK, body = SourceDeployKeyResponse), (status = CONFLICT, body = AdminProblemEnvelope),
+        (status = SERVICE_UNAVAILABLE, body = AdminProblemEnvelope)), tag = "Source"
+)]
+async fn get_deploy_key(request_id: RequestId, State(handle): State<SourceSyncHandle>) -> Response {
+    match handle.deploy_public_identity().await {
+        Ok(identity) => Json(identity).into_response(),
+        Err(error) => source_control_problem(error, request_id),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/admin/v1/source/configuration",
+    request_body = ReconfigureSourceRequest,
+    params(("Idempotency-Key" = Uuid, Header, description = "Retry identity for the proposed settings")),
+    responses(
+        (status = OK, body = BeginSourceSyncResponse),
+        (status = ACCEPTED, body = BeginSourceSyncResponse),
+        (status = BAD_REQUEST, body = AdminProblemEnvelope),
+        (status = FORBIDDEN, body = AdminProblemEnvelope),
+        (status = CONFLICT, body = AdminProblemEnvelope),
+        (status = PAYLOAD_TOO_LARGE, body = AdminProblemEnvelope),
+        (status = SERVICE_UNAVAILABLE, body = AdminProblemEnvelope)
+    ),
+    tag = "Source"
+)]
+async fn reconfigure_source(
+    request_id: RequestId,
+    principal: AdminPrincipal,
+    browser: Option<Extension<BrowserSessionContext>>,
+    State(handle): State<SourceSyncHandle>,
+    headers: HeaderMap,
+    request: Result<Json<ReconfigureSourceRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let fresh = match principal.authentication {
+        AdminAuthentication::BrowserSession { session_id } => {
+            browser.as_deref().is_some_and(|context| {
+                context.session.session_id == session_id
+                    && context.is_fresh_at(time::OffsetDateTime::now_utc())
+            })
+        }
+        AdminAuthentication::AgentCredential { .. } => false,
+    };
+    if !fresh {
+        return problem(
+            AdminProblem::forbidden(
+                "fresh_authentication_required",
+                "source changes require a recent Owner sign-in",
+            ),
+            request_id,
+        );
+    }
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            return problem(
+                AdminProblem::new(
+                    rejection.status(),
+                    "invalid_source_configuration",
+                    "source settings must contain valid values and the installed configuration version",
+                ),
+                request_id,
+            );
+        }
+    };
+    let key = match source_sync_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(spec) => return problem(spec, request_id),
+    };
+    match handle
+        .reconfigure(request, principal.mutation_audit(request_id, key))
+        .await
+    {
+        Ok(accepted) => {
+            let location = format!(
+                "/api/admin/v1/source-syncs/{}",
+                accepted.sync.source_sync_id
+            );
+            (
+                accepted_status(accepted.admission),
+                [(LOCATION, location)],
+                Json(accepted),
+            )
+                .into_response()
+        }
+        Err(error) => source_control_problem(error, request_id),
+    }
+}
+
 fn source_sync_json_rejection(status: StatusCode, request_id: RequestId) -> Response {
     if status == StatusCode::PAYLOAD_TOO_LARGE {
         problem(
@@ -395,6 +491,10 @@ fn source_control_problem(error: SourceControlError, request_id: RequestId) -> R
         ),
         SourceControlError::ShuttingDown => source_unavailable(),
         SourceControlError::ConfigurationUnavailable => source_unavailable(),
+        SourceControlError::CredentialUnavailable => AdminProblem::unavailable(
+            "source_credential_unavailable",
+            "the selected deploy public identity could not be inspected",
+        ),
         SourceControlError::Load(SourceLoadError::CursorNotFound) => AdminProblem::bad_request(
             "invalid_source_sync_cursor",
             "the source synchronization cursor does not exist",

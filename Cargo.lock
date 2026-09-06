@@ -1663,7 +1663,6 @@ dependencies = [
  "keyring",
  "maincopy-shared",
  "reqwest",
- "rpassword",
  "rustix",
  "serde",
  "serde_json",

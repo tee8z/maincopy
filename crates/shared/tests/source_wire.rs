@@ -1,3 +1,4 @@
+use maincopy_shared::source::SourceDeployKeyResponse;
 use maincopy_shared::source::{
     GIT_SHA1_SOURCE_COMMIT_PREFIX, SOURCE_PATH, SOURCE_SYNCS_PATH, SourceStatusResponse,
     SourceSyncFailureCode, SourceSyncId, SourceSyncOutcome, SourceSyncRequestOrigin,
@@ -360,5 +361,25 @@ fn source_status_wire_enforces_installation_and_active_operation_shapes() {
             serde_json::from_value::<SourceStatusResponse>(status).is_err(),
             "accepted {case}"
         );
+    }
+}
+
+#[test]
+fn deploy_public_identity_rejects_unsafe_or_unbounded_wire_strings() {
+    let value = serde_json::json!({
+        "credential_name": "deploy",
+        "public_key": format!("ssh-ed25519 {}", "A".repeat(68)),
+        "fingerprint": format!("SHA256:{}", "A".repeat(43)),
+    });
+    assert!(serde_json::from_value::<SourceDeployKeyResponse>(value.clone()).is_ok());
+    for (field, rejected) in [
+        ("public_key", "ssh-ed25519 \u{1b}[2J"),
+        ("public_key", "/private/key"),
+        ("fingerprint", "SHA256:unbounded"),
+        ("credential_name", "../private-key"),
+    ] {
+        let mut invalid = value.clone();
+        invalid[field] = serde_json::json!(rejected);
+        assert!(serde_json::from_value::<SourceDeployKeyResponse>(invalid).is_err());
     }
 }

@@ -24,6 +24,7 @@ use zeroize::Zeroizing;
 use super::process_harness::{CapturedChild, Daemon};
 
 mod account_workflows;
+mod agent_workflows;
 mod profile_workflows;
 
 use maincopy_shared::{
@@ -445,6 +446,22 @@ async fn managed_source_endpoints_enforce_their_agent_scopes() {
         )
         .await;
     assert_eq!(status.status(), StatusCode::OK);
+
+    for path in [
+        "/api/admin/v1/source/configuration",
+        "/api/admin/v1/source/deploy-key",
+    ] {
+        let method = if path.ends_with("configuration") {
+            Method::PUT
+        } else {
+            Method::GET
+        };
+        let denied = harness
+            .send_as(&source_operator, method, path, b"{}".to_vec(), true)
+            .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_problem(denied, "insufficient_scope").await;
+    }
 
     let sync = harness
         .send_json_as(&source_operator, Method::POST, SOURCE_SYNCS_PATH, json!({}))

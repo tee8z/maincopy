@@ -198,6 +198,9 @@ impl HelperError {
 }
 
 #[cfg(test)]
+mod golden_corpus;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

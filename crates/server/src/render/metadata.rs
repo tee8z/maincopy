@@ -18,6 +18,7 @@ pub(crate) struct PostHeadMetadataInput<'metadata> {
     pub(crate) published_at: Option<OffsetDateTime>,
     pub(crate) canonical_url: &'metadata CanonicalSiteUrl,
     pub(crate) author: &'metadata AuthorName,
+    pub(crate) image: Option<&'metadata str>,
 }
 
 /// Exact safe metadata fragments used by the Maud page shell.
@@ -97,6 +98,7 @@ pub(crate) fn render_post_head_metadata(
             name: input.author.as_str(),
         },
         keywords: input.tags,
+        image: input.image,
     };
     let serialized = serde_json::to_string(&document).map_err(MetadataRenderError::JsonLd)?;
     let json_ld = escape_json_for_html_script(&serialized).into_boxed_str();
@@ -152,6 +154,8 @@ struct BlogPostingJsonLd<'metadata> {
     date_modified: Option<&'metadata str>,
     author: BlogPostingAuthor<'metadata>,
     keywords: &'metadata [PostTag],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<&'metadata str>,
 }
 
 #[derive(Serialize)]
@@ -199,6 +203,7 @@ mod tests {
             updated_at: Some(timestamp("2026-09-01T11:12:13-04:00")),
             published_at: Some(timestamp("2026-09-02T15:16:17Z")),
             canonical_url: &canonical_url,
+            image: None,
             author: &author,
         };
 
@@ -243,6 +248,7 @@ mod tests {
             updated_at: None,
             published_at: None,
             canonical_url: &canonical_url,
+            image: None,
             author: &author,
         })
         .unwrap();
@@ -270,6 +276,7 @@ mod tests {
             updated_at: None,
             published_at: None,
             canonical_url: &canonical_url,
+            image: None,
             author: &author,
         })
         .unwrap();
@@ -316,6 +323,7 @@ mod tests {
             updated_at: None,
             published_at: None,
             canonical_url: &canonical_url,
+            image: None,
             author: &author,
         })
         .unwrap_err();

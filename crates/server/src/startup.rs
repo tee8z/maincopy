@@ -384,8 +384,8 @@ impl Application {
         })?;
         let shutdown = install_termination_signal()?;
         let database = start_database(&startup.host).await?;
-        let configuration = match database.store.source.configuration().await {
-            Ok(Some(configuration)) => configuration,
+        match database.store.source.configuration().await {
+            Ok(Some(_)) => {}
             Ok(None) => {
                 return Err(close_started_database(
                     database,
@@ -438,7 +438,6 @@ impl Application {
         };
         let (source_engine, source) = ManagedSourceEngine::new(
             database.store.source.clone(),
-            configuration,
             git,
             candidate_store.clone(),
             content_compiler.clone(),

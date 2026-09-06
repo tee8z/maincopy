@@ -19,6 +19,7 @@ mod password_executor;
 mod process_lock;
 pub mod render;
 mod source_bootstrap;
+mod source_key;
 mod source_provenance;
 mod source_sync;
 pub mod startup;

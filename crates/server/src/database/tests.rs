@@ -123,6 +123,7 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             "source_configuration_mutation_receipts",
             "source_configuration_revisions",
             "source_installation",
+            "source_reconfigurations",
             "source_sync_idempotency_aliases",
             "source_sync_operations",
             "user_nostr_credentials",
@@ -286,6 +287,7 @@ async fn managed_source_migration_preserves_existing_agent_scopes() {
             "source_configuration_mutation_receipts",
             "source_configuration_revisions",
             "source_installation",
+            "source_reconfigurations",
             "source_sync_idempotency_aliases",
             "source_sync_operations",
         ]
@@ -968,6 +970,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
             "source_installation.content_digest:BLOB",
             "source_installation.source_commit:BLOB",
             "source_installation.source_sync_id:BLOB",
+            "source_reconfigurations.source_sync_id:BLOB",
             "source_sync_idempotency_aliases.audit_event_id:BLOB",
             "source_sync_idempotency_aliases.command_fingerprint:BLOB",
             "source_sync_idempotency_aliases.idempotency_key:BLOB",

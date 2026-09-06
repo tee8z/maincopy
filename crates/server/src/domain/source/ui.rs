@@ -12,8 +12,11 @@ use maincopy_shared::{
     auth::{AdminAuditEventId, AdminScope},
     auth_api::SecretString,
     source::{
-        SourceStatusResponse, SourceSyncFailureCode, SourceSyncId, SourceSyncOutcome,
-        SourceSyncResource,
+        GitBranchName, ReconfigureSourceRequest, RepositoryContentSubdirectory,
+        SourceConfigurationVersion, SourcePollInterval, SourceStatusResponse,
+        SourceSyncFailureCode, SourceSyncId, SourceSyncOutcome, SourceSyncResource,
+        SshCredentialName, SshRemote, SshRemoteHost, SshRemotePort, SshRemoteUser,
+        SshRepositoryPath,
     },
 };
 use maud::{Markup, html};
@@ -50,6 +53,23 @@ struct SourceSyncForm {
     idempotency_key: Box<str>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceConfigurationForm {
+    #[serde(rename = "_csrf")]
+    csrf: SecretString,
+    idempotency_key: Box<str>,
+    expected_version: SourceConfigurationVersion,
+    user: SshRemoteUser,
+    host: SshRemoteHost,
+    port: SshRemotePort,
+    repository_path: SshRepositoryPath,
+    branch: GitBranchName,
+    content_subdirectory: RepositoryContentSubdirectory,
+    credential_name: SshCredentialName,
+    poll_interval_seconds: SourcePollInterval,
+}
+
 pub(crate) fn router(security: &AdminSecurityState) -> Router<AdminRuntimeState> {
     let page = browser_scoped_router(
         Router::new().route("/admin/source", get(show_source)),
@@ -63,7 +83,15 @@ pub(crate) fn router(security: &AdminSecurityState) -> Router<AdminRuntimeState>
         security,
         AdminScope::SourceSync,
     );
+    let configuration = browser_scoped_router(
+        Router::new()
+            .route("/admin/source/configuration", post(reconfigure_source))
+            .layer(DefaultBodyLimit::max(16 * 1024)),
+        security,
+        AdminScope::SourceManage,
+    );
     page.merge(sync)
+        .merge(configuration)
         .layer(middleware::from_fn(admin_ui::adapt_security_response))
 }
 
@@ -105,6 +133,11 @@ async fn show_source(
     });
 
     let is_managed = matches!(status, SourceStatusResponse::ManagedGit { .. });
+    let deploy_identity = if is_managed && session.scopes().contains(&AdminScope::SourceManage) {
+        Some(handle.deploy_public_identity().await)
+    } else {
+        None
+    };
     let can_sync = is_managed && session.scopes().contains(&AdminScope::SourceSync);
     let csrf = csrf_token.expose_secret();
     let idempotency_key = Uuid::new_v4();
@@ -134,6 +167,22 @@ async fn show_source(
                 }
             }
             (source_status_panel(&status))
+            @if let Some(identity) = &deploy_identity {
+                section class="panel" {
+                    h2 { "Selected deploy public key" }
+                    @match identity {
+                        Ok(identity) => {
+                            p { "Credential: " code { (identity.credential_name.as_str()) } }
+                            p { "Public key: " code { (&identity.public_key) } }
+                            p { "Fingerprint: " code { (&identity.fingerprint) } }
+                        }
+                        Err(_) => { p class="notice" { "The selected deploy public key is unavailable. Check the protected credential on the host." } }
+                    }
+                }
+            }
+            @if session.scopes().contains(&AdminScope::SourceManage) {
+                (source_configuration_form(&status, csrf, session.is_active_at(OffsetDateTime::now_utc()) && OffsetDateTime::now_utc() < session.fresh_until))
+            }
             @if can_sync {
                 section class="panel" aria-labelledby="sync-now" {
                     h2 id="sync-now" { "Sync now" }
@@ -226,6 +275,119 @@ async fn begin_source_sync(
             accepted.sync.source_sync_id
         )),
         Err(error) => source_mutation_error(error, request_id),
+    }
+}
+
+async fn reconfigure_source(
+    RequiredBrowserSession {
+        request_id,
+        session,
+        ..
+    }: RequiredBrowserSession,
+    State(handle): State<SourceSyncHandle>,
+    form: Result<Form<SourceConfigurationForm>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    if !(session.is_active_at(OffsetDateTime::now_utc())
+        && OffsetDateTime::now_utc() < session.fresh_until)
+    {
+        return admin_ui::error_response(
+            StatusCode::FORBIDDEN,
+            "Source settings unchanged",
+            "Source changes require a recent Owner sign-in. Sign in again, then reload source status.",
+            request_id,
+        );
+    }
+    let form = match form {
+        Ok(Form(form)) if !form.csrf.expose_secret().is_empty() => form,
+        _ => {
+            return admin_ui::error_response(
+                StatusCode::BAD_REQUEST,
+                "Source settings unchanged",
+                "The proposed source settings were invalid. Reload source status and try again.",
+                request_id,
+            );
+        }
+    };
+    let Some(key) = canonical_uuid(&form.idempotency_key) else {
+        return admin_ui::error_response(
+            StatusCode::BAD_REQUEST,
+            "Source settings unchanged",
+            "The operation identity was invalid. Reload source status and try again.",
+            request_id,
+        );
+    };
+    let request = ReconfigureSourceRequest {
+        remote: SshRemote {
+            user: form.user,
+            host: form.host,
+            port: form.port,
+            repository_path: form.repository_path,
+        },
+        branch: form.branch,
+        content_subdirectory: form.content_subdirectory,
+        credential_name: form.credential_name,
+        poll_interval_seconds: form.poll_interval_seconds,
+        expected_version: form.expected_version,
+    };
+    let audit = MutationAuditContext {
+        audit_event_id: AdminAuditEventId::from_uuid(Uuid::new_v4()),
+        principal: AuditPrincipalReference::BrowserSession {
+            user_id: session.user_id,
+            session_id: session.session_id,
+        },
+        request_id: Some(request_id.0),
+        idempotency_key: AdminMutationKey(key),
+    };
+    match handle.reconfigure(request, audit).await {
+        Ok(accepted) => admin_ui::redirect(&format!(
+            "/admin/source?sync={}",
+            accepted.sync.source_sync_id
+        )),
+        Err(error) => source_mutation_error(error, request_id),
+    }
+}
+
+fn source_configuration_form(status: &SourceStatusResponse, csrf: &str, fresh: bool) -> Markup {
+    let SourceStatusResponse::ManagedGit {
+        configuration,
+        active_sync,
+        ..
+    } = status
+    else {
+        return html! {};
+    };
+    let remote = &configuration.remote;
+    html! {
+        section class="panel" aria-labelledby="source-configuration" {
+            h2 id="source-configuration" { "Source settings" }
+            p { "Maincopy validates and compiles the proposed source before installing these settings. A failed change preserves the installed settings and public site." }
+            @if !fresh { p class="notice" { "Source changes require a recent sign-in. " a href="/admin/login" { "Sign in again" } } }
+            @if active_sync.is_some() { p class="notice" { "Wait for the active synchronization to finish, then reload this page before changing settings." } }
+            form method="post" action="/admin/source/configuration" {
+                input type="hidden" name="_csrf" value=(csrf);
+                input type="hidden" name="idempotency_key" value=(Uuid::new_v4());
+                input type="hidden" name="expected_version" value=(configuration.version.get());
+                fieldset disabled[!fresh || active_sync.is_some()] {
+                    label for="source-user" { "SSH user" }
+                    input id="source-user" name="user" value=(remote.user.as_str()) maxlength="64" required;
+                    label for="source-host" { "SSH host" }
+                    input id="source-host" name="host" value=(remote.host.as_str()) maxlength="253" required;
+                    label for="source-port" { "SSH port" }
+                    input id="source-port" name="port" type="number" value=(remote.port.get()) min="1" max="65535" required;
+                    label for="source-repository" { "Repository path" }
+                    input id="source-repository" name="repository_path" value=(remote.repository_path.as_str()) maxlength="1024" required;
+                    label for="source-branch" { "Branch" }
+                    input id="source-branch" name="branch" value=(configuration.branch.as_str()) maxlength="255" required;
+                    label for="source-subdirectory" { "Content subdirectory" }
+                    input id="source-subdirectory" name="content_subdirectory" value=(configuration.content_subdirectory.as_str()) maxlength="1024" required;
+                    label for="source-credential" { "Registered deploy credential" }
+                    input id="source-credential" name="credential_name" value=(configuration.credential_name.as_str()) maxlength="64" required;
+                    label for="source-poll" { "Poll interval in seconds" }
+                    input id="source-poll" name="poll_interval_seconds" type="number" value=(configuration.poll_interval_seconds.seconds()) min="30" max="86400" required;
+                    button type="submit" { "Validate and apply settings" }
+                }
+            }
+        }
     }
 }
 
@@ -430,6 +592,7 @@ fn source_mutation_error(error: SourceControlError, request_id: RequestId) -> Re
             "The synchronization request could not be represented safely.",
         ),
         SourceControlError::ConfigurationUnavailable
+        | SourceControlError::CredentialUnavailable
         | SourceControlError::Load(_)
         | SourceControlError::Mutation(_) => (
             StatusCode::SERVICE_UNAVAILABLE,

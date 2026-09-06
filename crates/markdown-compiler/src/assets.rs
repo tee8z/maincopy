@@ -148,6 +148,7 @@ pub struct ResolvedSiteAssets {
     pub(super) source_binding: PublicationAssetSourceBinding,
     pub(super) policy_binding: AssetResolutionPolicyBinding,
     pub favicon: Option<AssetRevisionReference>,
+    pub image: Option<AssetRevisionReference>,
     pub allowed_origins: Vec<ExternalAssetOrigin>,
     pub references: Vec<AssetRevisionReference>,
 }
@@ -156,6 +157,7 @@ impl ResolvedSiteAssets {
     pub fn new(
         publication: &PublicationSettings,
         favicon: Option<AssetRevisionReference>,
+        image: Option<AssetRevisionReference>,
         allowed_origins: Vec<ExternalAssetOrigin>,
         references: Vec<AssetRevisionReference>,
     ) -> Self {
@@ -163,6 +165,7 @@ impl ResolvedSiteAssets {
             source_binding: bind_publication_asset_source(publication),
             policy_binding: bind_asset_resolution_policy(&allowed_origins),
             favicon,
+            image,
             allowed_origins,
             references,
         }

@@ -231,8 +231,24 @@ fn parse_publication(
                             diagnostics,
                         )
                     });
+            let image = take_optional_string(&mut site, "image", "site.image", &path, diagnostics)
+                .and_then(|value| {
+                    parse_plain_text(
+                        value,
+                        UnresolvedAssetReference::new,
+                        "site.image",
+                        &path,
+                        diagnostics,
+                    )
+                });
             reject_unknown_fields(site, "site", &path, diagnostics);
-            Some(SiteSettings::new(title?, base_url?, description?, favicon))
+            Some(SiteSettings::new(
+                title?,
+                base_url?,
+                description?,
+                favicon,
+                image,
+            ))
         });
 
     let author = take_required_table(&mut table, "author", "author", &path, diagnostics).and_then(

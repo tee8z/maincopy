@@ -138,6 +138,7 @@ impl ContentCatalog {
             .site_assets
             .favicon
             .iter()
+            .chain(self.site_assets.image.iter())
             .chain(self.site_assets.references.iter())
             .chain(self.rendered_posts().flat_map(|post| {
                 post.assets
