@@ -8,6 +8,10 @@ use maincopy_shared::{
         SESSION_COOKIE_NAME, SecretString,
     },
     posts::{ListPostsResponse, POSTS_PATH},
+    profile_api::{
+        ACTIVE_TIP_RECIPIENT_PATH, ActiveTipRecipientResponse, CURRENT_USER_PROFILE_PATH,
+        PutActiveTipRecipientRequest, UpdateUserProfileRequest, UserProfileResponse,
+    },
     publication::{
         CONTENT_DIGEST_HEADER, ChangeReleaseRequest, IDEMPOTENCY_KEY_HEADER, ListReleasesResponse,
         POST_REVISION_HEADER, PREVIEW_DIGEST_HEADER, PUBLICATIONS_PATH, PreviewDigest,
@@ -173,6 +177,56 @@ impl AdminClient {
             .authenticated_request(Method::GET, SOURCE_PATH, Vec::new(), None)
             .await?;
         decode_status_json(response, StatusCode::OK)
+    }
+
+    pub(crate) async fn profile(&self) -> Result<Option<UserProfileResponse>, AdminClientError> {
+        let response = self
+            .authenticated_request(Method::GET, CURRENT_USER_PROFILE_PATH, Vec::new(), None)
+            .await?;
+        decode_current_profile(response)
+    }
+
+    pub(crate) async fn update_profile(
+        &self,
+        operation_id: Uuid,
+        request: &UpdateUserProfileRequest,
+    ) -> Result<UserProfileResponse, AdminClientError> {
+        let body = serde_json::to_vec(request).map_err(AdminClientError::RequestEncoding)?;
+        let response = self
+            .authenticated_request(
+                Method::PUT,
+                CURRENT_USER_PROFILE_PATH,
+                body,
+                Some(operation_id),
+            )
+            .await?;
+        decode_profile_change(response, request)
+    }
+
+    pub(crate) async fn tip_recipient(
+        &self,
+    ) -> Result<ActiveTipRecipientResponse, AdminClientError> {
+        let response = self
+            .authenticated_request(Method::GET, ACTIVE_TIP_RECIPIENT_PATH, Vec::new(), None)
+            .await?;
+        decode_status_json(response, StatusCode::OK)
+    }
+
+    pub(crate) async fn set_tip_recipient(
+        &self,
+        operation_id: Uuid,
+        request: &PutActiveTipRecipientRequest,
+    ) -> Result<ActiveTipRecipientResponse, AdminClientError> {
+        let body = serde_json::to_vec(request).map_err(AdminClientError::RequestEncoding)?;
+        let response = self
+            .authenticated_request(
+                Method::PUT,
+                ACTIVE_TIP_RECIPIENT_PATH,
+                body,
+                Some(operation_id),
+            )
+            .await?;
+        decode_recipient_change(response, request)
     }
 
     /// Starts or replays one durable managed-source synchronization.
@@ -961,6 +1015,60 @@ where
     serde_json::from_slice(&response.body).map_err(AdminClientError::InvalidResponse)
 }
 
+fn decode_current_profile(
+    response: HttpResponse,
+) -> Result<Option<UserProfileResponse>, AdminClientError> {
+    match decode_status_json(response, StatusCode::OK) {
+        Ok(profile) => Ok(Some(profile)),
+        Err(AdminClientError::HttpStatus {
+            status: StatusCode::NOT_FOUND,
+            problem: Some(problem),
+            ..
+        }) if problem.code.as_ref() == "profile_not_found" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn decode_profile_change(
+    response: HttpResponse,
+    request: &UpdateUserProfileRequest,
+) -> Result<UserProfileResponse, AdminClientError> {
+    let expected_status = if request.expected_version.is_none() {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    let profile: UserProfileResponse = decode_status_json(response, expected_status)?;
+    let expected_version = request
+        .expected_version
+        .map_or(1, |version| version.into_u64() + 1);
+    if profile.version.into_u64() != expected_version
+        || profile.display_name != request.display_name
+        || profile.lightning_address != request.lightning_address
+        || profile.tips_enabled != request.tips_enabled
+    {
+        return Err(AdminClientError::InvalidProfileResponse {
+            message: "the accepted profile does not match the requested values and version",
+        });
+    }
+    Ok(profile)
+}
+
+fn decode_recipient_change(
+    response: HttpResponse,
+    request: &PutActiveTipRecipientRequest,
+) -> Result<ActiveTipRecipientResponse, AdminClientError> {
+    let recipient: ActiveTipRecipientResponse = decode_status_json(response, StatusCode::OK)?;
+    if recipient.user_id != request.user_id
+        || recipient.version.into_u64() != request.expected_version.into_u64() + 1
+    {
+        return Err(AdminClientError::InvalidProfileResponse {
+            message: "the accepted recipient does not match the requested user and version",
+        });
+    }
+    Ok(recipient)
+}
+
 fn decode_status_json<Value>(
     response: HttpResponse,
     expected: StatusCode,
@@ -1275,6 +1383,9 @@ pub(crate) enum AdminClientError {
     #[error("the admin server returned an inconsistent publication response: {message}")]
     InvalidPublicationResponse { message: &'static str },
 
+    #[error("the admin server returned inconsistent profile state: {message}")]
+    InvalidProfileResponse { message: &'static str },
+
     #[error("the admin server returned an inconsistent source-sync response: {message}")]
     InvalidSourceSyncResponse { message: &'static str },
 }
@@ -1308,6 +1419,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use base64::{Engine as _, engine::general_purpose};
+    use maincopy_shared::profile::ProfileVersion;
     use reqwest::header::HeaderValue;
     use serde_json::json;
     use sha2::Digest as _;
@@ -1369,6 +1481,111 @@ mod tests {
             "expires_at": "2026-09-04T12:00:00Z"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn profile_receipts_bind_values_version_and_creation_status() {
+        let request: UpdateUserProfileRequest = serde_json::from_value(json!({
+            "display_name":"Alice", "lightning_address":"alice@example.test", "tips_enabled":true
+        }))
+        .unwrap();
+        let body = json!({"user_id":Uuid::new_v4(), "display_name":"Alice", "lightning_address":"alice@example.test", "tips_enabled":true, "version":1, "updated_at":"2026-09-05T12:00:00Z"});
+        let response = || json_response(StatusCode::CREATED, serde_json::to_vec(&body).unwrap());
+        assert!(decode_profile_change(response(), &request).is_ok());
+        for (field, value) in [
+            ("display_name", json!("Bob")),
+            ("lightning_address", json!(null)),
+            ("tips_enabled", json!(false)),
+            ("version", json!(2)),
+        ] {
+            let mut body = body.clone();
+            body[field] = value;
+            assert!(matches!(
+                decode_profile_change(
+                    json_response(StatusCode::CREATED, serde_json::to_vec(&body).unwrap()),
+                    &request
+                ),
+                Err(AdminClientError::InvalidProfileResponse { .. })
+            ));
+        }
+        assert!(matches!(
+            decode_profile_change(
+                json_response(StatusCode::OK, serde_json::to_vec(&body).unwrap()),
+                &request
+            ),
+            Err(AdminClientError::UnexpectedSuccessStatus { .. })
+        ));
+        let mut request = request;
+        request.expected_version = Some(ProfileVersion::new(1).unwrap());
+        let mut body = body;
+        body["version"] = json!(2);
+        assert!(
+            decode_profile_change(
+                json_response(StatusCode::OK, serde_json::to_vec(&body).unwrap()),
+                &request
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_missing_profile_response_means_unconfigured() {
+        let profile = json!({"user_id":Uuid::new_v4(), "display_name":null, "lightning_address":null, "tips_enabled":false, "version":1, "updated_at":"2026-09-05T12:00:00Z"});
+        assert!(
+            decode_current_profile(json_response(
+                StatusCode::OK,
+                serde_json::to_vec(&profile).unwrap()
+            ))
+            .unwrap()
+            .is_some()
+        );
+        for (status, code, missing) in [
+            (StatusCode::NOT_FOUND, "profile_not_found", true),
+            (StatusCode::NOT_FOUND, "route_not_found", false),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "profile_unavailable",
+                false,
+            ),
+        ] {
+            let body = serde_json::to_vec(
+                &json!({"error":{"code":code, "message":"safe failure", "request_id":REQUEST_ID}}),
+            )
+            .unwrap();
+            let result = decode_current_profile(json_response(status, body));
+            if missing {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn recipient_receipts_bind_both_selected_and_cleared_state() {
+        for user_id in [Some(Uuid::new_v4()), None] {
+            let request: PutActiveTipRecipientRequest =
+                serde_json::from_value(json!({"user_id":user_id, "expected_version":2})).unwrap();
+            let body = json!({"user_id":user_id, "version":3, "updated_at":"2026-09-05T12:00:00Z"});
+            assert!(
+                decode_recipient_change(
+                    json_response(StatusCode::OK, serde_json::to_vec(&body).unwrap()),
+                    &request
+                )
+                .is_ok()
+            );
+            for (field, value) in [("version", json!(2)), ("user_id", json!(Uuid::new_v4()))] {
+                let mut body = body.clone();
+                body[field] = value;
+                assert!(matches!(
+                    decode_recipient_change(
+                        json_response(StatusCode::OK, serde_json::to_vec(&body).unwrap()),
+                        &request
+                    ),
+                    Err(AdminClientError::InvalidProfileResponse { .. })
+                ));
+            }
+        }
     }
 
     fn begin_source_sync_response(admission: SourceSyncAdmission) -> BeginSourceSyncResponse {

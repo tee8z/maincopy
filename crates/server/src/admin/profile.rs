@@ -20,6 +20,9 @@ use utoipa_axum::{
 };
 use uuid::Uuid;
 
+mod ui;
+pub(super) use ui::browser_router;
+
 use super::{
     principal::{AdminAuthentication, AdminPrincipal},
     problem::{AdminProblem, AdminProblemEnvelope, problem_response},

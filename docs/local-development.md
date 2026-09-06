@@ -2,7 +2,7 @@
 
 Status: supported development workflow
 
-Last reviewed: 2026-09-04
+Last reviewed: 2026-09-05
 
 Related: [project overview](../README.md),
 [managed source runbook](managed-source.md),
@@ -230,7 +230,25 @@ Stale versions return `412 stale_release_version`. Reused keys with different
 inputs return `409 idempotency_conflict`. Refresh the release before starting
 a new operation after a conflict.
 
-### 5. Sign out before a state reset
+### 5. Manage your profile and tips
+
+Open **Profile** to create or replace your public display name and Lightning
+Address. Select whether your profile accepts tips. Empty fields clear their
+stored values.
+
+Open **Tips** to select the active recipient by user ID. The page shows your
+user ID and the selected recipient's eligibility. An empty recipient field
+removes the selection.
+
+Owner and Administrator accounts can use both pages. Publishers cannot access
+these settings. Every form includes the displayed resource version and one
+operation ID.
+
+If another edit changes the version, reload and review the current values.
+Profile and recipient edits do not approve articles. Ineligible or unconfigured
+recipients leave articles readable without tip links.
+
+### 6. Sign out before a state reset
 
 Return to the post list and choose `Sign out` before resetting local state.
 The browser returns to the sign-in page and clears the session and CSRF cookies.
@@ -476,6 +494,37 @@ scripts/dev-maincopy.sh logout
 
 A successful command reports `Revoked session` and its identifier. Stop the
 launcher with `Ctrl+C` after this command succeeds.
+
+### Profile and tip-recipient commands
+
+Use the same origin and certificate options as the other authenticated commands.
+Both human sessions and agents require the corresponding profile or Lightning
+scope.
+
+```console
+maincopy profile show
+maincopy profile create --display-name "Alice" --lightning-address alice@example.com --tips-enabled true
+maincopy profile update --expected-version 1 --display-name "Alice" --lightning-address alice@example.com --tips-enabled false
+maincopy tip-recipient show
+maincopy tip-recipient set USER_UUID --expected-version 1
+maincopy tip-recipient clear --expected-version 2
+```
+
+`profile create` requires an absent profile. `profile update` replaces all profile
+fields at the specified version. Omitted display-name and Lightning Address
+options clear those fields. `--tips-enabled true|false` is required.
+
+Recipient commands require the setting version from `tip-recipient show`.
+Selection requires an existing user. Tip links appear only while that account
+and its profile remain eligible.
+
+All mutations accept `--idempotency-key UUID` and generate one when omitted.
+Success output describes the accepted state. Use `show` to read the current
+state, which can differ after later edits.
+
+Failures retain the operation ID in human and `--json` output. Inspect current
+state after an uncertain result. Retry the identical command with its original
+key to recover its accepted result.
 
 ## Preserve or reset publication state
 

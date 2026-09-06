@@ -206,6 +206,7 @@ fn registered_router(security: &AdminSecurityState) -> (Router, utoipa::openapi:
     (
         api.merge(ui::public_router())
             .merge(ui::protected_router(security))
+            .merge(profile::browser_router(security))
             .merge(publication_ui::router(security))
             .merge(source_ui::router(security)),
         document,

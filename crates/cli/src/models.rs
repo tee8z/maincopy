@@ -1,5 +1,10 @@
 //! Command-line input models.
 
+mod profile;
+pub(crate) use profile::{
+    ProfileCommand, ProfileInvocation, TipRecipientCommand, TipRecipientInvocation,
+};
+
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -41,6 +46,16 @@ pub(crate) struct Arguments {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Inspect or replace your public display profile and Lightning Address.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    /// Inspect, select, or clear the site's active tip recipient.
+    TipRecipient {
+        #[command(subcommand)]
+        command: TipRecipientCommand,
+    },
     /// Create and protect a password-authenticated human session.
     Login {
         /// Canonical account username. The password is read from the terminal.

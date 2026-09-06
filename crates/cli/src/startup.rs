@@ -1,5 +1,8 @@
 //! CLI process startup, command execution, and output handling.
 
+mod profile;
+use profile::ProfileOutput;
+
 use std::{
     collections::HashSet,
     fs::OpenOptions,
@@ -56,6 +59,7 @@ const SOURCE_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_SOURCE_SYNC_POLLS: usize = 600;
 
 enum CommandOutput {
+    Profile(ProfileOutput),
     Login(AdminSessionResponse),
     Logout(RevokeAdminSessionResponse),
     AgentKeyConfigured {
@@ -140,6 +144,12 @@ impl PreviewSelection {
 
 #[derive(Debug, Error)]
 enum CliError {
+    #[error("profile or recipient operation {idempotency_key} failed: {source}")]
+    ProfileChange {
+        idempotency_key: Uuid,
+        #[source]
+        source: AdminClientError,
+    },
     #[error(transparent)]
     Admin(#[from] AdminClientError),
 
@@ -348,6 +358,26 @@ async fn execute(arguments: Arguments) -> Result<CommandOutput, CliError> {
         arguments.admin_ca_file.as_deref(),
     )?;
     match arguments.command {
+        Command::Profile { command } => profile::execute(
+            command.into_invocation(),
+            || client.profile(),
+            |operation, request| {
+                let client = &client;
+                async move { client.update_profile(operation, &request).await }
+            },
+        )
+        .await
+        .map(CommandOutput::Profile),
+        Command::TipRecipient { command } => profile::execute_recipient(
+            command.into_invocation(),
+            || client.tip_recipient(),
+            |operation, request| {
+                let client = &client;
+                async move { client.set_tip_recipient(operation, &request).await }
+            },
+        )
+        .await
+        .map(CommandOutput::Profile),
         Command::Login { username } => login(&client, username).await,
         Command::Logout => client
             .logout()
@@ -850,6 +880,7 @@ fn write_output(
     json: bool,
 ) -> Result<(), CliError> {
     match command {
+        CommandOutput::Profile(result) => profile::write_output(output, result, json),
         CommandOutput::Login(session) => write_login(output, session, json),
         CommandOutput::Logout(revoked) => write_logout(output, revoked, json),
         CommandOutput::AgentKeyConfigured { public_key } => {
@@ -1415,6 +1446,7 @@ fn error_exit(error: &CliError) -> u8 {
             return UNAVAILABLE;
         }
         CliError::Admin(_)
+        | CliError::ProfileChange { .. }
         | CliError::Publication { .. }
         | CliError::ReleaseChange { .. }
         | CliError::SourceSyncStart { .. }
@@ -1483,6 +1515,7 @@ fn error_exit(error: &CliError) -> u8 {
         | AdminClientError::InvalidResponse(_)
         | AdminClientError::InvalidPreviewResponse { .. }
         | AdminClientError::InvalidPublicationResponse { .. }
+        | AdminClientError::InvalidProfileResponse { .. }
         | AdminClientError::InvalidSourceSyncResponse { .. } => INTERNAL,
     }
 }
@@ -1497,6 +1530,7 @@ fn report_error(error: &CliError, exit: u8, json_output: bool) -> io::Result<()>
 
 #[derive(Clone, Copy)]
 enum ErrorRecovery {
+    ProfileChange(Uuid),
     None,
     Publication(Uuid),
     ReleaseChange {
@@ -1549,6 +1583,13 @@ fn write_human_error(
         writeln!(output, "maincopy: request ID: {request_id}")?;
     }
     match recovery {
+        ErrorRecovery::ProfileChange(idempotency_key) => {
+            writeln!(output, "maincopy: idempotency key: {idempotency_key}")?;
+            writeln!(
+                output,
+                "maincopy: inspect current state with profile show or tip-recipient show; retry only the identical command with this key"
+            )?;
+        }
         ErrorRecovery::None | ErrorRecovery::Publication(_) => {}
         ErrorRecovery::ReleaseChange { operation_id, .. } => {
             writeln!(
@@ -1597,6 +1638,7 @@ fn write_json_error(
             details.insert("operation_id".into(), json!(operation_id));
         }
         ErrorRecovery::Publication(idempotency_key)
+        | ErrorRecovery::ProfileChange(idempotency_key)
         | ErrorRecovery::SourceSyncStart(idempotency_key) => {
             details.insert("idempotency_key".into(), json!(idempotency_key));
         }
@@ -1628,6 +1670,9 @@ fn write_json_error(
 
 const fn error_recovery(error: &CliError) -> ErrorRecovery {
     match error {
+        CliError::ProfileChange {
+            idempotency_key, ..
+        } => ErrorRecovery::ProfileChange(*idempotency_key),
         CliError::Publication {
             idempotency_key, ..
         } => ErrorRecovery::Publication(*idempotency_key),
@@ -1708,6 +1753,7 @@ fn error_category(error: &CliError, exit: u8) -> &'static str {
 fn admin_error(error: &CliError) -> Option<&AdminClientError> {
     match error {
         CliError::Admin(error)
+        | CliError::ProfileChange { source: error, .. }
         | CliError::Publication { source: error, .. }
         | CliError::ReleaseChange { source: error, .. }
         | CliError::SourceSyncStart { source: error, .. }

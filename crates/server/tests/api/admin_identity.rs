@@ -28,6 +28,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod profile_workflows;
+
 use maincopy_shared::{
     auth::AdminScope,
     auth_api::{

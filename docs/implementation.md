@@ -27,7 +27,7 @@ flowchart LR
     Review --> Release[4. Release candidate]
 ```
 
-1. Complete account, profile, and managed-source administration workflows.
+1. Complete account and managed-source administration workflows.
 2. Add public-response metadata, Content Security Policy, and lifecycle polish.
 3. Add metrics, NixOS, Caddy, Litestream, backup, and restore support.
 4. Complete the security review, system matrix, documentation, and release dry run.
@@ -37,7 +37,7 @@ hosting, or Git write-back as part of V1.
 
 ## 1. Product closure
 
-### 1.1 Complete account and profile workflows
+### 1.1 Complete account workflows
 
 Complete the browser and CLI operations needed for ordinary administration.
 Preserve the fixed Owner, Administrator, and Publisher scope boundaries.
@@ -49,7 +49,6 @@ Deliverables:
 - Manage login and agent public-key credentials with fresh authentication.
 - Show the selected credential public key and fingerprint without exposing its
   private path or bytes.
-- Update the display profile, Lightning Address, and active tip recipient.
 - Provide clear empty, conflict, expired-session, and forbidden states.
 
 Required evidence:
@@ -59,7 +58,7 @@ Required evidence:
 - Reject Publisher access to users, roles, profiles, credentials, and source
   configuration.
 - Revoke sessions and agent credentials after user disablement.
-- Reject stale profile and role mutations without partial state.
+- Reject stale role mutations without partial state.
 
 ### 1.2 Complete managed-source administration
 
@@ -115,17 +114,13 @@ Deliverables:
 - Apply bounded request limits and structured access logs.
 - Drain active public requests during orderly shutdown.
 - Keep liveness independent from snapshot readiness.
-- Add browser forms for profile and active-recipient changes.
-- Explain ineligible and unconfigured recipient states without blocking pages.
-- Include the active tip projection in restart and restore evidence.
+- Include the active tip projection in offline restore evidence.
 
 Required evidence:
 
 - Drain an active request before the writer closes.
 - Fail readiness after a required supervised task exits.
-- Update and remove the tip recipient through the browser.
-- Keep articles readable when the selected tip recipient becomes invalid.
-- Reconstruct the same eligible tip projection after restart and restore.
+- Reconstruct the same eligible tip projection after offline restore.
 
 ### Product-closure gate
 

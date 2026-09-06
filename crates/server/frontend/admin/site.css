@@ -26,6 +26,10 @@ header,
   gap: 1rem;
 }
 
+.actions {
+  flex-wrap: wrap;
+}
+
 header,
 .row {
   justify-content: space-between;
@@ -92,7 +96,8 @@ label {
 }
 
 input[type="text"],
-input[type="password"] {
+input[type="password"],
+select {
   box-sizing: border-box;
   width: 100%;
   max-width: 34rem;

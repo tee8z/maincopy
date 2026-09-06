@@ -85,9 +85,19 @@ async fn public_router_does_not_expose_browser_admin_routes() {
 async fn public_router_does_not_expose_profile_or_tip_recipient_resources() {
     let app = public_router(public_state(Readiness::new(true)));
 
-    for path in [CURRENT_USER_PROFILE_PATH, ACTIVE_TIP_RECIPIENT_PATH] {
+    for path in [
+        CURRENT_USER_PROFILE_PATH,
+        ACTIVE_TIP_RECIPIENT_PATH,
+        "/admin/profile",
+        "/admin/tips",
+    ] {
         let response = get(app.clone(), path).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            request(app.clone(), Method::POST, path).await.status(),
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
     }
 }
 

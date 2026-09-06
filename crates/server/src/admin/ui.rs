@@ -201,7 +201,9 @@ pub(crate) async fn adapt_security_response(request: Request, next: Next) -> Res
     let response = next.run(request).await;
     match response.status() {
         StatusCode::UNAUTHORIZED => redirect("/admin/login"),
-        StatusCode::FORBIDDEN if method != Method::HEAD => {
+        StatusCode::FORBIDDEN if method != Method::HEAD
+            && !response.headers().get(axum::http::header::CONTENT_TYPE)
+                .is_some_and(|value| value == "text/html; charset=utf-8") => {
             request_id.map_or(response, |request_id| {
                 error_response(
                     StatusCode::FORBIDDEN,
@@ -213,6 +215,61 @@ pub(crate) async fn adapt_security_response(request: Request, next: Next) -> Res
         }
         _ => response,
     }
+}
+
+/// Presents a native form result without exposing internal response bodies.
+pub(crate) fn mutation_response(
+    response: Response,
+    location: &str,
+    request_id: RequestId,
+) -> Response {
+    let status = response.status();
+    if status.is_success() {
+        return redirect(location);
+    }
+    let message = match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            "The form was not valid. Check the fields and submit a current page."
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => "The form exceeded the size limit.",
+        StatusCode::UNAUTHORIZED => "Your session expired. Sign in again to continue.",
+        StatusCode::FORBIDDEN => {
+            "Your current session cannot authorize this change. Sign in again or contact an Owner."
+        }
+        StatusCode::NOT_FOUND => {
+            "The requested resource no longer exists. Reload before continuing."
+        }
+        StatusCode::PRECONDITION_FAILED => {
+            "This page is out of date. Reload and review the current values before submitting again."
+        }
+        StatusCode::CONFLICT => {
+            "This change conflicts with current state or an earlier operation. Reload and review the current values before submitting again."
+        }
+        StatusCode::TOO_MANY_REQUESTS => "The server is busy. Wait a moment and try again.",
+        _ => {
+            "The change could not be confirmed. Reload to inspect the current state before trying again."
+        }
+    };
+    let mut page = page_response(
+        status,
+        "Change did not complete",
+        PageKind::Authenticated,
+        html! {
+            section class="error" role="alert" {
+                h1 { "Change did not complete" }
+                p { (message) }
+                p class="muted" { "Request ID: " code { (request_id) } }
+            }
+            nav class="actions" aria-label="Recovery actions" {
+                a class="button" href=(location) { "Reload current state" }
+                a href="/admin/login" { "Sign in again" }
+            }
+        },
+    );
+    if let Some(retry_after) = response.headers().get(RETRY_AFTER) {
+        page.headers_mut().insert(RETRY_AFTER, retry_after.clone());
+    }
+    page
 }
 
 pub(crate) fn redirect(location: &str) -> Response {
@@ -288,6 +345,8 @@ pub(crate) fn page_response(
                             nav class="actions" aria-label="Administration" {
                                 a href="/admin" { "Posts" }
                                 a href="/admin/source" { "Source" }
+                                a href="/admin/profile" { "Profile" }
+                                a href="/admin/tips" { "Tips" }
                                 span class="muted" { "Private administration" }
                             }
                         }
