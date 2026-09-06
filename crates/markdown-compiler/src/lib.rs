@@ -42,9 +42,9 @@ pub use parser::{validate_content, validate_post_document, validate_post_documen
 pub use resolver::{
     AllowedOriginOrdinal, AssetReferenceLocation, AssetResolutionCode, AssetResolutionError,
     AssetResolutionErrors, AssetResolutionWarning, AssetResolutionWarningCode,
-    AssetResolutionWarnings, ResolveContentAssetsError, ResolvedContentAssets, ResolvedLocalAsset,
-    ResolvedLocalAssetLookupError, ResolvedLocalAssetStore, ResolvedPostAssetLookupError,
-    ResolvedPostAssetSet, ResolvedSiteAssetLookupError, resolve_content_assets,
+    AssetResolutionWarnings, PrepareContentError, PreparedContent, PreparedContentView,
+    PreparedPost, PreparedPostView, ResolvedLocalAsset, ResolvedLocalAssetLookupError,
+    ResolvedLocalAssetStore, prepare_content,
 };
 pub use startup::run;
 pub use tree::{

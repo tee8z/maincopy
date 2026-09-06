@@ -164,9 +164,7 @@ pub(crate) enum PublicationSchedulerError {
 mod tests {
     use std::{future::Future, path::Path};
 
-    use markdown_compiler::{
-        ContentTreeDigest, PostCollection, PostId, PostSlug, resolve_content_assets,
-    };
+    use markdown_compiler::{ContentTreeDigest, PostCollection, PostId, PostSlug, prepare_content};
     use tokio::task::JoinHandle;
 
     use super::*;
@@ -187,7 +185,7 @@ mod tests {
         },
         frontend_assets::embedded_manifest,
         render::{
-            ContentCatalog, SiteSnapshotReader, build_site_snapshot, compile_content_catalog,
+            ContentCatalog, SiteSnapshotReader, compile_content_catalog,
             render_bound_post_revision_preview, render_site_shell, snapshot_store,
         },
         web::Readiness,
@@ -246,11 +244,10 @@ mod tests {
         async fn start() -> Self {
             let catalog = catalog();
             let ledger = PublicLedgerProjection::empty();
-            let initial = build_site_snapshot(
-                render_site_shell(Arc::clone(&catalog), embedded_manifest(), &ledger).unwrap(),
-                &ledger,
-            )
-            .unwrap();
+            let initial = render_site_shell(Arc::clone(&catalog), embedded_manifest(), &ledger)
+                .unwrap()
+                .into_snapshot()
+                .unwrap();
             let initial_digest = initial.digest.clone();
             let root = Arc::new(tempfile::tempdir().unwrap());
             let database = database::bootstrap(database_configuration(
@@ -428,9 +425,8 @@ mod tests {
             Vec::new(),
             0,
         );
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        Arc::new(compile_content_catalog(&content, &assets).unwrap())
+        let content = prepare_content(&tree).unwrap();
+        Arc::new(compile_content_catalog(&content).unwrap())
     }
 
     #[test]

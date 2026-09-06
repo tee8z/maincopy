@@ -28,8 +28,7 @@ use crate::{
     frontend_assets::FrontendAssetManifest,
     render::{
         CatalogRetentionError, ContentCatalog, SiteSnapshot, SiteSnapshotActivator,
-        SiteSnapshotBuildError, build_site_snapshot, render_bound_post_revision_preview,
-        render_site_shell,
+        SiteSnapshotBuildError, render_bound_post_revision_preview, render_site_shell,
     },
     web::Readiness,
 };
@@ -116,6 +115,60 @@ struct PreparedPublishNow {
     requested_content_digest: ContentTreeDigest,
     accepted_preview_digest: PreviewDigest,
     requested: BeginPublishNow,
+}
+
+/// The exact activating snapshot validated before startup records observed posts.
+/// Recovery consumes these bytes instead of compiling or rendering them again.
+pub(crate) struct PreparedPublicationRecovery {
+    begun: BegunPublication,
+    selected: SelectedPost,
+    candidate: CandidateSnapshot,
+}
+
+impl PreparedPublicationRecovery {
+    pub(crate) fn prepare(
+        activation: RecoverablePublicationActivation,
+        catalog: Arc<ContentCatalog>,
+        frontend: &'static FrontendAssetManifest,
+        ledger: &PublicLedgerProjection,
+        tip_recipient: Option<&TipRecipientProjection>,
+        site: SiteHead,
+    ) -> Result<Self, PublicationActivationError> {
+        let view = activation.publication.view();
+        let selected = select_stored_post(&catalog, view)?;
+        let published_at = validate_activating(view, &selected)?;
+        if site.digest == activation.candidate_site_digest {
+            return Err(PublicationActivationError::DurableStateMismatch);
+        }
+        require_accepted_preview(
+            reproduce_preview_digest(&catalog, frontend, ledger, tip_recipient, &selected)?,
+            &activation.accepted_preview_digest,
+        )?;
+        let candidate = build_candidate(
+            catalog,
+            frontend,
+            ledger,
+            tip_recipient,
+            &selected,
+            published_at,
+        )?;
+        if candidate.already_published {
+            return Err(PublicationActivationError::DurableStateMismatch);
+        }
+        require_candidate_digest(&candidate, &activation.candidate_site_digest)?;
+        Ok(Self {
+            begun: BegunPublication {
+                publication_id: activation.publication_id,
+                publication: activation.publication,
+                site,
+                content_digest: activation.content_digest,
+                accepted_preview_digest: activation.accepted_preview_digest,
+                candidate_site_digest: activation.candidate_site_digest,
+            },
+            selected,
+            candidate,
+        })
+    }
 }
 
 enum PublicationReview {
@@ -836,7 +889,7 @@ impl PublicationCoordinator {
         let tip_recipient = self.profiles.effective_tip_recipient().await?;
         let shell = render_site_shell(Arc::clone(&self.catalog), self.frontend, &self.ledger)?
             .bind_tip_recipient(tip_recipient.clone());
-        let snapshot = build_site_snapshot(shell, &self.ledger)?;
+        let snapshot = shell.into_snapshot()?;
         self.activator
             .activate(&self.site.digest, snapshot)
             .map_err(|_| ProfileTransitionError::SnapshotActivationConflict)?;
@@ -1492,41 +1545,18 @@ impl PublicationCoordinator {
         Ok(published)
     }
 
-    /// Reconciles a durable `Activating` publication before listeners are bound.
+    /// Installs the preflighted `Activating` publication before listeners are bound.
     pub(crate) async fn recover(
         &mut self,
-        activation: RecoverablePublicationActivation,
+        prepared: PreparedPublicationRecovery,
     ) -> Result<PublishedPublication, PublicationActivationError> {
         let mut safety = FailClosedGuard::new(&self.readiness, &self.cancellation);
-        let view = activation.publication.view();
-        let catalog = self.catalog_for_content_digest(&activation.content_digest)?;
-        let selected = select_stored_post(&catalog, view)?;
-        require_accepted_preview(
-            reproduce_preview_digest(
-                &catalog,
-                self.frontend,
-                &self.ledger,
-                self.tip_recipient.as_ref(),
-                &selected,
-            )?,
-            &activation.accepted_preview_digest,
-        )?;
+        let PreparedPublicationRecovery {
+            begun,
+            selected,
+            candidate,
+        } = prepared;
         self.ensure_routes_available(&selected).await?;
-        let candidate = self.candidate_for_begun(
-            catalog,
-            &selected,
-            view,
-            &activation.candidate_site_digest,
-            None,
-        )?;
-        let begun = BegunPublication {
-            publication_id: activation.publication_id,
-            publication: activation.publication,
-            site: self.site.clone(),
-            content_digest: activation.content_digest,
-            accepted_preview_digest: activation.accepted_preview_digest,
-            candidate_site_digest: activation.candidate_site_digest,
-        };
         self.activate_and_finish(begun, selected, candidate, &mut safety)
             .await
     }
@@ -1558,10 +1588,7 @@ impl PublicationCoordinator {
         {
             return Err(PublicationActivationError::DurableStateMismatch);
         }
-        validate_activating(publication, selected)?;
-        let published_at = publication
-            .activation_started_at
-            .ok_or(PublicationActivationError::DurableStateMismatch)?;
+        let published_at = validate_activating(publication, selected)?;
         let candidate = match prebuilt {
             Some(prebuilt)
                 if prebuilt.published_at == published_at && prebuilt.digest == *stored_digest =>
@@ -1804,7 +1831,7 @@ fn build_candidate(
     };
     let shell =
         render_site_shell(catalog, frontend, &ledger)?.bind_tip_recipient(tip_recipient.cloned());
-    let snapshot = build_site_snapshot(shell, &ledger)?;
+    let snapshot = shell.into_snapshot()?;
     let digest = snapshot.digest.clone();
     Ok(CandidateSnapshot {
         ledger,
@@ -1818,14 +1845,15 @@ fn build_candidate(
 fn validate_activating(
     publication: &super::CanonicalPublicationView,
     selected: &SelectedPost,
-) -> Result<(), PublicationActivationError> {
+) -> Result<OffsetDateTime, PublicationActivationError> {
     if publication.stable_post_id != selected.stable_post_id
         || publication.pinned_post_digest != selected.revision
-        || publication.activation_started_at.is_none()
     {
         return Err(PublicationActivationError::DurableStateMismatch);
     }
-    Ok(())
+    publication
+        .activation_started_at
+        .ok_or(PublicationActivationError::DurableStateMismatch)
 }
 
 fn require_candidate_digest(
@@ -2219,9 +2247,7 @@ mod tests {
             snapshot_store,
         },
     };
-    use markdown_compiler::{
-        DiscoveredPost, LogicalAssetPath, PostCollection, resolve_content_assets,
-    };
+    use markdown_compiler::{DiscoveredPost, LogicalAssetPath, PostCollection, prepare_content};
 
     use crate::content_fixtures::{asset, content_tree, post, publication};
 
@@ -2338,9 +2364,8 @@ mod tests {
             Vec::new(),
             0,
         );
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        Arc::new(compile_content_catalog(&content, &assets).unwrap())
+        let content = prepare_content(&tree).unwrap();
+        Arc::new(compile_content_catalog(&content).unwrap())
     }
 
     fn compile_catalog(posts: Vec<DiscoveredPost>) -> Arc<ContentCatalog> {
@@ -2361,9 +2386,8 @@ mod tests {
             Vec::new(),
             0,
         );
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        Arc::new(compile_content_catalog(&content, &assets).unwrap())
+        let content = prepare_content(&tree).unwrap();
+        Arc::new(compile_content_catalog(&content).unwrap())
     }
 
     fn catalog_with_site_candidate(title: &str, favicon_bytes: &[u8]) -> Arc<ContentCatalog> {
@@ -2393,9 +2417,8 @@ mod tests {
             )],
             0,
         );
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        Arc::new(compile_content_catalog(&content, &assets).unwrap())
+        let content = prepare_content(&tree).unwrap();
+        Arc::new(compile_content_catalog(&content).unwrap())
     }
 
     fn post_source(id: &str, slug: &str, draft: bool) -> String {
@@ -2435,7 +2458,7 @@ mod tests {
 
     fn snapshot(catalog: &Arc<ContentCatalog>, ledger: &PublicLedgerProjection) -> SiteSnapshot {
         let shell = render_site_shell(Arc::clone(catalog), embedded_manifest(), ledger).unwrap();
-        build_site_snapshot(shell, ledger).unwrap()
+        shell.into_snapshot().unwrap()
     }
 
     fn snapshot_asset<'snapshot>(

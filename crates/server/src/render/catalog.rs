@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use markdown_compiler::{
     AssetRevisionReference, LogicalAssetPath, LogicalContentPath, PostId, PostRevisionDigest,
-    PublicationSettings, ResolvedContentAssets, ResolvedLocalAssetLookupError,
-    ResolvedLocalAssetStore, ResolvedPostAssetLookupError, ResolvedSiteAssets, ValidatedContent,
+    PreparedContent, PublicationSettings, ResolvedLocalAssetLookupError, ResolvedLocalAssetStore,
+    ResolvedSiteAssets,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -11,18 +11,17 @@ use thiserror::Error;
 use super::{
     MarkdownRenderError, RenderedPost,
     diagram::{DiagramRenderError, MermaidDiagramRenderer},
-    markdown::render_markdown_with_diagrams,
+    markdown::render_prepared_post,
 };
 #[cfg(test)]
 use markdown_compiler::{DigestedAsset, ResolvedPostAssets};
 
 /// Compile one validated candidate into a self-contained immutable catalog.
 pub fn compile_content_catalog(
-    content: &ValidatedContent,
-    assets: &ResolvedContentAssets,
+    content: &PreparedContent,
 ) -> Result<ContentCatalog, CatalogBuildError> {
     let compiler = ContentCompiler::discover().map_err(CatalogBuildError::compiler)?;
-    compiler.compile(content, assets)
+    compiler.compile(content)
 }
 
 /// One application-owned compilation capability with shared renderer admission.
@@ -42,11 +41,37 @@ impl ContentCompiler {
 
     pub(crate) fn compile(
         &self,
-        content: &ValidatedContent,
-        assets: &ResolvedContentAssets,
+        content: &PreparedContent,
     ) -> Result<ContentCatalog, CatalogBuildError> {
-        compile_content_catalog_with(content, assets, |document, post_assets, site_assets| {
-            render_markdown_with_diagrams(document, post_assets, site_assets, &self.diagrams)
+        let content = content.view();
+        let local_assets = Arc::new(content.local_assets.clone());
+        let mut current_revisions = BTreeMap::new();
+        let mut revisions = BTreeMap::new();
+
+        for post in content.posts {
+            let rendered = render_prepared_post(post, content.site_assets, &self.diagrams)
+                .map_err(CatalogBuildError::render)?;
+            let key = (
+                rendered.document.metadata.id.clone(),
+                rendered.revision.clone(),
+            );
+            // Preparation guarantees one document per post ID.
+            current_revisions.insert(key.0.clone(), key.1.clone());
+            revisions.insert(
+                key,
+                CatalogRevision {
+                    rendered: Arc::new(rendered),
+                    local_assets: Arc::clone(&local_assets),
+                },
+            );
+        }
+
+        Ok(ContentCatalog {
+            publication: content.publication.clone(),
+            site_assets: content.site_assets.clone(),
+            local_assets,
+            current_revisions,
+            revisions,
         })
     }
 }
@@ -55,58 +80,6 @@ impl ContentCompiler {
 pub(crate) enum ContentCompilerInitializationError {
     #[error("initialize the supervised Mermaid renderer")]
     Diagram(#[source] DiagramRenderError),
-}
-
-fn compile_content_catalog_with(
-    content: &ValidatedContent,
-    assets: &ResolvedContentAssets,
-    mut render: impl FnMut(
-        &markdown_compiler::PostDocument,
-        &markdown_compiler::ResolvedPostAssets,
-        &ResolvedSiteAssets,
-    ) -> Result<RenderedPost, MarkdownRenderError>,
-) -> Result<ContentCatalog, CatalogBuildError> {
-    if assets.posts.len() != content.posts.len() {
-        return Err(CatalogBuildError::candidate_source_mismatch());
-    }
-    let site_assets = assets
-        .site_assets_for(&content.publication)
-        .map_err(|error| CatalogBuildError::publication_assets(error.to_string()))?;
-    let local_assets = Arc::new(assets.local_assets.clone());
-    let mut current_revisions = BTreeMap::new();
-    let mut revisions = BTreeMap::new();
-
-    for document in &content.posts {
-        let post_assets = assets
-            .assets_for(document)
-            .map_err(|error| CatalogBuildError::post_assets(document.path.clone(), error))?;
-        let rendered =
-            render(document, post_assets, site_assets).map_err(CatalogBuildError::render)?;
-        let key = (
-            rendered.document.metadata.id.clone(),
-            rendered.revision.clone(),
-        );
-        if current_revisions
-            .insert(key.0.clone(), key.1.clone())
-            .is_some()
-        {
-            return Err(CatalogBuildError::duplicate(key));
-        }
-        let revision = CatalogRevision {
-            rendered: Arc::new(rendered),
-            local_assets: Arc::clone(&local_assets),
-        };
-        // The unique current post ID also makes this (post, revision) key unique.
-        revisions.insert(key, revision);
-    }
-
-    Ok(ContentCatalog {
-        publication: content.publication.clone(),
-        site_assets: site_assets.clone(),
-        local_assets,
-        current_revisions,
-        revisions,
-    })
 }
 
 /// Current candidate revisions plus exact retained historical render inputs.
@@ -221,11 +194,7 @@ pub(crate) struct CatalogRetentionError {
 #[serde(rename_all = "snake_case")]
 pub enum CatalogBuildErrorCode {
     ContentCompilerUnavailable,
-    CandidateSourceMismatch,
-    PublicationAssetsUnavailable,
-    PostAssetsUnavailable,
     PostRenderFailed,
-    DuplicateRevision,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize)]
@@ -245,48 +214,11 @@ impl CatalogBuildError {
         }
     }
 
-    fn post_assets(path: LogicalContentPath, error: ResolvedPostAssetLookupError) -> Self {
-        Self {
-            path,
-            code: CatalogBuildErrorCode::PostAssetsUnavailable,
-            message: error.to_string().into_boxed_str(),
-        }
-    }
-
-    fn publication_assets(message: String) -> Self {
-        Self {
-            path: LogicalContentPath::new("publication.toml"),
-            code: CatalogBuildErrorCode::PublicationAssetsUnavailable,
-            message: message.into_boxed_str(),
-        }
-    }
-
-    fn candidate_source_mismatch() -> Self {
-        Self {
-            path: LogicalContentPath::new("<content-catalog>"),
-            code: CatalogBuildErrorCode::CandidateSourceMismatch,
-            message: "resolved content assets and validated content contain different post sets"
-                .into(),
-        }
-    }
-
     fn render(error: MarkdownRenderError) -> Self {
         Self {
             path: error.path.clone(),
             code: CatalogBuildErrorCode::PostRenderFailed,
             message: error.to_string().into_boxed_str(),
-        }
-    }
-
-    fn duplicate(key: (PostId, PostRevisionDigest)) -> Self {
-        Self {
-            path: LogicalContentPath::new("<content-catalog>"),
-            code: CatalogBuildErrorCode::DuplicateRevision,
-            message: format!(
-                "post {} contains duplicate rendered revision {}",
-                key.0, key.1
-            )
-            .into_boxed_str(),
         }
     }
 }
@@ -297,16 +229,14 @@ mod tests {
     use crate::domain::publication::PublicLedgerProjection;
     use crate::domain::publication::PublishedPostRevision;
     use crate::frontend_assets::embedded_manifest;
-    use crate::render::{
-        SiteSnapshotBuildErrorCode, build_site_snapshot, render_site_shell, snapshot_store,
-    };
+    use crate::render::{SiteSnapshotBuildErrorCode, render_site_shell, snapshot_store};
     use markdown_compiler::{
         DiscoveredContentTree, LogicalAssetPath, PostCollection, SiteSnapshotDigest,
-        resolve_content_assets,
+        prepare_content,
     };
     use time::{Date, Month, OffsetDateTime, Time};
 
-    use crate::content_fixtures::{asset, content_tree, post, publication, validated_content};
+    use crate::content_fixtures::{asset, content_tree, post, publication};
 
     const FIRST_ID: &str = "4f054633-2d09-4b05-97d0-c6f0011a5199";
     const SECOND_ID: &str = "7d97b17a-686d-46f4-ad77-234f4973c69a";
@@ -380,9 +310,8 @@ mod tests {
     }
 
     fn compile_tree(tree: DiscoveredContentTree) -> ContentCatalog {
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        compile_content_catalog(&content, &assets).unwrap()
+        let content = prepare_content(&tree).unwrap();
+        compile_content_catalog(&content).unwrap()
     }
 
     fn compile(title: &str, origins: &[&str]) -> ContentCatalog {
@@ -514,68 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_rejects_publication_asset_cross_wiring_before_rendering() {
-        let source = tree("Source", &[], false);
-        let source_content = source.validate().unwrap();
-        let source_assets = resolve_content_assets(&source, &source_content).unwrap();
-        let other = tree("Different publication", &[], false);
-        let other_content = other.validate().unwrap();
-
-        let error = compile_content_catalog(&other_content, &source_assets).unwrap_err();
-        assert_eq!(
-            error.code,
-            CatalogBuildErrorCode::PublicationAssetsUnavailable
-        );
-    }
-
-    #[test]
-    fn catalog_rejects_asset_bundle_with_ignored_posts_and_bytes() {
-        let source = tree("Catalog", &[], true);
-        let full_content = source.validate().unwrap();
-        let full_assets = resolve_content_assets(&source, &full_content).unwrap();
-        let second = LogicalAssetPath::parse("assets/second.pdf").unwrap();
-        let second_document = full_content
-            .posts
-            .iter()
-            .find(|document| document.metadata.id.as_str() == SECOND_ID)
-            .unwrap();
-        let second_assets = full_assets.assets_for(second_document).unwrap();
-        let second_reference = local_asset_reference(second_assets, &second);
-        assert_eq!(
-            resolved_bytes(&full_assets.local_assets, second_reference),
-            b"second"
-        );
-        let subset = validated_content(
-            full_content.publication.clone(),
-            vec![full_content.posts[0].clone()],
-        );
-
-        let error = compile_content_catalog(&subset, &full_assets).unwrap_err();
-        assert_eq!(error.code, CatalogBuildErrorCode::CandidateSourceMismatch);
-    }
-
-    #[test]
-    fn catalog_rejects_post_source_cross_wiring() {
-        let source = tree("Catalog", &[], false);
-        let source_content = source.validate().unwrap();
-        let source_assets = resolve_content_assets(&source, &source_content).unwrap();
-
-        let changed = content_tree(
-            publication("publication.toml", publication_source("Catalog", &[])),
-            vec![post(
-                "drafts/first.md",
-                PostCollection::Drafts,
-                post_source(FIRST_ID, "first-post", "Changed source.\n", true),
-            )],
-            vec![],
-            0,
-        );
-        let changed_content = changed.validate().unwrap();
-        let error = compile_content_catalog(&changed_content, &source_assets).unwrap_err();
-        assert_eq!(error.code, CatalogBuildErrorCode::PostAssetsUnavailable);
-    }
-
-    #[test]
     fn equal_public_keys_from_different_policies_remain_candidate_scoped() {
         let old = compile(
             "Catalog",
@@ -598,26 +465,6 @@ mod tests {
         current_post
             .project_for_snapshot(&snapshot, &current.site_assets, &current.local_assets)
             .unwrap();
-    }
-
-    #[test]
-    fn catalog_error_wire_contract_is_stable() {
-        let source = tree("Catalog", &[], true);
-        let full_content = source.validate().unwrap();
-        let full_assets = resolve_content_assets(&source, &full_content).unwrap();
-        let subset = validated_content(
-            full_content.publication.clone(),
-            vec![full_content.posts[0].clone()],
-        );
-        let error = compile_content_catalog(&subset, &full_assets).unwrap_err();
-        assert_eq!(
-            serde_json::to_value(error).unwrap(),
-            serde_json::json!({
-                "path": "<content-catalog>",
-                "code": "candidate_source_mismatch",
-                "message": "resolved content assets and validated content contain different post sets"
-            })
-        );
     }
 
     #[test]
@@ -650,7 +497,7 @@ mod tests {
         .unwrap();
         let valid_shell =
             render_site_shell(Arc::new(catalog.clone()), embedded_manifest(), &ledger).unwrap();
-        let active = build_site_snapshot(valid_shell, &ledger).unwrap();
+        let active = valid_shell.into_snapshot().unwrap();
         let (reader, _activator) = snapshot_store(active);
         let before = reader.load_full();
 
@@ -680,24 +527,8 @@ mod tests {
                 "content_compiler_unavailable",
             ),
             (
-                CatalogBuildErrorCode::CandidateSourceMismatch,
-                "candidate_source_mismatch",
-            ),
-            (
-                CatalogBuildErrorCode::PublicationAssetsUnavailable,
-                "publication_assets_unavailable",
-            ),
-            (
-                CatalogBuildErrorCode::PostAssetsUnavailable,
-                "post_assets_unavailable",
-            ),
-            (
                 CatalogBuildErrorCode::PostRenderFailed,
                 "post_render_failed",
-            ),
-            (
-                CatalogBuildErrorCode::DuplicateRevision,
-                "duplicate_revision",
             ),
         ] {
             assert_eq!(serde_json::to_value(value).unwrap(), expected);

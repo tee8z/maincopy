@@ -25,8 +25,7 @@ use maincopy_shared::{
     },
     source::{
         BeginSourceSyncResponse, SourceStatusResponse, SourceSyncAdmission, SourceSyncFailureCode,
-        SourceSyncId, SourceSyncOutcome, SourceSyncResource, valid_source_commit,
-        valid_source_content_digest,
+        SourceSyncId, SourceSyncOutcome, SourceSyncResource,
     },
 };
 use serde::Serialize;
@@ -490,7 +489,7 @@ async fn complete_source_sync(
 ) -> Result<SourceSyncResource, CliError> {
     match disposition {
         SourceSyncDisposition::Async => {
-            validate_source_sync(&sync, idempotency_key)?;
+            source_sync_finished(&sync, idempotency_key)?;
             Ok(sync)
         }
         SourceSyncDisposition::Wait => wait_for_source_sync(client, sync, idempotency_key).await,
@@ -543,7 +542,7 @@ where
     let requested_at = initial.requested_at;
     let mut previous_version = initial.version;
     let mut previous_updated_at = initial.updated_at;
-    if validate_source_sync(&initial, idempotency_key)? {
+    if source_sync_finished(&initial, idempotency_key)? {
         return Ok(initial);
     }
 
@@ -576,7 +575,7 @@ where
         }
         previous_version = current.version;
         previous_updated_at = current.updated_at;
-        if validate_source_sync(&current, idempotency_key)? {
+        if source_sync_finished(&current, idempotency_key)? {
             return Ok(current);
         }
     }
@@ -587,73 +586,15 @@ where
     })
 }
 
-fn validate_source_sync(
+fn source_sync_finished(
     sync: &SourceSyncResource,
     idempotency_key: Uuid,
 ) -> Result<bool, CliError> {
-    let invalid = |message| invalid_source_sync(idempotency_key, sync.source_sync_id, message);
-    if sync.version == 0 {
-        return Err(invalid("operation version must be positive"));
-    }
-    if sync.updated_at < sync.requested_at {
-        return Err(invalid("updated_at precedes requested_at"));
-    }
-    if sync
-        .source_commit
-        .as_deref()
-        .is_some_and(|source_commit| !valid_source_commit(source_commit))
-    {
-        return Err(invalid("source_commit is not a canonical Git object ID"));
-    }
-    if sync
-        .content_digest
-        .as_deref()
-        .is_some_and(|digest| !valid_source_content_digest(digest))
-    {
-        return Err(invalid("content_digest is not a typed content digest"));
-    }
-
-    match (sync.outcome, sync.finished_at) {
-        (None, None) => {
-            if sync.failure_code.is_some() {
-                return Err(invalid(
-                    "non-terminal operation contains a terminal failure code",
-                ));
-            }
-            Ok(false)
-        }
-        (None, Some(_)) | (Some(_), None) => Err(invalid(
-            "outcome and finished_at must either both be present or both be absent",
-        )),
-        (Some(outcome), Some(finished_at)) => {
-            if finished_at < sync.updated_at {
-                return Err(invalid("finished_at precedes updated_at"));
-            }
-            match outcome {
-                SourceSyncOutcome::Applied | SourceSyncOutcome::NoChange => {
-                    if sync.failure_code.is_some() {
-                        return Err(invalid("successful operation contains a failure code"));
-                    }
-                    if sync.source_commit.is_none() || sync.content_digest.is_none() {
-                        return Err(invalid(
-                            "successful operation is missing its commit or content digest",
-                        ));
-                    }
-                    Ok(true)
-                }
-                SourceSyncOutcome::Failed => {
-                    if sync.failure_code.is_none() {
-                        return Err(invalid("failed operation does not contain a failure code"));
-                    }
-                    Err(terminal_source_sync_failure(sync, idempotency_key, outcome))
-                }
-                SourceSyncOutcome::Cancelled => {
-                    if sync.failure_code.is_some() {
-                        return Err(invalid("cancelled operation contains a failure code"));
-                    }
-                    Err(terminal_source_sync_failure(sync, idempotency_key, outcome))
-                }
-            }
+    match sync.outcome {
+        None => Ok(false),
+        Some(SourceSyncOutcome::Applied | SourceSyncOutcome::NoChange) => Ok(true),
+        Some(outcome @ (SourceSyncOutcome::Failed | SourceSyncOutcome::Cancelled)) => {
+            Err(terminal_source_sync_failure(sync, idempotency_key, outcome))
         }
     }
 }
@@ -1096,7 +1037,7 @@ fn write_source_sync(
     sync: SourceSyncResource,
     json: bool,
 ) -> Result<(), CliError> {
-    validate_source_sync(&sync, idempotency_key)?;
+    source_sync_finished(&sync, idempotency_key)?;
     if json {
         #[derive(Serialize)]
         struct SourceSyncOutput<'sync> {
@@ -2344,7 +2285,7 @@ mod tests {
     fn source_sync_failures_report_safe_details_and_recovery_identities() {
         let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
         let failed = source_sync_resource("fetching", Some(SourceSyncOutcome::Failed), 2);
-        let error = validate_source_sync(&failed, idempotency_key).unwrap_err();
+        let error = source_sync_finished(&failed, idempotency_key).unwrap_err();
         let exit = error_exit(&error);
 
         let mut json_output = Vec::new();
@@ -2368,132 +2309,22 @@ mod tests {
     }
 
     #[test]
-    fn source_sync_validation_rejects_untrusted_or_incomplete_terminal_metadata() {
+    fn source_sync_outcomes_control_completion() {
         let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
-
-        let mut invalid_commit =
-            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
-        invalid_commit.source_commit = Some("not-a-commit\n".into());
-        assert!(matches!(
-            validate_source_sync(&invalid_commit, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse { .. })
-        ));
-
-        let mut missing_digest =
-            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
-        missing_digest.content_digest = None;
-        assert!(matches!(
-            validate_source_sync(&missing_digest, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse { .. })
-        ));
-
-        let mut incomplete_no_change =
-            source_sync_resource("resolving_commit", Some(SourceSyncOutcome::NoChange), 2);
-        incomplete_no_change.content_digest = None;
-        assert!(matches!(
-            validate_source_sync(&incomplete_no_change, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse { .. })
-        ));
-
-        let mut cancelled = source_sync_resource("fetching", Some(SourceSyncOutcome::Cancelled), 2);
-        cancelled.failure_code = Some(SourceSyncFailureCode::Internal);
-        assert!(matches!(
-            validate_source_sync(&cancelled, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse { .. })
-        ));
-    }
-
-    #[test]
-    fn source_sync_validation_rejects_impossible_lifecycle_metadata() {
-        let idempotency_key = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
-
-        let mut zero_version = source_sync_resource("queued", None, 1);
-        zero_version.version = 0;
-        assert!(matches!(
-            validate_source_sync(&zero_version, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse {
-                message: "operation version must be positive",
-                ..
-            })
-        ));
-
-        let mut backwards_update = source_sync_resource("queued", None, 1);
-        backwards_update.updated_at = backwards_update.requested_at - time::Duration::SECOND;
-        assert!(matches!(
-            validate_source_sync(&backwards_update, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse {
-                message: "updated_at precedes requested_at",
-                ..
-            })
-        ));
-
-        let mut invalid_digest = source_sync_resource("queued", None, 1);
-        invalid_digest.content_digest = Some("content-b3-v1-not-a-digest".into());
-        assert!(matches!(
-            validate_source_sync(&invalid_digest, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse {
-                message: "content_digest is not a typed content digest",
-                ..
-            })
-        ));
-
-        let mut unfinished_with_outcome =
-            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
-        unfinished_with_outcome.finished_at = None;
-        assert!(matches!(
-            validate_source_sync(&unfinished_with_outcome, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse {
-                message: "outcome and finished_at must either both be present or both be absent",
-                ..
-            })
-        ));
-
-        let mut unfinished_with_failure = source_sync_resource("fetching", None, 2);
-        unfinished_with_failure.failure_code = Some(SourceSyncFailureCode::Internal);
-        assert!(matches!(
-            validate_source_sync(&unfinished_with_failure, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse {
-                message: "non-terminal operation contains a terminal failure code",
-                ..
-            })
-        ));
-
-        let mut backwards_finish =
-            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
-        backwards_finish.finished_at = Some(backwards_finish.updated_at - time::Duration::SECOND);
-        assert!(matches!(
-            validate_source_sync(&backwards_finish, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse {
-                message: "finished_at precedes updated_at",
-                ..
-            })
-        ));
-
-        let mut successful_with_failure =
-            source_sync_resource("reloading", Some(SourceSyncOutcome::Applied), 2);
-        successful_with_failure.failure_code = Some(SourceSyncFailureCode::Internal);
-        assert!(matches!(
-            validate_source_sync(&successful_with_failure, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse {
-                message: "successful operation contains a failure code",
-                ..
-            })
-        ));
-
-        let mut failed_without_code =
-            source_sync_resource("fetching", Some(SourceSyncOutcome::Failed), 2);
-        failed_without_code.failure_code = None;
-        assert!(matches!(
-            validate_source_sync(&failed_without_code, idempotency_key),
-            Err(CliError::InvalidSourceSyncResponse {
-                message: "failed operation does not contain a failure code",
-                ..
-            })
-        ));
-
+        for (stage, outcome, finished) in [
+            ("queued", None, false),
+            ("reloading", Some(SourceSyncOutcome::Applied), true),
+            ("resolving_commit", Some(SourceSyncOutcome::NoChange), true),
+        ] {
+            let sync = source_sync_resource(stage, outcome, 2);
+            assert_eq!(
+                source_sync_finished(&sync, idempotency_key).unwrap(),
+                finished
+            );
+        }
         let cancelled = source_sync_resource("fetching", Some(SourceSyncOutcome::Cancelled), 2);
         assert!(matches!(
-            validate_source_sync(&cancelled, idempotency_key),
+            source_sync_finished(&cancelled, idempotency_key),
             Err(CliError::SourceSyncTerminalFailure {
                 outcome: "cancelled",
                 failure_code: None,

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use axum::{
     Extension, Json,
     extract::{
-        DefaultBodyLimit, Path, Query,
+        DefaultBodyLimit, Path, Query, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header::CACHE_CONTROL},
@@ -32,7 +32,7 @@ use utoipa_axum::{
 use uuid::Uuid;
 
 use super::{
-    AdminSecurityState, BrowserSessionContext,
+    AdminRuntimeState, AdminSecurityState, BrowserSessionContext,
     idempotency::{IdempotencyKeyError, parse_idempotency_key},
     principal::{AdminAuthentication, AdminPrincipal},
     problem::{AdminProblem, AdminProblemEnvelope, problem_response},
@@ -60,52 +60,52 @@ const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 const RETRY_AFTER_ONE_SECOND: HeaderValue = HeaderValue::from_static("1");
 
-pub(super) fn user_read_routes() -> UtoipaMethodRouter {
+pub(super) fn user_read_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(list_users)
 }
 
-pub(super) fn user_item_read_routes() -> UtoipaMethodRouter {
+pub(super) fn user_item_read_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_user)
 }
 
-pub(super) fn user_create_routes() -> UtoipaMethodRouter {
+pub(super) fn user_create_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(create_user).layer(DefaultBodyLimit::max(IDENTITY_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn user_status_routes() -> UtoipaMethodRouter {
+pub(super) fn user_status_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(set_user_status).layer(DefaultBodyLimit::max(IDENTITY_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn user_role_routes() -> UtoipaMethodRouter {
+pub(super) fn user_role_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(replace_user_roles).layer(DefaultBodyLimit::max(IDENTITY_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn human_credential_routes() -> UtoipaMethodRouter {
+pub(super) fn human_credential_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(put_human_credential, remove_human_credential)
         .layer(DefaultBodyLimit::max(IDENTITY_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn agent_read_routes() -> UtoipaMethodRouter {
+pub(super) fn agent_read_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(list_agent_credentials)
 }
 
-pub(super) fn agent_item_read_routes() -> UtoipaMethodRouter {
+pub(super) fn agent_item_read_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_agent_credential)
 }
 
-pub(super) fn agent_registration_routes() -> UtoipaMethodRouter {
+pub(super) fn agent_registration_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(register_agent_credential).layer(DefaultBodyLimit::max(IDENTITY_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn agent_scope_routes() -> UtoipaMethodRouter {
+pub(super) fn agent_scope_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(replace_agent_scopes).layer(DefaultBodyLimit::max(IDENTITY_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn agent_revocation_routes() -> UtoipaMethodRouter {
+pub(super) fn agent_revocation_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(revoke_agent_credential).layer(DefaultBodyLimit::max(IDENTITY_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn audit_routes() -> UtoipaMethodRouter {
+pub(super) fn audit_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(list_audit_events)
 }
 
@@ -404,7 +404,7 @@ async fn set_user_status(
     Extension(security): Extension<AdminSecurityState>,
     principal: AdminPrincipal,
     browser: Option<Extension<BrowserSessionContext>>,
-    coordinator: Option<Extension<PublicationCoordinatorHandle>>,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
     request: Result<Json<SetUserStatusRequest>, JsonRejection>,
@@ -439,13 +439,6 @@ async fn set_user_status(
     {
         return response;
     }
-    let Some(Extension(coordinator)) = coordinator else {
-        tracing::error!(
-            %request_id,
-            "user status mutation rejected without an available tip presentation coordinator"
-        );
-        return problem(identity_unavailable(), request_id);
-    };
     match coordinator
         .set_user_status(
             security.store.clone(),

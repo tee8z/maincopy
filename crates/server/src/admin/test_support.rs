@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 use axum::{
     Router,
@@ -19,6 +23,8 @@ use tower::ServiceExt as _;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use markdown_compiler::prepare_content;
+
 use maincopy_shared::{
     auth::{AdminAuditEventId, AdminScope, AgentCredentialId, InstanceId, UserId},
     auth_api::{CSRF_COOKIE_NAME, SESSION_COOKIE_NAME},
@@ -26,13 +32,15 @@ use maincopy_shared::{
 };
 
 use super::{
-    AdminSecurityState, AdminSessionPolicy, admin_router, origin::AdminOrigin, runtime_admin_router,
+    AdminRuntimeState, AdminSecurityState, AdminSessionPolicy, origin::AdminOrigin,
+    runtime_admin_router,
 };
 use crate::{
     config::{
         DatabaseBusyTimeout, DatabaseConfigurationView, DatabaseReadPoolSize,
         DatabaseWriterQueueCapacity,
     },
+    content_fixtures::{content_tree, publication},
     database::{self, store::DatabaseStore},
     domain::{
         auth::{
@@ -43,9 +51,16 @@ use crate::{
                 RegisterAgentCredential,
             },
         },
-        publication::activation::PublicationCoordinatorHandle,
+        publication::{
+            PublicLedgerProjection,
+            activation::{PublicationCoordinator, PublicationCoordinatorHandle},
+            store::InstallStartupSnapshot,
+        },
     },
+    frontend_assets::embedded_manifest,
+    render::{compile_content_catalog, render_site_shell, snapshot_store},
     source_sync::SourceSyncHandle,
+    web::Readiness,
 };
 
 pub(crate) const ADMIN_ORIGIN: &str = "https://admin.example.test";
@@ -64,9 +79,89 @@ pub(crate) struct BrowserSession {
     csrf_token: Zeroizing<String>,
 }
 
+/// Complete, live runtime state for router tests, backed by the fixture's database.
+pub(crate) struct AdminTestRuntime {
+    pub(crate) state: AdminRuntimeState,
+    cancellation: CancellationToken,
+    actor: Option<JoinHandle<()>>,
+}
+
+impl AdminTestRuntime {
+    pub(crate) async fn start(store: &DatabaseStore) -> Self {
+        let tree = content_tree(
+            publication("publication.toml", "[site]\ntitle = \"Admin test\"\nbase_url = \"https://example.test/\"\ndescription = \"Admin router fixture.\"\n[author]\nname = \"Test author\"\n".into()),
+            Vec::new(), Vec::new(), 0,
+        );
+        let content_digest = tree.digest();
+        let prepared = prepare_content(&tree).expect("admin fixture content must prepare");
+        let catalog =
+            Arc::new(compile_content_catalog(&prepared).expect("admin fixture must compile"));
+        let ledger = PublicLedgerProjection::empty();
+        let snapshot = render_site_shell(Arc::clone(&catalog), embedded_manifest(), &ledger)
+            .expect("admin fixture must render")
+            .into_snapshot()
+            .expect("admin fixture snapshot must build");
+        let site = store
+            .publications
+            .install_startup_snapshot(InstallStartupSnapshot {
+                expected: None,
+                candidate_digest: snapshot.digest.clone(),
+                activated_at: OffsetDateTime::now_utc(),
+                source_commit: None,
+                posts: Vec::new(),
+            })
+            .await
+            .expect("admin fixture site must install");
+        let (_, activator) = snapshot_store(snapshot);
+        let coordinator = PublicationCoordinator {
+            catalog: Arc::clone(&catalog),
+            content_digest: content_digest.clone(),
+            candidates: Arc::new(BTreeMap::from([(content_digest, catalog)])),
+            ledger,
+            site,
+            activator,
+            store: store.publications.clone(),
+            profiles: store.profiles.clone(),
+            tip_recipient: None,
+            frontend: embedded_manifest(),
+            source_commit: None,
+            scheduled: BTreeMap::new(),
+            scheduler_wakeup: Arc::new(tokio::sync::Notify::new()),
+            readiness: Readiness::new(true),
+            cancellation: CancellationToken::new(),
+        };
+        let (publications, actor) = coordinator.into_actor(8);
+        let cancellation = CancellationToken::new();
+        let actor_cancellation = cancellation.clone();
+        let actor = tokio::spawn(async move {
+            actor
+                .run(actor_cancellation)
+                .await
+                .expect("admin fixture actor must stop cleanly");
+        });
+        Self {
+            state: AdminRuntimeState {
+                publications,
+                profiles: store.profiles.clone(),
+                source: SourceSyncHandle::external_checkout(store.source.clone()),
+            },
+            cancellation,
+            actor: Some(actor),
+        }
+    }
+
+    pub(crate) async fn stop_actor(&mut self) {
+        self.cancellation.cancel();
+        if let Some(actor) = self.actor.take() {
+            actor.await.expect("admin fixture actor must join");
+        }
+    }
+}
+
 pub(crate) struct ProtectedAdminHarness {
     _root: tempfile::TempDir,
     state: AdminSecurityState,
+    pub(crate) runtime: AdminTestRuntime,
     store: DatabaseStore,
     signing_key: SigningKey,
     shutdown: CancellationToken,
@@ -167,8 +262,10 @@ impl ProtectedAdminHarness {
         .await
         .expect("admin test security must initialize");
 
+        let runtime = AdminTestRuntime::start(&store).await;
         Self {
             _root: root,
+            runtime,
             state,
             store,
             signing_key,
@@ -187,7 +284,7 @@ impl ProtectedAdminHarness {
     }
 
     pub(crate) fn router(&self) -> Router {
-        admin_router(self.state.clone())
+        self.runtime_router(self.runtime.state.publications.clone())
     }
 
     pub(crate) fn request(
@@ -243,7 +340,12 @@ impl ProtectedAdminHarness {
         BrowserSession::from_login_headers(response.headers())
     }
 
-    pub(crate) async fn stop(self) {
+    pub(crate) async fn stop_publications(&mut self) {
+        self.runtime.stop_actor().await;
+    }
+
+    pub(crate) async fn stop(mut self) {
+        self.runtime.stop_actor().await;
         self.shutdown.cancel();
         drop(self.state);
         drop(self.store);

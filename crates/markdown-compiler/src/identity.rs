@@ -270,8 +270,10 @@ pub(crate) fn digest_publication_content(
     PublicationContentDigest(*transcript.finish().as_bytes())
 }
 
-pub(super) fn bind_post_asset_source(document: &PostDocument) -> PostAssetSourceBinding {
-    let canonical_content = digest_post_content(document);
+pub(super) fn bind_post_asset_source_with_content(
+    document: &PostDocument,
+    canonical_content: &PostContentDigest,
+) -> PostAssetSourceBinding {
     let mut transcript = Transcript::new(
         POST_ASSET_SOURCE_BINDING_CONTEXT,
         b"maincopy-post-asset-source-binding",
@@ -328,7 +330,8 @@ fn digest_post_revision(
     let referenced_assets = sorted_asset_references(&input.assets.references)?;
     let generated_assets = sorted_generated_assets(input.generated_assets)?;
     let content = digest_post_content(input.document);
-    if input.assets.source_binding != bind_post_asset_source(input.document) {
+    if input.assets.source_binding != bind_post_asset_source_with_content(input.document, &content)
+    {
         return Err(RevisionIdentityError::ResolvedAssetBindingMismatch {
             target: AssetBindingTarget::Post,
         });
@@ -339,21 +342,54 @@ fn digest_post_revision(
     {
         return Err(RevisionIdentityError::ResolvedAssetPolicyMismatch);
     }
+    Ok(digest_post_revision_components(
+        &content,
+        input.assets,
+        referenced_assets.into_iter(),
+        input.renderer,
+        input.pre_injection_article.as_bytes(),
+        &generated_assets,
+    ))
+}
+
+pub(super) fn digest_prepared_post_revision(
+    content: &PostContentDigest,
+    assets: &ResolvedPostAssets,
+    renderer: &PostRendererIdentity,
+    pre_injection_article: &[u8],
+) -> PostRevisionDigest {
+    digest_post_revision_components(
+        content,
+        assets,
+        assets.references.iter(),
+        renderer,
+        pre_injection_article,
+        &[],
+    )
+}
+
+fn digest_post_revision_components<'assets>(
+    content: &PostContentDigest,
+    assets: &ResolvedPostAssets,
+    references: impl ExactSizeIterator<Item = &'assets AssetRevisionReference>,
+    renderer: &PostRendererIdentity,
+    pre_injection_article: &[u8],
+    generated_assets: &[&DigestedAsset],
+) -> PostRevisionDigest {
     let mut transcript = Transcript::new(POST_REVISION_CONTEXT, b"maincopy-post-revision", 1);
     transcript.fixed_bytes(&content.0);
-    transcript.optional(input.assets.image.as_ref(), encode_asset_reference);
-    encode_asset_references(&mut transcript, &referenced_assets);
-    encode_post_renderer(&mut transcript, input.renderer);
-    transcript.bytes(input.pre_injection_article.as_bytes());
-    encode_generated_assets(&mut transcript, &generated_assets);
-    Ok(PostRevisionDigest::from_hash(transcript.finish()))
+    transcript.optional(assets.image.as_ref(), encode_asset_reference);
+    encode_asset_references(&mut transcript, references);
+    encode_post_renderer(&mut transcript, renderer);
+    transcript.bytes(pre_injection_article);
+    encode_generated_assets(&mut transcript, generated_assets);
+    PostRevisionDigest::from_hash(transcript.finish())
 }
 
 /// Close the post-rendering capability into its public revision identity.
 ///
-/// This is the only production seam that can construct the pre-injection
-/// wrapper. The content compiler's renderer is the sole production caller;
-/// public callers cannot compose a revision from arbitrary bytes.
+/// Independently supplied source and asset inputs are checked before encoding.
+/// Prepared posts retain these relationships and finalize through their own capability.
 pub fn finalize_post_revision(
     document: &PostDocument,
     assets: &ResolvedPostAssets,
@@ -405,7 +441,7 @@ pub fn finalize_preview_digest(
     for origin in allowed_origins {
         transcript.string(origin.as_str());
     }
-    encode_asset_references(&mut transcript, &references);
+    encode_asset_references(&mut transcript, references.into_iter());
     transcript.tag(5);
     encode_site_renderer(&mut transcript, input.site_renderer);
     transcript.bytes(input.pre_injection_post_shell);
@@ -455,7 +491,7 @@ fn digest_site_snapshot(
     for origin in allowed_origins {
         transcript.string(origin.as_str());
     }
-    encode_asset_references(&mut transcript, &site_assets);
+    encode_asset_references(&mut transcript, site_assets.into_iter());
     encode_site_renderer(&mut transcript, input.renderer);
     transcript.fixed_bytes(&input.pre_injection_shell.0);
     transcript.sequence_len(public_posts.len());
@@ -571,7 +607,10 @@ fn sorted_asset_references(
     Ok(references)
 }
 
-fn encode_asset_references(transcript: &mut Transcript, references: &[&AssetRevisionReference]) {
+fn encode_asset_references<'assets>(
+    transcript: &mut Transcript,
+    references: impl ExactSizeIterator<Item = &'assets AssetRevisionReference>,
+) {
     transcript.sequence_len(references.len());
     for reference in references {
         encode_asset_reference(transcript, reference);
@@ -1725,6 +1764,7 @@ name = "Example Author"
         );
         let approved_assets = ResolvedPostAssets::from_resolution(
             &post,
+            &digest_post_content(&post),
             &allowed,
             Some(image.clone()),
             Vec::new(),
@@ -1732,6 +1772,7 @@ name = "Example Author"
         );
         let expanded_assets = ResolvedPostAssets::from_resolution(
             &post,
+            &digest_post_content(&post),
             &expanded,
             Some(image),
             Vec::new(),

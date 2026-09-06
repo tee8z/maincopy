@@ -1,9 +1,9 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use markdown_compiler::{
-    ContentCandidateStore, ContentCandidateStoreError, ContentTreeDigest, ContentTreeLimits,
-    ContentValidationErrors, DiscoveredContentTree, ResolveContentAssetsError,
-    discover_content_tree, resolve_content_assets,
+    AssetResolutionErrors, ContentCandidateStore, ContentCandidateStoreError, ContentTreeDigest,
+    ContentTreeLimits, ContentValidationErrors, DiscoveredContentTree, PrepareContentError,
+    discover_content_tree, prepare_content,
 };
 use thiserror::Error;
 use tokio::{task::JoinError, time::MissedTickBehavior};
@@ -43,13 +43,16 @@ pub(crate) async fn prepare_immutable_candidate(
 ) -> Result<PreparedContentCandidate, ContentCandidatePreparationError> {
     tokio::task::spawn_blocking(move || {
         let content_digest = tree.digest();
-        let content = tree
-            .validate()
-            .map_err(ContentCandidatePreparationError::Validate)?;
-        let assets = resolve_content_assets(&tree, &content)
-            .map_err(ContentCandidatePreparationError::ResolveAssets)?;
+        let content = prepare_content(&tree).map_err(|error| match error {
+            PrepareContentError::InvalidContent(source) => {
+                ContentCandidatePreparationError::Validate(source)
+            }
+            PrepareContentError::AssetResolution(source) => {
+                ContentCandidatePreparationError::ResolveAssets(source)
+            }
+        })?;
         let catalog = compiler
-            .compile(&content, &assets)
+            .compile(&content)
             .map(Arc::new)
             .map_err(ContentCandidatePreparationError::Compile)?;
         let retained = candidate_store
@@ -78,7 +81,7 @@ pub(crate) enum ContentCandidatePreparationError {
     #[error("the immutable content candidate is invalid")]
     Validate(#[source] ContentValidationErrors),
     #[error("the immutable content candidate contains invalid asset references")]
-    ResolveAssets(#[source] ResolveContentAssetsError),
+    ResolveAssets(#[source] AssetResolutionErrors),
     #[error("the immutable content candidate could not be compiled")]
     Compile(#[source] CatalogBuildError),
     #[error("the immutable content candidate could not be retained durably")]
@@ -431,14 +434,9 @@ async fn compile_observed(
     tokio::task::spawn_blocking(move || {
         let digest = observed.digest.clone();
         let compiled: Result<(Arc<ContentCatalog>, Option<SourceCommit>), String> = (|| {
-            let content = observed
-                .tree
-                .validate()
-                .map_err(|error| error.to_string())?;
-            let assets = resolve_content_assets(&observed.tree, &content)
-                .map_err(|error| error.to_string())?;
+            let content = prepare_content(&observed.tree).map_err(|error| error.to_string())?;
             let catalog = compiler
-                .compile(&content, &assets)
+                .compile(&content)
                 .map(Arc::new)
                 .map_err(|error| error.to_string())?;
             let source_commit = match discover_source_commit(&root) {
@@ -551,9 +549,8 @@ mod tests {
             Vec::new(),
             total_bytes,
         );
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        let catalog = Arc::new(compile_content_catalog(&content, &assets).unwrap());
+        let content = prepare_content(&tree).unwrap();
+        let catalog = Arc::new(compile_content_catalog(&content).unwrap());
         CompiledCandidate {
             digest: tree.digest(),
             tree,

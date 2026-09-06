@@ -39,6 +39,7 @@ use utoipa_axum::{
 use uuid::Uuid;
 
 use super::{
+    AdminRuntimeState,
     origin::AdminOrigin,
     principal::{AdminAuthentication, AdminPrincipal},
     problem::{AdminProblem, AdminProblemEnvelope, problem_response},
@@ -308,22 +309,22 @@ where
     }
 }
 
-pub(super) fn login_challenge_routes() -> UtoipaMethodRouter {
+pub(super) fn login_challenge_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(create_login_challenge).layer(DefaultBodyLimit::max(AUTH_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn login_session_routes() -> UtoipaMethodRouter {
+pub(super) fn login_session_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(create_admin_session).layer(DefaultBodyLimit::max(AUTH_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn current_session_routes() -> UtoipaMethodRouter {
+pub(super) fn current_session_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_current_admin_session, revoke_current_admin_session)
 }
 
 pub(super) fn authenticate_layer(
-    routes: UtoipaMethodRouter,
+    routes: UtoipaMethodRouter<AdminRuntimeState>,
     security: &AdminSecurityState,
-) -> UtoipaMethodRouter {
+) -> UtoipaMethodRouter<AdminRuntimeState> {
     routes.layer(axum::middleware::from_fn_with_state(
         security.clone(),
         authenticate,
@@ -331,10 +332,10 @@ pub(super) fn authenticate_layer(
 }
 
 pub(super) fn scoped_layer(
-    routes: UtoipaMethodRouter,
+    routes: UtoipaMethodRouter<AdminRuntimeState>,
     security: &AdminSecurityState,
     scope: AdminScope,
-) -> UtoipaMethodRouter {
+) -> UtoipaMethodRouter<AdminRuntimeState> {
     routes
         .layer(axum::middleware::from_fn_with_state(scope, authorize_scope))
         .layer(axum::middleware::from_fn_with_state(
@@ -347,11 +348,11 @@ pub(super) fn scoped_layer(
 ///
 /// Browser admission runs before authorization so an otherwise capable agent
 /// cannot reach a handler intended to render or process browser-only state.
-pub(crate) fn browser_scoped_router(
-    routes: Router,
+pub(crate) fn browser_scoped_router<S: Clone + Send + Sync + 'static>(
+    routes: Router<S>,
     security: &AdminSecurityState,
     scope: AdminScope,
-) -> Router {
+) -> Router<S> {
     browser_session_router(
         routes.route_layer(axum::middleware::from_fn_with_state(scope, authorize_scope)),
         security,
@@ -362,7 +363,10 @@ pub(crate) fn browser_scoped_router(
 ///
 /// Self-service session revocation must remain available to any valid browser
 /// session, including one whose roles changed after it signed in.
-pub(crate) fn browser_session_router(routes: Router, security: &AdminSecurityState) -> Router {
+pub(crate) fn browser_session_router<S: Clone + Send + Sync + 'static>(
+    routes: Router<S>,
+    security: &AdminSecurityState,
+) -> Router<S> {
     routes
         .route_layer(axum::middleware::from_fn(require_browser_session))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -1422,7 +1426,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        admin::{admin_router, origin::AdminOrigin, request_id::assign},
+        admin::{
+            origin::AdminOrigin, request_id::assign, runtime_admin_router,
+            test_support::AdminTestRuntime,
+        },
         config::{
             DatabaseBusyTimeout, DatabaseConfigurationView, DatabaseReadPoolSize,
             DatabaseWriterQueueCapacity,
@@ -1450,6 +1457,7 @@ mod tests {
     struct SecurityHarness {
         _root: tempfile::TempDir,
         state: AdminSecurityState,
+        runtime: AdminTestRuntime,
         store: DatabaseStore,
         publisher_human_key: SigningKey,
         publisher_agent_key: SigningKey,
@@ -1535,8 +1543,10 @@ mod tests {
             )
             .await
             .unwrap();
+            let runtime = AdminTestRuntime::start(&store).await;
             Self {
                 _root: root,
+                runtime,
                 state,
                 store,
                 publisher_human_key,
@@ -1546,7 +1556,17 @@ mod tests {
             }
         }
 
-        async fn stop(self) {
+        fn router(&self) -> Router {
+            runtime_admin_router(
+                self.runtime.state.publications.clone(),
+                self.state.clone(),
+                self.runtime.state.profiles.clone(),
+                self.runtime.state.source.clone(),
+            )
+        }
+
+        async fn stop(mut self) {
+            self.runtime.stop_actor().await;
             self.shutdown.cancel();
             drop(self.state);
             drop(self.store);
@@ -1882,7 +1902,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_form_mutations_require_one_bounded_csrf_field_and_restore_exact_bytes() {
         let harness = SecurityHarness::start().await;
-        let login_app = admin_router(harness.state.clone());
+        let login_app = harness.router();
         let credentials = password_browser_credentials(&login_app).await;
         let app = browser_security_router(harness.state.clone());
 
@@ -2039,7 +2059,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn browser_routes_reject_agents_and_unbound_csrf_without_capturing_fallbacks() {
         let harness = SecurityHarness::start().await;
-        let login_app = admin_router(harness.state.clone());
+        let login_app = harness.router();
         let credentials = password_browser_credentials(&login_app).await;
         let app = browser_security_router(harness.state.clone());
 
@@ -2105,7 +2125,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn protected_router_enforces_host_origin_cookie_csrf_and_logout() {
         let harness = SecurityHarness::start().await;
-        let app = admin_router(harness.state.clone());
+        let app = harness.router();
         let challenge_body = serde_json::to_vec(&CreateLoginChallengeRequest {
             provider: HumanLoginProvider::Nostr,
         })
@@ -2302,7 +2322,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nostr_login_consumes_one_signed_challenge_exactly_once() {
         let harness = SecurityHarness::start().await;
-        let app = admin_router(harness.state.clone());
+        let app = harness.router();
         let challenge_request = request(
             Method::POST,
             LOGIN_CHALLENGES_PATH,
@@ -2351,7 +2371,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_proofs_are_exact_replay_protected_scoped_and_restore_the_body() {
         let harness = SecurityHarness::start().await;
-        let app = admin_router(harness.state.clone());
+        let app = harness.router();
         let path = CAPABILITIES_PATH;
         let authorization =
             agent_authorization(&harness.publisher_agent_key, &Method::GET, path, &[], None);

@@ -21,11 +21,11 @@ pub use catalog::{
 };
 pub use markdown::{
     CodeBlockOrdinal, MarkdownRenderError, MarkdownRenderErrorCode, MarkdownRenderLocation,
-    NavigationRejection, RenderDestinationKind, RenderedPost, render_markdown,
+    NavigationRejection, RenderDestinationKind, RenderedPost,
 };
 pub use site::{
     RenderedSiteShell, SiteSnapshot, SiteSnapshotBuildError, SiteSnapshotBuildErrorCode,
-    SiteSnapshotReader, build_site_snapshot, render_site_shell,
+    SiteSnapshotReader, render_site_shell,
 };
 
 pub(crate) use site::{

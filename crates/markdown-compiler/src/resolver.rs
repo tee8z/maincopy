@@ -10,104 +10,101 @@ use thiserror::Error;
 
 use super::{
     AssetRevisionReference, AuthoredMarkdownDestination, ContentValidationErrors, DigestedAsset,
-    DiscoveredContentTree, DraftStatus, ExternalAssetOrigin, ExternalAssetUrl, LogicalAssetPath,
+    DiscoveredContentTree, ExternalAssetOrigin, ExternalAssetUrl, LogicalAssetPath,
     LogicalContentPath, MarkdownDestinationKind, MarkdownDestinationOrdinal, MarkdownSourceRange,
-    PostDocument, PostId, ResolvedMarkdownDestination, ResolvedPostAssets, ResolvedSiteAssets,
-    ValidatedContent, digest_asset,
+    PostDocument, PostRendererIdentity, PostRevisionDigest, PublicationSettings,
+    ResolvedMarkdownDestination, ResolvedPostAssets, ResolvedSiteAssets, ValidatedContent,
+    digest_asset,
+    identity::{PostContentDigest, digest_post_content, digest_prepared_post_revision},
 };
 
-/// Resolve all authored content-asset references without performing network I/O.
-pub fn resolve_content_assets(
+/// Parse and resolve one owned content tree without network I/O.
+/// The result keeps each validated document paired with its approved assets.
+pub fn prepare_content(
     tree: &DiscoveredContentTree,
-    content: &ValidatedContent,
-) -> Result<ResolvedContentAssets, ResolveContentAssetsError> {
-    let tree_content = tree
+) -> Result<PreparedContent, PrepareContentError> {
+    let content = tree
         .validate()
-        .map_err(ResolveContentAssetsError::InvalidContent)?;
-    if &tree_content != content {
-        return Err(ResolveContentAssetsError::Resolution(
-            AssetResolutionErrors::one(AssetResolutionError::new(
-                LogicalContentPath::new("<content-root>"),
-                AssetReferenceLocation::ContentSource,
-                AssetResolutionCode::ContentSourceMismatch,
-                "validated content does not belong to the discovered content tree",
-            )),
-        ));
-    }
-
+        .map_err(PrepareContentError::InvalidContent)?;
     Resolver::new(tree, content).resolve()
 }
 
 #[derive(Debug, Error)]
-pub enum ResolveContentAssetsError {
+pub enum PrepareContentError {
     #[error("the discovered content tree is not valid")]
     InvalidContent(#[source] ContentValidationErrors),
     #[error(transparent)]
-    Resolution(#[from] AssetResolutionErrors),
+    AssetResolution(#[from] AssetResolutionErrors),
 }
 
-/// Resolver output that keeps typed references and their exact local bytes together.
+/// An immutable, compiler-owned candidate with source-bound asset inputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedContentAssets {
-    pub site: ResolvedSiteAssets,
-    pub posts: Vec<ResolvedPostAssetSet>,
-    pub local_assets: ResolvedLocalAssetStore,
-    pub warnings: AssetResolutionWarnings,
+pub struct PreparedContent {
+    publication: PublicationSettings,
+    site: ResolvedSiteAssets,
+    posts: Vec<PreparedPost>,
+    local_assets: ResolvedLocalAssetStore,
+    warnings: AssetResolutionWarnings,
 }
 
-impl ResolvedContentAssets {
-    pub fn site_assets_for(
-        &self,
-        publication: &super::PublicationSettings,
-    ) -> Result<&ResolvedSiteAssets, ResolvedSiteAssetLookupError> {
-        if self.site.source_binding != super::identity::bind_publication_asset_source(publication) {
-            return Err(ResolvedSiteAssetLookupError::SourceBindingMismatch);
-        }
-        Ok(&self.site)
-    }
+/// Read-only compiler inputs for composition in a renderer.
+#[derive(Clone, Copy)]
+pub struct PreparedContentView<'content> {
+    pub publication: &'content PublicationSettings,
+    pub site_assets: &'content ResolvedSiteAssets,
+    pub posts: &'content [PreparedPost],
+    pub local_assets: &'content ResolvedLocalAssetStore,
+    pub warnings: &'content AssetResolutionWarnings,
+}
 
-    pub fn assets_for(
-        &self,
-        document: &PostDocument,
-    ) -> Result<&ResolvedPostAssets, ResolvedPostAssetLookupError> {
-        let Some(entry) = self
-            .posts
-            .iter()
-            .find(|entry| entry.post_id == document.metadata.id)
-        else {
-            return Err(ResolvedPostAssetLookupError::UnknownPost);
-        };
-        if entry.path != document.path
-            || entry.assets.source_binding != super::identity::bind_post_asset_source(document)
-        {
-            return Err(ResolvedPostAssetLookupError::SourceBindingMismatch);
+impl PreparedContent {
+    pub fn view(&self) -> PreparedContentView<'_> {
+        PreparedContentView {
+            publication: &self.publication,
+            site_assets: &self.site,
+            posts: &self.posts,
+            local_assets: &self.local_assets,
+            warnings: &self.warnings,
         }
-        Ok(&entry.assets)
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResolvedSiteAssetLookupError {
-    #[error("the publication source does not match the resolved site asset capability")]
-    SourceBindingMismatch,
-}
-
+/// One validated document, its approved assets, and its cached content identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedPostAssetSet {
-    pub post_id: PostId,
-    pub path: LogicalContentPath,
-    pub draft: DraftStatus,
-    pub assets: ResolvedPostAssets,
+pub struct PreparedPost {
+    document: PostDocument,
+    assets: ResolvedPostAssets,
+    content_digest: PostContentDigest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResolvedPostAssetLookupError {
-    #[error("the post is not part of this asset resolution")]
-    UnknownPost,
-    #[error("the post source does not match the resolved asset capability")]
-    SourceBindingMismatch,
+/// A borrowed post/asset pair that cannot mutate the prepared candidate.
+#[derive(Clone, Copy)]
+pub struct PreparedPostView<'post> {
+    pub document: &'post PostDocument,
+    pub assets: &'post ResolvedPostAssets,
+}
+
+impl PreparedPost {
+    pub fn view(&self) -> PreparedPostView<'_> {
+        PreparedPostView {
+            document: &self.document,
+            assets: &self.assets,
+        }
+    }
+
+    /// Bind rendered bytes to the already validated source and asset identities.
+    pub fn finalize_revision(
+        &self,
+        renderer: &PostRendererIdentity,
+        pre_injection_article: &[u8],
+    ) -> PostRevisionDigest {
+        digest_prepared_post_revision(
+            &self.content_digest,
+            &self.assets,
+            renderer,
+            pre_injection_article,
+        )
+    }
 }
 
 /// Exact discovered bytes paired with the resolver-calculated identity.
@@ -191,7 +188,6 @@ pub enum AssetReferenceLocation {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssetResolutionCode {
-    ContentSourceMismatch,
     AllowedOriginInvalid,
     AllowedOriginDuplicated,
     AllowedOriginCountExceeded,
@@ -237,10 +233,6 @@ impl AssetResolutionError {
 pub struct AssetResolutionErrors(Vec<AssetResolutionError>);
 
 impl AssetResolutionErrors {
-    fn one(error: AssetResolutionError) -> Self {
-        Self(vec![error])
-    }
-
     pub fn errors(&self) -> &[AssetResolutionError] {
         &self.0
     }
@@ -297,7 +289,7 @@ impl AssetResolutionWarnings {
 
 struct Resolver<'input> {
     tree: &'input DiscoveredContentTree,
-    content: &'input ValidatedContent,
+    content: ValidatedContent,
     allowed_origins: Vec<ExternalAssetOrigin>,
     discovered_assets: BTreeMap<LogicalAssetPath, Arc<[u8]>>,
     resolved_local_assets: BTreeMap<LogicalAssetPath, ResolvedLocalAsset>,
@@ -306,7 +298,7 @@ struct Resolver<'input> {
 }
 
 impl<'input> Resolver<'input> {
-    fn new(tree: &'input DiscoveredContentTree, content: &'input ValidatedContent) -> Self {
+    fn new(tree: &'input DiscoveredContentTree, content: ValidatedContent) -> Self {
         Self {
             tree,
             content,
@@ -318,7 +310,7 @@ impl<'input> Resolver<'input> {
         }
     }
 
-    fn resolve(mut self) -> Result<ResolvedContentAssets, ResolveContentAssetsError> {
+    fn resolve(mut self) -> Result<PreparedContent, PrepareContentError> {
         self.index_local_assets();
         self.resolve_allowed_origins();
 
@@ -328,7 +320,7 @@ impl<'input> Resolver<'input> {
             .publication
             .site
             .favicon
-            .as_ref()
+            .clone()
             .and_then(|favicon| {
                 self.resolve_reference(
                     &publication_path,
@@ -345,24 +337,24 @@ impl<'input> Resolver<'input> {
         );
 
         let mut posts = Vec::with_capacity(self.content.posts.len());
-        for document in &self.content.posts {
+        for document in std::mem::take(&mut self.content.posts) {
             posts.push(self.resolve_post(document));
         }
-        posts.sort_by(|left, right| left.path.cmp(&right.path));
 
         if !self.errors.is_empty() {
             self.errors
                 .sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
             self.errors.dedup();
-            return Err(ResolveContentAssetsError::Resolution(
-                AssetResolutionErrors(self.errors),
-            ));
+            return Err(PrepareContentError::AssetResolution(AssetResolutionErrors(
+                self.errors,
+            )));
         }
 
         self.warnings
             .sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
         self.warnings.dedup();
-        Ok(ResolvedContentAssets {
+        Ok(PreparedContent {
+            publication: self.content.publication,
             site,
             posts,
             local_assets: ResolvedLocalAssetStore {
@@ -441,7 +433,7 @@ impl<'input> Resolver<'input> {
             .sort_by(|left, right| left.as_str().cmp(right.as_str()));
     }
 
-    fn resolve_post(&mut self, document: &PostDocument) -> ResolvedPostAssetSet {
+    fn resolve_post(&mut self, document: PostDocument) -> PreparedPost {
         let path = document.path.clone();
         let image = document.metadata.image.as_ref().and_then(|image| {
             self.resolve_reference(
@@ -505,17 +497,19 @@ impl<'input> Resolver<'input> {
             ));
         }
 
-        ResolvedPostAssetSet {
-            post_id: document.metadata.id.clone(),
-            path,
-            draft: document.metadata.draft,
-            assets: ResolvedPostAssets::from_resolution(
-                document,
-                &self.allowed_origins,
-                image,
-                references.into_values().collect(),
-                markdown_destinations,
-            ),
+        let content_digest = digest_post_content(&document);
+        let assets = ResolvedPostAssets::from_resolution(
+            &document,
+            &content_digest,
+            &self.allowed_origins,
+            image,
+            references.into_values().collect(),
+            markdown_destinations,
+        );
+        PreparedPost {
+            document,
+            assets,
+            content_digest,
         }
     }
 
@@ -722,8 +716,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::identity::finalize_post_revision;
     use crate::tree::{asset, post, publication};
-    use crate::{PostCollection, PostSource, PublicationSource, validate_content};
+    use crate::{ContentValidationCode, DraftStatus, PostCollection};
 
     const POST_ID: &str = "4f054633-2d09-4b05-97d0-c6f0011a5199";
     const SECOND_POST_ID: &str = "7d97b17a-686d-46f4-ad77-234f4973c69a";
@@ -793,9 +788,107 @@ mod tests {
         )
     }
 
-    fn resolve(tree: &DiscoveredContentTree) -> ResolvedContentAssets {
-        let content = tree.validate().expect("fixture content must validate");
-        resolve_content_assets(tree, &content).expect("fixture assets must resolve")
+    fn resolve(tree: &DiscoveredContentTree) -> PreparedContent {
+        prepare_content(tree).expect("fixture content and assets must validate")
+    }
+
+    #[test]
+    fn preparation_rejects_duplicate_posts_before_resolving_their_assets() {
+        let tree = content_tree(
+            publication_source(None, &[]),
+            vec![
+                (
+                    "posts/first.md",
+                    PostCollection::Posts,
+                    post_source(
+                        POST_ID,
+                        "first",
+                        None,
+                        false,
+                        "![missing](assets/missing.png)",
+                    ),
+                ),
+                (
+                    "posts/second.md",
+                    PostCollection::Posts,
+                    post_source(POST_ID, "second", None, false, "Second"),
+                ),
+            ],
+            Vec::new(),
+        );
+        let PrepareContentError::InvalidContent(errors) = prepare_content(&tree).unwrap_err()
+        else {
+            panic!("invalid documents must fail before asset resolution")
+        };
+        assert_eq!(errors.errors().len(), 1);
+        assert_eq!(
+            errors.errors()[0].code,
+            ContentValidationCode::DuplicatePostId
+        );
+    }
+
+    #[test]
+    fn prepared_pairs_and_revision_bytes_are_stable_across_discovery_order() {
+        let mut tree = content_tree(
+            publication_source(Some("assets/cover.png"), &["https://cdn.example.com"]),
+            vec![
+                (
+                    "posts/z-assets.md",
+                    PostCollection::Posts,
+                    post_source(
+                        POST_ID,
+                        "assets",
+                        Some("assets/cover.png"),
+                        false,
+                        "![z](https://cdn.example.com/z-v1.png)\n\
+                         [file](assets/file.pdf)\n\
+                         ![a](https://cdn.example.com/a-v1.png)\n\
+                         ![cover](assets/cover.png)\n\
+                         [repeated](assets/file.pdf)",
+                    ),
+                ),
+                (
+                    "drafts/a-empty.md",
+                    PostCollection::Drafts,
+                    post_source(SECOND_POST_ID, "empty", None, true, "No assets."),
+                ),
+            ],
+            vec![("assets/file.pdf", b"file"), ("assets/cover.png", b"cover")],
+        );
+        let prepared = prepare_content(&tree).unwrap();
+        tree.posts.reverse();
+        tree.assets.reverse();
+        assert_eq!(prepared, prepare_content(&tree).unwrap());
+        drop(tree);
+
+        let content = prepared.view();
+        assert_eq!(
+            content.posts[0].view().document.metadata.id.as_str(),
+            SECOND_POST_ID
+        );
+        assert!(content.posts[0].view().assets.references.is_empty());
+        assert_eq!(
+            content.posts[1].view().document.metadata.id.as_str(),
+            POST_ID
+        );
+        assert_eq!(content.posts[1].view().assets.references.len(), 4);
+        let renderer = PostRendererIdentity::baseline();
+        for post in content.posts {
+            let inputs = post.view();
+            let article = inputs.document.markdown.as_str().as_bytes();
+            assert_eq!(
+                post.finalize_revision(&renderer, article),
+                finalize_post_revision(
+                    inputs.document,
+                    inputs.assets,
+                    content.site_assets,
+                    &renderer,
+                    article,
+                    &[]
+                )
+                .expect("prepared inputs must satisfy the checked identity API"),
+            );
+        }
     }
 
     #[test]
@@ -904,9 +997,8 @@ mod tests {
             )],
             Vec::new(),
         );
-        let content = tree.validate().expect("fixture content must validate");
-        let error = resolve_content_assets(&tree, &content).expect_err("assets must fail");
-        let ResolveContentAssetsError::Resolution(errors) = error else {
+        let error = prepare_content(&tree).expect_err("assets must fail");
+        let PrepareContentError::AssetResolution(errors) = error else {
             panic!("resolution diagnostics were expected")
         };
         let codes: BTreeSet<_> = errors.errors().iter().map(|error| error.code).collect();
@@ -946,9 +1038,8 @@ mod tests {
                 )],
                 Vec::new(),
             );
-            let content = tree.validate().expect("fixture content must validate");
-            let ResolveContentAssetsError::Resolution(errors) =
-                resolve_content_assets(&tree, &content).expect_err("URL must fail")
+            let PrepareContentError::AssetResolution(errors) =
+                prepare_content(&tree).expect_err("URL must fail")
             else {
                 panic!("resolution diagnostics were expected")
             };
@@ -980,9 +1071,8 @@ mod tests {
             )],
             Vec::new(),
         );
-        let content = tree.validate().expect("fixture content must validate");
-        let ResolveContentAssetsError::Resolution(errors) =
-            resolve_content_assets(&tree, &content).expect_err("URLs must fail")
+        let PrepareContentError::AssetResolution(errors) =
+            prepare_content(&tree).expect_err("URLs must fail")
         else {
             panic!("resolution diagnostics were expected")
         };
@@ -1014,9 +1104,8 @@ mod tests {
             )],
             Vec::new(),
         );
-        let content = tree.validate().expect("fixture content must validate");
-        let ResolveContentAssetsError::Resolution(errors) =
-            resolve_content_assets(&tree, &content).expect_err("raw backslashes must fail")
+        let PrepareContentError::AssetResolution(errors) =
+            prepare_content(&tree).expect_err("raw backslashes must fail")
         else {
             panic!("resolution diagnostics were expected")
         };
@@ -1072,9 +1161,8 @@ mod tests {
                 )],
                 Vec::new(),
             );
-            let content = tree.validate().expect("fixture content must validate");
-            let ResolveContentAssetsError::Resolution(errors) =
-                resolve_content_assets(&tree, &content).expect_err("path must fail")
+            let PrepareContentError::AssetResolution(errors) =
+                prepare_content(&tree).expect_err("path must fail")
             else {
                 panic!("resolution diagnostics were expected")
             };
@@ -1201,50 +1289,6 @@ mod tests {
     }
 
     #[test]
-    fn post_capabilities_reject_cross_wired_sources() {
-        let first_tree = content_tree(
-            publication_source(None, &[]),
-            vec![(
-                "posts/first.md",
-                PostCollection::Posts,
-                post_source(POST_ID, "first", None, false, "First"),
-            )],
-            Vec::new(),
-        );
-        let second_tree = content_tree(
-            publication_source(None, &[]),
-            vec![(
-                "posts/second.md",
-                PostCollection::Posts,
-                post_source(POST_ID, "second", None, false, "Second"),
-            )],
-            Vec::new(),
-        );
-        let first_content = first_tree.validate().expect("first content must validate");
-        let second_content = second_tree
-            .validate()
-            .expect("second content must validate");
-
-        let ResolveContentAssetsError::Resolution(errors) =
-            resolve_content_assets(&first_tree, &second_content)
-                .expect_err("cross-wired tree and model must fail")
-        else {
-            panic!("resolution diagnostics were expected")
-        };
-        assert_eq!(
-            errors.errors()[0].code,
-            AssetResolutionCode::ContentSourceMismatch
-        );
-
-        let resolved = resolve_content_assets(&first_tree, &first_content)
-            .expect("matching tree and model must resolve");
-        assert_eq!(
-            resolved.assets_for(&second_content.posts[0]),
-            Err(ResolvedPostAssetLookupError::SourceBindingMismatch)
-        );
-    }
-
-    #[test]
     fn duplicate_discovered_asset_paths_are_rejected() {
         let publication_contents = publication_source(Some("assets/favicon.png"), &[]);
         let tree = DiscoveredContentTree::new(
@@ -1266,9 +1310,8 @@ mod tests {
             ],
             0,
         );
-        let content = tree.validate().expect("content must validate");
-        let ResolveContentAssetsError::Resolution(errors) =
-            resolve_content_assets(&tree, &content).expect_err("duplicate asset must fail")
+        let PrepareContentError::AssetResolution(errors) =
+            prepare_content(&tree).expect_err("duplicate asset must fail")
         else {
             panic!("resolution diagnostics were expected")
         };
@@ -1318,12 +1361,12 @@ mod tests {
         let public = resolved
             .posts
             .iter()
-            .find(|post| post.draft == DraftStatus::Publishable)
+            .find(|post| post.document.metadata.draft == DraftStatus::Publishable)
             .expect("publishable post must be present");
         let draft = resolved
             .posts
             .iter()
-            .find(|post| post.draft == DraftStatus::Draft)
+            .find(|post| post.document.metadata.draft == DraftStatus::Draft)
             .expect("draft post must be present");
         assert_eq!(public.assets.references.len(), 1);
         assert_eq!(draft.assets.references.len(), 1);
@@ -1340,18 +1383,6 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once("+++\n"))
             .expect("fixture frontmatter delimiters must exist");
         &markdown[range.as_range()]
-    }
-
-    #[test]
-    fn direct_validator_fixture_remains_compatible_with_resolver_inputs() {
-        let publication = publication_source(None, &[]);
-        let post = post_source(POST_ID, "direct", None, false, "Body");
-        let content = validate_content(
-            PublicationSource::new("publication.toml", &publication),
-            [PostSource::in_posts("posts/direct.md", &post)],
-        )
-        .expect("direct content must validate");
-        assert_eq!(content.posts.len(), 1);
     }
 
     #[test]
@@ -1396,10 +1427,6 @@ mod tests {
         }
 
         let codes = [
-            (
-                AssetResolutionCode::ContentSourceMismatch,
-                "content_source_mismatch",
-            ),
             (
                 AssetResolutionCode::AllowedOriginInvalid,
                 "allowed_origin_invalid",
@@ -1450,18 +1477,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(AssetResolutionWarningCode::ExternalUrlMayBeMutable).unwrap(),
             "external_url_may_be_mutable"
-        );
-        assert_eq!(
-            serde_json::to_value(ResolvedPostAssetLookupError::UnknownPost).unwrap(),
-            "unknown_post"
-        );
-        assert_eq!(
-            serde_json::to_value(ResolvedPostAssetLookupError::SourceBindingMismatch).unwrap(),
-            "source_binding_mismatch"
-        );
-        assert_eq!(
-            serde_json::to_value(ResolvedSiteAssetLookupError::SourceBindingMismatch).unwrap(),
-            "source_binding_mismatch"
         );
         assert_eq!(
             serde_json::to_value(ResolvedLocalAssetLookupError::Missing).unwrap(),

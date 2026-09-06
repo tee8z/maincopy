@@ -41,22 +41,19 @@ mod tests {
     use crate::{
         domain::publication::PublicLedgerProjection,
         frontend_assets::embedded_manifest,
-        render::{
-            SiteSnapshotReader, build_site_snapshot, compile_content_catalog, render_site_shell,
-        },
+        render::{SiteSnapshotReader, compile_content_catalog, render_site_shell},
         web::Readiness,
     };
-    use markdown_compiler::{ContentTreeLimits, discover_content_tree, resolve_content_assets};
+    use markdown_compiler::{ContentTreeLimits, discover_content_tree, prepare_content};
 
     fn public_state() -> PublicState {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/content");
         let tree = discover_content_tree(&root, ContentTreeLimits::default()).unwrap();
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        let catalog = Arc::new(compile_content_catalog(&content, &assets).unwrap());
+        let content = prepare_content(&tree).unwrap();
+        let catalog = Arc::new(compile_content_catalog(&content).unwrap());
         let ledger = PublicLedgerProjection::empty();
         let shell = render_site_shell(catalog, embedded_manifest(), &ledger).unwrap();
-        let snapshot = build_site_snapshot(shell, &ledger).unwrap();
+        let snapshot = shell.into_snapshot().unwrap();
         PublicState {
             snapshots: SiteSnapshotReader::from_snapshot(snapshot),
             readiness: Readiness::new(true),

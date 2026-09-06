@@ -485,14 +485,11 @@ mod tests {
     use crate::{
         domain::publication::{PublicLedgerProjection, PublishedPostRevision},
         frontend_assets::embedded_manifest,
-        render::{
-            SiteSnapshotReader, build_site_snapshot, compile_content_catalog, render_markdown,
-            render_site_shell,
-        },
+        render::{SiteSnapshotReader, compile_content_catalog, render_site_shell},
         web::{PublicState, Readiness, public_router},
     };
     use markdown_compiler::{
-        ContentTreeLimits, digest_asset, discover_content_tree, resolve_content_assets,
+        ContentTreeLimits, digest_asset, discover_content_tree, prepare_content,
     };
 
     const TEST_RESPONSE_LIMIT: usize = 64 * 1_024;
@@ -612,40 +609,26 @@ mod tests {
 
         let tree = discover_content_tree(root.path(), ContentTreeLimits::default())
             .expect("content asset fixture must be discovered");
-        let content = tree
-            .validate()
-            .expect("content asset fixture must validate");
-        let assets = resolve_content_assets(&tree, &content)
-            .expect("content asset fixture references must resolve");
-        let published = content
-            .posts
-            .iter()
-            .find(|document| document.metadata.slug.as_str() == "published-assets")
+        let content = prepare_content(&tree).expect("content asset fixture must prepare");
+        let catalog = Arc::new(
+            compile_content_catalog(&content).expect("content asset fixture must compile"),
+        );
+        let rendered = catalog
+            .rendered_posts()
+            .find(|post| post.document.metadata.slug.as_str() == "published-assets")
             .expect("published fixture post must exist");
-        let rendered = render_markdown(
-            published,
-            assets
-                .assets_for(published)
-                .expect("published fixture assets must exist"),
-            assets
-                .site_assets_for(&content.publication)
-                .expect("fixture site assets must exist"),
-        )
-        .expect("published fixture post must render");
         let ledger = PublicLedgerProjection::try_from_exact_entries([PublishedPostRevision::new(
             rendered.document.metadata.id.clone(),
-            rendered.revision,
+            rendered.revision.clone(),
             OffsetDateTime::from_unix_timestamp(2_000)
                 .expect("fixture publication time must be valid"),
         )])
         .expect("fixture ledger must be valid");
-        let catalog = Arc::new(
-            compile_content_catalog(&content, &assets).expect("content asset fixture must compile"),
-        );
         let shell = render_site_shell(catalog, embedded_manifest(), &ledger)
             .expect("content asset fixture shell must render");
-        let snapshot =
-            build_site_snapshot(shell, &ledger).expect("content asset fixture snapshot must build");
+        let snapshot = shell
+            .into_snapshot()
+            .expect("content asset fixture snapshot must build");
 
         let removed_source_root = root.path().to_path_buf();
         root.close()
@@ -756,24 +739,19 @@ mod tests {
         );
         assert_ne!(source.as_str(), tree.posts[0].source.as_ref());
         tree.posts[0].source = source.into_boxed_str();
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        let document = content.posts.first().unwrap();
-        let rendered = render_markdown(
-            document,
-            assets.assets_for(document).unwrap(),
-            assets.site_assets_for(&content.publication).unwrap(),
-        )
-        .unwrap();
+        let content = prepare_content(&tree).unwrap();
+        let catalog = Arc::new(compile_content_catalog(&content).unwrap());
+        let rendered = catalog
+            .current_post(&content.view().posts[0].view().document.metadata.id)
+            .unwrap();
         let ledger = PublicLedgerProjection::try_from_exact_entries([PublishedPostRevision::new(
             rendered.document.metadata.id.clone(),
             rendered.revision.clone(),
             OffsetDateTime::from_unix_timestamp(2_000).unwrap(),
         )])
         .unwrap();
-        let catalog = Arc::new(compile_content_catalog(&content, &assets).unwrap());
         let shell = render_site_shell(catalog, embedded_manifest(), &ledger).unwrap();
-        let snapshot = build_site_snapshot(shell, &ledger).unwrap();
+        let snapshot = shell.into_snapshot().unwrap();
         PublicState {
             snapshots: SiteSnapshotReader::from_snapshot(snapshot),
             readiness: Readiness::new(true),

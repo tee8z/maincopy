@@ -13,8 +13,8 @@ use clap::error::ErrorKind;
 use markdown_compiler::{
     ContentCandidateStore, ContentCandidateStoreError, ContentTreeDigest, ContentTreeLimits,
     ContentValidationErrors, DiscoveredContentTree, PostId, PostRevisionDigest,
-    ResolveContentAssetsError, SiteSnapshotDigest, ValidatedContent, discover_content_tree,
-    resolve_content_assets,
+    PrepareContentError, PreparedContent, SiteSnapshotDigest, discover_content_tree,
+    prepare_content,
 };
 use time::OffsetDateTime;
 use tokio::task::{JoinError, JoinHandle, JoinSet};
@@ -34,16 +34,13 @@ use crate::{
         auth::{Argon2idPolicy, store::ConfiguredLoginProviders},
         profile::TipRecipientProjection,
         publication::{
-            PublicLedgerProjection, PublishedPostRevision, SourceCommit,
+            PublicLedgerProjection, SourceCommit,
             activation::{
-                PublicationCoordinator, PublicationCoordinatorActor, PublicationCoordinatorHandle,
-                observed_post_revisions,
+                PreparedPublicationRecovery, PublicationActivationError, PublicationCoordinator,
+                PublicationCoordinatorActor, PublicationCoordinatorHandle, observed_post_revisions,
             },
             scheduler::PublicationScheduler,
-            store::{
-                InstallStartupSnapshot, ObservedPostRevision, RecoverablePublicationActivation,
-                StartupSnapshotState,
-            },
+            store::{InstallStartupSnapshot, ObservedPostRevision, StartupSnapshotState},
         },
     },
     error::{
@@ -56,7 +53,7 @@ use crate::{
     process_lock::{ProcessLock, ProcessLockError},
     render::{
         CatalogBuildError, CatalogRetentionError, ContentCatalog, ContentCompiler, SiteSnapshot,
-        build_site_snapshot, render_site_shell, snapshot_store,
+        render_site_shell, snapshot_store,
     },
     source_bootstrap::{configure_source, generate_source_key},
     source_provenance::{SourceCommitDiscovery, discover_source_commit},
@@ -65,7 +62,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::render::compile_content_catalog;
+use crate::{domain::publication::PublishedPostRevision, render::compile_content_catalog};
 
 type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), ApplicationError>> + Send>>;
 type CriticalTaskFuture = Pin<Box<dyn Future<Output = CriticalTaskResult> + Send>>;
@@ -79,7 +76,7 @@ const PUBLICATION_COORDINATOR_QUEUE_CAPACITY: usize = 32;
 /// task creation belong in [`Application::build`]. Runtime supervision and
 /// ordered shutdown belong in [`Application::run_until_stop`].
 pub(crate) struct Application {
-    _startup: StartupResources,
+    _process_lock: ProcessLock,
     _database: DatabaseStore,
     publication_coordinator: PublicationCoordinatorHandle,
     runtime: ApplicationRuntime,
@@ -87,15 +84,6 @@ pub(crate) struct Application {
     public_addr: std::net::SocketAddr,
     #[cfg(test)]
     admin_addr: std::net::SocketAddr,
-}
-
-enum StartupResources {
-    External {
-        _resources: Box<StartupConfiguration>,
-    },
-    Managed {
-        _resources: Box<StartupHostConfiguration>,
-    },
 }
 
 struct ApplicationRuntime {
@@ -111,7 +99,7 @@ struct StartupConfiguration {
     _process_lock: ProcessLock,
     _host: HostConfiguration,
     _content_tree: DiscoveredContentTree,
-    _validated_content: ValidatedContent,
+    content: PreparedContent,
 }
 
 /// Host-owned resources acquired before selecting a content source.
@@ -193,13 +181,18 @@ impl StartupHostConfiguration {
     {
         let host_view = self.host.view();
         let content_tree = discover(host_view.content_root, host_view.content_limits)?;
-        let validated_content = content_tree.validate()?;
+        let content = prepare_content(&content_tree).map_err(|error| match error {
+            PrepareContentError::InvalidContent(source) => ProcessError::Validation(source),
+            PrepareContentError::AssetResolution(source) => {
+                startup_failure(StartupStage::Content, "resolve content assets", source)
+            }
+        })?;
 
         Ok(StartupConfiguration {
             _process_lock: self.process_lock,
             _host: self.host,
             _content_tree: content_tree,
-            _validated_content: validated_content,
+            content,
         })
     }
 }
@@ -357,9 +350,7 @@ impl Application {
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
         Ok(Self::assemble(
-            StartupResources::External {
-                _resources: Box::new(startup),
-            },
+            startup._process_lock,
             database,
             serving_state,
             cancellation,
@@ -497,9 +488,7 @@ impl Application {
                 .map_err(|error| Box::new(error) as CriticalTaskFailure)
         });
         Ok(Self::assemble(
-            StartupResources::Managed {
-                _resources: Box::new(startup),
-            },
+            startup.process_lock,
             database,
             serving_state,
             cancellation,
@@ -510,7 +499,7 @@ impl Application {
 
     /// Starts the same supervised services after either source finishes preparation.
     fn assemble(
-        startup: StartupResources,
+        process_lock: ProcessLock,
         database: StartedDatabase,
         serving_state: ServingState,
         cancellation: CancellationToken,
@@ -564,7 +553,7 @@ impl Application {
         });
 
         Self {
-            _startup: startup,
+            _process_lock: process_lock,
             _database: database.store,
             publication_coordinator,
             runtime: ApplicationRuntime::with_database_writer(
@@ -590,7 +579,7 @@ impl Application {
 
     async fn run_until_stop(self) -> Result<(), ApplicationError> {
         let Self {
-            _startup: startup,
+            _process_lock: process_lock,
             _database: database,
             publication_coordinator,
             runtime,
@@ -602,7 +591,7 @@ impl Application {
         let runtime_result = runtime.run_until_stop().await;
         drop(publication_coordinator);
         drop(database);
-        drop(startup);
+        drop(process_lock);
         runtime_result
     }
 }
@@ -613,17 +602,9 @@ fn compile_startup_content(
     compiler: &ContentCompiler,
 ) -> Result<CompiledStartupContent, ProcessError> {
     let content_digest = startup._content_tree.digest();
-    let resolved_assets =
-        resolve_content_assets(&startup._content_tree, &startup._validated_content).map_err(
-            |error| startup_failure(StartupStage::Content, "resolve content assets", error),
-        )?;
-    let catalog = Arc::new(
-        compiler
-            .compile(&startup._validated_content, &resolved_assets)
-            .map_err(|error| {
-                startup_failure(StartupStage::Content, "compile the content catalog", error)
-            })?,
-    );
+    let catalog = Arc::new(compiler.compile(&startup.content).map_err(|error| {
+        startup_failure(StartupStage::Content, "compile the content catalog", error)
+    })?);
     let observed_posts = observed_post_revisions(&catalog);
     let source_commit = match discover_source_commit(content_root) {
         SourceCommitDiscovery::Discovered(commit) => Some(commit),
@@ -650,21 +631,13 @@ fn compile_retained_catalogs(
         .into_iter()
         .map(|candidate| {
             let digest = candidate.digest;
-            let content =
-                candidate
-                    .tree
-                    .validate()
-                    .map_err(|source| RetainedCatalogError::Validate {
-                        digest: digest.clone(),
-                        source,
-                    })?;
-            let assets = resolve_content_assets(&candidate.tree, &content).map_err(|source| {
-                RetainedCatalogError::ResolveAssets {
+            let content = prepare_content(&candidate.tree).map_err(|source| {
+                RetainedCatalogError::Prepare {
                     digest: digest.clone(),
                     source,
                 }
             })?;
-            match compiler.compile(&content, &assets) {
+            match compiler.compile(&content) {
                 Ok(catalog) => Ok((digest, Arc::new(catalog))),
                 Err(source) => Err(RetainedCatalogError::Compile { digest, source }),
             }
@@ -711,7 +684,7 @@ fn find_retained_public_snapshot(
             continue;
         };
         let shell = shell.bind_tip_recipient(tip_recipient.cloned());
-        let Ok(snapshot) = build_site_snapshot(shell, ledger) else {
+        let Ok(snapshot) = shell.into_snapshot() else {
             continue;
         };
         if &snapshot.digest == expected {
@@ -721,77 +694,6 @@ fn find_retained_public_snapshot(
     Err(RetainedCatalogError::PublicSnapshotUnavailable {
         expected: expected.clone(),
     })
-}
-
-fn find_retained_activation_catalog(
-    retained: &BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>,
-    ledger: &PublicLedgerProjection,
-    activation: &RecoverablePublicationActivation,
-    frontend: &'static FrontendAssetManifest,
-    tip_recipient: Option<&TipRecipientProjection>,
-) -> Result<Arc<ContentCatalog>, RetainedCatalogError> {
-    let view = activation.publication.view();
-    let activated_at = view
-        .activation_started_at
-        .ok_or(RetainedCatalogError::ActivationTimestampMissing)?;
-    let candidate_ledger = ledger.with_approved(PublishedPostRevision::new(
-        view.stable_post_id.clone(),
-        view.pinned_post_digest.clone(),
-        activated_at,
-    ));
-    let pins = candidate_ledger
-        .published_posts()
-        .map(|published| (published.post_id.clone(), published.revision.clone()))
-        .collect::<Vec<_>>();
-    for base in retained.values() {
-        let catalog = hydrate_catalog(base.as_ref().clone(), retained, pins.clone())?;
-        let Ok(shell) = render_site_shell(Arc::clone(&catalog), frontend, &candidate_ledger) else {
-            continue;
-        };
-        let shell = shell.bind_tip_recipient(tip_recipient.cloned());
-        let Ok(snapshot) = build_site_snapshot(shell, &candidate_ledger) else {
-            continue;
-        };
-        if snapshot.digest == activation.candidate_site_digest {
-            return Ok(catalog);
-        }
-    }
-    Err(RetainedCatalogError::ActivationSnapshotUnavailable {
-        expected: activation.candidate_site_digest.clone(),
-    })
-}
-
-fn rebuild_startup_snapshot(
-    startup: &StartupSnapshotState,
-    retained: &BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>,
-    preview_catalog: &Arc<ContentCatalog>,
-    frontend: &'static FrontendAssetManifest,
-    tip_recipient: Option<&TipRecipientProjection>,
-) -> Result<(Option<Arc<ContentCatalog>>, SiteSnapshot), ProcessError> {
-    let recovery_catalog = startup
-        .activating
-        .first()
-        .map(|activation| {
-            find_retained_activation_catalog(
-                retained,
-                &startup.ledger,
-                activation,
-                frontend,
-                tip_recipient,
-            )
-        })
-        .transpose()
-        .map_err(|error| {
-            startup_failure(
-                StartupStage::Content,
-                "rebuild the activating publication candidate",
-                error,
-            )
-        })?;
-    let snapshot =
-        rebuild_public_snapshot(startup, retained, preview_catalog, frontend, tip_recipient)?;
-    validate_rebuilt_startup_snapshot(startup, &snapshot)?;
-    Ok((recovery_catalog, snapshot))
 }
 
 fn rebuild_public_snapshot(
@@ -807,7 +709,7 @@ fn rebuild_public_snapshot(
                 startup_failure(StartupStage::Content, "render the site shell", error)
             })?
             .bind_tip_recipient(tip_recipient.cloned());
-        return build_site_snapshot(shell, &startup.ledger).map_err(|error| {
+        return shell.into_snapshot().map_err(|error| {
             startup_failure(StartupStage::Content, "build the site snapshot", error)
         });
     };
@@ -827,48 +729,15 @@ fn rebuild_public_snapshot(
     })
 }
 
-fn validate_rebuilt_startup_snapshot(
-    startup: &StartupSnapshotState,
-    snapshot: &SiteSnapshot,
-) -> Result<(), ProcessError> {
-    if !startup.activating.is_empty()
-        && startup.site.as_ref().map(|site| &site.digest) != Some(&snapshot.digest)
-    {
-        return Err(startup_failure(
-            StartupStage::Content,
-            "rebuild the durable pre-activation site snapshot",
-            StartupInvariantError::BaseSnapshotMismatch,
-        ));
-    }
-    if startup
-        .site
-        .as_ref()
-        .is_some_and(|expected| expected.digest != snapshot.digest)
-    {
-        return Err(startup_failure(
-            StartupStage::Content,
-            "rebuild the approved public site snapshot",
-            StartupInvariantError::PublicSnapshotMismatch,
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Debug, thiserror::Error)]
 enum RetainedCatalogError {
     #[error("retained content candidates could not be loaded")]
     Load(#[source] ContentCandidateStoreError),
-    #[error("retained content candidate {digest} is invalid")]
-    Validate {
+    #[error("retained content candidate {digest} could not be prepared")]
+    Prepare {
         digest: ContentTreeDigest,
         #[source]
-        source: ContentValidationErrors,
-    },
-    #[error("assets for retained content candidate {digest} could not be resolved")]
-    ResolveAssets {
-        digest: ContentTreeDigest,
-        #[source]
-        source: ResolveContentAssetsError,
+        source: PrepareContentError,
     },
     #[error("retained content candidate {digest} could not be compiled")]
     Compile {
@@ -885,10 +754,6 @@ enum RetainedCatalogError {
     Retain(#[source] CatalogRetentionError),
     #[error("no retained content candidate rebuilds durable site {expected}")]
     PublicSnapshotUnavailable { expected: SiteSnapshotDigest },
-    #[error("the activating publication has no activation timestamp")]
-    ActivationTimestampMissing,
-    #[error("no retained content candidate rebuilds activating site {expected}")]
-    ActivationSnapshotUnavailable { expected: SiteSnapshotDigest },
 }
 
 struct ServingStateInput<'resources> {
@@ -972,7 +837,39 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
             error,
         )
     })?;
-    let (recovery_catalog, snapshot) = rebuild_startup_snapshot(
+    let recovery = startup_state
+        .activating
+        .pop()
+        .map(|activation| {
+            let site = startup_state
+                .site
+                .clone()
+                .ok_or(PublicationActivationError::DurableStateMismatch)?;
+            let retained = retained_catalogs
+                .get(&activation.content_digest)
+                .ok_or(PublicationActivationError::DurableStateMismatch)?;
+            let mut catalog = retained.as_ref().clone();
+            catalog
+                .retain_revisions_from(&preview_catalog, ledger.revision_keys())
+                .map_err(|_| PublicationActivationError::DurableStateMismatch)?;
+            PreparedPublicationRecovery::prepare(
+                activation,
+                Arc::new(catalog),
+                frontend,
+                &ledger,
+                tip_recipient.as_ref(),
+                site,
+            )
+        })
+        .transpose()
+        .map_err(|error| {
+            startup_failure(
+                StartupStage::Content,
+                "rebuild the activating publication candidate",
+                error,
+            )
+        })?;
+    let snapshot = rebuild_public_snapshot(
         &startup_state,
         &retained_catalogs,
         &preview_catalog,
@@ -1000,7 +897,7 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
     let readiness = Readiness::default();
     let (snapshots, activator) = snapshot_store(snapshot);
     let mut publication_coordinator = PublicationCoordinator {
-        catalog: recovery_catalog.unwrap_or_else(|| Arc::clone(&preview_catalog)),
+        catalog: preview_catalog,
         content_digest: compiled.content_digest,
         candidates: Arc::new(retained_catalogs),
         ledger,
@@ -1020,9 +917,9 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         readiness: readiness.clone(),
         cancellation: cancellation.clone(),
     };
-    if let Some(activation) = startup_state.activating.pop() {
+    if let Some(recovery) = recovery {
         publication_coordinator
-            .recover(activation)
+            .recover(recovery)
             .await
             .map_err(|error| {
                 startup_failure(
@@ -1031,7 +928,6 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
                     error,
                 )
             })?;
-        publication_coordinator.catalog = preview_catalog;
     }
     let (publication_coordinator, publication_actor) =
         publication_coordinator.into_actor(PUBLICATION_COORDINATOR_QUEUE_CAPACITY);
@@ -1150,14 +1046,6 @@ async fn start_database(host: &HostConfiguration) -> Result<StartedDatabase, Pro
         task,
         security,
     })
-}
-
-#[derive(Debug, thiserror::Error)]
-enum StartupInvariantError {
-    #[error("the rebuilt base snapshot does not match the durable site head")]
-    BaseSnapshotMismatch,
-    #[error("the retained public representation does not match the durable site head")]
-    PublicSnapshotMismatch,
 }
 
 async fn close_started_database(
@@ -1692,7 +1580,7 @@ Durable article body.\n";
 
     async fn stop_built_application(application: Application) {
         let Application {
-            _startup: startup,
+            _process_lock: process_lock,
             _database: database,
             publication_coordinator,
             mut runtime,
@@ -1713,7 +1601,7 @@ Durable article body.\n";
         );
         drop(publication_coordinator);
         drop(database);
-        drop(startup);
+        drop(process_lock);
         tokio::task::yield_now().await;
     }
 
@@ -1829,7 +1717,7 @@ path_bytes = 400\n";
                 .contains("Pinned startup source")
         );
         assert_eq!(
-            startup._validated_content.publication.site.title.as_str(),
+            startup.content.view().publication.site.title.as_str(),
             "Pinned startup source"
         );
     }
@@ -1881,7 +1769,7 @@ path_bytes = 400\n";
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
 
         assert_eq!(
-            startup._validated_content.publication.tips,
+            startup.content.view().publication.tips,
             DefaultPostTipPolicy::Enabled
         );
     }
@@ -1974,12 +1862,16 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
     #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn application_build_serves_public_site_and_protected_admin_backend() {
-        let (_root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
+        let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
 
         let application = build_test_application(startup).await.unwrap();
 
+        assert!(matches!(
+            StartupHostConfiguration::load(root.path().join("maincopy.toml")),
+            Err(ProcessError::AlreadyRunning)
+        ));
         assert_eq!(application.runtime.critical_tasks.len(), 5);
         assert!(application.runtime.database_writer.is_some());
         let client = reqwest::Client::builder()
@@ -2013,6 +1905,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         );
 
         stop_built_application(application).await;
+        assert!(StartupHostConfiguration::load(root.path().join("maincopy.toml")).is_ok());
     }
 
     #[tokio::test]
@@ -2566,7 +2459,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
-    async fn startup_recovers_one_durable_publication_activation_before_binding() {
+    async fn startup_preflights_exact_activation_before_indexing_new_content_or_binding() {
         use sqlx::{ConnectOptions as _, Connection as _};
 
         let (root, arguments, _) = startup_fixture("", VALID_PUBLICATION);
@@ -2581,10 +2474,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let startup =
             StartupConfiguration::load_with_discovery(arguments, discover_content_tree).unwrap();
         let content_digest = startup._content_tree.digest();
-        let assets =
-            resolve_content_assets(&startup._content_tree, &startup._validated_content).unwrap();
-        let catalog =
-            Arc::new(compile_content_catalog(&startup._validated_content, &assets).unwrap());
+        let catalog = Arc::new(compile_content_catalog(&startup.content).unwrap());
         let post_id = PostId::parse(DURABLE_POST_ID).unwrap();
         let rendered = catalog.current_post(&post_id).unwrap();
         let revision = rendered.revision.clone();
@@ -2609,7 +2499,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             .unwrap();
         let shell = render_site_shell(Arc::clone(&catalog), embedded_manifest(), &candidate_ledger)
             .unwrap();
-        let candidate = build_site_snapshot(shell, &candidate_ledger).unwrap();
+        let candidate = shell.into_snapshot().unwrap();
         let candidate_digest = candidate.digest.clone();
         let activation_at_ns = i64::try_from(activation_at.unix_timestamp_nanos()).unwrap();
         let publication_id = uuid::Uuid::parse_str(DURABLE_PUBLICATION_ID)
@@ -2644,13 +2534,92 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         .execute(&mut connection)
         .await
         .unwrap();
+        let original_site: Vec<u8> =
+            sqlx::query_scalar("SELECT current_site_digest FROM site_state WHERE singleton = 1")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE canonical_publications SET activation_site_digest = ?")
+            .bind([0xab_u8; 32].as_slice())
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        drop(startup);
+
+        fs::write(
+            content_root.join("posts/durable-publication.md"),
+            DURABLE_POST.replace("Durable article body.", "Later private revision."),
+        )
+        .unwrap();
+        let startup = StartupConfiguration::load_with_discovery(
+            root.path().join("maincopy.toml"),
+            discover_content_tree,
+        )
+        .unwrap();
+        let error = match build_test_application(startup).await {
+            Ok(_) => panic!("an unreproducible activation must reject startup"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProcessError::Application(ApplicationError::Startup {
+                stage: StartupStage::Content,
+                operation: "rebuild the activating publication candidate",
+                ..
+            })
+        ));
+
+        let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database_path)
+            .connect()
+            .await
+            .unwrap();
+        let revisions: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT revision_digest FROM post_revisions")
+                .fetch_all(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(revisions, vec![revision.as_bytes().to_vec()]);
+        let durable_site: Vec<u8> =
+            sqlx::query_scalar("SELECT current_site_digest FROM site_state WHERE singleton = 1")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(durable_site, original_site);
+        let state: String = sqlx::query_scalar("SELECT state FROM canonical_publications")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(state, "activating");
+        sqlx::query("UPDATE canonical_publications SET activation_site_digest = ?")
+            .bind(candidate_digest.as_bytes().as_slice())
+            .execute(&mut connection)
+            .await
+            .unwrap();
         connection.close().await.unwrap();
 
+        let startup = StartupConfiguration::load_with_discovery(
+            root.path().join("maincopy.toml"),
+            discover_content_tree,
+        )
+        .unwrap();
         let application = build_test_application(startup).await.unwrap();
         {
             let projection = application.publication_coordinator.read();
             assert_eq!(projection.site.digest, candidate_digest);
             assert_eq!(projection.ledger.len(), 1);
+            let current = projection
+                .catalog
+                .current_post(&PostId::parse(DURABLE_POST_ID).unwrap())
+                .unwrap();
+            assert_ne!(current.revision, revision);
+            assert!(
+                current
+                    .article
+                    .identity_html
+                    .contains("Later private revision.")
+            );
         }
         let response = reqwest::Client::builder()
             .no_proxy()

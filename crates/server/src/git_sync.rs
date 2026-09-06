@@ -1818,8 +1818,8 @@ mod tests {
         },
         frontend_assets::embedded_manifest,
         render::{
-            ContentCompiler, SiteSnapshotReader, build_site_snapshot, render_bound_post_preview,
-            render_site_shell, snapshot_store,
+            ContentCompiler, SiteSnapshotReader, render_bound_post_preview, render_site_shell,
+            snapshot_store,
         },
         source_sync::{ManagedSourceEngine, ManagedSourceSyncError},
         web::Readiness,
@@ -2049,7 +2049,7 @@ mod tests {
             let shell =
                 render_site_shell(Arc::clone(&candidate.catalog), embedded_manifest(), &ledger)
                     .unwrap();
-            let snapshot = build_site_snapshot(shell, &ledger).unwrap();
+            let snapshot = shell.into_snapshot().unwrap();
             let site = fixture
                 .store
                 .publications

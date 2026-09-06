@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::{Extension, Router, middleware};
+use axum::{Extension, Router, extract::FromRef, middleware};
 use utoipa::OpenApi;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
@@ -37,8 +37,39 @@ pub(crate) use security::{
 };
 pub(crate) use server::AdminServer;
 
+/// Runtime dependencies required before the administration router can serve requests.
+#[derive(Clone)]
+pub(crate) struct AdminRuntimeState {
+    pub(crate) publications: PublicationCoordinatorHandle,
+    pub(crate) profiles: ProfileStore,
+    pub(crate) source: SourceSyncHandle,
+}
+
+impl FromRef<AdminRuntimeState> for PublicationCoordinatorHandle {
+    fn from_ref(state: &AdminRuntimeState) -> Self {
+        state.publications.clone()
+    }
+}
+
+impl FromRef<AdminRuntimeState> for ProfileStore {
+    fn from_ref(state: &AdminRuntimeState) -> Self {
+        state.profiles.clone()
+    }
+}
+
+impl FromRef<AdminRuntimeState> for SourceSyncHandle {
+    fn from_ref(state: &AdminRuntimeState) -> Self {
+        state.source.clone()
+    }
+}
+
 /// Builds the protected administration router without binding a listener.
-pub(crate) fn admin_router(security: AdminSecurityState) -> Router {
+pub(crate) fn runtime_admin_router(
+    publications: PublicationCoordinatorHandle,
+    security: AdminSecurityState,
+    profiles: ProfileStore,
+    source: SourceSyncHandle,
+) -> Router {
     let (router, document) = registered_router(&security);
     router
         .layer(Extension(Arc::new(document)))
@@ -53,10 +84,17 @@ pub(crate) fn admin_router(security: AdminSecurityState) -> Router {
         ))
         .layer(middleware::from_fn(request_id::assign))
         .layer(middleware::from_fn(security::harden_private_response))
+        .with_state(AdminRuntimeState {
+            publications,
+            profiles,
+            source,
+        })
 }
 
-fn registered_router(security: &AdminSecurityState) -> (Router, utoipa::openapi::OpenApi) {
-    let (api, document) = OpenApiRouter::<()>::with_openapi(AdminApi::openapi())
+fn registered_router(
+    security: &AdminSecurityState,
+) -> (Router<AdminRuntimeState>, utoipa::openapi::OpenApi) {
+    let (api, document) = OpenApiRouter::<AdminRuntimeState>::with_openapi(AdminApi::openapi())
         .routes(scoped_routes(
             routes!(capabilities::get_admin_capabilities),
             security,
@@ -215,24 +253,11 @@ fn registered_router(security: &AdminSecurityState) -> (Router, utoipa::openapi:
 }
 
 fn scoped_routes(
-    routes: utoipa_axum::router::UtoipaMethodRouter,
+    routes: utoipa_axum::router::UtoipaMethodRouter<AdminRuntimeState>,
     security: &AdminSecurityState,
     scope: AdminScope,
-) -> utoipa_axum::router::UtoipaMethodRouter {
+) -> utoipa_axum::router::UtoipaMethodRouter<AdminRuntimeState> {
     security::scoped_layer(routes, security, scope)
-}
-
-/// Builds the private administration router with live publication state.
-pub(crate) fn runtime_admin_router(
-    publications: PublicationCoordinatorHandle,
-    security: AdminSecurityState,
-    profiles: ProfileStore,
-    source: SourceSyncHandle,
-) -> Router {
-    admin_router(security)
-        .layer(Extension(publications))
-        .layer(Extension(profiles))
-        .layer(Extension(source))
 }
 
 #[cfg(test)]
@@ -391,7 +416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protected_publication_routes_validate_inputs_before_runtime_lookup() {
+    async fn protected_publication_routes_validate_inputs_and_report_missing_content() {
         const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
         const CANDIDATE: &str =
             "content-b3-v1-4444444444444444444444444444444444444444444444444444444444444444";
@@ -404,8 +429,7 @@ mod tests {
             .oneshot(harness.request(Method::GET, POSTS_PATH, Bytes::new(), None))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_problem(response, "publication_unavailable").await;
+        assert_eq!(response.status(), StatusCode::OK);
 
         for path in [
             format!("{POSTS_PATH}?limit=0"),
@@ -428,27 +452,31 @@ mod tests {
             assert!(response.headers().get("x-request-id").is_some(), "{path}");
         }
 
-        for path in [
-            format!("{POSTS_PATH}/{POST_ID}/preview"),
-            format!("/api/admin/v1/preview-assets/{CANDIDATE}?path=assets/preview.png"),
+        for (path, code) in [
+            (format!("{POSTS_PATH}/{POST_ID}/preview"), "post_not_found"),
+            (
+                format!("/api/admin/v1/preview-assets/{CANDIDATE}?path=assets/preview.png"),
+                "preview_candidate_unavailable",
+            ),
         ] {
             let response = router
                 .clone()
                 .oneshot(harness.request(Method::GET, &path, Bytes::new(), None))
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
             assert_eq!(response.headers()[CACHE_CONTROL], "private, no-store");
-            assert_problem(response, "publication_unavailable").await;
+            assert_problem(response, code).await;
         }
         harness.stop().await;
     }
 
     #[tokio::test]
-    async fn status_mutation_without_publication_coordinator_is_rejected_before_commit() {
+    async fn status_mutation_with_closed_publication_actor_is_rejected_before_commit() {
         const USERS_PATH: &str = "/api/admin/v1/identity/users";
 
-        let harness = ProtectedAdminHarness::start().await;
+        let mut harness = ProtectedAdminHarness::start().await;
+        harness.stop_publications().await;
         let router = harness.router();
         let response = router
             .clone()

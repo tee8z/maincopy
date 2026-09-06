@@ -1,11 +1,10 @@
 use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 
-use markdown_compiler::identity::finalize_post_revision;
 use markdown_compiler::{
     AssetRevisionReference, DigestedAsset, LogicalAssetPath, LogicalContentPath,
     MarkdownDestinationKind, MarkdownDestinationOrdinal, PostDocument, PostRendererIdentity,
-    PostRevisionDigest, ResolvedLocalAssetLookupError, ResolvedLocalAssetStore, ResolvedPostAssets,
-    ResolvedSiteAssets, RevisionIdentityError, SiteSnapshotDigest,
+    PostRevisionDigest, PreparedPost, ResolvedLocalAssetLookupError, ResolvedLocalAssetStore,
+    ResolvedPostAssets, ResolvedSiteAssets, SiteSnapshotDigest,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::Serialize;
@@ -25,62 +24,41 @@ const MAX_MERMAID_SVG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MERMAID_BLOCKS: usize = 64;
 const MAX_CODE_BLOCKS: usize = 256;
 
-/// Render one post with the closed V1 CommonMark pipeline.
-pub fn render_markdown(
-    document: &PostDocument,
-    assets: &ResolvedPostAssets,
-    site_assets: &ResolvedSiteAssets,
-) -> Result<RenderedPost, MarkdownRenderError> {
-    let diagrams = MermaidDiagramRenderer::discover()
-        .map_err(|error| mermaid_error(document, MarkdownRenderLocation::Document, error.code()))?;
-    render_markdown_with_renderer(
-        document,
-        assets,
-        site_assets,
-        RendererLimits::production(),
-        &mut |source, ordinal| diagrams.render(source, &document.metadata.id, ordinal),
-    )
-}
-
-pub(super) fn render_markdown_with_diagrams(
-    document: &PostDocument,
-    assets: &ResolvedPostAssets,
+/// Render the source and assets paired by compiler preparation.
+pub(super) fn render_prepared_post(
+    post: &PreparedPost,
     site_assets: &ResolvedSiteAssets,
     diagrams: &MermaidDiagramRenderer,
 ) -> Result<RenderedPost, MarkdownRenderError> {
     render_markdown_with_renderer(
-        document,
-        assets,
+        post,
         site_assets,
         RendererLimits::production(),
-        &mut |source, ordinal| diagrams.render(source, &document.metadata.id, ordinal),
+        &mut |source, ordinal| diagrams.render(source, &post.view().document.metadata.id, ordinal),
     )
 }
 
 fn render_markdown_with_renderer(
-    document: &PostDocument,
-    assets: &ResolvedPostAssets,
+    post: &PreparedPost,
     site_assets: &ResolvedSiteAssets,
     limits: RendererLimits,
     render_mermaid: &mut dyn FnMut(&str, NonZeroUsize) -> Result<SanitizedSvg, DiagramRenderError>,
 ) -> Result<RenderedPost, MarkdownRenderError> {
+    let input = post.view();
     let identity = PostRendererIdentity::baseline();
-    let article = MarkdownEventRenderer::new(document, assets, site_assets, render_mermaid, limits)
-        .render()?;
-    let revision = finalize_post_revision(
-        document,
-        assets,
+    let article = MarkdownEventRenderer::new(
+        input.document,
+        input.assets,
         site_assets,
-        &identity,
-        article.identity_html.as_bytes(),
-        // The v1 revision format retains an empty generated-file section; diagrams are inline.
-        &[],
+        render_mermaid,
+        limits,
     )
-    .map_err(|error| identity_error(document, error))?;
+    .render()?;
+    let revision = post.finalize_revision(&identity, article.identity_html.as_bytes());
 
     Ok(RenderedPost {
-        document: document.clone(),
-        assets: assets.clone(),
+        document: input.document.clone(),
+        assets: input.assets.clone(),
         renderer: identity,
         article,
         revision,
@@ -1289,15 +1267,6 @@ fn destination_kind(kind: MarkdownDestinationKind) -> RenderDestinationKind {
     }
 }
 
-fn identity_error(document: &PostDocument, error: RevisionIdentityError) -> MarkdownRenderError {
-    MarkdownRenderError::new(
-        document,
-        MarkdownRenderLocation::Document,
-        MarkdownRenderErrorCode::RevisionIdentityRejected,
-        error.to_string(),
-    )
-}
-
 fn local_asset_projection_error(
     path: &LogicalContentPath,
     error: ResolvedLocalAssetLookupError,
@@ -1370,9 +1339,7 @@ mod tests {
     use maincopy_diagram_renderer::client::MermaidRenderError;
 
     use super::*;
-    use markdown_compiler::{
-        PostCollection, ResolvedContentAssets, ValidatedContent, resolve_content_assets,
-    };
+    use markdown_compiler::{PostCollection, PreparedContent, prepare_content};
 
     use crate::content_fixtures::{asset, content_tree, post, publication};
     use crate::render::svg::{MermaidSvgSanitizer, SvgScope};
@@ -1389,27 +1356,16 @@ mod tests {
     }
 
     fn render_markdown_for_test(
-        document: &PostDocument,
-        assets: &ResolvedPostAssets,
-        site_assets: &ResolvedSiteAssets,
+        content: &PreparedContent,
         limits: RendererLimits,
     ) -> Result<RenderedPost, MarkdownRenderError> {
+        let content = content.view();
         render_markdown_with_renderer(
-            document,
-            assets,
-            site_assets,
+            &content.posts[0],
+            content.site_assets,
             limits,
             &mut render_fixture_mermaid,
         )
-    }
-
-    fn render_markdown_with_limits(
-        document: &PostDocument,
-        assets: &ResolvedPostAssets,
-        site_assets: &ResolvedSiteAssets,
-        limits: RendererLimits,
-    ) -> Result<RenderedPost, MarkdownRenderError> {
-        render_markdown_for_test(document, assets, site_assets, limits)
     }
 
     fn publication_source(title: &str, origins: &[&str]) -> String {
@@ -1450,7 +1406,7 @@ mod tests {
         body: &str,
         draft: bool,
         asset_paths: &[&str],
-    ) -> (ValidatedContent, ResolvedContentAssets) {
+    ) -> PreparedContent {
         let tree = content_tree(
             publication("publication.toml", publication_source(title, origins)),
             vec![post(
@@ -1477,16 +1433,10 @@ mod tests {
                 .collect(),
             0,
         );
-        let content = tree.validate().expect("fixture content must validate");
-        let assets = resolve_content_assets(&tree, &content).expect("fixture assets must resolve");
-        (content, assets)
+        prepare_content(&tree).expect("fixture content and assets must validate")
     }
 
-    fn candidate_with_local_bytes(
-        body: &str,
-        path: Option<&str>,
-        bytes: &[u8],
-    ) -> (ValidatedContent, ResolvedContentAssets) {
+    fn candidate_with_local_bytes(body: &str, path: Option<&str>, bytes: &[u8]) -> PreparedContent {
         let discovered_assets = path
             .map(|path| {
                 vec![asset(
@@ -1505,31 +1455,19 @@ mod tests {
             discovered_assets,
             0,
         );
-        let content = tree.validate().expect("fixture content must validate");
-        let assets = resolve_content_assets(&tree, &content).expect("fixture assets must resolve");
-        (content, assets)
+        prepare_content(&tree).expect("fixture content and assets must validate")
     }
 
     fn render(origins: &[&str], body: &str, asset_paths: &[&str]) -> RenderedPost {
-        let (content, assets) = candidate("Renderer", origins, body, false, asset_paths);
-        render_markdown_for_test(
-            &content.posts[0],
-            assets.assets_for(&content.posts[0]).unwrap(),
-            &assets.site,
-            RendererLimits::production(),
-        )
-        .expect("fixture must render")
+        let assets = candidate("Renderer", origins, body, false, asset_paths);
+        render_markdown_for_test(&assets, RendererLimits::production())
+            .expect("fixture must render")
     }
 
     fn render_error(body: &str) -> MarkdownRenderError {
-        let (content, assets) = candidate("Renderer", &[], body, false, &[]);
-        render_markdown_for_test(
-            &content.posts[0],
-            assets.assets_for(&content.posts[0]).unwrap(),
-            &assets.site,
-            RendererLimits::production(),
-        )
-        .expect_err("fixture must be rejected")
+        let assets = candidate("Renderer", &[], body, false, &[]);
+        render_markdown_for_test(&assets, RendererLimits::production())
+            .expect_err("fixture must be rejected")
     }
 
     fn snapshot() -> SiteSnapshotDigest {
@@ -1539,13 +1477,13 @@ mod tests {
     fn collect_and_escape_image_alt_events(
         events: Vec<Event<'static>>,
     ) -> Result<(String, String), MarkdownRenderError> {
-        let (content, assets) = candidate("Renderer", &[], "body", false, &[]);
-        let document = &content.posts[0];
+        let assets = candidate("Renderer", &[], "body", false, &[]);
+        let document = assets.view().posts[0].view().document;
         let mut render_mermaid = render_fixture_mermaid;
         let mut renderer = MarkdownEventRenderer::new(
             document,
-            assets.assets_for(document).unwrap(),
-            &assets.site,
+            assets.view().posts[0].view().assets,
+            assets.view().site_assets,
             &mut render_mermaid,
             RendererLimits::production(),
         );
@@ -1583,7 +1521,7 @@ mod tests {
         assert!(first.article.identity_html.contains("<svg "));
         assert!(!first.article.identity_html.contains("graph TD"));
 
-        let (_, projection_assets) = candidate(
+        let projection_assets = candidate(
             "Renderer",
             &[],
             body,
@@ -1593,8 +1531,8 @@ mod tests {
         let projected = first
             .project_for_snapshot(
                 &snapshot(),
-                &projection_assets.site,
-                &projection_assets.local_assets,
+                projection_assets.view().site_assets,
+                projection_assets.view().local_assets,
             )
             .unwrap();
         assert!(projected.contains(&format!("/assets/{}/images/diagram.png", snapshot())));
@@ -1673,13 +1611,13 @@ mod tests {
             );
         }
 
-        let (content, assets) = candidate("Renderer", &[], "body", false, &[]);
-        let document = &content.posts[0];
+        let assets = candidate("Renderer", &[], "body", false, &[]);
+        let document = assets.view().posts[0].view().document;
         let mut render_mermaid = render_fixture_mermaid;
         let renderer = MarkdownEventRenderer::new(
             document,
-            assets.assets_for(document).unwrap(),
-            &assets.site,
+            assets.view().posts[0].view().assets,
+            assets.view().site_assets,
             &mut render_mermaid,
             RendererLimits::production(),
         );
@@ -1750,25 +1688,22 @@ mod tests {
     #[test]
     fn preview_and_public_projection_reuse_exact_release_rendering() {
         let body = "```rust\nfn main() {}\n```\n\n```ascii\n+---+\n| A |\n+---+\n```\n\n```mermaid\nflowchart LR\nA-->B\n```\n";
-        let (content, assets) = candidate("Renderer", &[], body, false, &[]);
-        let document = &content.posts[0];
-        let rendered = render_markdown_for_test(
-            document,
-            assets.assets_for(document).unwrap(),
-            &assets.site,
-            RendererLimits::production(),
-        )
-        .unwrap();
+        let assets = candidate("Renderer", &[], body, false, &[]);
+        let rendered = render_markdown_for_test(&assets, RendererLimits::production()).unwrap();
 
         let preview = rendered
             .project_for_preview(
                 "/api/admin/v1/preview-assets",
-                &assets.site,
-                &assets.local_assets,
+                assets.view().site_assets,
+                assets.view().local_assets,
             )
             .unwrap();
         let public = rendered
-            .project_for_snapshot(&snapshot(), &assets.site, &assets.local_assets)
+            .project_for_snapshot(
+                &snapshot(),
+                assets.view().site_assets,
+                assets.view().local_assets,
+            )
             .unwrap();
 
         assert_eq!(preview, public);
@@ -1846,54 +1781,77 @@ mod tests {
     #[test]
     fn resolver_occurrences_are_unique_exact_and_exhaustive() {
         let body = "[safe](/safe)\n\n![image](assets/image.png)\n\n[file](assets/file.pdf)\n";
-        let (content, assets) = candidate(
+        let assets = candidate(
             "Renderer",
             &[],
             body,
             false,
             &["assets/image.png", "assets/file.pdf"],
         );
-        let approved = assets.assets_for(&content.posts[0]).unwrap();
+        let approved = assets.view().posts[0].view().assets;
 
-        let (reordered, _) = candidate(
+        let reordered = candidate(
             "Renderer",
             &[],
             "![image](assets/image.png)\n\n[safe](/safe)\n\n[file](assets/file.pdf)\n",
             false,
             &["assets/image.png", "assets/file.pdf"],
         );
-        let error = render_markdown(&reordered.posts[0], approved, &assets.site).unwrap_err();
+        let error = MarkdownEventRenderer::new(
+            reordered.view().posts[0].view().document,
+            approved,
+            assets.view().site_assets,
+            &mut render_fixture_mermaid,
+            RendererLimits::production(),
+        )
+        .render()
+        .unwrap_err();
         assert_eq!(error.code, MarkdownRenderErrorCode::AssetOccurrenceMissing);
 
-        let (shifted, _) = candidate(
+        let shifted = candidate(
             "Renderer",
             &[],
             "[safe](/safe)\n\n \n![image](assets/image.png)\n\n[file](assets/file.pdf)\n",
             false,
             &["assets/image.png", "assets/file.pdf"],
         );
-        let error = render_markdown(&shifted.posts[0], approved, &assets.site).unwrap_err();
+        let error = MarkdownEventRenderer::new(
+            shifted.view().posts[0].view().document,
+            approved,
+            assets.view().site_assets,
+            &mut render_fixture_mermaid,
+            RendererLimits::production(),
+        )
+        .render()
+        .unwrap_err();
         assert_eq!(error.code, MarkdownRenderErrorCode::AssetOccurrenceMismatch);
 
-        let (removed, _) = candidate("Renderer", &[], "[safe](/safe)\n", false, &[]);
-        let error = render_markdown(&removed.posts[0], approved, &assets.site).unwrap_err();
+        let removed = candidate("Renderer", &[], "[safe](/safe)\n", false, &[]);
+        let error = MarkdownEventRenderer::new(
+            removed.view().posts[0].view().document,
+            approved,
+            assets.view().site_assets,
+            &mut render_fixture_mermaid,
+            RendererLimits::production(),
+        )
+        .render()
+        .unwrap_err();
         assert_eq!(error.code, MarkdownRenderErrorCode::AssetOccurrenceUnused);
     }
 
     #[test]
     fn mermaid_timeout_rejects_the_article_with_the_authored_code_block_location() {
-        let (content, assets) = candidate(
+        let assets = candidate(
             "Renderer",
             &[],
             "```text\nplain\n```\n\n```mermaid\ngraph TD; A-->B\n```\n",
             false,
             &[],
         );
-        let document = &content.posts[0];
+        let document = assets.view().posts[0].view().document;
         let error = render_markdown_with_renderer(
-            document,
-            assets.assets_for(document).unwrap(),
-            &assets.site,
+            &assets.view().posts[0],
+            assets.view().site_assets,
             RendererLimits::production(),
             &mut |_, _| Err(DiagramRenderError::Renderer(MermaidRenderError::TimedOut)),
         )
@@ -1914,9 +1872,7 @@ mod tests {
 
     #[test]
     fn renderer_limits_are_inclusive_and_fail_one_byte_or_block_past() {
-        let (content, assets) = candidate("Renderer", &[], "```mermaid\nabc\n```\n", false, &[]);
-        let document = &content.posts[0];
-        let post_assets = assets.assets_for(document).unwrap();
+        let assets = candidate("Renderer", &[], "```mermaid\nabc\n```\n", false, &[]);
         let base = RendererLimits {
             rendered_html_bytes: 1_024,
             mermaid_source_bytes: 4,
@@ -1924,11 +1880,9 @@ mod tests {
             mermaid_blocks: 1,
             code_blocks: 256,
         };
-        render_markdown_with_limits(document, post_assets, &assets.site, base).unwrap();
-        let error = render_markdown_with_limits(
-            document,
-            post_assets,
-            &assets.site,
+        render_markdown_for_test(&assets, base).unwrap();
+        let error = render_markdown_for_test(
+            &assets,
             RendererLimits {
                 mermaid_source_bytes: 3,
                 ..base
@@ -1941,20 +1895,16 @@ mod tests {
             .unwrap()
             .as_str()
             .len();
-        render_markdown_with_limits(
-            document,
-            post_assets,
-            &assets.site,
+        render_markdown_for_test(
+            &assets,
             RendererLimits {
                 mermaid_svg_bytes: svg_bytes,
                 ..base
             },
         )
         .unwrap();
-        let error = render_markdown_with_limits(
-            document,
-            post_assets,
-            &assets.site,
+        let error = render_markdown_for_test(
+            &assets,
             RendererLimits {
                 mermaid_svg_bytes: svg_bytes - 1,
                 ..base
@@ -1966,32 +1916,23 @@ mod tests {
             MarkdownRenderErrorCode::MermaidRenderedOutputTooLarge
         );
 
-        let (two_content, two_assets) = candidate(
+        let two_assets = candidate(
             "Renderer",
             &[],
             "```mermaid\na\n```\n\n```mermaid\nb\n```\n",
             false,
             &[],
         );
-        let error = render_markdown_with_limits(
-            &two_content.posts[0],
-            two_assets.assets_for(&two_content.posts[0]).unwrap(),
-            &two_assets.site,
-            base,
-        )
-        .unwrap_err();
+        let error = render_markdown_for_test(&two_assets, base).unwrap_err();
         assert_eq!(
             error.code,
             MarkdownRenderErrorCode::MermaidBlockCountExceeded
         );
 
-        let (two_code_content, two_code_assets) =
+        let two_code_assets =
             candidate("Renderer", &[], "```\na\n```\n\n```\nb\n```\n", false, &[]);
-        let two_code_document = &two_code_content.posts[0];
-        let error = render_markdown_with_limits(
-            two_code_document,
-            two_code_assets.assets_for(two_code_document).unwrap(),
-            &two_code_assets.site,
+        let error = render_markdown_for_test(
+            &two_code_assets,
             RendererLimits {
                 code_blocks: 1,
                 ..base
@@ -2003,11 +1944,9 @@ mod tests {
         let mut writer = ArticleWriter::new(3);
         assert!(writer.write("abc").is_ok());
         assert!(writer.write("d").is_err());
-        let (small_content, small_assets) = candidate("Renderer", &[], "a", false, &[]);
-        let error = render_markdown_with_limits(
-            &small_content.posts[0],
-            small_assets.assets_for(&small_content.posts[0]).unwrap(),
-            &small_assets.site,
+        let small_assets = candidate("Renderer", &[], "a", false, &[]);
+        let error = render_markdown_for_test(
+            &small_assets,
             RendererLimits {
                 rendered_html_bytes: 7,
                 ..base
@@ -2020,35 +1959,32 @@ mod tests {
     #[test]
     fn stale_policy_product_cannot_project_even_when_public_revision_is_unchanged() {
         let body = "![cover](https://cdn.example.com/cover-v1.png)\n";
-        let (old_content, old_assets) = candidate(
+        let old_assets = candidate(
             "Renderer",
             &["https://cdn.example.com", "https://unused.example.com"],
             body,
             false,
             &[],
         );
-        let old = render_markdown(
-            &old_content.posts[0],
-            old_assets.assets_for(&old_content.posts[0]).unwrap(),
-            &old_assets.site,
-        )
-        .unwrap();
-        let (new_content, new_assets) =
-            candidate("Renderer", &["https://cdn.example.com"], body, false, &[]);
-        let fresh = render_markdown(
-            &new_content.posts[0],
-            new_assets.assets_for(&new_content.posts[0]).unwrap(),
-            &new_assets.site,
-        )
-        .unwrap();
+        let old = render_markdown_for_test(&old_assets, RendererLimits::production()).unwrap();
+        let new_assets = candidate("Renderer", &["https://cdn.example.com"], body, false, &[]);
+        let fresh = render_markdown_for_test(&new_assets, RendererLimits::production()).unwrap();
         assert_eq!(old.revision, fresh.revision);
         let error = old
-            .project_for_snapshot(&snapshot(), &new_assets.site, &new_assets.local_assets)
+            .project_for_snapshot(
+                &snapshot(),
+                new_assets.view().site_assets,
+                new_assets.view().local_assets,
+            )
             .unwrap_err();
         assert_eq!(error.code, MarkdownRenderErrorCode::AssetPolicyMismatch);
         assert!(
             fresh
-                .project_for_snapshot(&snapshot(), &new_assets.site, &new_assets.local_assets,)
+                .project_for_snapshot(
+                    &snapshot(),
+                    new_assets.view().site_assets,
+                    new_assets.view().local_assets,
+                )
                 .unwrap()
                 .contains("https://cdn.example.com/cover-v1.png")
         );
@@ -2057,21 +1993,15 @@ mod tests {
     #[test]
     fn projection_requires_the_candidate_store_to_match_every_local_asset_digest() {
         let body = "![cover](assets/cover.png)\n";
-        let (old_content, old_assets) =
-            candidate_with_local_bytes(body, Some("assets/cover.png"), b"old bytes");
-        let old = render_markdown(
-            &old_content.posts[0],
-            old_assets.assets_for(&old_content.posts[0]).unwrap(),
-            &old_assets.site,
-        )
-        .unwrap();
-        let (_, changed_assets) =
+        let old_assets = candidate_with_local_bytes(body, Some("assets/cover.png"), b"old bytes");
+        let old = render_markdown_for_test(&old_assets, RendererLimits::production()).unwrap();
+        let changed_assets =
             candidate_with_local_bytes(body, Some("assets/cover.png"), b"changed bytes");
         let error = old
             .project_for_snapshot(
                 &snapshot(),
-                &changed_assets.site,
-                &changed_assets.local_assets,
+                changed_assets.view().site_assets,
+                changed_assets.view().local_assets,
             )
             .unwrap_err();
         assert_eq!(
@@ -2079,20 +2009,24 @@ mod tests {
             MarkdownRenderErrorCode::LocalAssetDigestMismatch
         );
 
-        let (_, missing_assets) = candidate_with_local_bytes("No asset.\n", None, b"");
+        let missing_assets = candidate_with_local_bytes("No asset.\n", None, b"");
         let error = old
             .project_for_snapshot(
                 &snapshot(),
-                &missing_assets.site,
-                &missing_assets.local_assets,
+                missing_assets.view().site_assets,
+                missing_assets.view().local_assets,
             )
             .unwrap_err();
         assert_eq!(error.code, MarkdownRenderErrorCode::LocalAssetMissing);
 
         assert!(
-            old.project_for_snapshot(&snapshot(), &old_assets.site, &old_assets.local_assets,)
-                .unwrap()
-                .contains(&format!("/assets/{}/cover.png", snapshot()))
+            old.project_for_snapshot(
+                &snapshot(),
+                old_assets.view().site_assets,
+                old_assets.view().local_assets,
+            )
+            .unwrap()
+            .contains(&format!("/assets/{}/cover.png", snapshot()))
         );
     }
 

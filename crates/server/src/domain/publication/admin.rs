@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request},
+    extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use crate::{
     admin::{
+        AdminRuntimeState,
         idempotency::{IdempotencyKeyError, parse_idempotency_key},
         problem::{AdminProblem, AdminProblemEnvelope, problem_response},
         request_id::RequestId,
@@ -76,19 +77,19 @@ const ASSET_SANDBOX: HeaderValue = HeaderValue::from_static("sandbox; default-sr
 const DOWNLOAD_ASSET: HeaderValue =
     HeaderValue::from_static("attachment; filename=\"preview-asset\"");
 
-pub(crate) fn list_routes() -> UtoipaMethodRouter {
+pub(crate) fn list_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(list_posts)
 }
 
-pub(crate) fn preview_routes() -> UtoipaMethodRouter {
+pub(crate) fn preview_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_post_preview)
 }
 
-pub(crate) fn preview_asset_routes() -> UtoipaMethodRouter {
+pub(crate) fn preview_asset_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_preview_asset)
 }
 
-pub(crate) fn routes() -> UtoipaMethodRouter {
+pub(crate) fn routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(create_publication).layer(DefaultBodyLimit::max(MAX_PUBLICATION_REQUEST_BYTES))
 }
 
@@ -294,44 +295,6 @@ where
     }
 }
 
-struct AvailablePublication(PublicationCoordinatorHandle);
-
-impl<S> FromRequestParts<S> for AvailablePublication
-where
-    S: Send + Sync,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = publication_request_id(parts, state).await?;
-        parts
-            .extensions
-            .get::<PublicationCoordinatorHandle>()
-            .cloned()
-            .map(Self)
-            .ok_or_else(|| problem(publication_unavailable(), request_id))
-    }
-}
-
-struct AvailablePreviewPublication(PublicationCoordinatorHandle);
-
-impl<S> FromRequestParts<S> for AvailablePreviewPublication
-where
-    S: Send + Sync,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = publication_request_id(parts, state).await?;
-        parts
-            .extensions
-            .get::<PublicationCoordinatorHandle>()
-            .cloned()
-            .map(Self)
-            .ok_or_else(|| preview_problem(publication_unavailable(), request_id))
-    }
-}
-
 pub(crate) struct PublicationCommand {
     request_id: RequestId,
     coordinator: PublicationCoordinatorHandle,
@@ -342,20 +305,16 @@ pub(crate) struct PublicationCommand {
     scheduled_for: Option<OffsetDateTime>,
 }
 
-impl<S> FromRequest<S> for PublicationCommand
-where
-    S: Send + Sync,
-{
+impl FromRequest<AdminRuntimeState> for PublicationCommand {
     type Rejection = Response;
 
-    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(
+        request: Request,
+        state: &AdminRuntimeState,
+    ) -> Result<Self, Self::Rejection> {
         let (mut parts, body) = request.into_parts();
         let request_id = publication_request_id(&mut parts, state).await?;
         let headers = parts.headers.clone();
-        let coordinator = parts
-            .extensions
-            .get::<PublicationCoordinatorHandle>()
-            .cloned();
         let request = Request::from_parts(parts, body);
         let Json(request) = Json::<PublishNowRequest>::from_request(request, state)
             .await
@@ -414,8 +373,7 @@ where
                     request_id,
                 )
             })?;
-        let coordinator =
-            coordinator.ok_or_else(|| problem(publication_unavailable(), request_id))?;
+        let coordinator = state.publications.clone();
 
         Ok(Self {
             request_id,
@@ -461,7 +419,7 @@ where
 )]
 async fn list_posts(
     PostsPage { cursor, limit }: PostsPage,
-    AvailablePublication(coordinator): AvailablePublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
 ) -> Response {
     let coordinator = coordinator.read();
     Json(posts_page(
@@ -524,7 +482,7 @@ async fn get_post_preview(
         expected_revision,
         expected_content_digest,
     }: PostPreviewInput,
-    AvailablePreviewPublication(coordinator): AvailablePreviewPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
 ) -> Response {
     let coordinator = coordinator.read();
     let (content_digest, catalog) = match expected_content_digest {
@@ -695,7 +653,7 @@ async fn get_preview_asset(
         content_digest,
         asset_path,
     }: PreviewAssetInput,
-    AvailablePreviewPublication(coordinator): AvailablePreviewPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
 ) -> Response {
     let bytes = {
         let coordinator = coordinator.read();
@@ -1106,12 +1064,12 @@ mod tests {
             },
         },
         frontend_assets::embedded_manifest,
-        render::{build_site_snapshot, compile_content_catalog, render_site_shell, snapshot_store},
+        render::{compile_content_catalog, render_site_shell, snapshot_store},
         web::Readiness,
     };
     use markdown_compiler::{
         DiscoveredAsset, LogicalAssetPath, PostAlias, PostCollection, SiteSnapshotDigest,
-        resolve_content_assets,
+        prepare_content,
     };
 
     use crate::content_fixtures::{asset, content_tree, post, publication};
@@ -1120,10 +1078,11 @@ mod tests {
     const PREVIEW_ASSET_PATH: &str = "assets/preview.png";
     const CURRENT_PREVIEW_ASSET: &[u8] = b"current preview image";
 
-    fn publication_command_router() -> axum::Router {
+    fn publication_command_router(state: AdminRuntimeState) -> axum::Router {
         axum::Router::new()
             .route("/", axum::routing::post(create_publication))
             .layer(DefaultBodyLimit::max(MAX_PUBLICATION_REQUEST_BYTES))
+            .with_state(state)
     }
 
     fn publication_command_request(body: Body) -> Request {
@@ -1147,8 +1106,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_publication_json_precedes_missing_coordinator() {
-        let response = publication_command_router()
+    async fn malformed_publication_json_is_rejected_before_command_execution() {
+        let harness = ProtectedAdminHarness::start().await;
+        let response = publication_command_router(harness.runtime.state.clone())
             .oneshot(publication_command_request(Body::from("{")))
             .await
             .unwrap();
@@ -1158,11 +1118,13 @@ mod tests {
             response_problem_code(response).await,
             "invalid_request_body"
         );
+        harness.stop().await;
     }
 
     #[tokio::test]
-    async fn oversized_publication_json_precedes_missing_coordinator() {
-        let response = publication_command_router()
+    async fn oversized_publication_json_preserves_payload_too_large() {
+        let harness = ProtectedAdminHarness::start().await;
+        let response = publication_command_router(harness.runtime.state.clone())
             .oneshot(publication_command_request(Body::from(vec![
                 b' ';
                 MAX_PUBLICATION_REQUEST_BYTES
@@ -1176,17 +1138,20 @@ mod tests {
             response_problem_code(response).await,
             "request_body_too_large"
         );
+        harness.stop().await;
     }
 
     #[tokio::test]
-    async fn valid_publication_command_reports_missing_coordinator() {
+    async fn valid_publication_command_reports_closed_coordinator() {
         let body = serde_json::json!({
             "post_id": "11111111-1111-4111-8111-111111111111",
             "preview_digest": format!("preview-b3-v1-{}", "22".repeat(32)),
             "expected_revision": null
         })
         .to_string();
-        let response = publication_command_router()
+        let mut harness = ProtectedAdminHarness::start().await;
+        harness.stop_publications().await;
+        let response = publication_command_router(harness.runtime.state.clone())
             .oneshot(publication_command_request(Body::from(body)))
             .await
             .unwrap();
@@ -1196,6 +1161,7 @@ mod tests {
             response_problem_code(response).await,
             "publication_unavailable"
         );
+        harness.stop().await;
     }
 
     fn posts_catalog() -> ContentCatalog {
@@ -1299,9 +1265,8 @@ mod tests {
         })
         .collect();
         let tree = content_tree(publication, posts, assets, 0);
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        compile_content_catalog(&content, &assets).unwrap()
+        let prepared = prepare_content(&tree).unwrap();
+        compile_content_catalog(&prepared).unwrap()
     }
 
     struct PreviewRuntime {
@@ -1353,7 +1318,7 @@ mod tests {
         content_digest: ContentTreeDigest,
     ) -> PreviewRuntime {
         let shell = render_site_shell(Arc::clone(&public), embedded_manifest(), &ledger).unwrap();
-        let snapshot = build_site_snapshot(shell, &ledger).unwrap();
+        let snapshot = shell.into_snapshot().unwrap();
         let site = SiteHead {
             digest: snapshot.digest.clone(),
             version: 1,

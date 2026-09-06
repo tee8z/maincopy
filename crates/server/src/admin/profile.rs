@@ -1,7 +1,9 @@
 use axum::{
     Json,
-    extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Request, rejection::JsonRejection},
-    http::{HeaderMap, HeaderValue, StatusCode, request::Parts},
+    extract::{
+        DefaultBodyLimit, FromRequest, FromRequestParts, Request, State, rejection::JsonRejection,
+    },
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse as _, Response},
 };
 use maincopy_shared::profile_api::{
@@ -19,6 +21,7 @@ mod ui;
 pub(super) use ui::browser_router;
 
 use super::{
+    AdminRuntimeState,
     idempotency::{IdempotencyKeyError, parse_idempotency_key},
     principal::AdminPrincipal,
     problem::{AdminProblem, AdminProblemEnvelope, problem_response},
@@ -42,12 +45,12 @@ use crate::{
 const PROFILE_REQUEST_BODY_LIMIT: usize = 8 * 1024;
 const RETRY_AFTER_ONE_SECOND: HeaderValue = HeaderValue::from_static("1");
 
-pub(super) fn profile_routes() -> UtoipaMethodRouter {
+pub(super) fn profile_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_current_profile, put_current_profile)
         .layer(DefaultBodyLimit::max(PROFILE_REQUEST_BODY_LIMIT))
 }
 
-pub(super) fn tip_recipient_routes() -> UtoipaMethodRouter {
+pub(super) fn tip_recipient_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_active_tip_recipient, put_active_tip_recipient)
         .layer(DefaultBodyLimit::max(PROFILE_REQUEST_BODY_LIMIT))
 }
@@ -65,7 +68,7 @@ pub(super) fn tip_recipient_routes() -> UtoipaMethodRouter {
 async fn get_current_profile(
     request_id: RequestId,
     principal: AdminPrincipal,
-    AvailableProfileStore(store): AvailableProfileStore,
+    State(store): State<ProfileStore>,
 ) -> Response {
     match store.profile(principal.user_id).await {
         Ok(Some(profile)) => Json(profile_response(profile)).into_response(),
@@ -147,7 +150,7 @@ async fn put_current_profile(
 )]
 async fn get_active_tip_recipient(
     request_id: RequestId,
-    AvailableProfileStore(store): AvailableProfileStore,
+    State(store): State<ProfileStore>,
 ) -> Response {
     match store.active_tip_recipient().await {
         Ok(setting) => Json(recipient_response(setting)).into_response(),
@@ -205,27 +208,6 @@ async fn put_active_tip_recipient(
     }
 }
 
-struct AvailableProfileStore(ProfileStore);
-
-impl<S> FromRequestParts<S> for AvailableProfileStore
-where
-    S: Send + Sync,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = RequestId::from_request_parts(parts, state)
-            .await
-            .map_err(|error| error.into_response())?;
-        parts
-            .extensions
-            .get::<ProfileStore>()
-            .cloned()
-            .map(Self)
-            .ok_or_else(|| unavailable(request_id))
-    }
-}
-
 struct ProfileCommand<T> {
     request_id: RequestId,
     principal: AdminPrincipal,
@@ -234,14 +216,16 @@ struct ProfileCommand<T> {
     request: T,
 }
 
-impl<S, T> FromRequest<S> for ProfileCommand<T>
+impl<T> FromRequest<AdminRuntimeState> for ProfileCommand<T>
 where
-    S: Send + Sync,
     T: DeserializeOwned,
 {
     type Rejection = Response;
 
-    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(
+        request: Request,
+        state: &AdminRuntimeState,
+    ) -> Result<Self, Self::Rejection> {
         let (mut parts, body) = request.into_parts();
         let request_id = RequestId::from_request_parts(&mut parts, state)
             .await
@@ -250,17 +234,13 @@ where
             .await
             .map_err(|error| error.into_response())?;
         let headers = parts.headers.clone();
-        let coordinator = parts
-            .extensions
-            .get::<PublicationCoordinatorHandle>()
-            .cloned();
         let request = Request::from_parts(parts, body);
         let Json(request) = Json::<T>::from_request(request, state)
             .await
             .map_err(|rejection| json_rejection(rejection, request_id))?;
         let idempotency_key =
             profile_idempotency_key(&headers).map_err(|spec| problem(spec, request_id))?;
-        let coordinator = coordinator.ok_or_else(|| unavailable(request_id))?;
+        let coordinator = state.publications.clone();
         let audit = principal.mutation_audit(request_id, idempotency_key);
         Ok(Self {
             request_id,
@@ -394,10 +374,6 @@ fn transition_problem(error: ProfileTransitionError, request_id: RequestId) -> A
     spec
 }
 
-fn unavailable(request_id: RequestId) -> Response {
-    problem(profile_unavailable(), request_id)
-}
-
 const fn profile_unavailable() -> AdminProblem {
     AdminProblem::unavailable(
         "profile_unavailable",
@@ -435,6 +411,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::admin::test_support::ProtectedAdminHarness;
 
     const IDEMPOTENCY_KEY: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
     const VALID_PROFILE_BODY: &[u8] =
@@ -444,7 +421,7 @@ mod tests {
         StatusCode::NO_CONTENT
     }
 
-    fn extractor_router() -> Router {
+    fn extractor_router(state: AdminRuntimeState) -> Router {
         let principal = AdminPrincipal {
             user_id: UserId::from_uuid(Uuid::new_v4()),
             scopes: Arc::new(BTreeSet::<AdminScope>::new()),
@@ -457,6 +434,7 @@ mod tests {
             .layer(DefaultBodyLimit::max(PROFILE_REQUEST_BODY_LIMIT))
             .layer(Extension(principal))
             .layer(Extension(RequestId(Uuid::new_v4())))
+            .with_state(state)
     }
 
     fn profile_request(body: Bytes, idempotency_key: Option<&str>) -> HttpRequest<Body> {
@@ -503,19 +481,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_profile_body_precedes_missing_idempotency_key_and_runtime_state() {
-        let response = extractor_router()
+    async fn malformed_profile_body_precedes_missing_idempotency_key() {
+        let harness = ProtectedAdminHarness::start().await;
+        let response = extractor_router(harness.runtime.state.clone())
             .oneshot(profile_request(Bytes::from_static(b"{"), None))
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(error_code(response).await, "invalid_profile_request");
+        harness.stop().await;
     }
 
     #[tokio::test]
-    async fn valid_profile_body_reports_missing_idempotency_key_before_runtime_state() {
-        let response = extractor_router()
+    async fn valid_profile_body_requires_idempotency_key() {
+        let harness = ProtectedAdminHarness::start().await;
+        let response = extractor_router(harness.runtime.state.clone())
             .oneshot(profile_request(
                 Bytes::from_static(VALID_PROFILE_BODY),
                 None,
@@ -525,25 +506,13 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(error_code(response).await, "missing_idempotency_key");
-    }
-
-    #[tokio::test]
-    async fn valid_profile_command_reports_missing_runtime_state() {
-        let response = extractor_router()
-            .oneshot(profile_request(
-                Bytes::from_static(VALID_PROFILE_BODY),
-                Some(IDEMPOTENCY_KEY),
-            ))
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error_code(response).await, "profile_unavailable");
+        harness.stop().await;
     }
 
     #[tokio::test]
     async fn oversized_profile_body_preserves_payload_too_large() {
-        let response = extractor_router()
+        let harness = ProtectedAdminHarness::start().await;
+        let response = extractor_router(harness.runtime.state.clone())
             .oneshot(profile_request(
                 Bytes::from(vec![b' '; PROFILE_REQUEST_BODY_LIMIT + 1]),
                 None,
@@ -553,5 +522,6 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(error_code(response).await, "profile_request_too_large");
+        harness.stop().await;
     }
 }

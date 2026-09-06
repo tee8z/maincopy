@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use axum::{
-    Extension, Form, Router,
-    extract::{DefaultBodyLimit, rejection::FormRejection},
+    Form, Router,
+    extract::{DefaultBodyLimit, State, rejection::FormRejection},
     http::StatusCode,
     middleware,
     response::Response,
@@ -18,17 +18,19 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{AvailableProfileStore, PROFILE_REQUEST_BODY_LIMIT, load_problem, transition_problem};
+use super::{PROFILE_REQUEST_BODY_LIMIT, load_problem, transition_problem};
 use crate::{
     admin::{
-        AdminSecurityState, BrowserFormSession, browser_scoped_router,
+        AdminRuntimeState, AdminSecurityState, BrowserFormSession, browser_scoped_router,
         principal::AdminPrincipal,
         request_id::RequestId,
         ui::{PageKind, adapt_security_response, mutation_error_response, page_response, redirect},
     },
     domain::{
         auth::store::AdminMutationKey,
-        profile::{ProfilePrecondition, SetTipRecipient, StoredUserProfile, UpdateProfile},
+        profile::{
+            ProfilePrecondition, ProfileStore, SetTipRecipient, StoredUserProfile, UpdateProfile,
+        },
         publication::activation::PublicationCoordinatorHandle,
     },
 };
@@ -70,7 +72,7 @@ where
     }
 }
 
-pub(in crate::admin) fn browser_router(security: &AdminSecurityState) -> Router {
+pub(in crate::admin) fn browser_router(security: &AdminSecurityState) -> Router<AdminRuntimeState> {
     browser_scoped_router(
         Router::new().route("/admin/profile", get(show_profile).post(save_profile)),
         security,
@@ -91,7 +93,7 @@ pub(in crate::admin) fn browser_router(security: &AdminSecurityState) -> Router 
 async fn show_profile(
     request_id: RequestId,
     browser: BrowserFormSession,
-    AvailableProfileStore(store): AvailableProfileStore,
+    State(store): State<ProfileStore>,
 ) -> Response {
     let profile = match store.profile(browser.session.user_id).await {
         Ok(profile) => profile,
@@ -154,13 +156,12 @@ fn profile_form(browser: &BrowserFormSession, profile: Option<&StoredUserProfile
 async fn save_profile(
     request_id: RequestId,
     principal: AdminPrincipal,
-    coordinator: Option<Extension<PublicationCoordinatorHandle>>,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     form: Result<Form<ProfileForm>, FormRejection>,
 ) -> Response {
-    let status = match (coordinator, form) {
-        (_, Err(error)) => error.status(),
-        (None, _) => StatusCode::SERVICE_UNAVAILABLE,
-        (Some(Extension(coordinator)), Ok(Form(form))) => {
+    let status = match form {
+        Err(error) => error.status(),
+        Ok(Form(form)) => {
             let result = coordinator
                 .update_profile(UpdateProfile {
                     user_id: principal.user_id,
@@ -185,7 +186,7 @@ async fn save_profile(
 async fn show_tip_recipient(
     request_id: RequestId,
     browser: BrowserFormSession,
-    AvailableProfileStore(store): AvailableProfileStore,
+    State(store): State<ProfileStore>,
 ) -> Response {
     let setting = match store.active_tip_recipient().await {
         Ok(setting) => setting,
@@ -244,13 +245,12 @@ async fn show_tip_recipient(
 async fn save_tip_recipient(
     request_id: RequestId,
     principal: AdminPrincipal,
-    coordinator: Option<Extension<PublicationCoordinatorHandle>>,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     form: Result<Form<TipRecipientForm>, FormRejection>,
 ) -> Response {
-    let status = match (coordinator, form) {
-        (_, Err(error)) => error.status(),
-        (None, _) => StatusCode::SERVICE_UNAVAILABLE,
-        (Some(Extension(coordinator)), Ok(Form(form))) => {
+    let status = match form {
+        Err(error) => error.status(),
+        Ok(Form(form)) => {
             match coordinator
                 .set_tip_recipient(SetTipRecipient {
                     expected_version: form.expected_version,

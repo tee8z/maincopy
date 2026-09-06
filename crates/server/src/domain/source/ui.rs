@@ -2,10 +2,10 @@
 
 use axum::{
     Form, Router,
-    extract::{DefaultBodyLimit, FromRequestParts, Query},
-    http::{StatusCode, request::Parts},
+    extract::{DefaultBodyLimit, Query, State},
+    http::StatusCode,
     middleware,
-    response::{IntoResponse as _, Response},
+    response::Response,
     routing::{get, post},
 };
 use maincopy_shared::{
@@ -23,7 +23,8 @@ use uuid::Uuid;
 
 use crate::{
     admin::{
-        AdminSecurityState, BrowserFormSession, RequiredBrowserSession, browser_scoped_router,
+        AdminRuntimeState, AdminSecurityState, BrowserFormSession, RequiredBrowserSession,
+        browser_scoped_router,
         request_id::RequestId,
         ui::{self as admin_ui, PageKind},
     },
@@ -49,28 +50,7 @@ struct SourceSyncForm {
     idempotency_key: Box<str>,
 }
 
-struct UiSource(SourceSyncHandle);
-
-impl<S> FromRequestParts<S> for UiSource
-where
-    S: Send + Sync,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = RequestId::from_request_parts(parts, state)
-            .await
-            .map_err(|error| error.into_response())?;
-        parts
-            .extensions
-            .get::<SourceSyncHandle>()
-            .cloned()
-            .map(Self)
-            .ok_or_else(|| source_unavailable(request_id))
-    }
-}
-
-pub(crate) fn router(security: &AdminSecurityState) -> Router {
+pub(crate) fn router(security: &AdminSecurityState) -> Router<AdminRuntimeState> {
     let page = browser_scoped_router(
         Router::new().route("/admin/source", get(show_source)),
         security,
@@ -93,7 +73,7 @@ async fn show_source(
         session,
         csrf_token,
     }: BrowserFormSession,
-    UiSource(handle): UiSource,
+    State(handle): State<SourceSyncHandle>,
     query: Result<Query<SourcePageQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
@@ -193,7 +173,7 @@ async fn begin_source_sync(
         session,
         ..
     }: RequiredBrowserSession,
-    UiSource(handle): UiSource,
+    State(handle): State<SourceSyncHandle>,
     form: Result<Form<SourceSyncForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
     let form = match form {

@@ -662,113 +662,79 @@ enum PreInjectionPage<'view> {
     Error(PublicErrorPage),
 }
 
-pub fn build_site_snapshot(
-    shell: RenderedSiteShell,
-    ledger: &PublicLedgerProjection,
-) -> Result<SiteSnapshot, SiteSnapshotBuildError> {
-    validate_snapshot_shell(&shell, ledger)?;
-    let public_posts: Vec<_> = ledger
-        .published_posts()
-        .map(|published| {
-            PublishedPostIdentityInput::new(
-                &published.post_id,
-                &published.revision,
-                published.published_at,
-            )
+impl RenderedSiteShell {
+    /// Consumes the exact inputs selected and validated when this shell was rendered.
+    pub fn into_snapshot(self) -> Result<SiteSnapshot, SiteSnapshotBuildError> {
+        let public_posts: Vec<_> = self
+            .ledger
+            .published_posts()
+            .map(|published| {
+                PublishedPostIdentityInput::new(
+                    &published.post_id,
+                    &published.revision,
+                    published.published_at,
+                )
+            })
+            .collect();
+        let digest = finalize_site_snapshot(
+            &self.catalog.publication,
+            &self.catalog.site_assets,
+            &self.renderer,
+            &self.pre_injection_output,
+            &public_posts,
+        )
+        .map_err(SiteSnapshotBuildError::identity)?;
+
+        let mut retained = RetainedHtmlBudget::new();
+        let tip_handoff = self
+            .tip_recipient
+            .as_ref()
+            .map(TipHandoff::new)
+            .transpose()?;
+        let pages = render_snapshot_pages(&self, &digest, tip_handoff.as_ref(), &mut retained)?;
+        let publication = &self.catalog.publication;
+        let not_found = rendered_error_page(
+            publication,
+            self.frontend,
+            PublicErrorPage::NotFound,
+            &mut retained,
+        )?;
+        let method_not_allowed = rendered_error_page(
+            publication,
+            self.frontend,
+            PublicErrorPage::MethodNotAllowed,
+            &mut retained,
+        )?;
+        let assets = collect_public_assets(&self, &digest)?;
+        let feed = self.feed;
+        let robots = self.robots;
+        let sitemap = self.sitemap;
+        let redirects = self.redirects;
+        let presentation_digest = presentation_digest(
+            &pages,
+            &redirects,
+            &not_found,
+            &method_not_allowed,
+            &feed,
+            &robots,
+            &sitemap,
+        );
+
+        Ok(SiteSnapshot {
+            digest,
+            presentation_digest,
+            feed,
+            robots,
+            sitemap,
+            pages,
+            redirects,
+            not_found,
+            method_not_allowed,
+            assets,
+            frontend: self.frontend,
+            retained_html_bytes: retained.used,
         })
-        .collect();
-    let digest = finalize_site_snapshot(
-        &shell.catalog.publication,
-        &shell.catalog.site_assets,
-        &shell.renderer,
-        &shell.pre_injection_output,
-        &public_posts,
-    )
-    .map_err(SiteSnapshotBuildError::identity)?;
-
-    let mut retained = RetainedHtmlBudget::new();
-    let tip_handoff = shell
-        .tip_recipient
-        .as_ref()
-        .map(TipHandoff::new)
-        .transpose()?;
-    let pages = render_snapshot_pages(&shell, &digest, tip_handoff.as_ref(), &mut retained)?;
-    let publication = &shell.catalog.publication;
-    let not_found = rendered_error_page(
-        publication,
-        shell.frontend,
-        PublicErrorPage::NotFound,
-        &mut retained,
-    )?;
-    let method_not_allowed = rendered_error_page(
-        publication,
-        shell.frontend,
-        PublicErrorPage::MethodNotAllowed,
-        &mut retained,
-    )?;
-    let feed = shell.feed.clone();
-    let robots = shell.robots.clone();
-    let sitemap = shell.sitemap.clone();
-    let assets = collect_public_assets(&shell, &digest)?;
-    let redirects = shell.redirects;
-    let presentation_digest = presentation_digest(
-        &pages,
-        &redirects,
-        &not_found,
-        &method_not_allowed,
-        &feed,
-        &robots,
-        &sitemap,
-    );
-
-    Ok(SiteSnapshot {
-        digest,
-        presentation_digest,
-        feed,
-        robots,
-        sitemap,
-        pages,
-        redirects,
-        not_found,
-        method_not_allowed,
-        assets,
-        frontend: shell.frontend,
-        retained_html_bytes: retained.used,
-    })
-}
-
-fn validate_snapshot_shell(
-    shell: &RenderedSiteShell,
-    ledger: &PublicLedgerProjection,
-) -> Result<(), SiteSnapshotBuildError> {
-    if &shell.ledger != ledger {
-        return Err(SiteSnapshotBuildError::new(
-            SiteSnapshotBuildErrorCode::LedgerMismatch,
-            None,
-            "the site shell belongs to a different public-ledger projection",
-        ));
     }
-    shell
-        .frontend
-        .validate()
-        .map_err(|error| SiteSnapshotBuildError::frontend(error.to_string()))?;
-    if shell.renderer.frontend_bundle != *shell.frontend.bundle_digest.as_bytes() {
-        return Err(SiteSnapshotBuildError::new(
-            SiteSnapshotBuildErrorCode::FrontendMismatch,
-            None,
-            "the site shell belongs to a different frontend bundle",
-        ));
-    }
-
-    let selected = select_public_posts(&shell.catalog, ledger)?;
-    if selected.as_slice() != shell.posts.as_ref() {
-        return Err(SiteSnapshotBuildError::new(
-            SiteSnapshotBuildErrorCode::SourceBindingMismatch,
-            None,
-            "the site shell does not match its bound content catalog",
-        ));
-    }
-    Ok(())
 }
 
 fn render_snapshot_pages(
@@ -1332,11 +1298,8 @@ pub(crate) struct SnapshotActivationError {
 #[serde(rename_all = "snake_case")]
 pub enum SiteSnapshotBuildErrorCode {
     FrontendManifestInvalid,
-    FrontendMismatch,
-    LedgerMismatch,
     RevisionUnavailable,
     DraftSelected,
-    SourceBindingMismatch,
     RouteCollision,
     RouteLimitExceeded,
     PageLimitExceeded,
@@ -2039,13 +2002,10 @@ mod tests {
     use maincopy_shared::profile::{LightningAddress, ProfileDisplayName};
 
     use super::*;
-    use crate::{
-        frontend_assets::embedded_manifest,
-        render::{compile_content_catalog, render_markdown},
-    };
+    use crate::{frontend_assets::embedded_manifest, render::compile_content_catalog};
     use markdown_compiler::{
         LogicalAssetPath, PostCollection, ResolvedPostAssets, ResolvedSiteAssets, digest_asset,
-        resolve_content_assets,
+        prepare_content,
     };
 
     use crate::content_fixtures::{asset, content_tree, post, publication};
@@ -2220,22 +2180,17 @@ mod tests {
             ],
             0,
         );
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
-        let mut revisions = BTreeMap::new();
-        for document in &content.posts {
-            let rendered = render_markdown(
-                document,
-                assets.assets_for(document).unwrap(),
-                assets.site_assets_for(&content.publication).unwrap(),
-            )
-            .unwrap();
-            revisions.insert(
-                rendered.document.metadata.id.clone(),
-                rendered.revision.clone(),
-            );
-        }
-        let catalog = Arc::new(compile_content_catalog(&content, &assets).unwrap());
+        let content = prepare_content(&tree).unwrap();
+        let catalog = Arc::new(compile_content_catalog(&content).unwrap());
+        let revisions = catalog
+            .rendered_posts()
+            .map(|rendered| {
+                (
+                    rendered.document.metadata.id.clone(),
+                    rendered.revision.clone(),
+                )
+            })
+            .collect();
         Fixture { catalog, revisions }
     }
 
@@ -2263,7 +2218,7 @@ mod tests {
         ledger: &PublicLedgerProjection,
     ) -> Result<SiteSnapshot, SiteSnapshotBuildError> {
         let shell = render_site_shell(Arc::clone(&fixture.catalog), embedded_manifest(), ledger)?;
-        build_site_snapshot(shell, ledger)
+        shell.into_snapshot()
     }
 
     fn preview_asset_endpoint() -> String {
@@ -3484,14 +3439,42 @@ mod tests {
     }
 
     #[test]
-    fn shell_cannot_be_cross_wired_to_another_ledger() {
+    fn snapshot_identity_and_presentation_preserve_canonical_bytes() {
         let fixture = fixture();
-        let first = projection([entry(&fixture, FIRST_ID, 1_000)]);
-        let second = projection([entry(&fixture, SECOND_ID, 1_000)]);
+        let ledger = projection([
+            entry(&fixture, FIRST_ID, 1_000),
+            entry(&fixture, SECOND_ID, 2_000),
+        ]);
+        let snapshot = build_snapshot(&fixture, &ledger).unwrap();
+        assert_eq!(
+            snapshot.digest.to_string(),
+            "site-b3-v1-a4137f0ba4bbe1a56fa1c5eecf7e54530760f1201e13342abbbd6e447590d58e"
+        );
+        assert_eq!(
+            snapshot.presentation_digest,
+            PresentationDigest([
+                188, 168, 166, 21, 39, 106, 219, 180, 145, 10, 46, 246, 109, 59, 28, 240, 233, 21,
+                131, 184, 232, 4, 21, 52, 106, 225, 98, 201, 30, 199, 188, 119,
+            ])
+        );
+    }
+
+    #[test]
+    fn snapshot_uses_the_ledger_bound_before_the_caller_changes_it() {
+        let fixture = fixture();
+        let mut ledger = projection([entry(&fixture, FIRST_ID, 1_000)]);
+        let expected = build_snapshot(&fixture, &ledger).unwrap();
         let shell =
-            render_site_shell(Arc::clone(&fixture.catalog), embedded_manifest(), &first).unwrap();
-        let error = build_site_snapshot(shell, &second).unwrap_err();
-        assert_eq!(error.code, SiteSnapshotBuildErrorCode::LedgerMismatch);
+            render_site_shell(Arc::clone(&fixture.catalog), embedded_manifest(), &ledger).unwrap();
+        ledger = projection([entry(&fixture, SECOND_ID, 1_000)]);
+
+        let snapshot = shell.into_snapshot().unwrap();
+        assert_eq!(snapshot.digest, expected.digest);
+        assert_eq!(snapshot.presentation_digest, expected.presentation_digest);
+        assert_ne!(
+            snapshot.digest,
+            build_snapshot(&fixture, &ledger).unwrap().digest
+        );
     }
 
     #[test]
@@ -3628,53 +3611,77 @@ mod tests {
 
     #[test]
     fn all_public_error_and_activation_enum_wire_names_are_stable() {
-        let build_codes = [
-            SiteSnapshotBuildErrorCode::FrontendManifestInvalid,
-            SiteSnapshotBuildErrorCode::FrontendMismatch,
-            SiteSnapshotBuildErrorCode::LedgerMismatch,
-            SiteSnapshotBuildErrorCode::RevisionUnavailable,
-            SiteSnapshotBuildErrorCode::DraftSelected,
-            SiteSnapshotBuildErrorCode::SourceBindingMismatch,
-            SiteSnapshotBuildErrorCode::RouteCollision,
-            SiteSnapshotBuildErrorCode::RouteLimitExceeded,
-            SiteSnapshotBuildErrorCode::PageLimitExceeded,
-            SiteSnapshotBuildErrorCode::RetainedHtmlLimitExceeded,
-            SiteSnapshotBuildErrorCode::AssetUnavailable,
-            SiteSnapshotBuildErrorCode::AssetCollision,
-            SiteSnapshotBuildErrorCode::PublicAssetCountLimitExceeded,
-            SiteSnapshotBuildErrorCode::RetainedAssetLimitExceeded,
-            SiteSnapshotBuildErrorCode::ArticleProjectionFailed,
-            SiteSnapshotBuildErrorCode::RssRenderFailed,
-            SiteSnapshotBuildErrorCode::RobotsRenderFailed,
-            SiteSnapshotBuildErrorCode::SitemapRenderFailed,
-            SiteSnapshotBuildErrorCode::MetadataRenderFailed,
-            SiteSnapshotBuildErrorCode::QrCodeGenerationFailed,
-            SiteSnapshotBuildErrorCode::IdentityRejected,
-        ];
-        let names = [
-            "frontend_manifest_invalid",
-            "frontend_mismatch",
-            "ledger_mismatch",
-            "revision_unavailable",
-            "draft_selected",
-            "source_binding_mismatch",
-            "route_collision",
-            "route_limit_exceeded",
-            "page_limit_exceeded",
-            "retained_html_limit_exceeded",
-            "asset_unavailable",
-            "asset_collision",
-            "public_asset_count_limit_exceeded",
-            "retained_asset_limit_exceeded",
-            "article_projection_failed",
-            "rss_render_failed",
-            "robots_render_failed",
-            "sitemap_render_failed",
-            "metadata_render_failed",
-            "qr_code_generation_failed",
-            "identity_rejected",
-        ];
-        for (code, name) in build_codes.into_iter().zip(names) {
+        for (code, name) in [
+            (
+                SiteSnapshotBuildErrorCode::FrontendManifestInvalid,
+                "frontend_manifest_invalid",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::RevisionUnavailable,
+                "revision_unavailable",
+            ),
+            (SiteSnapshotBuildErrorCode::DraftSelected, "draft_selected"),
+            (
+                SiteSnapshotBuildErrorCode::RouteCollision,
+                "route_collision",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::RouteLimitExceeded,
+                "route_limit_exceeded",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::PageLimitExceeded,
+                "page_limit_exceeded",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::RetainedHtmlLimitExceeded,
+                "retained_html_limit_exceeded",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::AssetUnavailable,
+                "asset_unavailable",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::AssetCollision,
+                "asset_collision",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::PublicAssetCountLimitExceeded,
+                "public_asset_count_limit_exceeded",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::RetainedAssetLimitExceeded,
+                "retained_asset_limit_exceeded",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::ArticleProjectionFailed,
+                "article_projection_failed",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::RssRenderFailed,
+                "rss_render_failed",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::RobotsRenderFailed,
+                "robots_render_failed",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::SitemapRenderFailed,
+                "sitemap_render_failed",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::MetadataRenderFailed,
+                "metadata_render_failed",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::QrCodeGenerationFailed,
+                "qr_code_generation_failed",
+            ),
+            (
+                SiteSnapshotBuildErrorCode::IdentityRejected,
+                "identity_rejected",
+            ),
+        ] {
             assert_eq!(serde_json::to_value(code).unwrap(), name);
         }
         assert_eq!(

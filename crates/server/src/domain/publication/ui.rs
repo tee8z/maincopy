@@ -1,7 +1,7 @@
 use axum::{
     Form, Router,
-    extract::{DefaultBodyLimit, FromRequestParts, Path, Query},
-    http::{HeaderMap, StatusCode, request::Parts},
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse as _, Response},
     routing::{get, post},
@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use crate::{
     admin::{
-        AdminSecurityState, BrowserFormSession, RequiredBrowserSession, browser_scoped_router,
+        AdminRuntimeState, AdminSecurityState, BrowserFormSession, RequiredBrowserSession,
+        browser_scoped_router,
         request_id::RequestId,
         ui::{self as admin_ui, PageKind},
     },
@@ -120,35 +121,7 @@ struct ReviewBinding {
     expected_public_revision: ReviewedPublicRevision,
 }
 
-struct UiPublication(PublicationCoordinatorHandle);
-
-impl<S> FromRequestParts<S> for UiPublication
-where
-    S: Send + Sync,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = RequestId::from_request_parts(parts, state)
-            .await
-            .map_err(|rejection| rejection.into_response())?;
-        parts
-            .extensions
-            .get::<PublicationCoordinatorHandle>()
-            .cloned()
-            .map(Self)
-            .ok_or_else(|| {
-                admin_ui::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Publication unavailable",
-                    "Publication state is temporarily unavailable.",
-                    request_id,
-                )
-            })
-    }
-}
-
-pub(crate) fn router(security_state: &AdminSecurityState) -> Router {
+pub(crate) fn router(security_state: &AdminSecurityState) -> Router<AdminRuntimeState> {
     let overview = browser_scoped_router(
         Router::new().route("/admin", get(show_overview)),
         security_state,
@@ -195,7 +168,7 @@ async fn show_overview(
         csrf_token,
         session,
     }: BrowserFormSession,
-    UiPublication(coordinator): UiPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     query: Result<Query<OverviewQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
@@ -332,7 +305,7 @@ async fn show_overview(
 async fn show_review(
     request_id: RequestId,
     RequiredBrowserSession { session, .. }: RequiredBrowserSession,
-    UiPublication(coordinator): UiPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     Path(encoded_post_id): Path<String>,
 ) -> Response {
     let post_id = match PostId::parse(&encoded_post_id) {
@@ -478,7 +451,7 @@ async fn show_confirmation(
         csrf_token,
         session,
     }: BrowserFormSession,
-    UiPublication(coordinator): UiPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     Path(encoded_post_id): Path<String>,
     query: Result<Query<RawReviewConfirmation>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
@@ -627,7 +600,7 @@ async fn show_confirmation(
 async fn publish(
     request_id: RequestId,
     _browser: RequiredBrowserSession,
-    UiPublication(coordinator): UiPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     Path(encoded_post_id): Path<String>,
     form: Result<Form<RawPublicationApproval>, axum::extract::rejection::FormRejection>,
 ) -> Response {
@@ -806,7 +779,7 @@ impl RawReleaseChange {
 async fn change_release(
     request_id: RequestId,
     _browser: RequiredBrowserSession,
-    UiPublication(coordinator): UiPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     Path(encoded_release_id): Path<String>,
     form: Result<Form<RawReleaseChange>, axum::extract::rejection::FormRejection>,
 ) -> Response {
@@ -918,7 +891,7 @@ struct ReleasesQuery {
 async fn show_releases(
     request_id: RequestId,
     _browser: RequiredBrowserSession,
-    UiPublication(coordinator): UiPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     query: Result<Query<ReleasesQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
@@ -990,7 +963,7 @@ async fn show_release(
         csrf_token,
         session: _,
     }: BrowserFormSession,
-    UiPublication(coordinator): UiPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     Path(encoded_release_id): Path<String>,
     query: Result<Query<ReleaseDetailQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
@@ -1149,7 +1122,7 @@ fn release_status(state: CanonicalState) -> (&'static str, &'static str) {
 
 async fn get_application_asset(
     _browser: RequiredBrowserSession,
-    UiPublication(coordinator): UiPublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     Path((digest, name)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
@@ -1350,7 +1323,7 @@ mod workflow_tests {
     use maincopy_shared::auth_api::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME, SESSION_COOKIE_NAME};
     use markdown_compiler::{
         ContentTreeDigest, PostCollection, PostId, PostRevisionDigest, PostSlug, PreviewDigest,
-        resolve_content_assets,
+        prepare_content,
     };
     use time::OffsetDateTime;
     use tokio::task::JoinHandle;
@@ -1377,8 +1350,8 @@ mod workflow_tests {
         },
         frontend_assets::embedded_manifest,
         render::{
-            ContentCatalog, SiteSnapshotReader, build_site_snapshot, compile_content_catalog,
-            render_bound_post_preview, render_site_shell, snapshot_store,
+            ContentCatalog, SiteSnapshotReader, compile_content_catalog, render_bound_post_preview,
+            render_site_shell, snapshot_store,
         },
         web::Readiness,
     };
@@ -2641,10 +2614,9 @@ mod workflow_tests {
             0,
         );
         let content_digest = tree.digest();
-        let content = tree.validate().unwrap();
-        let assets = resolve_content_assets(&tree, &content).unwrap();
+        let prepared = prepare_content(&tree).unwrap();
         (
-            Arc::new(compile_content_catalog(&content, &assets).unwrap()),
+            Arc::new(compile_content_catalog(&prepared).unwrap()),
             content_digest,
         )
     }
@@ -2663,7 +2635,7 @@ mod workflow_tests {
     ) -> WorkflowRuntime {
         let ledger = PublicLedgerProjection::empty();
         let shell = render_site_shell(Arc::clone(&catalog), embedded_manifest(), &ledger).unwrap();
-        let initial_snapshot = build_site_snapshot(shell, &ledger).unwrap();
+        let initial_snapshot = shell.into_snapshot().unwrap();
         let initial_digest = initial_snapshot.digest.clone();
         let (snapshots, activator) = snapshot_store(initial_snapshot);
 

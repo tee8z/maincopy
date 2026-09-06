@@ -2,7 +2,7 @@
 
 use axum::{
     Json,
-    extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request},
+    extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION, request::Parts},
     response::{IntoResponse as _, Response},
 };
@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     admin::{
+        AdminRuntimeState,
         idempotency::{IdempotencyKeyError, parse_idempotency_key},
         principal::AdminPrincipal,
         problem::{AdminProblem, AdminProblemEnvelope, problem_response},
@@ -38,19 +39,19 @@ const DEFAULT_SOURCE_SYNC_PAGE_LIMIT: u16 = 20;
 const MAX_SOURCE_SYNC_PAGE_LIMIT: u16 = 100;
 const RETRY_AFTER_ONE_SECOND: HeaderValue = HeaderValue::from_static("1");
 
-pub(crate) fn status_routes() -> UtoipaMethodRouter {
+pub(crate) fn status_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_source_status)
 }
 
-pub(crate) fn sync_list_routes() -> UtoipaMethodRouter {
+pub(crate) fn sync_list_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(list_source_syncs)
 }
 
-pub(crate) fn sync_item_routes() -> UtoipaMethodRouter {
+pub(crate) fn sync_item_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_source_sync)
 }
 
-pub(crate) fn sync_mutation_routes() -> UtoipaMethodRouter {
+pub(crate) fn sync_mutation_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(begin_source_sync).layer(DefaultBodyLimit::max(MAX_SOURCE_SYNC_REQUEST_BYTES))
 }
 
@@ -138,27 +139,6 @@ where
     }
 }
 
-struct AvailableSourceControl(SourceSyncHandle);
-
-impl<S> FromRequestParts<S> for AvailableSourceControl
-where
-    S: Send + Sync,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = RequestId::from_request_parts(parts, state)
-            .await
-            .map_err(|error| error.into_response())?;
-        parts
-            .extensions
-            .get::<SourceSyncHandle>()
-            .cloned()
-            .map(Self)
-            .ok_or_else(|| unavailable(request_id))
-    }
-}
-
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct BeginSourceSyncRequest {}
@@ -169,13 +149,13 @@ struct SourceSyncCommand {
     audit: MutationAuditContext,
 }
 
-impl<S> FromRequest<S> for SourceSyncCommand
-where
-    S: Send + Sync,
-{
+impl FromRequest<AdminRuntimeState> for SourceSyncCommand {
     type Rejection = Response;
 
-    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(
+        request: Request,
+        state: &AdminRuntimeState,
+    ) -> Result<Self, Self::Rejection> {
         let (mut parts, body) = request.into_parts();
         let request_id = RequestId::from_request_parts(&mut parts, state)
             .await
@@ -184,7 +164,6 @@ where
             .await
             .map_err(|error| error.into_response())?;
         let headers = parts.headers.clone();
-        let handle = parts.extensions.get::<SourceSyncHandle>().cloned();
         let request = Request::from_parts(parts, body);
         let Json(BeginSourceSyncRequest {}) =
             Json::<BeginSourceSyncRequest>::from_request(request, state)
@@ -192,7 +171,7 @@ where
                 .map_err(|rejection| source_sync_json_rejection(rejection.status(), request_id))?;
         let idempotency_key =
             source_sync_idempotency_key(&headers).map_err(|spec| problem(spec, request_id))?;
-        let handle = handle.ok_or_else(|| unavailable(request_id))?;
+        let handle = state.source.clone();
         Ok(Self {
             request_id,
             handle,
@@ -214,7 +193,7 @@ where
 )]
 async fn get_source_status(
     request_id: RequestId,
-    AvailableSourceControl(handle): AvailableSourceControl,
+    State(handle): State<SourceSyncHandle>,
 ) -> Response {
     match handle.status().await {
         Ok(status) => Json(status).into_response(),
@@ -242,7 +221,7 @@ async fn get_source_status(
 async fn list_source_syncs(
     request_id: RequestId,
     SourceSyncPage { cursor, limit }: SourceSyncPage,
-    AvailableSourceControl(handle): AvailableSourceControl,
+    State(handle): State<SourceSyncHandle>,
 ) -> Response {
     match handle.list(cursor, limit).await {
         Ok(page) => Json(page).into_response(),
@@ -271,7 +250,7 @@ async fn list_source_syncs(
 async fn get_source_sync(
     request_id: RequestId,
     SourceSyncIdentifier(source_sync_id): SourceSyncIdentifier,
-    AvailableSourceControl(handle): AvailableSourceControl,
+    State(handle): State<SourceSyncHandle>,
 ) -> Response {
     match handle.sync(source_sync_id).await {
         Ok(Some(sync)) => Json(sync).into_response(),
@@ -463,10 +442,6 @@ const fn source_unavailable() -> AdminProblem {
         "source_unavailable",
         "source synchronization state is temporarily unavailable",
     )
-}
-
-fn unavailable(request_id: RequestId) -> Response {
-    problem(source_unavailable(), request_id)
 }
 
 fn problem(spec: AdminProblem, request_id: RequestId) -> Response {

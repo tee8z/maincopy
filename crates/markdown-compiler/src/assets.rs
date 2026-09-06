@@ -3,8 +3,9 @@ use std::{num::NonZeroUsize, ops::Range};
 use serde::Serialize;
 
 use super::identity::{
-    AssetResolutionPolicyBinding, PostAssetSourceBinding, PublicationAssetSourceBinding,
-    bind_asset_resolution_policy, bind_post_asset_source, bind_publication_asset_source,
+    AssetResolutionPolicyBinding, PostAssetSourceBinding, PostContentDigest,
+    PublicationAssetSourceBinding, bind_asset_resolution_policy,
+    bind_post_asset_source_with_content, bind_publication_asset_source, digest_post_content,
 };
 use super::{AssetRevisionReference, ExternalAssetOrigin, PostDocument, PublicationSettings};
 
@@ -109,18 +110,26 @@ impl ResolvedPostAssets {
         image: Option<AssetRevisionReference>,
         references: Vec<AssetRevisionReference>,
     ) -> Self {
-        Self::from_resolution(document, &[], image, references, Vec::new())
+        Self::from_resolution(
+            document,
+            &digest_post_content(document),
+            &[],
+            image,
+            references,
+            Vec::new(),
+        )
     }
 
     pub(super) fn from_resolution(
         document: &PostDocument,
+        content_digest: &PostContentDigest,
         allowed_origins: &[ExternalAssetOrigin],
         image: Option<AssetRevisionReference>,
         references: Vec<AssetRevisionReference>,
         markdown_destinations: Vec<ResolvedMarkdownDestination>,
     ) -> Self {
         Self {
-            source_binding: bind_post_asset_source(document),
+            source_binding: bind_post_asset_source_with_content(document, content_digest),
             policy_binding: bind_asset_resolution_policy(allowed_origins),
             image,
             references,

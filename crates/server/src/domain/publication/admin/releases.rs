@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{
-        DefaultBodyLimit, Path, Query,
+        DefaultBodyLimit, Path, Query, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::{HeaderMap, StatusCode},
@@ -20,10 +20,10 @@ use utoipa_axum::{
 use uuid::Uuid;
 
 use super::{
-    AvailablePublication, ErrorSpec, MAX_PUBLICATION_REQUEST_BYTES, activation_error,
-    idempotency_key, problem, wire_preview_digest,
+    ErrorSpec, MAX_PUBLICATION_REQUEST_BYTES, activation_error, idempotency_key, problem,
+    wire_preview_digest,
 };
-use crate::admin::{problem::AdminProblemEnvelope, request_id::RequestId};
+use crate::admin::{AdminRuntimeState, problem::AdminProblemEnvelope, request_id::RequestId};
 use crate::domain::publication::{
     ActivationBlockReason, CanonicalState,
     activation::{PublicationCoordinatorHandle, ReleaseTransitionError, RetryRelease},
@@ -33,13 +33,13 @@ use crate::domain::publication::{
     },
 };
 
-pub(crate) fn list_routes() -> UtoipaMethodRouter {
+pub(crate) fn list_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(list_releases)
 }
-pub(crate) fn item_routes() -> UtoipaMethodRouter {
+pub(crate) fn item_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_release, change_release).layer(DefaultBodyLimit::max(MAX_PUBLICATION_REQUEST_BYTES))
 }
-pub(crate) fn operation_routes() -> UtoipaMethodRouter {
+pub(crate) fn operation_routes() -> UtoipaMethodRouter<AdminRuntimeState> {
     routes!(get_operation)
 }
 
@@ -55,7 +55,7 @@ struct ReleaseQuery {
 async fn list_releases(
     request_id: RequestId,
     query: Result<Query<ReleaseQuery>, QueryRejection>,
-    AvailablePublication(coordinator): AvailablePublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
 ) -> Response {
     let Ok(Query(query)) = query else {
         return invalid_input(request_id);
@@ -84,7 +84,7 @@ async fn list_releases(
 async fn get_release(
     request_id: RequestId,
     id: Result<Path<Uuid>, PathRejection>,
-    AvailablePublication(coordinator): AvailablePublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
 ) -> Response {
     let Ok(Path(id)) = id else {
         return invalid_input(request_id);
@@ -109,7 +109,7 @@ async fn get_release(
 async fn get_operation(
     request_id: RequestId,
     id: Result<Path<Uuid>, PathRejection>,
-    AvailablePublication(coordinator): AvailablePublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
 ) -> Response {
     let Ok(Path(id)) = id else {
         return invalid_input(request_id);
@@ -145,7 +145,7 @@ async fn change_release(
     request_id: RequestId,
     id: Result<Path<Uuid>, PathRejection>,
     headers: HeaderMap,
-    AvailablePublication(coordinator): AvailablePublication,
+    State(coordinator): State<PublicationCoordinatorHandle>,
     body: Result<Json<ChangeReleaseRequest>, JsonRejection>,
 ) -> Response {
     let Ok(Path(publication_id)) = id else {

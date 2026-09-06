@@ -15,7 +15,7 @@ use maud::{DOCTYPE, Markup, html};
 use serde::Deserialize;
 
 use super::{
-    assets,
+    AdminRuntimeState, assets,
     request_id::RequestId,
     security::{
         self, AdminSecurityState, RequiredBrowserSession, TrustedLoginRequest,
@@ -47,14 +47,14 @@ struct LogoutForm {
     _csrf: SecretString,
 }
 
-pub(super) fn public_router() -> Router {
+pub(super) fn public_router() -> Router<AdminRuntimeState> {
     Router::new()
         .route("/admin/login", get(show_login).post(submit_password_login))
         .route("/admin/assets/{digest}/{name}", get(assets::get))
         .layer(DefaultBodyLimit::max(MAX_LOGIN_FORM_BYTES))
 }
 
-pub(super) fn protected_router(security: &AdminSecurityState) -> Router {
+pub(super) fn protected_router(security: &AdminSecurityState) -> Router<AdminRuntimeState> {
     browser_session_router(
         Router::new()
             .route("/admin/logout", post(logout))

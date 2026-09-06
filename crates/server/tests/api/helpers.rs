@@ -10,24 +10,25 @@ use tower::ServiceExt;
 use maincopy_server::{
     domain::publication::PublicLedgerProjection,
     frontend_assets::embedded_manifest,
-    render::{SiteSnapshotReader, build_site_snapshot, compile_content_catalog, render_site_shell},
+    render::{SiteSnapshotReader, compile_content_catalog, render_site_shell},
     web::{PublicState, Readiness},
 };
-use markdown_compiler::{ContentTreeLimits, discover_content_tree, resolve_content_assets};
+use markdown_compiler::{ContentTreeLimits, discover_content_tree, prepare_content};
 
 pub fn public_state(readiness: Readiness) -> PublicState {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/content");
     let tree = discover_content_tree(&root, ContentTreeLimits::default())
         .expect("example content tree must be discoverable");
-    let content = tree.validate().expect("example content must validate");
-    let assets = resolve_content_assets(&tree, &content).expect("example assets must resolve");
+    let content = prepare_content(&tree).expect("example content and assets must prepare");
     let catalog = std::sync::Arc::new(
-        compile_content_catalog(&content, &assets).expect("example catalog must compile"),
+        compile_content_catalog(&content).expect("example catalog must compile"),
     );
     let ledger = PublicLedgerProjection::empty();
     let shell = render_site_shell(catalog, embedded_manifest(), &ledger)
         .expect("empty public shell must render");
-    let snapshot = build_site_snapshot(shell, &ledger).expect("empty public snapshot must build");
+    let snapshot = shell
+        .into_snapshot()
+        .expect("empty public snapshot must build");
     PublicState {
         snapshots: SiteSnapshotReader::from_snapshot(snapshot),
         readiness,

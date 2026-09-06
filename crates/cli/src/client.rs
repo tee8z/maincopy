@@ -2027,6 +2027,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn source_sync_http_decode_rejects_invalid_lifecycle_before_orchestration() {
+        let mut body =
+            serde_json::to_value(begin_source_sync_response(SourceSyncAdmission::Created)).unwrap();
+        body["sync"]["outcome"] = json!("applied");
+        body["sync"]["finished_at"] = json!("2026-09-04T12:00:00Z");
+        let response = json_response(StatusCode::ACCEPTED, serde_json::to_vec(&body).unwrap());
+        assert!(matches!(
+            decode_begin_source_sync_http_response(response),
+            Err(AdminClientError::InvalidResponse(_))
+        ));
+    }
+
     const SESSION_TOKEN: &str =
         "mcs1_1111111111111111111111111111111111111111111111111111111111111111";
     const CSRF_TOKEN: &str =
