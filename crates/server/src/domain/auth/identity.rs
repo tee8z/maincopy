@@ -1,7 +1,9 @@
 use std::{fmt, str::FromStr};
 
+use base64::{Engine as _, engine::general_purpose};
 use k256::schnorr::VerifyingKey;
 use serde::{Deserialize, Serialize, de};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 pub const MAX_USERNAME_BYTES: usize = 64;
@@ -125,6 +127,14 @@ impl NostrPublicKey {
 
     pub fn as_str(&self) -> &str {
         &self.encoded
+    }
+
+    /// SHA-256 of the raw x-only public key, encoded as unpadded Base64.
+    pub(crate) fn fingerprint(&self) -> String {
+        format!(
+            "SHA256:{}",
+            general_purpose::STANDARD_NO_PAD.encode(Sha256::digest(self.bytes))
+        )
     }
 
     pub(crate) fn verifying_key(&self) -> VerifyingKey {

@@ -39,7 +39,7 @@ use crate::{
         },
     },
     domain::{
-        auth::{MAX_PASSWORD_SCALARS, MAX_USERNAME_BYTES, MIN_PASSWORD_SCALARS},
+        auth::{MAX_PASSWORD_SCALARS, MAX_USERNAME_BYTES, MIN_PASSWORD_SCALARS, NostrPublicKey},
         publication::activation::PublicationCoordinatorHandle,
     },
 };
@@ -445,6 +445,9 @@ fn credential_forms(
             HumanCredentialResponse::Password { .. } => None,
         });
     html! {
+        @if let Some((public_key, _)) = nostr {
+            (registered_nostr_key(public_key))
+        }
         @if security.providers.accepts(HumanLoginProvider::Password) {
             form method="post" action=(format!("/admin/users/{}/password", user.user_id)) {
                 h3 { "Password" }
@@ -489,6 +492,24 @@ fn password_inputs(prefix: &str, username: &str) -> Markup {
         label for=(format!("{prefix}-confirmation")) { "Confirm new password" }
         input name="confirmation" id=(format!("{prefix}-confirmation")) type="password" autocomplete="new-password" minlength=(MIN_PASSWORD_SCALARS) maxlength=(maximum_units) required;
         p class="muted" { "Use 15 to 128 characters. Passwords are never shown after submission." }
+    }
+}
+
+fn registered_nostr_key(public_key: &str) -> Markup {
+    let Ok(key) = NostrPublicKey::parse(public_key) else {
+        return html! { p { "Registered key metadata is unavailable." } };
+    };
+    html! {
+        section {
+            h3 { "Current registered Nostr key" }
+            dl {
+                dt { "Public key" }
+                dd { code { (key.as_str()) } }
+                dt { "SHA-256 fingerprint" }
+                dd { code { (key.fingerprint()) } }
+            }
+            p { "This fingerprint identifies the saved key. Saving a replacement updates it." }
+        }
     }
 }
 
@@ -744,4 +765,28 @@ async fn remove_credential(
     )
     .await;
     mutation_response(response, "/admin/users", request_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registered_nostr_key;
+
+    #[test]
+    fn registered_key_metadata_matches_the_cli_fingerprint_and_rejects_invalid_points() {
+        // Public key from the first BIP-340 test vector.
+        let public_key = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+        let page = registered_nostr_key(public_key).into_string();
+        assert!(page.contains(public_key));
+        assert!(page.contains("SHA256:fHnzBx4oNE6BU79sc8KU6+N1SuxOLLjLRHGy9Ey18i0"));
+        assert!(page.contains("saved key"));
+        for invalid in [
+            "<script>untrusted</script>",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ] {
+            let page = registered_nostr_key(invalid).into_string();
+            assert!(!page.contains(invalid));
+            assert!(!page.contains("SHA256:"));
+            assert!(page.contains("unavailable"));
+        }
+    }
 }

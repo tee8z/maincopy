@@ -266,6 +266,9 @@ its content hash, with API connections restricted to the same origin.
 
 To add a Nostr key to an existing account, open that account's **Nostr login
 key** form. Enter the public key as 64 lowercase hexadecimal characters.
+The account page displays the saved public key and its SHA-256 fingerprint.
+The fingerprint updates after a replacement is accepted. It uses the same raw-key
+hash and unpadded Base64 format as `maincopy agent-key inspect`.
 
 New accounts receive the Publisher role by default. Owners can also create
 Administrators and Owners. Publishers cannot open account administration.

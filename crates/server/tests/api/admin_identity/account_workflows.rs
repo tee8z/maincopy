@@ -353,7 +353,7 @@ async fn browser_nostr_credentials_preserve_the_last_usable_login_method() {
     let (_, owner) = password_login(&harness.client, &harness.admin_url).await;
     let page = browser_page(&harness, &owner, "/admin/users").await;
     assert!(page.contains("Create with a Nostr key"));
-    let first_key = test_public_key(53);
+    let first_key = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9".to_owned();
     let response = browser_request(
         &harness,
         &owner,
@@ -372,6 +372,7 @@ async fn browser_nostr_credentials_preserve_the_last_usable_login_method() {
     let user_id = user_path.strip_prefix("/admin/users/").unwrap();
     let page = browser_page(&harness, &owner, &user_path).await;
     assert!(page.contains(&first_key));
+    assert!(page.contains("SHA256:fHnzBx4oNE6BU79sc8KU6+N1SuxOLLjLRHGy9Ey18i0"));
     let second_key = test_public_key(54);
     let replacement = [
         ("operation_id", operation_id(&page)),
@@ -394,6 +395,8 @@ async fn browser_nostr_credentials_preserve_the_last_usable_login_method() {
     }
     let page = browser_page(&harness, &owner, &user_path).await;
     assert!(page.contains(&second_key));
+    assert!(page.contains("SHA-256 fingerprint"));
+    assert!(!page.contains("SHA256:fHnzBx4oNE6BU79sc8KU6+N1SuxOLLjLRHGy9Ey18i0"));
     let removal = [
         ("operation_id", operation_id(&page)),
         ("expected_version", "2"),
