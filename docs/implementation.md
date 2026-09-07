@@ -1,6 +1,6 @@
 # Remaining Maincopy v1 work
 
-Last reviewed: 2026-09-06
+Last reviewed: 2026-09-07
 
 This is the current status and unfinished work. [Design](design.md) records
 architecture; [quality](quality.md) defines engineering rules. Detailed change
@@ -8,129 +8,92 @@ and test-run history belongs in Git and CI.
 
 ## Current status
 
-Core publishing, administration, managed Git, metrics, encrypted backup tooling,
-and release automation are implemented. Email is in progress. Home-server setup,
+Core publishing, administration, managed Git, metrics, encrypted backups, email,
+and release automation are implemented and locally validated. Home-server setup,
 real-provider acceptance, release credentials, and the first public release remain.
 
-The last fully validated code batch is
-[`459573a`](https://github.com/tee8z/maincopy/commit/459573a58d07ff99f5989eeae4da0bd7e3382faa).
-It passed these checks on 2026-09-06:
+The latest validated code is
+[`5cb2a02`](https://github.com/tee8z/maincopy/commit/5cb2a02c759aaaff5d8de30804375ed946750584).
+It passed these checks on 2026-09-07:
 
 | Check | Result |
 | --- | --- |
-| Concurrent Rust tests | 994 passed; one existing ignored test; 16 threads |
-| Formatting and Clippy | Passed with warnings denied |
-| Manual CRAP | Maximum 19.662785; zero violations; 93.69% line coverage |
-| Canonical Nix checks and build | Passed on x86_64 Linux, including the packaged deployment VM |
-| Release helper fixtures | 13 passed with real GPG and a loopback registry |
-| Hosted CI | [Linux Nix and Windows client jobs passed](https://github.com/tee8z/maincopy/actions/runs/34059358517) |
+| Concurrent instrumented Rust tests | 1,154 passed; one existing ignored test; 16 threads |
+| Formatting and Clippy | Passed with warnings denied, including the pinned Nix toolchain |
+| Manual CRAP | Maximum 19.749526; zero violations; 93.92% line coverage |
+| Canonical Nix checks and build | Passed on x86_64 Linux, including the packaged deployment and restore VM |
+| Backup operations | 28 passed, including finite retention and private credential staging |
 
-Local runbook and package rehearsals also passed. These results exclude ongoing
-email code and do not establish ARM64, actual B2, owner-signer, or deployed-system acceptance.
+ARM64, actual SES/B2, Owner signers, and deployed-system acceptance remain.
 The final release needs fresh evidence for its exact candidate.
 
 ## Work order
 
-1. Complete email privacy, unsubscribe, removal, and durable dispatch.
-2. Configure release accounts, protected environments, and the ARM64 runner in parallel.
-3. Prepare the home server, networking, storage, and protected credentials.
-4. Connect SES, DNS, signers, monitoring, and encrypted Backblaze B2 recovery.
-5. Complete deployed acceptance and publish the first release.
+1. Prepare the home server and connect SES, DNS, signers, monitoring, and encrypted B2 backups.
+2. Complete deployed acceptance and publish the first release.
 
-Use isolated workstreams where they do not share implementation boundaries.
-Update this plan after each integrated batch passes its final quality checks.
+Release account and ARM64 runner setup can proceed alongside host preparation.
+Update this plan when an integrated batch passes its final quality gate.
 
 ## Email
 
-Use SES; DynamoDB is excluded. [Email delivery](email-delivery.md) is the single
-source for consent, storage, dispatch, and deliverability requirements.
+Consent and attempts use the existing database. Double opt-in, removal routes,
+Owner campaign screens, SES dispatch, feedback recovery, and consent reset are implemented.
+Restore retires consent; finite backup epochs bound retained history.
+The code simplification pass and README, changelog, and operational documentation cleanup are complete.
 
-- Finish the concrete SES adapter, owner-reviewed campaign UI, and supervised dispatcher.
-- Resolve subscriber storage and its encrypted backup/deletion recovery policy.
-  Separate local SQLite outside the current site checkpoints is proposed; owner direction remains pending.
-- Finish double opt-in, scanner-safe controls, RFC 8058 one-click unsubscribe,
-  address removal, suppression, bounded retention, and protected credentials.
-- Verify removal during dispatch, re-enrollment, reordered events, provider failure,
-  cancellation, restart, and old-backup restoration. Never automatically retry an unknown send.
-- Prove redaction and that site checkpoints contain no subscriber records or controls.
-- Complete SES domain authentication, feedback handling, quotas, budgets, and authorized mailbox tests during deployment.
+Complete actual SES domain/queue permissions, quotas, mailbox tests, and privacy
+acceptance using the [email guide](email-delivery.md#provider-acceptance-before-launch).
 
-Keep capture and sending disabled until privacy, recovery, dispatch, and
-real-provider deliverability acceptance pass together. If unfinished, release
-core v1 with email disabled; do not ship capture alone.
+Use SES; DynamoDB is excluded. Keep capture and sending disabled until all
+required acceptance passes. Do not release address capture without removal and delivery controls.
 
 ## Home server and recovery
 
-Follow [deployment](deployment.md), [backup and restore](backup-restore.md), and
-[observability](observability.md) on the selected host.
+Use [deployment](deployment.md), [backup and restore](backup-restore.md), and
+[observability](observability.md) as the operational procedures.
 
-- Deploy the reviewed package with the owner's content and protected credentials.
-- Verify public HTTPS, private administration, origin checks, forwarded-header removal,
-  offline owner initialization, service permissions, and restart without journaled credentials.
-- Connect the intended Prometheus scraper and verify storage, queue, and backup health.
-- Publish a complete encrypted checkpoint to the actual B2 bucket and restore it
-  with an independently retained key and compatible package.
-- Recover retained local ciphertext without the active object cache.
-- Verify pages, RSS, sitemap, profiles, tips, rejected pre-restore sessions and agent grants,
-  and acceptance consumption before replication or normal writes.
-- Inject backup failure and confirm public reading remains available.
-- Measure capture, replay, content verification, encryption, upload, and restore
-  with representative data. Record recovery lag, duration, disk needs, and key-recovery steps.
-- Set and accept a remote retention policy and storage budget. Remote immutable
-  objects have no automatic deletion policy yet; local ciphertext retention is seven days.
-
-The checkpoint timer targets one minute after the previous job finishes.
-Replay, validation, encryption, and upload add to recovery lag.
-Local replicas and fixture B2 transport do not complete off-site acceptance.
+- Provision the reviewed package, content, private administration network, DNS,
+  HTTPS, persistent storage, and protected credentials.
+- Initialize the Owner offline; verify permissions, restart, and logging without
+  exposed credentials or subscriber data.
+- Connect monitoring and alerting, including upstream SES/SNS delivery health.
+- Publish to the actual B2 bucket and restore with an independently retained key
+  and compatible package. Also recover local ciphertext without its active cache.
+- Verify actual bucket lifecycle/version deletion, restored-session rejection,
+  consent retirement, and acceptance before replication resumes.
+- Measure recovery lag, disk needs, and restore duration with representative content.
+  Inject backup failure and confirm the public site stays available.
 
 ## System and security acceptance
 
-- Exercise one managed Git site through browser, human CLI, and agent API:
-  login, sync, preview, immediate/scheduled release, update, cancellation, blocked
-  retry, profiles/tips, metrics, backup, restore, and shutdown.
-- Verify successful and cancelled Nostr login with the owner's browser and CLI
-  signers. Record versions, platforms, and protected session storage.
-- Inject startup, writer, activation, Git, renderer, gateway, and restore failures.
-  Confirm the last committed public snapshot survives wherever required by design.
-- Review passwords and enumeration, session lifecycle, cookies/CSRF, NIP-98
-  replay and request binding, roles/scopes, route isolation, and gateway TLS.
-- Review Git credentials, content traversal, HTML/SVG/CSP, secret handling,
-  corruption, queue saturation, backup/restore, dependency licenses, and advisories.
-- Record representative request/compile latency, queue depth, WAL size, backup
-  lag, runtime use, and shutdown duration. Close every critical or high-risk finding.
-- Execute remaining authenticated CLI examples, browser trust setup, managed Git,
-  deployment, B2 recovery, and release instructions on the intended systems.
-  Help parsing and local fixtures do not replace these checks.
-- Recheck examples and internal links after final release metadata is fixed.
+- Exercise the publishing workflow through browser, human CLI, and scoped agent:
+  sync, preview, immediate/scheduled publication, updates, cancellation, and blocked retry.
+- Test the Owner's actual Nostr signers, credential storage, profiles, and tips.
+- Verify gateway isolation, authorization, CSRF/NIP-98 replay protection, request
+  bounds, secret handling, content sanitization, and failure/shutdown behavior.
+- Review dependency licenses and advisories; close critical or high-risk findings.
+- Execute the retained setup/recovery examples on the intended systems and record
+  representative runtime, request, compilation, and backup behavior.
+
+Local fixtures cannot complete real-provider, signer, or deployed-system acceptance.
 
 ## First release
 
-The [release workflow](../.github/workflows/release.yml) prepares all five crates
-from one reviewed version and signed tag. Follow [release](release.md) for exact
-configuration, artifacts, publication order, retries, and version-pinned Nix use.
+Follow [release](release.md) for the maintained publication procedure.
 
-- Select the version and finish the [Unreleased changelog](../CHANGELOG.md#unreleased).
-- Configure the crates.io publisher, trusted signer, protected release environment,
-  and immutable GitHub Releases. Confirm ordinary CI cannot access release secrets.
-- Provision the dedicated ARM64 runner with KVM and execute both Linux architecture gates.
-- Freeze workspace and path-dependency versions; prepare clean package archives,
-  signed tag, checksum manifest, and verified candidate artifacts.
-- Review the packaged CLI, server, renderer, content examples, Nix outputs, and install instructions.
-- Include required third-party notices in the distribution artifacts.
-- Complete final acceptance for that candidate before registry uploads or public release publication.
+- Select the version and finalize the [changelog](../CHANGELOG.md#unreleased).
+- Configure crates.io ownership/token, the trusted signer, protected release
+  environment, and immutable GitHub Releases.
+- Provision the dedicated ARM64 KVM runner and pass both Linux architecture gates.
+- Prepare consistent versions, package archives, signed tag, notices, and verified artifacts.
+- Complete acceptance for the exact candidate before registry or public release uploads.
 
 ## Quality gate
 
-Use `cargo check` and Clippy during implementation. Defer full workspace tests
-and CRAP measurement until the final pre-commit gate. Run canonical Nix checks
-before code commits and pushes, as required by [quality](quality.md).
-
-Completion requires meaningful transition, rejection, limit, restart, and
-isolation tests; typed/redacted errors; matching schema and domain invariants;
-supervised shutdown; documented limits and dependencies; and current runbooks.
-Record the production need for new public APIs, traits, trivial getters, unsafe
-blocks, and lint exceptions. Do not mark a feature complete from fixtures alone
-when its acceptance requires an external system.
+Follow [quality.md](quality.md). Use `cargo check` and Clippy during implementation;
+run full workspace tests, CRAP, and canonical Nix checks before a code commit and push.
+Keep one current validation baseline above. Detailed batch history belongs in Git and CI.
 
 ## Deferred work
 

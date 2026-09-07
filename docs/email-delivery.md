@@ -1,234 +1,268 @@
-# Mailing-list privacy and dispatch plan
+# Email operations and privacy
 
-Status: active first-release work; subscriber capture and sending remain disabled.
+Status: implemented and locally validated. Production capture and sending remain disabled pending provider and privacy acceptance.
 
-Last reviewed: 2026-09-06
+Use this guide to configure SES, operate the mailing list, and recover interrupted delivery.
+[Implementation](implementation.md) records remaining acceptance. [Deployment](deployment.md) covers the host; [backup and restore](backup-restore.md) covers encrypted checkpoints.
 
-Related: [system design](design.md), [implementation plan](implementation.md), and
-[engineering style](quality.md).
+## Scope and cost
 
-## Selected delivery provider
+The first campaign announces one explicitly published article revision. An Owner reviews and authorizes its email separately from website publication.
+SES is the selected provider. DynamoDB is excluded; mail tables use the existing application SQLite database and sole writer.
+Other providers can become concrete adapters when needed. There is no speculative adapter framework or SES contact-list dependency.
 
-Use Amazon Simple Email Service (SES) for the first email implementation.
-The owner selected SES for its usage-based price and expects fewer than 2,000 subscribers for the foreseeable future.
-DynamoDB is excluded. SES selection does not introduce another AWS database.
+SES à-la-carte outbound delivery costs $0.10 per 1,000 recipient messages, checked on 2026-09-06.
+Four monthly messages to 2,000 subscribers cost $0.80 before confirmation emails, message data, feedback processing, taxes, and optional services.
+Select à-la-carte pricing and confirm actual account charges. Avoid unneeded paid packages or dedicated IP addresses.
+See [SES pricing](https://aws.amazon.com/ses/pricing/).
 
-Implement email before home-server deployment. Enable capture and sending only after
-privacy, recovery, dispatch, and deliverability acceptance passes together.
-Local fixtures do not establish provider behavior or deployment acceptance.
+## Configure mail
 
-The first campaign announces one explicitly published article revision. An owner
-reviews and authorizes its email separately from website publication.
-Automatic X, Substack, and Nostr delivery remain outside this increment.
+Keep mail disabled until provider and privacy acceptance pass with authorized test recipients.
+For NixOS, configure public settings and protected file references through the module:
 
-Current work includes public announcement preparation and the SES transport and
-campaign-storage implementation. A working subscription or removal service is not complete.
+```nix
+services.maincopy.mail = {
+  mode = "ses";
+  sender = "newsletter@example.com";
+  region = "us-east-1";
+  configurationSet = "maincopy";
+  credentialFile = "/var/lib/maincopy-secrets/mail-ses.json";
+  controlSigningKeyFile = "/var/lib/maincopy-secrets/mail-controls.key";
+  maxCampaignRecipients = 2000;
+  maxDailyMessages = 5000;
+  maxDailyConfirmationMessages = 100;
+  sendIntervalMilliseconds = 1000;
+  subscriptions = {
+    mode = "paused";
+    operatorName = "Example publication";
+    postalAddress = "REPLACE WITH YOUR PUBLIC POSTAL ADDRESS";
+    purpose = "Email announcements of newly published articles.";
+    privacyUrl = "https://example.com/privacy";
+    contactAddress = "contact@example.com";
+  };
+  feedback = {
+    queueUrl = "https://sqs.us-east-1.amazonaws.com/123456789012/maincopy-feedback";
+    topicArn = "arn:aws:sns:us-east-1:123456789012:maincopy-feedback";
+  };
+};
+```
 
-## Cost and operating scope
+Replace all example identities and disclosures. The postal address appears publicly in signup information and message footers.
+Use a valid public mailing address appropriate for the operator. See the [FTC commercial-email requirements](https://www.ftc.gov/business-guidance/resources/can-spam-act-compliance-guide-business).
 
-SES a-la-carte outbound delivery costs $0.10 per 1,000 recipient messages.
-At 2,000 subscribers and four newsletters per month, 8,000 deliveries cost $0.80 before additional charges.
-Message data, confirmation emails, event processing, and optional services add to that amount.
-These estimates exclude taxes and temporary credits. Pricing was checked on 2026-09-06.
-Select à-la-carte pricing during setup. New accounts can default to Essentials,
-which currently charges $0.16 per 1,000 emails.
-[AWS SES pricing](https://aws.amazon.com/ses/pricing/).
+Supply secret paths as strings. Never use Nix path literals or `builtins.readFile` for secret material.
+The module copies systemd credentials into private service-owned runtime files.
+The server accepts owned regular files with mode `0400` or `0600`; it rejects symlinks and oversized files.
 
-Keep optional paid services disabled unless the deployment needs them.
-Use explicit sending budgets and the account's actual quotas. Do not assume
-production access, a dedicated IP address, or a paid deliverability package.
-A provider price advantage does not remove consent, erasure, or recovery obligations.
+The SES credential file is bounded JSON with this shape:
 
-Brevo and Mailchimp remain possible later adapters. They are not required for this deployment.
-Their hosted campaign workflows differ from SES recipient sending; switching requires a concrete migration design.
+```json
+{"access_key_id":"REPLACE_WITH_ACCESS_KEY_ID","secret_access_key":"REPLACE_WITH_SECRET_ACCESS_KEY"}
+```
 
-## Data ownership and storage decision
+Temporary credentials can include `session_token`. Provision replacements before expiration, then restart Maincopy.
+The server does not discover credentials from the environment or refresh them through an AWS SDK.
 
-Treat subscriber addresses and linkable identifiers as personally identifiable information (PII).
-Keep subscriber addresses, contact hashes, consent tokens, recipient lists, and raw
-subscriber events out of the existing site SQLite database, WAL, Git content, and B2 checkpoints.
+Generate the control key once, without overwriting an existing key:
 
-The proposed subscriber authority is a separate SQLite database on the home server.
-Its location, access protection, deletion behavior, and independent encrypted backup
-and recovery policy must be settled before enabling capture.
-The owner is reviewing local storage versus an external subscriber authority.
-Do not silently include this database in the existing Litestream capture or site export.
-Without a separate backup, loss of this database also loses the mailing-list state.
+```sh
+sudo install -d -m 0700 /var/lib/maincopy-secrets
+sudo sh -c 'set -C; umask 077; head -c 32 /dev/urandom | od -An -v -tx1 | tr -d " \n" > /var/lib/maincopy-secrets/mail-controls.key'
+```
 
-The site database may retain reviewed public campaign content, sender configuration
-bindings, owner authorization, campaign identities, and aggregate dispatch outcomes.
-Use typed commands through its sole writer. Keep subscriber records and individual
-recipient state within the selected subscriber authority.
+The file contains 64 lowercase hexadecimal characters, optionally followed by one newline.
+Retain an independently protected recovery copy. Changing the control key or publication origin can strand existing unsubscribe links.
+Startup rejects that change while linked subscriber state remains. SES credential rotation does not change management-link signatures.
 
-Use protected Maincopy-owned buffers for transient addresses, credentials, control
-tokens, and provider payloads. Bound input and redact diagnostics.
-Do not put them in logs, traces, metrics, audit text, or error messages.
-Framework JSON, HTTP, TLS, and AWS signing allocations have separate lifetimes;
-complete memory wiping is not guaranteed.
+For direct server configuration, use `[mail] mode = "ses"` and the equivalent snake_case field names.
+Use `credential_file`, `control_signing_key_file`, `configuration_set`, and `send_interval_milliseconds`.
+Nested tables are `[mail.subscriptions]` and `[mail.feedback]`.
+Omitting subscriptions enables campaign review only. Omitting mail selects disabled mode.
+Once addresses exist, keep subscriptions configured as `paused` when stopping capture and sending; this preserves removal controls.
 
-SES necessarily processes recipient addresses and message content during delivery.
-Document provider retention and suppression separately. Do not describe removal from
-Maincopy as instant deletion of every provider or backup copy.
+## Connect SES feedback
 
-## SES transport boundary
+Use one AWS account and commercial region for the verified SES identity, configuration set, standard SNS topic, and standard SQS queues.
+Maincopy makes signed HTTPS requests to fixed regional endpoints. It exposes no public feedback webhook.
 
-Start with one concrete SES adapter with inherent methods. Add other concrete
-adapters when their production implementations exist; use a closed enum when selecting among them.
-Do not add a plugin framework or a speculative project trait.
+```mermaid
+flowchart LR
+    Owner[Owner approval] --> Writer[Application SQLite writer]
+    Reader[Signup or removal] --> Writer
+    Writer -->|Committed recipient attempt| Sender[SES dispatcher]
+    Sender --> SES
+    SES -->|Configuration-set events| SNS[Dedicated SNS topic]
+    SNS --> SQS[Dedicated SQS queue]
+    SQS --> Worker[Feedback worker]
+    Worker -->|Commit before acknowledgement| Writer
+    SQS -->|Failed deliveries| DLQ[Dead-letter queue]
+```
 
-Keep public announcement rendering, owner approval, consent, cancellation, and
-recovery policy in Maincopy's mail domain. The SES adapter owns request validation,
-AWS request signing, bounded HTTPS, and typed provider outcomes.
-Use protected runtime credentials with a fixed regional endpoint.
-Disable automatic transport retries for non-idempotent sends.
+Enable configuration-set events for sends, deliveries, bounces, complaints, rejects, and rendering failures.
+Retain the SNS envelope: set the SQS subscription's `RawMessageDelivery` to `false`.
+Use only the intended subscription and omit `FilterPolicy`; filtered delivery would silently discard required feedback.
+Identity-level notifications without the required attempt tags cannot replace configuration-set events.
+See [SES SNS event destinations](https://docs.aws.amazon.com/ses/latest/dg/event-publishing-add-event-destination-sns.html).
 
-Each approved campaign binds the public revision, rendered bytes, template version,
-subject, sender, provider configuration, audience policy, and authorization.
-A configuration change affects new approvals. Existing work retains its original binding.
-Do not reroute uncertain submissions through another provider.
+Create a dedicated source queue and dead-letter queue (DLQ) with these settings:
 
-SES contact management is not the consent or delivery ledger for this design.
-Sending with `ListManagementOptions` can create an absent contact automatically.
-The adapter must omit this field so a stale send cannot recreate a deleted SES contact.
-[SES list management](https://docs.aws.amazon.com/ses/latest/dg/sending-email-list-management.html).
+| Setting | Source queue | DLQ |
+| --- | --- | --- |
+| Queue type | Standard | Standard |
+| Message retention | 3,600–86,400 seconds | Greater than source; at most 345,600 seconds |
+| Maximum message size | 1,024–65,536 bytes | 1,024–65,536 bytes |
+| Encryption | SQS-managed encryption enabled | SQS-managed encryption enabled |
+| Redrive | Exact DLQ ARN; `maxReceiveCount` 3–10 | No chained DLQ |
+| Redrive allow policy | Not used for admission | `byQueue`, containing only the exact source ARN |
+| Resource policy | Exact policy below | No additional resource policy |
 
-The contact APIs do not establish conditional consent updates or strongly consistent
-recovery reads. `UpdateContact` also requires resupplying existing topic preferences.
-Do not use contact attributes as a replacement for durable admission and deletion state.
-[UpdateContact](https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_UpdateContact.html),
-[SES consistency guidance](https://docs.aws.amazon.com/ses/latest/dg/troubleshoot-general.html).
+The source resource policy must contain exactly two statements, with version `2012-10-17`:
 
-## Consent, unsubscribe, and removal
+| Field | Allow statement | Deny statement |
+| --- | --- | --- |
+| `Effect` | `Allow` | `Deny` |
+| `Principal` | `{"Service":"sns.amazonaws.com"}` | `"*"` |
+| `Action` | `sqs:SendMessage` | `sqs:SendMessage` |
+| `Resource` | Exact source queue ARN | Exact source queue ARN |
+| `Condition.ArnEquals.aws:SourceArn` | Exact SNS topic ARN | Absent |
+| `Condition.StringEquals.aws:SourceAccount` | Exact account ID | Absent |
+| `Condition.ArnNotEquals.aws:SourceArn` | Absent | Exact SNS topic ARN |
 
-Maincopy owns the public signup and confirmation flow. Publish the mailing purpose,
-operator identity, privacy notice, contact channel, and retention policy before capture.
-Require double opt-in before newsletter eligibility. Do not infer consent from an
-SES contact, successful send response, imported address, or restored record.
-[AWS sending practices](https://docs.aws.amazon.com/ses/latest/dg/tips-and-best-practices.html).
+The explicit Deny also rejects requests without `aws:SourceArn`. It prevents same-account identity grants from bypassing the SNS-only producer restriction.
+Maincopy rejects extra statements, wildcard resources, different principals, and unsupported conditions.
 
-Bound repeated signup and confirmation attempts. Use generic responses to resist
-enumeration and list bombing. Expire unconfirmed requests and their unnecessary PII.
-Confirmation tokens must bind their purpose, site, enrollment generation, nonce, and expiry.
-Consume confirmation state atomically. A signed token alone is not single-use.
+Restrict the SNS topic separately. Allow `sns:Publish` only from `ses.amazonaws.com`, with the exact source account and configuration-set ARN.
+Also explicitly deny `sns:Publish` when `aws:SourceArn` differs from that configuration-set ARN or is absent.
+Remove default broad publishing grants. Maincopy validates the queue policy but does not retrieve the topic policy; verify effective topic permissions during deployment.
 
-Every newsletter needs a visible **Unsubscribe and remove my address** control.
-It must stop future admission and perform the requested cleanup, with accurate
-pending, unknown, and completion states. Do not require a Maincopy account or send a goodbye email.
-Fresh enrollment must create new consent and invalidate controls for the old generation.
+Give the runtime credential only the needed sending and feedback permissions:
 
-Support [RFC 8058 one-click unsubscribe](https://www.rfc-editor.org/rfc/rfc8058.html).
-Its authenticated HTTPS `POST` must work without login, cookies, redirects, or
-additional confirmation. Verify DKIM coverage for both unsubscribe headers in real mail.
-Unsubscribe controls must remain usable after a short confirmation-token lifetime expires.
+- `ses:SendEmail` for the selected sender identity and configuration set, with appropriate sender conditions.
+- `sqs:GetQueueAttributes` for the source queue and DLQ.
+- `sqs:ReceiveMessage` and `sqs:DeleteMessage` for the source queue.
 
-Browser `GET` requests only display a confirmation page; they must not change consent.
-Use an explicit browser action for removal, restrictive CSP, `no-store`, and `no-referrer`.
-Keep tokens out of access logs and third-party resources.
+Keep this application the only consumer. Do not extend visibility or redrive arbitrary messages into its authenticated source queue.
+Keep queue/topic administrative permissions outside the runtime credential.
 
-The subscriber authority must serialize consent revocation with recipient admission.
-A removal request blocks new admission and cancels work not yet admitted.
-Previously admitted or delivered messages cannot be reliably recalled; state this boundary clearly.
-A delayed cleanup attempt must not erase a fresh enrollment accidentally.
+Monitor the SES event destination, SNS subscription, and upstream delivery failures separately.
+Healthy SQS polling cannot detect a disabled destination, filtered subscription, or feedback that never reached SQS.
+The source queue's processing DLQ does not capture SNS delivery failures.
+An SNS subscription DLQ is a separate provider resource; include any such resource in privacy retention and recovery procedures.
+SNS failure metrics can report only exhausted retries, so they do not establish immediate detection of an upstream backlog.
+See [SNS filtering](https://docs.aws.amazon.com/sns/latest/dg/sns-subscription-filter-policies.html), [subscription DLQs](https://docs.aws.amazon.com/sns/latest/dg/sns-dead-letter-queues.html), and [SNS monitoring](https://docs.aws.amazon.com/sns/latest/dg/sns-monitoring-using-cloudwatch.html).
 
-Treat complaints and hard bounces as suppression events. Authenticate feedback,
-handle duplicates and reordering, and keep raw recipient payloads out of the site ledger.
-Do not remove suppression merely to make another send succeed.
+## Consent, removal, and retention
 
-SES account-level suppression and internal global suppression are separate from
-contact membership. Account entries can persist until removed; global hard-bounce
-entries can persist for up to 14 days without a customer deletion interface.
-These facts limit any promise of complete provider erasure.
-[Account suppression](https://docs.aws.amazon.com/ses/latest/dg/sending-email-suppression-list.html),
-[Global suppression](https://docs.aws.amazon.com/ses/latest/dg/sending-email-global-suppression-list.html).
+Link readers to `/email/subscribe` after launch acceptance. Signup requires an explicit consent checkbox and email confirmation.
+Addresses are matched case-insensitively; delivery preserves the supplied spelling.
+Generic signup responses avoid revealing existing subscriptions. Confirmation requests have a one-hour cooldown and separate daily budget.
 
-## Durable campaign dispatch
+Pending consent expires 24 hours after signup. Confirmation links work once within that window; queued mail can arrive with less remaining validity.
+Management links remain usable without that expiry. A fresh enrollment receives a new generation; old links cannot remove the new subscription.
+Browser `GET` and `HEAD` never change consent. Explicit browser `POST` performs confirmation or removal.
+Newsletter messages also support [RFC 8058 one-click unsubscribe](https://www.rfc-editor.org/rfc/rfc8058.html), without login, cookies, redirects, or another confirmation.
 
-Only an owner with fresh browser authentication may create or authorize a campaign.
-Publishers and current agent scopes gain no email authority implicitly.
-Recheck current authority and the public revision inside the sole-writer transaction.
-Never select a private preview, draft, or later unreviewed revision.
+Removal clears the address, mailbox digest, and confirmation verifier in one writer transaction.
+The same transaction prevents future recipient admission. Messages already admitted to delivery cannot reliably be recalled.
+Maincopy sends no goodbye email. Hard bounces and complaints remove eligibility and create a bounded suppression digest.
+Suppression expiry never reactivates consent; fresh voluntary enrollment is required.
 
-Persist the reviewed content and a unique operation identity before provider work.
-Use bounded claims, leases, fencing, and typed transitions. Keep provider calls
-outside database transactions. A lease expiry must not authorize a duplicate send.
+| Local data | Retention rule |
+| --- | --- |
+| Pending address | Confirmation expires after 24 hours; supervised cleanup removes expired data in bounded batches |
+| Active address | Until removal, suppression, or explicit consent reset |
+| Minimized attempt correlation | Up to 14 days from its admission/creation retention boundary |
+| Suppression digest | 30 days from local processing of the suppression event |
+| Aggregate campaign and operation receipts | Retained without recipient addresses |
 
-The initial campaign workflow permits one active campaign. Distinguish drafts,
-queued work, claimed work, cancellation in progress, completion, unknown outcomes,
-and quarantine. Keep aggregate accepted, rejected, and unknown counts accurate.
-Provider acceptance does not prove inbox delivery.
+Cleanup runs while mail is disabled and needs no SES credential. Host downtime and cleanup backlog can delay physical processing.
+Addresses, tokens, and provider payloads must stay out of logs, traces, metrics, audit text, Git, and public content.
+Access logs record route patterns, not private token paths. Apply the same restriction to gateways and external observability systems.
 
-SES sends to supplied recipients rather than accepting a durable provider campaign.
-The recipient dispatcher therefore needs durable progress and current consent checks
-in the subscriber authority. Define the audience cutoff without copying recipients into site checkpoints.
-[SES SendEmail](https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html).
+SQLite uses `secure_delete`. This clears deleted logical database content; it does not guarantee immediate erasure of historical WAL, filesystem, or hardware copies.
+Maincopy zeroizes its protected buffers. SQL drivers, HTTP, TLS, signing libraries, and framework allocations have separate lifetimes.
+The [backup retention procedure](backup-restore.md) bounds retained replica/checkpoint copies through finite replica epochs and encrypted checkpoints.
+Do not describe unsubscribe as immediate deletion from all storage or providers.
 
-Commit recipient admission before transmission. Bind it to the campaign approval,
-configuration, current consent generation, and a unique attempt identity.
-Honor cancellation and sending budgets at admission. Record the outcome afterward.
+SES processes recipient addresses and message content. Account-level suppression can persist until separately removed; Maincopy never clears it to force delivery.
+Global hard-bounce suppression can last up to 14 days. See [account suppression](https://docs.aws.amazon.com/ses/latest/dg/sending-email-suppression-list.html) and [global suppression](https://docs.aws.amazon.com/ses/latest/dg/sending-email-global-suppression-list.html).
+SNS retries delivery to SQS for approximately 23 days during failures. This provider retention is separate from queue and Maincopy retention.
+See [SNS retry policies](https://docs.aws.amazon.com/sns/latest/dg/sns-message-delivery-retries.html).
 
-SES `SendEmail` has no documented client idempotency token. A timeout can mean the
-provider accepted the message while the response was lost.
-Record that outcome as unknown and do not resend automatically.
-Correlated provider events may supply positive acceptance evidence; silence is not proof of rejection.
-[SES event publishing](https://docs.aws.amazon.com/ses/latest/dg/monitor-using-event-publishing.html).
+## Approve and operate campaigns
 
-The application owns, supervises, cancels, and awaits mail workers.
-Shutdown closes ingress, stops new claims, drains accepted work, and records unresolved outcomes.
-Provider failures must not block public reading or roll back website publication.
+Open **Mail** in the private administration screen. Use a fresh session from a currently enabled Owner.
+Publish the intended article revision first, then review its email. Review includes immutable content, sender settings, audience cutoff, and current readiness.
+Approve sending separately. Only one campaign can be active.
 
-## Backup and restore protection
+Each recipient admission rechecks consent, suppression, Owner authority, cancellation, configuration, and budgets inside the existing sole writer.
+The audience cutoff uses confirmation sequence, so later subscriptions and clock changes cannot enlarge an approved audience.
+The dispatcher commits an attempt before calling SES. Confirmation messages share the total daily budget and have their own cap.
+Default pacing permits one request per second; actual account quotas can require a slower setting.
 
-Existing site checkpoints must contain no subscriber records, recipient lists, or control tokens.
-Verify the boundary across SQLite, WAL, retained content, diagnostics, and exported bundles.
-The separate subscriber authority needs its own deletion and recovery acceptance.
+Accepted means SES accepted the request, not that it reached an inbox.
+A timeout or malformed response leaves an unknown outcome. Maincopy never automatically retries that attempt, including after restart.
+Authenticated feedback can establish later acceptance. Silence cannot prove rejection.
+SES has no documented client idempotency token for [SendEmail](https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html).
 
-Quarantine unfinished campaigns in the offline site-restore acceptance transaction,
-before an accepted-restore marker can enable startup. Also quarantine interrupted
-claims before a new worker admits work after a restart.
-Preserve completed receipts without replaying them.
+Use campaign cancellation to stop new recipients. Cancellation drains already admitted work before finalizing aggregate outcomes.
+Use subscriptions mode `paused` for a host-wide pause while keeping confirmation and removal controls available.
+Configuration changes require new approval for affected work. Never route an uncertain submission through another provider.
 
-A site restore must not overwrite current subscriber consent, replay confirmation
-requests, or restart old sends. Resuming mail requires current subscriber state and
-explicit owner review. A restored subscriber copy must not revive removed consent.
-Keep capture disabled until the subscriber backup policy proves these properties.
+## Recover feedback or restored data
 
-## Deployment and deliverability acceptance
+An unavailable feedback source stops new capture and sending. Removal remains available.
+First inspect credentials, network access, queue policy, retention, backlog, and DLQ status without copying recipient payloads into logs.
+An ordinary network interruption does not erase consent.
 
-Complete this procedure with the selected SES account and authorized test recipients:
+An interrupted receive request leaves a durable recovery lease. Maincopy waits until that signed request can no longer hide a message.
+The maximum lease is 1,042 seconds from its signed timestamp, followed by a 180-second drain observation window.
+This bound combines 900 seconds of signature validity, 20 seconds of long polling, 120 seconds of visibility, and two seconds of precision allowance.
+See [SQS request expiration](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/CommonErrors.html) and [ReceiveMessage](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html).
+The worker uses authenticated provider time, repeated long polls, and visible, in-flight, and delayed counts from both queues.
+Missing or regressing provider time keeps mail unavailable. Additional deliveries restart the drain window.
+These observations establish conservative operational readiness, not atomic proof that a distributed queue is empty.
+See [SQS empty-queue guidance](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/confirm-queue-is-empty.html).
 
-1. Select the AWS region, sending domain, visible sender, and monitored reply address.
-2. Verify the SES identity and configure Easy DKIM with the provider's exact DNS records.
-3. Configure a custom MAIL FROM domain and its required SPF records when selected.
-4. Publish DMARC and verify alignment for the visible sender domain.
-5. Select à-la-carte pricing and disable unneeded paid options.
-6. Request production access and record actual sending quotas and rate limits.
-7. Create a narrowly scoped runtime credential and protect it outside Git and backups.
-8. Configure authenticated bounce, complaint, and delivery-event handling with bounded retention.
-9. Verify that effective suppression includes both `BOUNCE` and `COMPLAINT`, without a configuration-set override that disables either.
-10. Disable open and click tracking in every event destination and optional engagement service.
-11. Inspect delivered HTML, plain text, sender information, and DKIM-covered unsubscribe headers.
-12. Test confirmation, one-click unsubscribe, removal, suppression, restart, and restore with controlled recipients.
-13. Start with a small confirmed audience and verify budgets and the campaign pause mechanism.
+A persistent reconciliation gap cannot clear through a later successful poll.
+Lost retention, conflicting event correlation, rejected feedback, and an observed trust violation require operator review.
+Do not bypass the gap by editing SQLite or marking the worker healthy manually.
 
-Check the effective configuration, including overrides, against
-[SES suppression settings](https://docs.aws.amazon.com/ses/latest/dg/sending-email-suppression-list.html).
-SES open and click tracking modifies messages and collects recipient activity.
-[SES tracking behavior](https://docs.aws.amazon.com/ses/latest/dg/configure-custom-open-click-domains.html).
+If trustworthy consent/feedback continuity cannot be recovered:
 
-Do not send tests or campaigns without owner authorization for the recipients and launch.
-Record redacted DNS, authentication, control, and recovery evidence.
+1. Repair the feedback source and identify any old queued or retried events.
+2. Open **Mail → Recover email delivery** with fresh Owner authentication.
+3. Review the removal scope, then type `REMOVE SUBSCRIBERS` to execute the reset.
+4. Retain the operation identity if the response is lost; retry the same form.
+5. Keep subscriptions paused while isolating old source traffic and validating the repaired provider configuration.
+6. Restart with enabled subscriptions only after the current source establishes healthy feedback readiness.
+
+The reset removes all current enrollment and attempt eligibility, including arrivals after the review page opened.
+It quarantines unfinished campaigns and preserves aggregate history, suppression digests, and daily budgets.
+It rotates a non-PII delivery epoch. Authenticated events for known retired epochs cannot affect fresh consent.
+Unknown epochs remain a conflict; timestamps cannot establish their provenance.
+Readers must voluntarily subscribe again. Never email the old list to request renewed consent.
+
+Offline restore acceptance also discards restored consent and rotates its delivery epoch before normal startup or replication.
+An old checkpoint can lack epochs created after that checkpoint. Isolate old queue/topic traffic before admitting a fresh source baseline.
+Do not replay restored confirmations, campaigns, or uncertain sends. Follow the complete [restore acceptance procedure](backup-restore.md).
+
+## Provider acceptance before launch
+
+Complete these checks with the selected SES account and explicitly authorized recipients:
+
+1. Verify the sending identity and install the provider's exact Easy DKIM DNS records.
+2. Configure custom MAIL FROM and SPF when selected; publish DMARC and verify sender alignment.
+3. Request production access, then record actual account quotas and rate limits.
+4. Verify effective bounce and complaint suppression, including configuration-set overrides.
+5. Disable open/click tracking and unnecessary destinations or paid services.
+6. Verify SNS/SQS policies, retained envelopes, tagging, and bounded queue retention against actual events.
+7. Inspect delivered HTML, plain text, sender, postal footer, and DKIM coverage of both unsubscribe headers.
+8. Exercise confirmation, scanner visits, one-click removal, suppression, cancellation, outages, restart, and old-checkpoint restore.
+9. Verify gateway redaction, independent key recovery, encrypted B2 retention, and restored-data quarantine.
+10. Begin with a small confirmed audience and inspect readiness and aggregate outcomes before expanding.
+
+Use current [Google](https://support.google.com/a/answer/81126), [Yahoo](https://senders.yahooinc.com/best-practices/), and [Microsoft sender requirements](https://techcommunity.microsoft.com/blog/microsoftdefenderforoffice365blog/strengthening-email-ecosystem-outlook%E2%80%99s-new-requirements-for-high%E2%80%90volume-senders/4399730).
 Authentication and list hygiene reduce blocking risk; they cannot guarantee inbox placement.
-
-Use the receiving services' current sender requirements when configuring the account:
-[Google sender guidelines](https://support.google.com/a/answer/81126),
-[Yahoo sender requirements](https://senders.yahooinc.com/best-practices/), and
-[Microsoft high-volume sender requirements](https://techcommunity.microsoft.com/blog/microsoftdefenderforoffice365blog/strengthening-email-ecosystem-outlook%E2%80%99s-new-requirements-for-high%E2%80%90volume-senders/4399730).
-
-## Inclusion gate
-
-Exercise confirmation expiry and replay, enumeration resistance, removal during every
-dispatch stage, duplicate and reordered feedback, provider outages, restart, and older-backup restoration.
-Verify PII redaction, cleanup, suppression, and no automatic retry of unknown sends.
-
-If any required check remains incomplete, release core V1 with subscriptions and sending disabled.
-Do not ship address capture alone.
+Local fixtures do not complete provider acceptance. If acceptance remains incomplete, release core v1 with capture and sending disabled.

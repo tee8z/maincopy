@@ -1,18 +1,12 @@
 # Configure managed Git synchronization
 
-Use this runbook for one read-only SSH repository and exact branch.
-Synchronization prepares private previews; publication requires separate approval.
-See [design](design.md#content-sources-and-retention) for the source and retention boundaries.
+Connect one read-only SSH repository and exact branch. Synchronization prepares private previews; publication requires separate approval.
+For host installation, use [deployment](deployment.md).
 
-## Configuration ownership
+## Configure the host
 
-| Location | Values |
-| --- | --- |
-| Host `maincopy.toml` | Source mode, mirror path, process limits, named credential file references |
-| Protected host files | SSH private key and verified `known_hosts` entries |
-| SQLite | Remote, branch, content subdirectory, credential name, poll interval, sync operations |
-
-Register each credential in the host configuration. Offline and online source settings select its name:
+Host configuration owns the source mode, mirror, process limits, and credential file references.
+SQLite stores the selected remote, branch, content directory, credential name, and poll interval.
 
 ```toml
 [paths]
@@ -28,92 +22,62 @@ private_key_file = "/var/lib/maincopy-credentials/source-key"
 known_hosts_file = "/etc/maincopy/source-known-hosts"
 ```
 
-The mirror must be a dedicated direct child of `paths.state_root` and must not contain SQLite.
-Relative host paths resolve beside `maincopy.toml`. Keep private keys outside Git and the Nix store.
+Use a dedicated mirror directly beneath `paths.state_root`, separate from SQLite.
+Relative paths resolve beside `maincopy.toml`. Keep private keys outside Git and the Nix store.
 Resolved credential paths permit only ASCII letters, digits, slashes, periods, underscores, and hyphens.
-
-These `[source]` settings bound Git operations. Values must be positive and within the host parser's maximums.
-
-| Setting | Default | Purpose |
-| --- | ---: | --- |
-| `fetch_timeout_seconds` | `120` | Wall time per Git phase |
-| `command_output_bytes` | `33554432` | Captured output |
-| `mirror_bytes` | `2147483648` | Mirror size |
-| `file_bytes` | `1073741824` | Child-process file size |
-| `address_space_bytes` | `2147483648` | Child-process address space |
-| `cpu_seconds` | `120` | Child-process CPU time |
-| `open_files` | `256` | Child-process open files |
+Default limits allow 120 seconds per Git phase and a 2 GiB mirror.
 
 ## Prepare the credential
 
-Stop `maincopyd` before credential generation and initial setup.
+Stop `maincopyd` before initial setup. Create a protected private-key directory, then generate a dedicated key:
 
-1. Create a protected parent directory for the private key.
-2. Install the host configuration above.
-3. Generate a dedicated Ed25519 key:
+```console
+maincopyd --config /etc/maincopy/maincopy.toml source generate-key \
+  --private-key-file /var/lib/maincopy-credentials/source-key
+```
 
-   ```console
-   maincopyd --config /etc/maincopy/maincopy.toml \
-     source generate-key \
-     --private-key-file /var/lib/maincopy-credentials/source-key
-   ```
-
-4. Record the printed public key and SHA-256 fingerprint.
-5. Install only the public key as a read-only repository deploy key.
-6. Obtain the host key through a trusted, independent channel.
-7. Write that verified entry to the configured `known_hosts` file.
-
-For a nondefault port, use the OpenSSH `[host]:port` host-field form.
+Record the printed public key and fingerprint. Install only the public key as a read-only repository deploy key.
 The generator refuses to overwrite the private key or its `.pub` file.
 
-> [!WARNING]
-> Use read-only repository access. Write access increases the effect of a compromised deploy key.
+Obtain the SSH host key through a trusted, independent channel and write the verified entry to `known_hosts`.
+For a nondefault port, use the OpenSSH `[host]:port` host-field form.
+Unverified `ssh-keyscan` output does not establish the server's identity.
 
-> [!CAUTION]
-> Do not trust unverified `ssh-keyscan` output. A substituted host key can direct the connection to an attacker.
+The daemon must own the private key, with mode `0600` or stricter, and have read access to both files.
+The `known_hosts` file and parent directories may belong to root or the daemon; reject group or world write access.
+Maincopy rejects symlinks, empty or oversized files, and unsafe ownership or permissions.
 
-Give the daemon read access to both files. The private key must belong to the daemon user, with mode `0600` or stricter.
-The `known_hosts` file may belong to root or the daemon user, without group or world write access.
-Use root-owned or daemon-owned parent directories without group or world write access.
-Maincopy rejects symlinks, empty or oversized files, and unsafe ownership or permissions. It rechecks credential paths before each transport command.
+## Store initial source settings
 
-## Store source settings
-
-Source setup requires an enabled owner. For new state, bootstrap the owner while the daemon is stopped:
+Source setup requires an enabled Owner. For fresh state, bootstrap one while the daemon is stopped:
 
 ```console
 maincopyd --config /etc/maincopy/maincopy.toml \
   identity bootstrap password --username owner
 ```
 
-Enter the password only at the protected prompt. Then store the initial source settings:
+Enter the password at the protected prompt. Store the initial source settings:
 
 ```console
-maincopyd --config /etc/maincopy/maincopy.toml \
-  source configure \
+maincopyd --config /etc/maincopy/maincopy.toml source configure \
   --user git --host git.example.test --port 22 \
   --repository-path publisher/site.git --branch main \
   --content-subdirectory publication --credential-name deploy \
   --poll-interval-seconds 300
 ```
 
-Use `.` for a repository-root content directory. Poll intervals range from 30 through 86400 seconds.
-For repairs, add `--expected-version CURRENT_VERSION` to reject stale settings changes.
-Offline commands acquire exclusive ownership and bind no listener; they refuse to run against a running instance.
+Use `.` for repository-root content. Poll intervals range from 30 through 86400 seconds.
+For an offline repair, add `--expected-version CURRENT_VERSION` to reject a stale change.
+Offline commands acquire exclusive ownership and refuse to operate against a running instance.
 
 ## Start and inspect synchronization
-
-Start the configured daemon:
 
 ```console
 maincopyd --config /etc/maincopy/maincopy.toml
 ```
 
 Managed startup synchronizes and compiles content before opening listeners. Invalid settings or content prevent readiness.
-
-Use the same HTTPS administration origin for every CLI invocation; replace the examples with your deployed origin.
-For a private CA, add `--admin-ca-file /path/to/trusted-ca.pem` each time.
-The CLI does not remember origin or CA options.
+Use your HTTPS administration origin for CLI operations:
 
 ```console
 maincopy --admin-origin https://admin.example.com login --username owner
@@ -121,129 +85,74 @@ maincopy --admin-origin https://admin.example.com source status
 maincopy --admin-origin https://admin.example.com source sync --wait
 ```
 
-`--wait` follows the durable operation to completion. Use `--async` instead to return after admission.
-Add `--json` for machine-readable output and `--idempotency-key UUID` for repeatable manual requests.
+For a private CA, also supply `--admin-ca-file /path/to/trusted-ca.pem` on every invocation.
+`--wait` follows the operation to completion; `--async` returns after admission.
+Use `source --help` for commands and `--json` for structured results.
 
 ## Everyday Git-to-preview loop
 
 1. Commit Markdown and local assets, then push the configured branch.
-2. Wait for **Next poll**, choose **Sync now** on `/admin/source`, or run the CLI synchronization above.
-3. When the result is `applied`, open **Posts** and review **Not published** or **Unpublished changes**.
-4. Review the exact preview, then publish that revision explicitly.
+2. Wait for **Next poll**, choose **Sync now** on `/admin/source`, or run `source sync --wait`.
+3. After `applied`, open **Posts** and review **Not published** or **Unpublished changes**.
+4. Review the exact preview and approve publication separately.
 
-Ordinary content changes need no restart or source reconfiguration.
-Failed fetches or compilation preserve the previous private catalog and public site.
+Ordinary content edits need no restart. Failed synchronization preserves the previous private catalog and public site.
+`no_change` means the branch still resolves to the installed commit.
 
 ## Change source settings online
 
-Sign in recently as an Owner, then open **Source settings** on `/admin/source`.
-The form accepts a remote, branch, subdirectory, host-registered credential name, and poll interval.
-Agent credentials cannot authorize these changes.
+Sign in recently as an Owner and open **Source settings** on `/admin/source`.
+Select the remote, branch, content directory, registered credential name, and poll interval. Agent credentials cannot authorize reconfiguration.
 
-For CLI changes, inspect the installed version and deploy identity:
+For CLI changes, inspect `source status` and `source deploy-key`, then use `source configure --help`.
+Supply all proposed settings, the inspected `--expected-version`, and either `--wait` or `--async`.
+Compare the selected deploy public key and fingerprint with the repository registration.
 
-```console
-maincopy --admin-origin https://admin.example.com source status
-maincopy --admin-origin https://admin.example.com source deploy-key
-```
+The proposal must fetch and compile successfully before its settings and private catalog replace the current installation.
+Failure or cancellation preserves the prior installation. Successful reconfiguration does not publish content.
+An active sync and a configuration proposal cannot run together; wait for completion and reload status before another change.
 
-The deploy-key command prints the selected public key and fingerprint, without credential paths.
-Submit all proposed settings, replacing `1` with the installed version:
-
-```console
-maincopy --admin-origin https://admin.example.com source configure \
-  --user git --host git.example.test --port 22 \
-  --repository-path publisher/site.git --branch main \
-  --content-subdirectory publication --credential-name deploy \
-  --poll-interval-seconds 300 --expected-version 1 --wait
-```
-
-Use `--async` to return after admission. Repeat an uncertain request with its original `--idempotency-key UUID` and identical settings.
-
-Installed settings, polling, and the private catalog remain authoritative until the proposal passes fetch, validation, compilation, and durable installation.
-Successful installation activates the settings and catalog together; it does not publish.
-Failure or cancellation preserves the prior installation. Versions can have gaps, so always read the displayed version.
-
-Reconfiguration conflicts with an active sync, and ordinary sync conflicts with an active proposal.
-Wait for completion, then reload status before another settings change.
-A restart marks an unfinished proposal `failed` with code `interrupted`, then synchronizes the installed settings.
-The old operation retains its terminal result. Submit corrected settings with a new retry identity.
-
-## Operation behavior
-
-Concurrent ordinary sync requests share one durable operation identifier.
-
-| Outcome | Meaning |
-| --- | --- |
-| `applied` | A new private candidate was installed. |
-| `no_change` | The branch still resolves to the installed commit. |
-| `cancelled` | Shutdown stopped the operation before completion. |
-| `failed` | Inspect the stable failure code. |
-
-A live `no_change` skips compilation; startup recompiles retained content to reconstruct serving state.
-Shutdown drains work already compiling or committing. Unexpected termination leaves an `interrupted` result after restart.
-
-Maincopy retains the newest 4,096 manual retry aliases. Reusing a retained key returns its original operation.
-An expired key conflicts instead of starting new work; use a fresh key.
-History retains 4,096 terminal operations plus active, installed, and alias-referenced operations. Older history cursors can expire.
+After a lost response, retry identical settings with the original `--idempotency-key`, not the operation ID.
+Changed settings need a new retry identity. After `interrupted`, inspect the installed settings before submitting a new proposal.
+Always use the displayed version; failed proposals can leave version gaps.
 
 ## Failure diagnosis
 
-Inspect `latest_sync.failure_code` and the operation ID:
-
-```console
-maincopy --admin-origin https://admin.example.com --json source status
-```
+Inspect `latest_sync.failure_code` and the operation ID with `--json source status`.
+Source responses omit SSH output and credential paths; correlate operation IDs with safe server diagnostics.
 
 | Failure code | Action |
 | --- | --- |
-| `credential_unavailable` | Check the selected name, ownership, and private-key mode. |
+| `credential_unavailable` | Check the credential name, ownership, and private-key mode. |
 | `unknown_host` | Verify the trusted `known_hosts` entry for the exact host and port. |
 | `authentication_failed` | Check read-only deploy-key registration and daemon access to the matching private key. |
 | `remote_unavailable` | Check DNS, routing, SSH port, and repository availability. |
-| `fetch_failed` | Check repository access, then correlate the operation ID with safe server logs. |
-| `branch_unavailable` | Check the exact remote branch name. |
+| `fetch_failed` | Check repository access, then inspect diagnostics for the operation ID. |
+| `branch_unavailable` | Check the exact branch name. |
 | `validation_failed`, `compile_failed` | Validate the same commit locally and fix the content in Git. |
-| `candidate_failed` | Check candidate integrity and capacity; correlate the operation ID with server logs. |
-| `timed_out` | Check repository size and connectivity before increasing limits. |
-| `interrupted` | Investigate the previous process failure, then request a new sync. |
+| `candidate_failed` | Check candidate integrity and capacity before retrying. |
+| `timed_out` | Check repository size and connectivity before changing host limits. |
+| `interrupted` | Investigate the process failure, then request a new synchronization. |
 
-For a `cancelled` outcome, wait for service readiness before retrying.
-After correcting the cause, run:
+For `cancelled`, wait for service readiness. After fixing the cause, run `source sync --wait` again.
+Concurrent ordinary sync requests share an operation. A retained retry key returns its original result, not necessarily the current installation.
+If a retry key or history cursor has expired, inspect current status before starting a new request.
 
-```console
-maincopy --admin-origin https://admin.example.com source sync --wait
-```
+## Candidate retention
 
-Source resources omit SSH output and credential paths. Use operation IDs and failure codes to correlate safe logs.
-
-## Candidate retention contract
-
-Automatic candidate collection is disabled. At 4,096 archive/staging entries or 1 GiB of archive bytes, new candidates are rejected.
-Existing revisions remain intact. The Git mirror is a disposable transport cache, not a backup.
-
-Retention must preserve every candidate reachable from these roots:
-
-| Root | Required artifacts |
-| --- | --- |
-| Installed source and private catalog | Installed candidate and every previewable revision |
-| Current public revisions | Exact Markdown, assets, renderer identities, and compiled output |
-| Nonterminal releases | Inputs needed to complete or recover each release |
-| Active sync or configuration proposal | Materialized candidates until a terminal result is durable |
-| Compatible backup recovery points | Every digest named by a retained backup manifest |
-
-Directory age, expired cursors, and pruned sync history do not prove an artifact is unused.
-Do not remove candidates to recover capacity without accounting for all roots.
-See [backup and restore](backup-restore.md) for complete recovery points.
+Automatic candidate collection is disabled. New candidates are rejected at 4,096 archive/staging entries or 1 GiB of archive bytes.
+Existing revisions remain intact. Do not delete candidates merely because they are old or absent from synchronization history.
+Public revisions, previews, unfinished work, and retained backups can still need those artifacts.
+Follow [backup and restore](backup-restore.md) for complete recovery points; the Git mirror is only a disposable transport cache.
 
 ## External checkout mode
 
-For an operator-maintained local tree, omit the managed mirror and credential registry:
+For an operator-maintained local tree, use the default mode and omit managed credentials and mirror settings:
 
 ```toml
 [source]
 mode = "external_checkout"
 ```
 
-This is the default mode. `paths.content_root` selects the tree; Maincopy observes it without Git network or write operations.
-`source status` reports `external_checkout`. Manual source sync is unsupported because the operator owns checkout updates.
+`paths.content_root` selects the tree. Maincopy observes it without Git network or write operations.
+`source status` reports `external_checkout`; manual source sync is unsupported because the operator owns checkout updates.

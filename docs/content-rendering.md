@@ -1,8 +1,51 @@
 # Content rendering
 
-Use this reference when authoring Markdown, diagrams, and images.
-Maincopy compiles articles before publication; preview and public pages share the compiled article content.
-Start with the [example post](../crates/server/examples/content/posts/hello-maincopy.md) for required frontmatter.
+Author articles in Markdown with strict TOML frontmatter. Maincopy compiles content
+before publication; previews and public pages use the compiled article.
+
+## Content root
+
+A content root contains site metadata, article files, and optional local assets:
+
+```text
+content/
+|-- publication.toml
+|-- posts/
+|   `-- hello-maincopy.md
+`-- assets/
+    `-- hillside.webp
+```
+
+Define the public site in `publication.toml`:
+
+```toml
+[site]
+title = "Example Site"
+base_url = "https://example.com"
+description = "Notes from Example Author."
+
+[author]
+name = "Example Author"
+```
+
+Start each article with TOML frontmatter:
+
+```markdown
++++
+id = "1dd7559b-90a9-4c5b-a13c-70bf6ec01e92"
+title = "Hello, Maincopy"
+slug = "hello-maincopy"
+aliases = ["welcome"]
+authored_at = 2026-08-29T10:15:00-04:00
+description = "A short description for feeds and page metadata."
++++
+
+Article Markdown starts here.
+```
+
+Keep `id` stable when renaming or moving an article. Approved slugs and aliases
+belong to that identity; another article cannot claim them.
+See the [example publication](../crates/server/examples/content) for a minimal content root.
 
 ## Code fences
 
@@ -73,19 +116,16 @@ Put local files below `assets/` in the content root, then reference them from Ma
 Use PNG, JPEG, GIF, WebP, AVIF, or ICO for browser image display.
 Authored SVG and unrecognized file types are served as attachments.
 
-Configure optional site images and allowed external origins in `publication.toml`:
+Add optional image keys to the existing `[site]` table in `publication.toml`:
 
 ```toml
-[site]
-title = "Example"
-base_url = "https://example.com/"
-description = "An example publication."
 favicon = "assets/favicon.png"
 image = "assets/site-cover.webp"
+```
 
-[author]
-name = "Example Author"
+To allow external images, add an `[assets]` table:
 
+```toml
 [assets]
 allowed_https_origins = ["https://images.example.com"]
 ```
