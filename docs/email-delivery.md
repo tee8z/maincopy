@@ -11,10 +11,8 @@ The first campaign announces one explicitly published article revision. An Owner
 SES is the selected provider. DynamoDB is excluded; mail tables use the existing application SQLite database and sole writer.
 Other providers can become concrete adapters when needed. There is no speculative adapter framework or SES contact-list dependency.
 
-SES à-la-carte outbound delivery costs $0.10 per 1,000 recipient messages, checked on 2026-09-06.
-Four monthly messages to 2,000 subscribers cost $0.80 before confirmation emails, message data, feedback processing, taxes, and optional services.
+See the [running cost examples](../README.md#running-costs) for SES rates and optional service charges.
 Select à-la-carte pricing and confirm actual account charges. Avoid unneeded paid packages or dedicated IP addresses.
-See [SES pricing](https://aws.amazon.com/ses/pricing/).
 
 ## Configure mail
 
