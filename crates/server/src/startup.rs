@@ -33,6 +33,14 @@ use crate::{
     database::{self, DatabaseStore},
     domain::{
         auth::{Argon2idPolicy, store::ConfiguredLoginProviders},
+        mail::{
+            config::MailConfiguration,
+            dispatch::MailDispatcher,
+            feedback::FeedbackWorker,
+            retention::MailRetention,
+            runtime::{PreparedMail, prepare_mail},
+            ui::MailUiState,
+        },
         profile::TipRecipientProjection,
         publication::{
             PublicLedgerProjection, SourceCommit,
@@ -42,8 +50,8 @@ use crate::{
             },
             scheduler::PublicationScheduler,
             store::{
-                InstallStartupSnapshot, ObservedPostRevision, RetainedReleaseInput,
-                StartupSnapshotState,
+                InstallStartupSnapshot, ObservedPostRevision, RecoverablePublicationActivation,
+                RetainedReleaseInput, StartupSnapshotState,
             },
         },
     },
@@ -64,7 +72,7 @@ use crate::{
     source_bootstrap::{configure_source, generate_source_key},
     source_provenance::{SourceCommitDiscovery, discover_source_commit},
     source_sync::{ManagedSourceEngine, SourceSyncHandle},
-    web::{PublicServer, PublicState, Readiness},
+    web::{PublicServer, PublicState, Readiness, public_router_with_routes},
 };
 
 #[cfg(test)]
@@ -133,6 +141,8 @@ struct ServingState {
     admin_server: AdminServer,
     metrics_server: MetricsServer,
     metrics_collector: MetricsCollector,
+    mail_dispatcher: Option<MailDispatcher>,
+    mail_feedback: Option<FeedbackWorker>,
 }
 
 struct StartedDatabase {
@@ -393,6 +403,7 @@ impl Application {
             metrics_bind: host.metrics_bind,
             backup: BackupHealth::new(host.backup),
             security: database.security.clone(),
+            mail: host.mail,
             cancellation: cancellation.clone(),
             candidate_store: &candidate_store,
             content_compiler: &content_compiler,
@@ -414,12 +425,7 @@ impl Application {
             cancellation.clone(),
             content_compiler,
         );
-        let content_task = CriticalTask::new(CriticalTaskName::ContentSync, async move {
-            content_sync
-                .run()
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
+        let content_task = CriticalTask::new(CriticalTaskName::ContentSync, content_sync.run());
         Ok(Self::assemble(
             startup._process_lock,
             database,
@@ -540,6 +546,7 @@ impl Application {
             metrics_bind: host.metrics_bind,
             backup: BackupHealth::new(host.backup),
             security: database.security.clone(),
+            mail: host.mail,
             cancellation: cancellation.clone(),
             candidate_store: &candidate_store,
             content_compiler: &content_compiler,
@@ -553,12 +560,7 @@ impl Application {
             }
         };
         let source_sync = source_engine.into_live(serving_state.publication_coordinator.clone());
-        let source_task = CriticalTask::new(CriticalTaskName::SourceSync, async move {
-            source_sync
-                .run()
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
+        let source_task = CriticalTask::new(CriticalTaskName::SourceSync, source_sync.run());
         Ok(Self::assemble(
             startup.process_lock,
             database,
@@ -586,60 +588,68 @@ impl Application {
             admin_server,
             metrics_server,
             metrics_collector,
+            mail_dispatcher,
+            mail_feedback,
         } = serving_state;
         #[cfg(test)]
         let public_addr = public_server.local_addr;
         #[cfg(test)]
         let admin_addr = admin_server.local_addr;
-        let public_cancellation = cancellation.clone();
-        let public_task = CriticalTask::new(CriticalTaskName::PublicServer, async move {
-            public_server
-                .serve(public_cancellation)
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
-        let admin_cancellation = cancellation.clone();
-        let admin_task = CriticalTask::new(CriticalTaskName::AdminServer, async move {
-            admin_server
-                .serve(admin_cancellation)
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
-        let metrics_cancellation = cancellation.clone();
-        let metrics_task = CriticalTask::new(CriticalTaskName::MetricsServer, async move {
-            metrics_server
-                .serve(metrics_cancellation)
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
-        let collector_cancellation = cancellation.clone();
-        let collector_task = CriticalTask::new(CriticalTaskName::MetricsCollector, async move {
-            metrics_collector
-                .run(collector_cancellation)
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
-        let actor_cancellation = cancellation.clone();
-        let publication_actor_task =
-            CriticalTask::new(CriticalTaskName::PublicationCoordinator, async move {
-                publication_actor
-                    .run(actor_cancellation)
-                    .await
-                    .map_err(|error| Box::new(error) as CriticalTaskFailure)
-            });
+        let public_task = CriticalTask::new(
+            CriticalTaskName::PublicServer,
+            public_server.serve(cancellation.clone()),
+        );
+        let admin_task = CriticalTask::new(
+            CriticalTaskName::AdminServer,
+            admin_server.serve(cancellation.clone()),
+        );
+        let metrics_task = CriticalTask::new(
+            CriticalTaskName::MetricsServer,
+            metrics_server.serve(cancellation.clone()),
+        );
+        let collector_task = CriticalTask::new(
+            CriticalTaskName::MetricsCollector,
+            metrics_collector.run(cancellation.clone()),
+        );
+        let publication_actor_task = CriticalTask::new(
+            CriticalTaskName::PublicationCoordinator,
+            publication_actor.run(cancellation.clone()),
+        );
         let scheduler = PublicationScheduler::new(
             database.store.publications.clone(),
             publication_coordinator.clone(),
             publication_coordinator.scheduler_wakeup(),
             cancellation.clone(),
         );
-        let scheduler_task = CriticalTask::new(CriticalTaskName::Scheduler, async move {
-            scheduler
-                .run()
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        });
+        let scheduler_task = CriticalTask::new(CriticalTaskName::Scheduler, scheduler.run());
 
+        let retention = MailRetention::new(database.store.subscribers.clone());
+        let retention_task = CriticalTask::new(
+            CriticalTaskName::MailRetention,
+            retention.run(cancellation.clone()),
+        );
+        let mut tasks = vec![
+            retention_task,
+            publication_actor_task,
+            public_task,
+            admin_task,
+            metrics_task,
+            collector_task,
+            source_task,
+            scheduler_task,
+        ];
+        if let Some(dispatcher) = mail_dispatcher {
+            tasks.push(CriticalTask::new(
+                CriticalTaskName::MailDispatch,
+                dispatcher.run(cancellation.clone()),
+            ));
+        }
+        if let Some(feedback) = mail_feedback {
+            tasks.push(CriticalTask::new(
+                CriticalTaskName::MailFeedback,
+                feedback.run(cancellation.clone()),
+            ));
+        }
         Self {
             _process_lock: process_lock,
             _database: database.store,
@@ -649,15 +659,7 @@ impl Application {
                 cancellation,
                 database.shutdown,
                 shutdown,
-                vec![
-                    publication_actor_task,
-                    public_task,
-                    admin_task,
-                    metrics_task,
-                    collector_task,
-                    source_task,
-                    scheduler_task,
-                ],
+                tasks,
                 database.task,
             ),
             #[cfg(test)]
@@ -856,40 +858,13 @@ impl RestoreContentInputs {
         preview: &Arc<ContentCatalog>,
     ) -> Result<(), ProcessError> {
         for activation in self.startup.activating.iter().cloned() {
-            let site = self.startup.site.clone().ok_or_else(|| {
-                startup_failure(
-                    StartupStage::Content,
-                    "verify restored activation head",
-                    PublicationActivationError::DurableStateMismatch,
-                )
-            })?;
-            let mut catalog = catalogs
-                .get(&activation.content_digest)
-                .ok_or_else(|| {
-                    startup_failure(
-                        StartupStage::Content,
-                        "verify restored activation candidate",
-                        RetainedCatalogError::CandidateUnavailable,
-                    )
-                })?
-                .as_ref()
-                .clone();
-            catalog
-                .retain_revisions_from(preview, self.startup.ledger.revision_keys())
-                .map_err(|error| {
-                    startup_failure(
-                        StartupStage::Content,
-                        "verify restored activation revisions",
-                        error,
-                    )
-                })?;
-            PreparedPublicationRecovery::prepare(
+            rebuild_activating_publication(
                 activation,
-                Arc::new(catalog),
+                &self.startup,
+                catalogs,
+                preview,
                 embedded_manifest(),
-                &self.startup.ledger,
                 self.tip_recipient.as_ref(),
-                site,
             )
             .map_err(|error| {
                 startup_failure(StartupStage::Content, "verify restored activation", error)
@@ -897,6 +872,47 @@ impl RestoreContentInputs {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum StartupRecoveryError {
+    #[error("the activating publication has no durable site head")]
+    MissingSite,
+    #[error("the activating publication's retained content candidate is unavailable")]
+    MissingCandidate,
+    #[error("the activating publication's retained revisions could not be hydrated")]
+    Revisions(#[from] CatalogRetentionError),
+    #[error("the activating publication could not be reconstructed")]
+    Activation(#[from] PublicationActivationError),
+}
+
+/// Reconstruct the same pinned activation for offline restore preflight and startup recovery.
+fn rebuild_activating_publication(
+    activation: RecoverablePublicationActivation,
+    startup: &StartupSnapshotState,
+    catalogs: &BTreeMap<ContentTreeDigest, Arc<ContentCatalog>>,
+    preview: &ContentCatalog,
+    frontend: &'static FrontendAssetManifest,
+    tip_recipient: Option<&TipRecipientProjection>,
+) -> Result<PreparedPublicationRecovery, StartupRecoveryError> {
+    let site = startup
+        .site
+        .clone()
+        .ok_or(StartupRecoveryError::MissingSite)?;
+    let mut catalog = catalogs
+        .get(&activation.content_digest)
+        .ok_or(StartupRecoveryError::MissingCandidate)?
+        .as_ref()
+        .clone();
+    catalog.retain_revisions_from(preview, startup.ledger.revision_keys())?;
+    Ok(PreparedPublicationRecovery::prepare(
+        activation,
+        Arc::new(catalog),
+        frontend,
+        &startup.ledger,
+        tip_recipient,
+        site,
+    )?)
 }
 
 fn compile_retained_catalogs(
@@ -1038,6 +1054,7 @@ enum RetainedCatalogError {
 
 struct ServingStateInput<'resources> {
     database: &'resources DatabaseStore,
+    mail: &'resources MailConfiguration,
     compiled: CompiledStartupContent,
     frontend: &'static FrontendAssetManifest,
     public_bind: std::net::SocketAddr,
@@ -1054,6 +1071,7 @@ struct ServingStateInput<'resources> {
 async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingState, ProcessError> {
     let ServingStateInput {
         database,
+        mail,
         compiled,
         frontend,
         public_bind,
@@ -1066,6 +1084,29 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         content_compiler,
         source,
     } = input;
+    database
+        .mail
+        .quarantine_interrupted(OffsetDateTime::now_utc())
+        .await
+        .map_err(|error| {
+            startup_failure(
+                StartupStage::Database,
+                "quarantine interrupted mail campaigns",
+                error,
+            )
+        })?;
+    let PreparedMail {
+        access: mail_access,
+        public_routes: mail_routes,
+        dispatcher: mail_dispatcher,
+        feedback: mail_feedback,
+    } = prepare_mail(
+        mail,
+        database,
+        compiled.catalog.publication.site.base_url.clone(),
+    )
+    .await
+    .map_err(|error| startup_failure(StartupStage::Configuration, "prepare mail runtime", error))?;
     let tip_recipient = database
         .profiles
         .effective_tip_recipient()
@@ -1125,24 +1166,13 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         .activating
         .pop()
         .map(|activation| {
-            let site = startup_state
-                .site
-                .clone()
-                .ok_or(PublicationActivationError::DurableStateMismatch)?;
-            let retained = retained_catalogs
-                .get(&activation.content_digest)
-                .ok_or(PublicationActivationError::DurableStateMismatch)?;
-            let mut catalog = retained.as_ref().clone();
-            catalog
-                .retain_revisions_from(&preview_catalog, ledger.revision_keys())
-                .map_err(|_| PublicationActivationError::DurableStateMismatch)?;
-            PreparedPublicationRecovery::prepare(
+            rebuild_activating_publication(
                 activation,
-                Arc::new(catalog),
+                &startup_state,
+                &retained_catalogs,
+                &preview_catalog,
                 frontend,
-                &ledger,
                 tip_recipient.as_ref(),
-                site,
             )
         })
         .transpose()
@@ -1220,15 +1250,25 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         security,
         database.profiles.clone(),
         source,
-    );
-    let public_server = PublicServer::bind(
-        public_bind,
-        PublicState {
-            snapshots,
-            readiness: readiness.clone(),
+        MailUiState {
+            campaigns: database.mail.clone(),
+            subscribers: database.subscribers.clone(),
+            publications: publication_coordinator.clone(),
+            snapshots: snapshots.clone(),
+            access: mail_access,
         },
-    )
-    .await
+    );
+    let public_state = PublicState {
+        snapshots,
+        readiness: readiness.clone(),
+    };
+    let public_server = match mail_routes {
+        Some(routes) => {
+            PublicServer::bind_router(public_bind, public_router_with_routes(public_state, routes))
+                .await
+        }
+        None => PublicServer::bind(public_bind, public_state).await,
+    }
     .map_err(|error| startup_failure(StartupStage::Listeners, "bind the public listener", error))?;
     tracing::info!(bind = %public_server.local_addr, "public listener bound");
     let admin_server = AdminServer::bind(admin_bind, protected_admin_router)
@@ -1260,6 +1300,8 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         tokio::runtime::Handle::current(),
     );
     Ok(ServingState {
+        mail_dispatcher,
+        mail_feedback,
         metrics_server,
         metrics_collector,
         readiness,
@@ -1310,15 +1352,9 @@ async fn start_database(host: &HostConfiguration) -> Result<StartedDatabase, Pro
     };
     let (store, writer) = database.into_store(host.database.writer_queue_capacity.get());
     let shutdown = CancellationToken::new();
-    let writer_shutdown = shutdown.clone();
     let task = spawn_critical_task(CriticalTask::new(
         CriticalTaskName::DatabaseWriter,
-        async move {
-            writer
-                .run(writer_shutdown)
-                .await
-                .map_err(|error| Box::new(error) as CriticalTaskFailure)
-        },
+        writer.run(shutdown.clone()),
     ));
 
     if let Err(error) = identity_bootstrap::initialize_startup_identity(
@@ -1553,13 +1589,14 @@ struct CriticalTask {
 }
 
 impl CriticalTask {
-    fn new<Future>(name: CriticalTaskName, future: Future) -> Self
+    fn new<Future, Error>(name: CriticalTaskName, future: Future) -> Self
     where
-        Future: std::future::Future<Output = CriticalTaskResult> + Send + 'static,
+        Future: std::future::Future<Output = Result<(), Error>> + Send + 'static,
+        Error: Into<CriticalTaskFailure>,
     {
         Self {
             name,
-            future: Box::pin(future),
+            future: Box::pin(async move { future.await.map_err(Into::into) }),
         }
     }
 }
@@ -1700,12 +1737,15 @@ mod tests {
         admin::test_support::{ADMIN_AUTHORITY, ADMIN_ORIGIN, agent_authorization},
         cli::BootstrapCredential,
         config::{ConfigurationValidationCode, IdentityStartupBootstrap},
-        domain::auth::{
-            NostrPublicKey,
-            store::{
-                AdminMutationKey, AuditPrincipalReference, BootstrapIdentity, MutationAuditContext,
-                NewHumanCredential, RegisterAgentCredential,
+        domain::{
+            auth::{
+                NostrPublicKey,
+                store::{
+                    AdminMutationKey, AuditPrincipalReference, BootstrapIdentity,
+                    MutationAuditContext, NewHumanCredential, RegisterAgentCredential,
+                },
             },
+            mail::runtime::{MailReviewAccessError, MailStartupError},
         },
         render::render_bound_post_preview,
     };
@@ -1744,10 +1784,15 @@ Durable article body.\n";
     }
 
     fn startup_host_source(extra: &str, public_bind: &str) -> String {
-        startup_host_source_with_admin(extra, public_bind, "127.0.0.1:0")
+        startup_host_source_with_listeners(extra, public_bind, "127.0.0.1:0", "127.0.0.1:0")
     }
 
-    fn startup_host_source_with_admin(extra: &str, public_bind: &str, admin_bind: &str) -> String {
+    fn startup_host_source_with_listeners(
+        extra: &str,
+        public_bind: &str,
+        admin_bind: &str,
+        metrics_bind: &str,
+    ) -> String {
         format!(
             "[paths]\n\
              content_root = \"content\"\n\
@@ -1757,7 +1802,7 @@ Durable article body.\n";
              bind = \"{public_bind}\"\n\
              {extra}\n\
              [metrics]\n\
-             bind = \"127.0.0.1:0\"\n\
+             bind = \"{metrics_bind}\"\n\
              [admin]\n\
              bind = \"{admin_bind}\"\n\
              origin = \"https://admin.example.test\"\n"
@@ -2303,7 +2348,8 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             StartupHostConfiguration::load(root.path().join("maincopy.toml")),
             Err(ProcessError::AlreadyRunning)
         ));
-        assert_eq!(application.runtime.critical_tasks.len(), 7);
+        // Retention remains supervised even though this fixture disables mail.
+        assert_eq!(application.runtime.critical_tasks.len(), 8);
         assert!(application.runtime.database_writer.is_some());
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -3274,6 +3320,97 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
+    async fn mail_credential_failure_releases_database_process_and_listener_ownership() {
+        use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+
+        let (root, config_path, _) = startup_fixture("", VALID_PUBLICATION);
+        let reservations = [
+            reserve_loopback_port(),
+            reserve_loopback_port(),
+            reserve_loopback_port(),
+        ];
+        let addresses = reservations
+            .each_ref()
+            .map(|socket| socket.local_addr().unwrap());
+        let host_source = startup_host_source_with_listeners(
+            "",
+            &addresses[0].to_string(),
+            &addresses[1].to_string(),
+            &addresses[2].to_string(),
+        );
+        fs::write(
+            &config_path,
+            format!(
+                "{host_source}\n\
+                 [mail]\n\
+                 mode = \"ses\"\n\
+                 sender = \"newsletter@example.com\"\n\
+                 region = \"us-east-1\"\n\
+                 configuration_set = \"newsletter\"\n\
+                 credential_file = \"private-mail-credential.json\"\n\
+                 control_signing_key_file = \"unused-control.key\"\n"
+            ),
+        )
+        .unwrap();
+        let credential_path = root.path().join("private-mail-credential.json");
+        let mut credential = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&credential_path)
+            .unwrap();
+        // A protected file reaches parsing; its unknown field must remain out
+        // of diagnostics together with the credential bytes and runtime path.
+        credential
+            .write_all(br#"{"access_key_id":"AKIDEXAMPLE","secret_access_key":"private-fixture-secret-material","unexpected":"invalid"}"#)
+            .unwrap();
+        drop(credential);
+        let startup =
+            StartupConfiguration::load_with_discovery(config_path.clone(), discover_content_tree)
+                .unwrap();
+        bootstrap_test_identity(&startup).await;
+        let error = match Application::build(startup).await {
+            Ok(_) => panic!("malformed SES credentials must fail application construction"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            ProcessError::Application(ApplicationError::Startup {
+                stage: StartupStage::Configuration,
+                operation: "prepare mail runtime",
+                source,
+            }) if matches!(source.downcast_ref::<MailStartupError>(),
+                Some(MailStartupError::Review(MailReviewAccessError::CredentialInvalid)))
+        ));
+        let diagnostic = format!("{error}\n{error:?}");
+        for private in [
+            credential_path.to_str().unwrap(),
+            "private-mail-credential.json",
+            "private-fixture-secret-material",
+        ] {
+            assert!(!diagnostic.contains(private));
+        }
+
+        // These acquire the actual resources, so a detached writer or retained
+        // process guard cannot pass merely because startup returned an error.
+        let configuration = HostConfigurationLoader::from_process_working_directory()
+            .unwrap()
+            .load(&config_path)
+            .unwrap();
+        let host = configuration.view();
+        let process_lock = ProcessLock::acquire(host.runtime_root).unwrap();
+        let database = database::bootstrap(host.database).await.unwrap();
+        for address in addresses {
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            drop(listener);
+        }
+        database.close().await.unwrap();
+        drop(process_lock);
+        drop(reservations);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn listener_failure_releases_the_public_port_and_database_ownership() {
         let (root, _, _) = startup_fixture("", VALID_PUBLICATION);
         let config_path = root.path().join("maincopy.toml");
@@ -3318,7 +3455,12 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let occupied = tokio::net::TcpListener::bind(admin_addr).await.unwrap();
         fs::write(
             &config_path,
-            startup_host_source_with_admin("", "127.0.0.1:0", &admin_addr.to_string()),
+            startup_host_source_with_listeners(
+                "",
+                "127.0.0.1:0",
+                &admin_addr.to_string(),
+                "127.0.0.1:0",
+            ),
         )
         .unwrap();
         let arguments = config_path.clone();
@@ -3479,7 +3621,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             CriticalTaskName::Worker,
             async {
                 failed.await.unwrap();
-                Ok(())
+                Ok::<(), CriticalTaskFailure>(())
             },
         ));
         let running = tokio::spawn(application.run_until_stop());
@@ -3527,7 +3669,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                         observed_order.fetch_add(1, Ordering::SeqCst);
                     }
                     drained.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok::<(), CriticalTaskFailure>(())
                 })
             })
             .collect();
@@ -3568,7 +3710,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             writer_shutdown.cancelled().await;
             let _ = writer_started_tx.send(());
             let _ = writer_release_rx.await;
-            Ok(())
+            Ok::<(), CriticalTaskFailure>(())
         });
         let application = ApplicationRuntime::with_database_writer(
             readiness.clone(),
@@ -3612,12 +3754,12 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             producer_shutdown.cancelled().await;
             let _ = producer_cancelled_tx.send(());
             let _ = producer_release_rx.await;
-            Ok(())
+            Ok::<(), CriticalTaskFailure>(())
         });
         let writer = CriticalTask::new(CriticalTaskName::DatabaseWriter, async move {
             writer_shutdown.cancelled().await;
             let _ = writer_cancelled_tx.send(());
-            Ok(())
+            Ok::<(), CriticalTaskFailure>(())
         });
         let application = ApplicationRuntime::with_database_writer(
             readiness.clone(),
@@ -3719,8 +3861,6 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let readiness = Readiness::default();
         let cancellation = CancellationToken::new();
         let writer_shutdown = CancellationToken::new();
-        let collector_cancellation = cancellation.clone();
-        let shutdown = writer_shutdown.clone();
         let application = ApplicationRuntime::with_database_writer(
             readiness.clone(),
             cancellation.clone(),
@@ -3728,21 +3868,11 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             Box::pin(std::future::pending()),
             vec![CriticalTask::new(
                 CriticalTaskName::MetricsCollector,
-                async move {
-                    collector
-                        .run(collector_cancellation)
-                        .await
-                        .map_err(|error| Box::new(error) as CriticalTaskFailure)
-                },
+                collector.run(cancellation.clone()),
             )],
             spawn_critical_task(CriticalTask::new(
                 CriticalTaskName::DatabaseWriter,
-                async move {
-                    writer
-                        .run(shutdown)
-                        .await
-                        .map_err(|error| Box::new(error) as CriticalTaskFailure)
-                },
+                writer.run(writer_shutdown.clone()),
             )),
         );
         let result = tokio::time::timeout(
@@ -3776,11 +3906,11 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             CriticalTask::new(CriticalTaskName::Worker, async move {
                 cancellation.cancelled().await;
                 companion_drained.store(true, Ordering::SeqCst);
-                Ok(())
+                Ok::<(), CriticalTaskFailure>(())
             })
         };
         let writer = CriticalTask::new(CriticalTaskName::DatabaseWriter, async {
-            Err(Box::new(std::io::Error::other("writer stopped")) as CriticalTaskFailure)
+            Err(std::io::Error::other("writer stopped"))
         });
         let application = ApplicationRuntime::with_database_writer(
             readiness.clone(),
@@ -3797,8 +3927,9 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             result,
             Err(ApplicationError::CriticalTaskFailed {
                 task: CriticalTaskName::DatabaseWriter,
-                ..
-            })
+                source,
+            }) if source.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.to_string() == "writer stopped")
         ));
         assert!(!readiness.is_ready());
         assert!(cancellation.is_cancelled());
@@ -3826,7 +3957,7 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             async move {
                 cancellation.cancelled().await;
                 companion_drained.store(true, Ordering::SeqCst);
-                Ok(())
+                Ok::<(), CriticalTaskFailure>(())
             }
         };
         let application = ApplicationRuntime::with_parts(

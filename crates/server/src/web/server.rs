@@ -15,12 +15,16 @@ pub(crate) struct PublicServer {
 
 impl PublicServer {
     pub(crate) async fn bind(bind: SocketAddr, state: PublicState) -> io::Result<Self> {
+        Self::bind_router(bind, public_router(state)).await
+    }
+
+    pub(crate) async fn bind_router(bind: SocketAddr, router: Router) -> io::Result<Self> {
         let listener = TcpListener::bind(bind).await?;
         let local_addr = listener.local_addr()?;
         Ok(Self {
             local_addr,
             listener,
-            router: public_router(state),
+            router,
         })
     }
 

@@ -85,7 +85,7 @@ pub(crate) enum ContentCompilerInitializationError {
 /// Current candidate revisions plus exact retained historical render inputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentCatalog {
-    pub(super) publication: PublicationSettings,
+    pub(crate) publication: PublicationSettings,
     pub(super) site_assets: ResolvedSiteAssets,
     pub(super) local_assets: Arc<ResolvedLocalAssetStore>,
     current_revisions: BTreeMap<PostId, PostRevisionDigest>,

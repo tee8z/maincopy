@@ -7,6 +7,13 @@ use crate::{
     database::{self, DatabaseStartupError},
     domain::{
         auth::store::{AuthApplyError, AuthCommandError, AuthLoadError},
+        mail::{
+            store::{CampaignApplyError, CampaignCommandError, CampaignLoadError},
+            subscriber::{
+                SubscriberCommandError,
+                store::{SubscriberApplyError, SubscriberLoadError},
+            },
+        },
         profile::store::ProfileLoadError,
     },
     error::{ApplicationError, ProcessError, StartupStage},
@@ -123,6 +130,16 @@ enum BackupFormat {
 
 #[derive(Debug, Error)]
 pub(crate) enum RestoreError {
+    #[error("offline restore acceptance could not finish truncating the SQLite WAL")]
+    CheckpointIncomplete,
+    #[error("restored subscriber state is invalid")]
+    SubscriberLoad(#[from] SubscriberLoadError),
+    #[error("restored subscriber eligibility discard was rejected")]
+    Subscriber(SubscriberCommandError),
+    #[error("restored campaign state is invalid")]
+    CampaignLoad(#[from] CampaignLoadError),
+    #[error("restored campaign quarantine was rejected")]
+    Campaign(CampaignCommandError),
     #[error("the restore destination must be empty and use the configured state directory")]
     DestinationNotEmpty,
     #[error("restore input paths must be regular files in protected directories")]
@@ -172,6 +189,26 @@ impl From<AuthApplyError> for RestoreError {
             AuthApplyError::Command(error) => Self::Identity(error),
             AuthApplyError::Operation(error) => Self::Sql(error),
             AuthApplyError::CorruptStoredState => Self::Integrity,
+        }
+    }
+}
+
+impl From<CampaignApplyError> for RestoreError {
+    fn from(error: CampaignApplyError) -> Self {
+        match error {
+            CampaignApplyError::Command(error) => Self::Campaign(error),
+            CampaignApplyError::Operation(error) => Self::Sql(error),
+            CampaignApplyError::CorruptStoredState => Self::Integrity,
+        }
+    }
+}
+
+impl From<SubscriberApplyError> for RestoreError {
+    fn from(error: SubscriberApplyError) -> Self {
+        match error {
+            SubscriberApplyError::Command(error) => Self::Subscriber(error),
+            SubscriberApplyError::Operation(error) => Self::Sql(error),
+            SubscriberApplyError::CorruptStoredState => Self::Integrity,
         }
     }
 }

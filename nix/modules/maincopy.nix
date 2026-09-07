@@ -45,6 +45,15 @@ let
   stateDir = "/var/lib/${cfg.stateDirectory}";
   runtimeParent = "/run/${cfg.runtimeDirectory}";
   runtimeDir = "${runtimeParent}/private";
+  mail = import ./mail.nix {
+    inherit
+      lib
+      pkgs
+      runtimeDir
+      pathType
+      ;
+    settings = cfg.mail;
+  };
   origin = "https://${cfg.admin.domain}${
     lib.optionalString (cfg.admin.port != 443) ":${toString cfg.admin.port}"
   }";
@@ -67,6 +76,7 @@ let
       metrics.bind = "127.0.0.1:${toString cfg.metricsPort}";
       database.path = "${stateDir}/database/maincopy.db";
       identity.startup_bootstrap = "require_existing";
+      mail = mail.hostConfig;
     }
     // lib.optionalAttrs cfg.backup.enable {
       backup = {
@@ -82,12 +92,14 @@ let
       };
     }
   );
-  credentials = lib.concatLists (
-    lib.mapAttrsToList (name: files: [
-      "${name}-key:${files.privateKeyFile}"
-      "${name}-hosts:${files.knownHostsFile}"
-    ]) cfg.source.credentials
-  );
+  credentials =
+    lib.concatLists (
+      lib.mapAttrsToList (name: files: [
+        "${name}-key:${files.privateKeyFile}"
+        "${name}-hosts:${files.knownHostsFile}"
+      ]) cfg.source.credentials
+    )
+    ++ mail.credentials;
   prepareCredentials = pkgs.writeShellScript "maincopy-prepare-credentials" ''
     set -eu
     umask 077
@@ -99,6 +111,7 @@ let
         ${pkgs.coreutils}/bin/install -m 0600 "$CREDENTIALS_DIRECTORY/${name}-hosts" ${lib.escapeShellArg "${runtimeDir}/credentials/${name}-hosts"}
       '') cfg.source.credentials
     )}
+    ${mail.prepareCredentials}
   '';
   serviceIsolation = import ./service-isolation.nix;
   daemonService = serviceIsolation // {
@@ -328,6 +341,7 @@ in
         default = { };
       };
     };
+    mail = mail.option;
     source = {
       managed = mkOption {
         type = types.bool;
@@ -364,12 +378,14 @@ in
             "maincopy-backup"
             "maincopy-litestream"
             "maincopy-backup-status"
+            "maincopy-backup-expire"
           ])
           && !(lib.elem cfg.runtimeDirectory [
             "maincopy-gateway"
             "maincopy-backup"
             "maincopy-litestream"
             "maincopy-backup-status"
+            "maincopy-backup-expire"
           ]);
         message = "Maincopy daemon directories must not overlap gateway or backup service directories.";
       }
@@ -409,6 +425,7 @@ in
         message = "Maincopy SSH credential references require managed source mode.";
       }
     ]
+    ++ mail.assertions
     ++
       map
         (tls: {

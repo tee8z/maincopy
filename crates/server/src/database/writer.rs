@@ -6,8 +6,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::domain::mail::subscriber::{
+    SubscriberCommandError,
+    store::{self as subscriber_store, SubscriberApplyError, SubscriberStore},
+};
 use sqlx::{Connection as _, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use thiserror::Error;
+use time::OffsetDateTime;
 #[cfg(test)]
 use tokio::sync::Barrier;
 use tokio::sync::{mpsc, oneshot};
@@ -25,6 +30,11 @@ use crate::domain::auth::store::{
     create_user, put_human_credential, record_admin_audit_failure, register_agent_credential,
     remove_human_credential, replace_agent_scopes, replace_user_roles, revoke_agent_credential,
     revoke_browser_session, set_user_status,
+};
+use crate::domain::mail::store::{
+    CampaignApplyError, CampaignCommandError, CampaignStore, approve_campaign, cancel_campaign,
+    claim_campaign, create_campaign, finish_campaign, quarantine_interrupted_campaigns,
+    renew_campaign_claim,
 };
 use crate::domain::profile::store::{
     ProfileApplyError, ProfileCommandError, ProfileStore, apply_set_tip_recipient,
@@ -75,7 +85,9 @@ impl BootstrappedDatabase {
                 AuthStore::new(readers.clone(), mutations.clone()),
                 ProfileStore::new(readers.clone(), mutations.clone()),
                 PublicationStore::new(readers.clone(), mutations.clone()),
-                SourceStore::new(readers.clone(), mutations),
+                SourceStore::new(readers.clone(), mutations.clone()),
+                CampaignStore::new(readers.clone(), mutations.clone()),
+                SubscriberStore::new(readers.clone(), mutations),
                 health,
             ),
             DatabaseWriter {
@@ -320,6 +332,254 @@ async fn apply_mutation(
     mutation: Mutation,
 ) -> Result<AppliedMutation, FailedMutation> {
     match mutation {
+        Mutation::BeginMailFeedbackPoll {
+            binding,
+            run_id,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::begin_feedback_poll(
+                transaction,
+                binding,
+                run_id,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::CompleteMailFeedbackPoll {
+            binding,
+            run_id,
+            poll_id,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::complete_feedback_poll(transaction, binding, run_id, poll_id).await,
+        ),
+        Mutation::DeferMailFeedbackPoll {
+            binding,
+            run_id,
+            poll_id,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::defer_feedback_poll(transaction, binding, run_id, poll_id).await,
+        ),
+        Mutation::ResetMailSubscriberConsent {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::reset_consent(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::BeginMailFeedbackRun {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::begin_feedback_run(
+                transaction,
+                command,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::RecordMailFeedbackObservation {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::record_feedback_observation(
+                transaction,
+                command,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::FinishMailFeedbackRun {
+            configuration_binding,
+            run_id,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::finish_feedback_run(transaction, configuration_binding, run_id).await,
+        ),
+        Mutation::InitializeMailControls {
+            binding,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::initialize_controls(transaction, binding).await,
+        ),
+        Mutation::PauseMailSubscribers { respond_to } => {
+            subscriber_response(respond_to, subscriber_store::pause(transaction).await)
+        }
+        Mutation::SetSubscriberPolicy { policy, respond_to } => subscriber_response(
+            respond_to,
+            subscriber_store::set_policy(
+                transaction,
+                policy,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::RecordMailFeedbackHealth {
+            binding,
+            health,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::record_feedback_health(
+                transaction,
+                binding,
+                health,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::RecordMailFeedbackIntegrityFailure {
+            binding,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::record_feedback_integrity_failure(transaction, binding).await,
+        ),
+        Mutation::RequestMailEnrollment {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::request_enrollment(
+                transaction,
+                command,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::ConfirmMailEnrollment {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::confirm(
+                transaction,
+                command,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::RemoveMailEnrollment {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::remove(
+                transaction,
+                command,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::ClaimMailConfirmation {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::claim_confirmation(
+                transaction,
+                command,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::AdmitMailRecipient {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::admit_campaign_recipient(
+                transaction,
+                command,
+                OffsetDateTime::now_utc(),
+            )
+            .await,
+        ),
+        Mutation::FinishMailAttempt {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::finish_attempt(
+                transaction,
+                command,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::ApplyMailFeedback {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            subscriber_store::apply_feedback(
+                transaction,
+                command,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::QuarantineMailAttempts { respond_to } => subscriber_response(
+            respond_to,
+            subscriber_store::quarantine_interrupted(
+                transaction,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await,
+        ),
+        Mutation::CleanupMailSubscribers { respond_to } => subscriber_response(
+            respond_to,
+            subscriber_store::cleanup(transaction, OffsetDateTime::now_utc().unix_timestamp())
+                .await,
+        ),
+        Mutation::CreateMailCampaign {
+            command,
+            respond_to,
+        } => campaign_response(
+            respond_to,
+            create_campaign(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::ApproveMailCampaign {
+            command,
+            respond_to,
+        } => campaign_response(
+            respond_to,
+            approve_campaign(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::CancelMailCampaign {
+            command,
+            respond_to,
+        } => campaign_response(
+            respond_to,
+            cancel_campaign(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::ClaimMailCampaign {
+            command,
+            respond_to,
+        } => campaign_response(respond_to, claim_campaign(transaction, command).await),
+        Mutation::FinishMailCampaign {
+            command,
+            respond_to,
+        } => campaign_response(respond_to, finish_campaign(transaction, command).await),
+        Mutation::RenewMailCampaignClaim {
+            command,
+            respond_to,
+        } => campaign_response(
+            respond_to,
+            renew_campaign_claim(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::QuarantineInterruptedMail { now, respond_to } => campaign_response(
+            respond_to,
+            quarantine_interrupted_campaigns(transaction, now).await,
+        ),
         Mutation::RecordAdminAuditFailure {
             command,
             respond_to,
@@ -584,6 +844,44 @@ impl AppliedMutation {
     #[cfg(test)]
     const fn is_crash_test_candidate(&self) -> bool {
         self.crash_test_candidate
+    }
+}
+
+fn subscriber_response<Output: Send + 'static>(
+    respond_to: oneshot::Sender<Result<Output, SubscriberCommandError>>,
+    result: Result<Output, SubscriberApplyError>,
+) -> Result<AppliedMutation, FailedMutation> {
+    match result {
+        Ok(output) => Ok(AppliedMutation::new(
+            respond_to,
+            output,
+            SubscriberCommandError::OutcomeUnknown,
+            true,
+        )),
+        Err(SubscriberApplyError::Command(error)) => Err(command_failure(respond_to, error)),
+        Err(SubscriberApplyError::Operation(error)) => Err(FailedMutation::Operation(error)),
+        Err(SubscriberApplyError::CorruptStoredState) => {
+            Err(FailedMutation::Corrupt("mail subscriber"))
+        }
+    }
+}
+
+fn campaign_response<Output: Send + 'static>(
+    respond_to: oneshot::Sender<Result<Output, CampaignCommandError>>,
+    result: Result<Output, CampaignApplyError>,
+) -> Result<AppliedMutation, FailedMutation> {
+    match result {
+        Ok(output) => Ok(AppliedMutation::new(
+            respond_to,
+            output,
+            CampaignCommandError::OutcomeUnknown,
+            true,
+        )),
+        Err(CampaignApplyError::Command(error)) => Err(command_failure(respond_to, error)),
+        Err(CampaignApplyError::Operation(error)) => Err(FailedMutation::Operation(error)),
+        Err(CampaignApplyError::CorruptStoredState) => {
+            Err(FailedMutation::Corrupt("mail campaign"))
+        }
     }
 }
 

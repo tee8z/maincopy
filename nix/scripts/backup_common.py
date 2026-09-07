@@ -1,13 +1,16 @@
 """Protected files and stock rclone plumbing shared by checkpoint tools."""
 import base64
 import configparser
+from contextlib import contextmanager
 import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import stat
 import selectors
+import shutil
 import time
 import subprocess
 import tempfile
@@ -49,6 +52,17 @@ def protected_directory(path):
         raise BackupFailure("protected directory validation")
 
 
+@contextmanager
+def checkpoint_lock(directory, *, wait=False):
+    descriptor = os.open(directory / ".checkpoint.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "rb+") as lock:
+        metadata = os.fstat(lock.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077 or metadata.st_uid != os.getuid():
+            raise BackupFailure("checkpoint lock validation")
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        yield
+
+
 def run(command, stage, timeout=180, output=None, input_bytes=None, maximum=MAX_MANIFEST):
     # Drain bounded stdout while the child runs. Fail and kill the child as soon
     # as its control response exceeds the limit, without buffering it to disk.
@@ -85,14 +99,16 @@ def run(command, stage, timeout=180, output=None, input_bytes=None, maximum=MAX_
         raise BackupFailure(stage) from error
 
 
-def runtime_config(args, directory, cache):
-    raw_key = protected_file(args.key, 128).strip()
-    try:
-        decoded = base64.b64decode(raw_key, validate=True)
-    except ValueError as error:
-        raise BackupFailure("crypt key validation") from error
-    if len(decoded) != 32 or base64.b64encode(decoded) != raw_key:
-        raise BackupFailure("crypt key validation")
+def b2_destination(args):
+    if not isinstance(args.bucket, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{5,49}", args.bucket):
+        raise BackupFailure("backup bucket validation")
+    if not isinstance(args.prefix, str) or len(args.prefix) > 256 or not re.fullmatch(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", args.prefix):
+        raise BackupFailure("backup prefix validation")
+    return f"maincopy-b2:{args.bucket}/{args.prefix}"
+
+
+def credential_profile(args):
+    b2_destination(args)
     profile = configparser.ConfigParser(interpolation=None)
     try:
         profile.read_string(protected_file(args.credentials, 16384).decode("utf-8"))
@@ -105,19 +121,41 @@ def runtime_config(args, directory, cache):
         raise BackupFailure("B2 credential fields validation")
     if any(not re.fullmatch(r"[A-Za-z0-9/_+=.-]{1,256}", values[field]) for field in ("account", "key")):
         raise BackupFailure("B2 credential value validation")
-    # rclone's standard obscure command receives the key on stdin. The generated
-    # config is still a secret: obscure is reversible, not encryption at rest.
-    obscured = run([args.rclone, "obscure", "-"], "crypt key preparation", 15,
-                   input_bytes=raw_key, maximum=1024).decode("ascii").strip()
-    for remote, target in (("localcrypt", str(cache)),
-                           ("offsitecrypt", f"maincopy-b2:{args.bucket}/{args.prefix}")):
-        profile[remote] = {"type": "crypt", "remote": target, "password": obscured,
-                           "filename_encryption": "standard", "directory_name_encryption": "true"}
+    return profile
+
+
+def write_config(profile, directory):
     path = directory / "rclone.conf"
     with path.open("x", encoding="utf-8") as output:
         os.chmod(path, 0o600)
         profile.write(output)
     return path
+
+
+def runtime_config(args, directory, cache, epoch=None):
+    raw_key = protected_file(args.key, 128).strip()
+    try:
+        decoded = base64.b64decode(raw_key, validate=True)
+    except ValueError as error:
+        raise BackupFailure("crypt key validation") from error
+    if len(decoded) != 32 or base64.b64encode(decoded) != raw_key:
+        raise BackupFailure("crypt key validation")
+    profile = credential_profile(args)
+    destination = b2_destination(args)
+    if epoch is not None:
+        if not CHECKPOINT_NAME.fullmatch(epoch):
+            raise BackupFailure("backup epoch validation")
+        destination += "/epochs/" + epoch
+    # rclone's standard obscure command receives the key on stdin. The generated
+    # config is still a secret: obscure is reversible, not encryption at rest.
+    obscured = run([args.rclone, "obscure", "-"], "crypt key preparation", 15,
+                   input_bytes=raw_key, maximum=1024).decode("ascii").strip()
+    for remote, target in (("localcrypt", str(cache)),
+                           ("offsitecrypt", destination),
+                           ("selectioncrypt", b2_destination(args))):
+        profile[remote] = {"type": "crypt", "remote": target, "password": obscured,
+                           "filename_encryption": "standard", "directory_name_encryption": "true"}
+    return write_config(profile, directory)
 
 
 def rclone(args, config, *command, timeout=180, maximum=MAX_MANIFEST):
@@ -209,3 +247,22 @@ def write_report(path, healthy, success):
 def add_common_arguments(parser):
     for name in ("config", "maincopyd", "litestream", "rclone", "key", "credentials", "bucket", "prefix"):
         parser.add_argument("--" + name, required=True)
+
+def cleanup_staging(directory):
+    with os.scandir(directory) as entries:
+        count = 0
+        for entry in entries:
+            if re.fullmatch(r"\.(?:capture|expiry)-[a-z0-9_]{8}", entry.name):
+                count += 1
+                if count > 1024 or not entry.is_dir(follow_symlinks=False):
+                    raise BackupFailure("stale checkpoint staging validation")
+                shutil.rmtree(entry.path)
+    retained = directory / "checkpoints"
+    if retained.exists():
+        protected_directory(retained)
+        with os.scandir(retained) as entries:
+            for entry in entries:
+                if entry.name.startswith(".pending-") and CHECKPOINT_NAME.fullmatch(entry.name[9:]):
+                    if not entry.is_dir(follow_symlinks=False):
+                        raise BackupFailure("pending checkpoint validation")
+                    shutil.rmtree(entry.path)

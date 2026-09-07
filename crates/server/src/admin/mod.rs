@@ -4,6 +4,7 @@ use axum::{Extension, Router, extract::FromRef, middleware};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::domain::{
+    mail::ui::{self as mail_ui, MailUiState},
     profile::ProfileStore,
     publication::{
         activation::PublicationCoordinatorHandle, admin as publication_admin, ui as publication_ui,
@@ -32,7 +33,7 @@ pub(crate) mod ui;
 use openapi::{AdminApi, RouteAuthentication, describe_authentication};
 pub(crate) use security::{
     AdminSecurityState, AdminSessionPolicy, BrowserFormSession, BrowserSessionContext,
-    RequiredBrowserSession, browser_scoped_router,
+    RequiredBrowserSession, browser_scoped_router, browser_session_router,
 };
 pub(crate) use server::AdminServer;
 
@@ -68,8 +69,9 @@ pub(crate) fn runtime_admin_router(
     security: AdminSecurityState,
     profiles: ProfileStore,
     source: SourceSyncHandle,
+    mail: MailUiState,
 ) -> Router {
-    let (router, document) = registered_router(&security);
+    let (router, document) = registered_router(&security, mail);
     router
         .layer(Extension(Arc::new(document)))
         .layer(Extension(security.clone()))
@@ -92,6 +94,7 @@ pub(crate) fn runtime_admin_router(
 
 fn registered_router(
     security: &AdminSecurityState,
+    mail: MailUiState,
 ) -> (Router<AdminRuntimeState>, utoipa::openapi::OpenApi) {
     let (api, document) = OpenApiRouter::<AdminRuntimeState>::with_openapi(AdminApi::document())
         .routes(scoped_routes(
@@ -255,7 +258,8 @@ fn registered_router(
             .merge(profile::browser_router(security))
             .merge(identity::browser_router(security))
             .merge(publication_ui::router(security))
-            .merge(source_ui::router(security)),
+            .merge(source_ui::router(security))
+            .merge(mail_ui::router(security, mail)),
         document,
     )
 }

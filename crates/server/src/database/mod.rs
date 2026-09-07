@@ -85,6 +85,7 @@ pub(crate) async fn bootstrap(
 
     let identity = preflight_database(configuration.path, expected_file).await?;
     let options = SqliteConnectOptions::new()
+        .disable_statement_logging()
         .filename(configuration.path)
         .create_if_missing(false)
         .foreign_keys(true)
@@ -149,6 +150,7 @@ async fn open_read_pool(
         }
     })?;
     let options = SqliteConnectOptions::new()
+        .disable_statement_logging()
         .filename(configuration.path)
         .create_if_missing(false)
         .read_only(true)
@@ -311,6 +313,7 @@ async fn preflight_database(
     expected_file: ExpectedFile,
 ) -> Result<DatabaseIdentity, DatabaseStartupError> {
     let options = SqliteConnectOptions::new()
+        .disable_statement_logging()
         .filename(path)
         .create_if_missing(false)
         .read_only(true);
@@ -504,6 +507,7 @@ async fn configure_connection(
 
     for statement in [
         "PRAGMA synchronous = NORMAL",
+        "PRAGMA secure_delete = ON",
         "PRAGMA foreign_keys = ON",
         "PRAGMA trusted_schema = OFF",
         "PRAGMA ignore_check_constraints = OFF",
@@ -517,6 +521,7 @@ async fn configure_connection(
     }
 
     verify_integer_pragma(connection, "PRAGMA synchronous", 1, "synchronous").await?;
+    verify_integer_pragma(connection, "PRAGMA secure_delete", 1, "secure_delete").await?;
     verify_integer_pragma(connection, "PRAGMA foreign_keys", 1, "foreign_keys").await?;
     verify_integer_pragma(connection, "PRAGMA trusted_schema", 0, "trusted_schema").await?;
     verify_integer_pragma(

@@ -63,6 +63,10 @@ async fn public_router_does_not_expose_browser_admin_routes() {
     for path in [
         "/admin".to_owned(),
         "/admin/login".to_owned(),
+        "/admin/mail".to_owned(),
+        "/admin/mail/recovery".to_owned(),
+        format!("/admin/mail/posts/{POST_ID}/review"),
+        format!("/admin/mail/campaigns/{POST_ID}"),
         "/admin/agents".to_owned(),
         format!("/admin/agents/{POST_ID}"),
         "/admin/users".to_owned(),
@@ -85,7 +89,11 @@ async fn public_router_does_not_expose_browser_admin_routes() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
     for path in [
+        "/admin/mail/recovery".to_owned(),
         "/admin/users".to_owned(),
+        format!("/admin/mail/posts/{POST_ID}/review"),
+        format!("/admin/mail/campaigns/{POST_ID}/approve"),
+        format!("/admin/mail/campaigns/{POST_ID}/cancel"),
         "/admin/agents".to_owned(),
         format!("/admin/agents/{POST_ID}/scopes"),
         format!("/admin/agents/{POST_ID}/revoke"),
@@ -206,5 +214,23 @@ async fn public_router_does_not_expose_metrics() {
             request(app.clone(), method, "/metrics").await.status(),
             StatusCode::NOT_FOUND
         );
+    }
+}
+
+#[tokio::test]
+async fn disabled_mail_exposes_no_public_capture_or_control_routes() {
+    let app = public_router(public_state(Readiness::new(true)));
+    for path in [
+        "/email/subscribe",
+        "/email/confirm/private-token",
+        "/email/unsubscribe/private-token",
+    ] {
+        for method in [Method::GET, Method::HEAD, Method::POST] {
+            assert_eq!(
+                request(app.clone(), method, path).await.status(),
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
     }
 }

@@ -51,6 +51,7 @@ use crate::{
                 RegisterAgentCredential,
             },
         },
+        mail::ui::{MailUiAccess, MailUiState},
         publication::{
             PublicLedgerProjection,
             activation::{PublicationCoordinator, PublicationCoordinatorHandle},
@@ -82,6 +83,7 @@ pub(crate) struct BrowserSession {
 /// Complete, live runtime state for router tests, backed by the fixture's database.
 pub(crate) struct AdminTestRuntime {
     pub(crate) state: AdminRuntimeState,
+    pub(crate) mail: MailUiState,
     cancellation: CancellationToken,
     actor: Option<JoinHandle<()>>,
 }
@@ -112,7 +114,7 @@ impl AdminTestRuntime {
             })
             .await
             .expect("admin fixture site must install");
-        let (_, activator) = snapshot_store(snapshot);
+        let (snapshots, activator) = snapshot_store(snapshot);
         let coordinator = PublicationCoordinator {
             catalog: Arc::clone(&catalog),
             content_digest: content_digest.clone(),
@@ -140,6 +142,13 @@ impl AdminTestRuntime {
                 .expect("admin fixture actor must stop cleanly");
         });
         Self {
+            mail: MailUiState {
+                campaigns: store.mail.clone(),
+                subscribers: store.subscribers.clone(),
+                publications: publications.clone(),
+                snapshots,
+                access: MailUiAccess::Unavailable,
+            },
             state: AdminRuntimeState {
                 publications,
                 profiles: store.profiles.clone(),
@@ -275,11 +284,14 @@ impl ProtectedAdminHarness {
     }
 
     pub(crate) fn runtime_router(&self, publications: PublicationCoordinatorHandle) -> Router {
+        let mut mail = self.runtime.mail.clone();
+        mail.publications = publications.clone();
         runtime_admin_router(
             publications,
             self.state.clone(),
             self.store.profiles.clone(),
             SourceSyncHandle::external_checkout(self.store.source.clone()),
+            mail,
         )
     }
 
@@ -314,9 +326,19 @@ impl ProtectedAdminHarness {
     }
 
     pub(crate) async fn password_login(&self, router: &Router) -> BrowserSession {
+        self.password_login_as(router, OWNER_USERNAME, OWNER_PASSWORD)
+            .await
+    }
+
+    pub(crate) async fn password_login_as(
+        &self,
+        router: &Router,
+        username: &str,
+        password: &str,
+    ) -> BrowserSession {
         let body = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("username", OWNER_USERNAME)
-            .append_pair("password", OWNER_PASSWORD)
+            .append_pair("username", username)
+            .append_pair("password", password)
             .finish();
         let request = Request::builder()
             .method(Method::POST)
@@ -334,7 +356,7 @@ impl ProtectedAdminHarness {
         assert_eq!(
             response.status(),
             StatusCode::SEE_OTHER,
-            "the fixed owner password must create a browser session"
+            "the fixture credential must create a browser session"
         );
 
         BrowserSession::from_login_headers(response.headers())

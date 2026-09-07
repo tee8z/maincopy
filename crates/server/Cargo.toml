@@ -19,10 +19,13 @@ path = "src/bin/maincopy_ssh.rs"
 [dependencies]
 arc-swap.workspace = true
 argon2.workspace = true
-axum.workspace = true
+aws-credential-types.workspace = true
+aws-sigv4 = { workspace = true, features = ["sign-http", "http1"] }
+axum = { workspace = true, features = ["multipart"] }
 base64.workspace = true
 bech32 = { workspace = true, features = ["std"] }
 blake3.workspace = true
+bytes.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 libsqlite3-sys.workspace = true
@@ -35,6 +38,7 @@ prometheus.workspace = true
 pulldown-cmark.workspace = true
 qrcode.workspace = true
 quick-xml.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -70,7 +74,6 @@ rustix = { workspace = true, features = ["fs", "std"] }
 [dev-dependencies]
 lightningcss.workspace = true
 mermaid-rs-renderer.workspace = true
-reqwest.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }

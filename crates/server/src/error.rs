@@ -183,6 +183,9 @@ pub enum CriticalTaskName {
     DatabaseWriter,
     Scheduler,
     SourceSync,
+    MailDispatch,
+    MailFeedback,
+    MailRetention,
     Worker,
 }
 
@@ -196,6 +199,9 @@ impl_display!(CriticalTaskName {
     Self::DatabaseWriter => "database writer",
     Self::Scheduler => "scheduler",
     Self::SourceSync => "source sync",
+    Self::MailDispatch => "mail dispatch",
+    Self::MailFeedback => "mail feedback",
+    Self::MailRetention => "mail retention",
     Self::Worker => "worker",
 });
 
@@ -373,6 +379,9 @@ mod tests {
             CriticalTaskName::DatabaseWriter => "database writer",
             CriticalTaskName::Scheduler => "scheduler",
             CriticalTaskName::SourceSync => "source sync",
+            CriticalTaskName::MailDispatch => "mail dispatch",
+            CriticalTaskName::MailFeedback => "mail feedback",
+            CriticalTaskName::MailRetention => "mail retention",
             CriticalTaskName::Worker => "worker",
             StartupStage::Configuration => "configuration",
             StartupStage::ProcessLock => "process lock",

@@ -1,10 +1,64 @@
 use std::{
     fmt,
+    fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
 };
 
+use thiserror::Error;
 use zeroize::Zeroize as _;
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ProtectedSecretFileError {
+    #[error("the secret must be a bounded private regular file owned by this service")]
+    Protection,
+    #[error("the protected secret file could not be read")]
+    Read,
+}
+
+/// Open the validated descriptor without following a final symlink or blocking
+/// on a special file. Callers must also bound reads against concurrent growth.
+#[cfg(unix)]
+pub(crate) fn open_protected_secret_file(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<File, ProtectedSecretFileError> {
+    use rustix::{
+        fs::{Mode, OFlags, open},
+        process::geteuid,
+    };
+    use std::os::unix::fs::MetadataExt as _;
+    if !path.is_absolute() {
+        return Err(ProtectedSecretFileError::Protection);
+    }
+    let file = File::from(
+        open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ProtectedSecretFileError::Read)?,
+    );
+    let metadata = file
+        .metadata()
+        .map_err(|_| ProtectedSecretFileError::Read)?;
+    if !metadata.is_file()
+        || metadata.uid() != geteuid().as_raw()
+        || !matches!(metadata.mode() & 0o7777, 0o400 | 0o600)
+        || metadata.len() > max_bytes
+    {
+        return Err(ProtectedSecretFileError::Protection);
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_protected_secret_file(
+    _path: &Path,
+    _max_bytes: u64,
+) -> Result<File, ProtectedSecretFileError> {
+    Err(ProtectedSecretFileError::Protection)
+}
 
 const MAX_RESOLVED_SECRET_BYTES: usize = 64 * 1024;
 const RESOLVED_SECRET_BUFFER_BYTES: usize = MAX_RESOLVED_SECRET_BYTES + 1;
@@ -138,13 +192,6 @@ impl Drop for ResolvedSecret {
 /// The consuming composition boundary must open and validate the credential file
 /// before it calls this boundary. This function does not define file-opening
 /// policy.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "reserved for the first host feature that consumes a protected file"
-    )
-)]
 pub(crate) fn with_resolved_secret<Output>(
     reader: &mut impl Read,
     use_secret: impl for<'secret> FnOnce(&'secret [u8]) -> Output,

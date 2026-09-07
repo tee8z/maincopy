@@ -15,13 +15,16 @@ let
   '';
   uploadProbe = pkgs.writeScript "b2-ciphertext-upload-probe" ''
     #!${pkgs.python3}/bin/python3
-    import configparser, os, pathlib, sys
+    import configparser, json, os, pathlib, sys
     args = sys.argv[1:]
     assert "fixture-secret-key" not in " ".join(args)
     offsite = "/var/lib/maincopy-backup/offsite-fixture"
     if any(value.startswith("maincopy-b2:") for value in args):
         if pathlib.Path("/var/lib/maincopy-backup/interrupt-upload").exists():
             sys.exit(41)
+        if "lifecycle" in args:
+            print(json.dumps([{"fileNamePrefix":"", "daysFromUploadingToHiding":9, "daysFromHidingToDeleting":1, "daysFromStartingToCancelingUnfinishedLargeFiles":1}]))
+            sys.exit(0)
         if "--files-from" in args:
             listing = pathlib.Path(args[args.index("--files-from") + 1]).read_text().splitlines()
             for name in listing:
@@ -35,10 +38,29 @@ let
         path = pathlib.Path(args[args.index("--config") + 1])
         config = configparser.ConfigParser(interpolation=None)
         config.read(path)
-        config["offsitecrypt"]["remote"] = offsite
+        for remote in ("offsitecrypt", "selectioncrypt"):
+            target = config[remote]["remote"]
+            if target.startswith("maincopy-b2:fixture-bucket/maincopy"):
+                config[remote]["remote"] = offsite + target.split("maincopy-b2:fixture-bucket/maincopy", 1)[1]
         with path.open("w") as output:
             config.write(output)
     os.execv("${pkgs.rclone}/bin/rclone", ["${pkgs.rclone}/bin/rclone", *args])
+  '';
+  expiryIsolationProbe = pkgs.writeShellScript "maincopy-expiry-isolation-probe" ''
+    set -eu
+    test ! -r /run/maincopy-backup/private/.config-visibility/rclone.conf
+    test ! -r /run/credentials/maincopy-backup.service/crypt-key
+    test ! -r /run/maincopy/private/credentials/mail-ses
+    test ! -r /run/maincopy/private/credentials/mail-controls
+    test ! -r /var/lib/fixture-secrets/crypt-key
+    if test "$1" = remote; then
+      test ! -r /var/lib/maincopy-backup/visibility-plaintext
+      test -w /var/lib/maincopy-backup/.checkpoint.lock
+      test -r /run/maincopy-backup-expire/private/b2-credentials
+    else
+      test -r /var/lib/maincopy-backup/visibility-plaintext
+      test ! -r /run/maincopy-backup-expire/private/b2-credentials
+    fi
   '';
   commonArguments = [
     "--config"
@@ -63,10 +85,12 @@ let
     + pkgs.lib.escapeShellArgs (
       commonArguments
       ++ [
+        "--runtime-directory"
+        "/run/maincopy-backup/private"
         "--directory"
         "/var/lib/maincopy-backup"
         "--replica"
-        "/var/lib/maincopy-litestream/replica"
+        "/var/lib/maincopy-litestream/active/replica"
         "--socket"
         "/run/maincopy-litestream/private/control.sock"
         "--database"
@@ -120,6 +144,23 @@ pkgs.testers.runNixOSTest {
         credentialsFile = "/var/lib/fixture-secrets/b2.conf";
         bucket = "fixture-bucket";
       };
+      mail = {
+        mode = "ses";
+        sender = "news@example.test";
+        region = "us-east-1";
+        configurationSet = "maincopy-newsletter";
+        credentialFile = "/var/lib/fixture-secrets/mail-ses.json";
+        controlSigningKeyFile = "/var/lib/fixture-secrets/mail-controls";
+        subscriptions = {
+          # Paused, with no feedback source: no mail network worker starts.
+          mode = "paused";
+          operatorName = "Deployment fixture";
+          postalAddress = "123 Fixture Street, Test City";
+          purpose = "Receive published articles.";
+          privacyUrl = "https://site.example.test/privacy/";
+          contactAddress = "contact@example.test";
+        };
+      };
     };
     # Only B2 transport is replaced. Native Litestream, Rust manifests/restore,
     # rclone crypt, and systemd isolation all execute in the VM.
@@ -131,6 +172,16 @@ pkgs.testers.runNixOSTest {
       OnBootSec = lib.mkForce "1h";
       OnUnitInactiveSec = lib.mkForce "1h";
     };
+    # Retention has focused native fixtures below the real Nix sandbox; do
+    # not let its remote timer use production B2 credentials in this VM.
+    systemd.timers.maincopy-backup-expire-local.timerConfig.OnBootSec = lib.mkForce "1h";
+    systemd.timers.maincopy-backup-expire-remote.timerConfig.OnBootSec = lib.mkForce "1h";
+    # Native fixtures exercise expiration behavior. These invocations exercise
+    # the actual unit namespaces while publisher-shaped secret staging exists.
+    systemd.services.maincopy-backup-expire-local.serviceConfig.ExecStart =
+      lib.mkForce "${expiryIsolationProbe} local";
+    systemd.services.maincopy-backup-expire-remote.serviceConfig.ExecStart =
+      lib.mkForce "${expiryIsolationProbe} remote";
     environment.systemPackages = [
       pkgs.curl
       pkgs.jq
@@ -148,6 +199,12 @@ pkgs.testers.runNixOSTest {
       account=fixture-account
       key=fixture-secret-key
       EOF
+      cat > /var/lib/fixture-secrets/mail-ses.json <<'EOF'
+      {"access_key_id":"AKIDEXAMPLE","secret_access_key":"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"}
+      EOF
+      if ! test -e /var/lib/fixture-secrets/mail-controls; then
+        ${pkgs.python3}/bin/python3 -c 'import os,pathlib; pathlib.Path("/var/lib/fixture-secrets/mail-controls").write_text(os.urandom(32).hex())'
+      fi
       chmod 0600 /var/lib/fixture-secrets/*
     '';
   };
@@ -182,6 +239,19 @@ pkgs.testers.runNixOSTest {
                 machine.succeed(f"nsenter --target {process} --mount --pid -- su -s /bin/sh maincopy -c 'test ! -r {directory}/visibility-fixture'")
             machine.succeed(f"rm {directory}/visibility-fixture")
 
+    def assert_expiration_namespaces_hide_publisher_staging():
+        private = "/run/maincopy-backup/private/.config-visibility"
+        secret = private + "/rclone.conf"
+        bulk = "/var/lib/maincopy-backup/visibility-plaintext"
+        # Harmless bytes model both the private credential config and bulk
+        # capture. Native tests verify where the real config is created.
+        machine.succeed(f"install -d -o maincopy -g maincopy -m 0700 {private}")
+        for path in [secret, bulk]:
+            machine.succeed(f"install -o maincopy -g maincopy -m 0600 /dev/null {path}")
+        machine.succeed(f"su -s /bin/sh maincopy -c 'test -r {secret} && test -r {bulk}'")
+        machine.succeed("systemctl start maincopy-backup-expire-local.service maincopy-backup-expire-remote.service")
+        machine.succeed(f"rm {secret} {bulk}; rmdir {private}")
+
     start_all()
     machine.wait_for_unit("multi-user.target")
     machine.wait_until_succeeds("systemctl is-failed maincopy.service")
@@ -200,6 +270,14 @@ pkgs.testers.runNixOSTest {
     public = "curl -ksS --resolve site.example.test:443:127.0.0.1 https://site.example.test"
     admin = "curl -ksS --resolve admin.localhost:8443:127.0.0.1 https://admin.localhost:8443"
     machine.wait_until_succeeds(public + "/health/live -f")
+    machine.succeed(public + "/email/subscribe -f | grep -q 'New subscriptions are paused'")
+    for name in ["mail-ses", "mail-controls"]:
+        path = "/run/maincopy/private/credentials/" + name
+        machine.succeed(f"test $(stat -c %a {path}) = 600")
+        machine.succeed(f"test $(stat -c %U {path}) = maincopy")
+        machine.fail(f"su -s /bin/sh maincopy-gateway -c 'test -r {path}'")
+        process = machine.succeed("systemctl show maincopy-litestream.service --property=MainPID --value").strip()
+        machine.succeed(f"nsenter --target {process} --mount --pid -- su -s /bin/sh maincopy -c 'test ! -r {path}'")
     machine.succeed(admin + "/admin/login -f | grep -q 'Sign in'")
     for path in ["/admin", "/admin/users", "/api/admin/v1/auth/sessions", "/metrics"]:
         assert machine.succeed(public + path + " -o /dev/null -w '%{http_code}'").strip() == "404"
@@ -214,12 +292,27 @@ pkgs.testers.runNixOSTest {
     machine.fail("su -s /bin/sh maincopy-gateway -c 'cat /var/lib/maincopy/database/maincopy.db'")
     wait_for_replication()
     assert_late_created_secret_paths_are_hidden()
+    assert_expiration_namespaces_hide_publisher_staging()
     machine.succeed("systemctl start maincopy-backup.service")
     assert_late_created_secret_paths_are_hidden()
+    assert_expiration_namespaces_hide_publisher_staging()
     machine.succeed("curl -fsS http://127.0.0.1:3000/health/live")
     report = json.loads(machine.succeed("cat /var/lib/maincopy-backup-status/backup-status.json"))
     assert report["state"] == "healthy" and report["last_success_at"]
     machine.succeed("test $(stat -c %a /var/lib/maincopy-backup-status/backup-status.json) = 600")
+    # Explicit rollover leaves the web process alive and starts a distinct
+    # native base instead of keeping a shared historical LTX dependency.
+    web_pid = machine.succeed("systemctl show maincopy.service -p MainPID --value").strip()
+    epoch = json.loads(machine.succeed("cat /var/lib/maincopy-litestream/active/epoch.json"))["epoch"]
+    machine.fail("${pkgs.util-linux}/bin/flock --nonblock /var/lib/maincopy-litestream/.native.lock true")
+    machine.succeed("systemctl restart maincopy-litestream.service")
+    assert machine.succeed("systemctl show maincopy.service -p MainPID --value").strip() == web_pid
+    assert json.loads(machine.succeed("cat /var/lib/maincopy-litestream/active/epoch.json"))["epoch"] != epoch
+    machine.succeed("curl -fsS http://127.0.0.1:3000/health/ready")
+    wait_for_replication()
+    machine.succeed("systemctl start maincopy-backup.service")
+    report = json.loads(machine.succeed("cat /var/lib/maincopy-backup-status/backup-status.json"))
+    assert report["state"] == "healthy"
     machine.succeed("touch /var/lib/maincopy-backup/interrupt-upload")
     machine.fail("systemctl start maincopy-backup.service")
     failed = json.loads(machine.succeed("cat /var/lib/maincopy-backup-status/backup-status.json"))

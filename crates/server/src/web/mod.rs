@@ -8,7 +8,8 @@ use axum::{
     extract::{Request, State},
     http::HeaderValue,
     http::header::{
-        CONTENT_SECURITY_POLICY, REFERRER_POLICY as REFERRER_HEADER, X_CONTENT_TYPE_OPTIONS,
+        CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY as REFERRER_HEADER,
+        X_CONTENT_TYPE_OPTIONS,
     },
     middleware::{self, Next},
     response::Response,
@@ -65,10 +66,17 @@ pub struct PublicState {
 
 /// Builds the public router without binding a listener.
 pub fn public_router(state: PublicState) -> Router {
+    public_router_with_routes(state, Router::new())
+}
+
+/// Compose enabled public features before applying the listener's admission and
+/// response policies. The ordinary public router remains useful without mail.
+pub(crate) fn public_router_with_routes(state: PublicState, routes: Router) -> Router {
     request_limits::apply(
         Router::new()
             .merge(publication_router(state.snapshots.clone()))
-            .merge(health_router(state.readiness)),
+            .merge(health_router(state.readiness))
+            .merge(routes),
     )
     .layer(middleware::from_fn_with_state(
         state.snapshots,
@@ -82,13 +90,19 @@ async fn public_response_policy(
     next: Next,
 ) -> Response {
     let snapshot = snapshots.load_full();
+    let private_mail_path = request.uri().path().starts_with("/email/");
     request.extensions_mut().insert(snapshot.clone());
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers
         .entry(CONTENT_SECURITY_POLICY)
         .or_insert_with(|| snapshot.response_policy.content_security_policy.clone());
-    headers.insert(REFERRER_HEADER, REFERRER_POLICY);
+    if private_mail_path {
+        headers.insert(REFERRER_HEADER, HeaderValue::from_static("no-referrer"));
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    } else {
+        headers.entry(REFERRER_HEADER).or_insert(REFERRER_POLICY);
+    }
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
 }
@@ -162,5 +176,44 @@ mod tests {
         assert!(body.contains("Original"));
         assert!(!body.contains("Replacement"));
         assert!(snapshots.load_full().index_page().contains("Replacement"));
+    }
+
+    #[tokio::test]
+    async fn mail_controls_keep_private_headers_when_admission_rejects_before_the_handler() {
+        let (snapshots, _) = snapshot_store(snapshot("Mail", "https://assets.example"));
+        let routes = Router::new().route(
+            "/email/unsubscribe/{token}",
+            axum::routing::get(|| async { "control page" }),
+        );
+        let app = public_router_with_routes(
+            PublicState {
+                snapshots,
+                readiness: Readiness::new(true),
+            },
+            routes,
+        );
+        for (body, expected) in [
+            (Body::empty(), axum::http::StatusCode::OK),
+            (
+                Body::from(vec![b'x'; 8193]),
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/email/unsubscribe/private-control-marker")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(response.headers()[REFERRER_HEADER], "no-referrer");
+            assert_eq!(response.headers()[CACHE_CONTROL], "private, no-store");
+            let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-control-marker"));
+        }
     }
 }

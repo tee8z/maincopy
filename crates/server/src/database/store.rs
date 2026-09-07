@@ -1,4 +1,12 @@
 use super::health::DatabaseHealth;
+use crate::domain::mail::subscriber::{
+    AdmitCampaignRecipient, ApplyFeedback, AttemptOutcome, BeginFeedbackRun, ClaimConfirmation,
+    ConfirmEnrollment, ControlOutcome, DeliveryAdmission, EnrollmentRequestResult, FeedbackHealth,
+    FeedbackPollAdmission, FeedbackRunAdmission, FinishAttempt, ManageEnrollment,
+    RecordFeedbackObservation, RequestEnrollment, ResetSubscriberConsent,
+    ResetSubscriberConsentResult, SubscriberCleanup, SubscriberCommandError, SubscriberPolicy,
+    store::SubscriberStore,
+};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -9,6 +17,13 @@ use crate::domain::auth::store::{
     RegisterAgentCredential, RemoveHumanCredential, ReplaceAgentScopes, ReplaceUserRoles,
     RevokeAgentCredential, RevokeBrowserSession, SetUserStatus, StoredLoginChallenge,
     UserMutationResult,
+};
+use crate::domain::mail::{
+    campaign::Campaign,
+    store::{
+        ApproveCampaign, CampaignCommandError, CampaignStore, CancelCampaign, ClaimCampaign,
+        CreateCampaign, FinishCampaign, RenewCampaignClaim,
+    },
 };
 use crate::domain::profile::store::{
     ProfileStore, SetTipRecipient, SetTipRecipientResult, UpdateProfile, UpdateProfileResult,
@@ -37,6 +52,8 @@ pub(crate) struct DatabaseStore {
     pub(crate) profiles: ProfileStore,
     pub(crate) publications: PublicationStore,
     pub(crate) source: SourceStore,
+    pub(crate) mail: CampaignStore,
+    pub(crate) subscribers: SubscriberStore,
 }
 
 impl DatabaseStore {
@@ -45,6 +62,8 @@ impl DatabaseStore {
         profiles: ProfileStore,
         publications: PublicationStore,
         source: SourceStore,
+        mail: CampaignStore,
+        subscribers: SubscriberStore,
         health: DatabaseHealth,
     ) -> Self {
         Self {
@@ -53,6 +72,8 @@ impl DatabaseStore {
             profiles,
             publications,
             source,
+            mail,
+            subscribers,
         }
     }
 }
@@ -90,6 +111,124 @@ impl MutationSender {
 }
 
 pub(crate) enum Mutation {
+    BeginMailFeedbackPoll {
+        binding: [u8; 32],
+        run_id: uuid::Uuid,
+        respond_to: oneshot::Sender<Result<FeedbackPollAdmission, SubscriberCommandError>>,
+    },
+    CompleteMailFeedbackPoll {
+        binding: [u8; 32],
+        run_id: uuid::Uuid,
+        poll_id: uuid::Uuid,
+        respond_to: oneshot::Sender<Result<(), SubscriberCommandError>>,
+    },
+    DeferMailFeedbackPoll {
+        binding: [u8; 32],
+        run_id: uuid::Uuid,
+        poll_id: uuid::Uuid,
+        respond_to: oneshot::Sender<Result<(), SubscriberCommandError>>,
+    },
+    ResetMailSubscriberConsent {
+        command: ResetSubscriberConsent,
+        respond_to: oneshot::Sender<Result<ResetSubscriberConsentResult, SubscriberCommandError>>,
+    },
+
+    BeginMailFeedbackRun {
+        command: BeginFeedbackRun,
+        respond_to: oneshot::Sender<Result<FeedbackRunAdmission, SubscriberCommandError>>,
+    },
+    RecordMailFeedbackObservation {
+        command: RecordFeedbackObservation,
+        respond_to: oneshot::Sender<Result<(), SubscriberCommandError>>,
+    },
+    FinishMailFeedbackRun {
+        configuration_binding: [u8; 32],
+        run_id: uuid::Uuid,
+        respond_to: oneshot::Sender<Result<(), SubscriberCommandError>>,
+    },
+
+    InitializeMailControls {
+        binding: [u8; 32],
+        respond_to: oneshot::Sender<Result<(), SubscriberCommandError>>,
+    },
+    PauseMailSubscribers {
+        respond_to: oneshot::Sender<Result<(), SubscriberCommandError>>,
+    },
+    SetSubscriberPolicy {
+        policy: SubscriberPolicy,
+        respond_to: oneshot::Sender<Result<(), SubscriberCommandError>>,
+    },
+    RecordMailFeedbackHealth {
+        binding: [u8; 32],
+        health: FeedbackHealth,
+        respond_to: oneshot::Sender<Result<(), SubscriberCommandError>>,
+    },
+    RecordMailFeedbackIntegrityFailure {
+        binding: [u8; 32],
+        respond_to: oneshot::Sender<Result<FeedbackHealth, SubscriberCommandError>>,
+    },
+    RequestMailEnrollment {
+        command: RequestEnrollment,
+        respond_to: oneshot::Sender<Result<EnrollmentRequestResult, SubscriberCommandError>>,
+    },
+    ConfirmMailEnrollment {
+        command: ConfirmEnrollment,
+        respond_to: oneshot::Sender<Result<ControlOutcome, SubscriberCommandError>>,
+    },
+    RemoveMailEnrollment {
+        command: ManageEnrollment,
+        respond_to: oneshot::Sender<Result<ControlOutcome, SubscriberCommandError>>,
+    },
+    ClaimMailConfirmation {
+        command: ClaimConfirmation,
+        respond_to: oneshot::Sender<Result<DeliveryAdmission, SubscriberCommandError>>,
+    },
+    AdmitMailRecipient {
+        command: AdmitCampaignRecipient,
+        respond_to: oneshot::Sender<Result<DeliveryAdmission, SubscriberCommandError>>,
+    },
+    FinishMailAttempt {
+        command: FinishAttempt,
+        respond_to: oneshot::Sender<Result<AttemptOutcome, SubscriberCommandError>>,
+    },
+    ApplyMailFeedback {
+        command: ApplyFeedback,
+        respond_to: oneshot::Sender<Result<ControlOutcome, SubscriberCommandError>>,
+    },
+    QuarantineMailAttempts {
+        respond_to: oneshot::Sender<Result<u64, SubscriberCommandError>>,
+    },
+    CleanupMailSubscribers {
+        respond_to: oneshot::Sender<Result<SubscriberCleanup, SubscriberCommandError>>,
+    },
+    CreateMailCampaign {
+        command: CreateCampaign,
+        respond_to: oneshot::Sender<Result<Campaign, CampaignCommandError>>,
+    },
+    ApproveMailCampaign {
+        command: ApproveCampaign,
+        respond_to: oneshot::Sender<Result<Campaign, CampaignCommandError>>,
+    },
+    CancelMailCampaign {
+        command: CancelCampaign,
+        respond_to: oneshot::Sender<Result<Campaign, CampaignCommandError>>,
+    },
+    ClaimMailCampaign {
+        command: ClaimCampaign,
+        respond_to: oneshot::Sender<Result<Option<Campaign>, CampaignCommandError>>,
+    },
+    FinishMailCampaign {
+        command: FinishCampaign,
+        respond_to: oneshot::Sender<Result<Campaign, CampaignCommandError>>,
+    },
+    RenewMailCampaignClaim {
+        command: RenewCampaignClaim,
+        respond_to: oneshot::Sender<Result<Campaign, CampaignCommandError>>,
+    },
+    QuarantineInterruptedMail {
+        now: time::OffsetDateTime,
+        respond_to: oneshot::Sender<Result<u64, CampaignCommandError>>,
+    },
     BlockScheduled {
         command: BlockScheduled,
         respond_to: oneshot::Sender<Result<(), DatabaseCommandError>>,

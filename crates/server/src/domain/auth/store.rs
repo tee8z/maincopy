@@ -3244,6 +3244,33 @@ pub(crate) async fn invalidate_restored_credentials(
     .await
 }
 
+/// Campaign authorization is an Owner-only human action, independent of grants.
+pub(crate) async fn require_fresh_browser_owner(
+    transaction: &mut Transaction<'_, Sqlite>,
+    principal: &AuditPrincipalReference,
+    now: OffsetDateTime,
+) -> Result<UserId, AuthApplyError> {
+    require_fresh_browser_scope(transaction, principal, AdminScope::RoleAssign, now).await?;
+    let AuditPrincipalReference::BrowserSession { user_id, .. } = *principal else {
+        return Err(AuthCommandError::ScopeEscalation.into());
+    };
+    require_enabled_owner(transaction, user_id).await?;
+    Ok(user_id)
+}
+
+/// Long-running approved campaigns retain authority only while their approving
+/// human remains an enabled Owner. This does not extend browser freshness.
+pub(crate) async fn require_enabled_owner(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user_id: UserId,
+) -> Result<(), AuthApplyError> {
+    let user = required_user(transaction, user_id).await?;
+    if user.status != UserStatus::Enabled || !user.roles.contains(&UserRole::Owner) {
+        return Err(AuthCommandError::ScopeEscalation.into());
+    }
+    Ok(())
+}
+
 pub(crate) async fn require_fresh_browser_scope(
     transaction: &mut Transaction<'_, Sqlite>,
     principal: &AuditPrincipalReference,

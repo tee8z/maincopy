@@ -28,6 +28,31 @@ const MAX_STARTUP_POST_REVISIONS: usize = 10_000;
 const ROUTE_OWNERSHIP_QUERY_BATCH_SIZE: usize = 500;
 const ROUTE_VALIDATION_BATCH_SIZE: i64 = 500;
 
+/// Other capabilities may approve only the exact currently public revision and
+/// site they reviewed. The sole writer checks this with the approval mutation.
+pub(crate) async fn matches_publication_review(
+    transaction: &mut Transaction<'_, Sqlite>,
+    post_id: &PostId,
+    revision: &PostRevisionDigest,
+    site: &SiteHead,
+) -> Result<bool, PublicationMutationError> {
+    let version = i64::try_from(site.version)
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM site_state WHERE singleton = 1 AND current_site_digest = ? AND version = ?) \
+         AND (SELECT COUNT(*) FROM canonical_publications WHERE stable_post_id = ? AND state = 'published') = 1 \
+         AND EXISTS(SELECT 1 FROM canonical_publications WHERE stable_post_id = ? AND state = 'published' AND current_published_digest = ?)",
+    )
+    .bind(site.digest.as_bytes().as_slice())
+    .bind(version)
+    .bind(post_id.as_uuid().as_bytes().as_slice())
+    .bind(post_id.as_uuid().as_bytes().as_slice())
+    .bind(revision.as_bytes().as_slice())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)
+}
+
 /// Durable release details shown independently of the current source candidate.
 pub(crate) struct ReleaseView {
     pub publication_id: Uuid,

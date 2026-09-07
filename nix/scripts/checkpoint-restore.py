@@ -7,9 +7,10 @@ from pathlib import Path
 import re
 import tempfile
 
-from backup_common import (BackupFailure, CHECKPOINT_NAME, add_common_arguments,
-                           manifest_inventory, protected_directory, rclone, run,
+from backup_common import (BackupFailure, add_common_arguments,
+                           manifest_inventory, protected_directory, protected_file, rclone, run,
                            runtime_config)
+from backup_epochs import epoch_time, selection
 
 
 def restore(args):
@@ -24,11 +25,21 @@ def restore(args):
         cache = staging / "unused-local-cache"
         protected_directory(cache)
         config = runtime_config(args, staging, cache)
-        source = "latest.json"
-        if args.checkpoint is not None:
-            if not CHECKPOINT_NAME.fullmatch(args.checkpoint):
-                raise BackupFailure("checkpoint selection validation")
-            source = "checkpoints/" + args.checkpoint + ".json"
+        if (args.epoch is None) != (args.checkpoint is None):
+            raise BackupFailure("explicit recovery requires both epoch and checkpoint")
+        if args.checkpoint is None:
+            selected = staging / "selection.json"
+            rclone(args, config, "copyto", "--max-transfer", "1024", "--cutoff-mode", "hard",
+                   "selectioncrypt:latest.json", str(selected))
+            epoch, checkpoint = selection(json.loads(protected_file(selected, 1024)))
+        else:
+            epoch, checkpoint = args.epoch, args.checkpoint
+            epoch_time(epoch)
+            epoch_time(checkpoint)
+        epoch_config = staging / "epoch-config"
+        protected_directory(epoch_config)
+        config = runtime_config(args, epoch_config, cache, epoch)
+        source = "checkpoints/" + checkpoint + ".json"
         manifest_path = directory / "checkpoint.json"
         rclone(args, config, "copyto", "--max-transfer", "4194304", "--cutoff-mode", "hard",
                "offsitecrypt:" + source, str(manifest_path))
@@ -63,6 +74,7 @@ def main():
     add_common_arguments(parser)
     parser.add_argument("--directory", required=True, help="New protected recovery workspace; must not exist")
     parser.add_argument("--checkpoint", help="Explicit UTC-UUID checkpoint name; default is the last completely published checkpoint")
+    parser.add_argument("--epoch", help="UTC-UUID epoch containing the explicitly selected checkpoint")
     args = parser.parse_args()
     os.umask(0o077)
     try:

@@ -17,9 +17,12 @@ import tempfile
 import uuid
 
 from backup_common import (BackupFailure, CANDIDATE_NAME, CHECKPOINT_NAME, LTX_NAME, MAX_BYTES,
-                           MAX_FILES, UTC, add_common_arguments, encoded_paths,
+                           MAX_FILES, UTC, add_common_arguments, atomic_json, b2_destination, checkpoint_lock, cleanup_staging, encoded_paths,
                            manifest_inventory, previous_success, protected_directory,
                            protected_file, rclone, run, runtime_config, write_report)
+
+from backup_epochs import (PUBLICATION_ALLOWANCE_SECONDS, SELECTION_FORMAT, load_epoch,
+                           sync_directory, validate_lifecycle)
 
 
 MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
@@ -120,7 +123,7 @@ def stage_plan(args, staging, confirmed):
             raise BackupFailure("replica plan byte limit")
         pin_file(replica / relative, staging / relative, size)
     (staging / "plan.json").write_bytes(raw_plan)
-    return total
+    return total, cutoff
 
 
 def stage_artifacts(args, staging, total):
@@ -153,12 +156,8 @@ def capture(args, staging, confirmed):
         captured = staging / f"capture-{attempt}"
         protected_directory(captured)
         try:
-            total = stage_plan(args, captured, confirmed)
+            total, cutoff = stage_plan(args, captured, confirmed)
             stage_artifacts(args, captured, total)
-            plan = json.loads((captured / "plan.json").read_bytes())
-            cutoff = plan.get("max_txid")
-            if not isinstance(cutoff, str) or not re.fullmatch(r"[0-9a-f]{16}", cutoff):
-                raise BackupFailure("replica cutoff validation")
             database = captured / "database.sqlite3"
             run([args.litestream, "restore", "-txid", cutoff, "-integrity-check", "full",
                  "-o", str(database), "file://" + str(captured)], "checkpoint reference replay", 180)
@@ -191,22 +190,14 @@ def encrypt_objects(args, config, captured, inventory, staging):
     return ["objects/" + name.name for name in objects.iterdir()]
 
 
-def send_objects(args, config, cache, encoded, staging):
+def send_objects(args, config, cache, encoded, staging, epoch):
     listing = staging / "encrypted-files"
     listing.write_text("\n".join(encoded) + "\n", encoding="ascii")
     rclone(args, config, "copy", "--ignore-existing", "--checksum", "--files-from", str(listing),
-           str(cache), f"maincopy-b2:{args.bucket}/{args.prefix}", timeout=180)
+           str(cache), b2_destination(args) + "/epochs/" + epoch, timeout=180)
 
 
-def sync_directory(path):
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def retain_checkpoint(directory, name, cache, encrypted_objects, encrypted_manifest, latest_name):
+def retain_checkpoint(directory, name, epoch, cache, encrypted_objects, encrypted_manifest, latest_name):
     retained = directory / "checkpoints"
     protected_directory(retained)
     pending = retained / (".pending-" + name)
@@ -217,9 +208,12 @@ def retain_checkpoint(directory, name, cache, encrypted_objects, encrypted_manif
             protected_file(source)
             with source.open("rb") as contents:
                 os.fsync(contents.fileno())
-            target = pending / (latest_name if relative == encrypted_manifest else relative)
+            target = pending / "epochs" / epoch / relative
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.link(source, target)
+        os.link(cache / latest_name, pending / latest_name)
+        with (pending / latest_name).open("rb") as contents:
+            os.fsync(contents.fileno())
         for nested in sorted((path for path in pending.rglob("*") if path.is_dir()), reverse=True):
             sync_directory(nested)
         sync_directory(pending)
@@ -229,26 +223,27 @@ def retain_checkpoint(directory, name, cache, encrypted_objects, encrypted_manif
     finally:
         if pending.exists():
             shutil.rmtree(pending)
-    cutoff = datetime.datetime.now(UTC) - datetime.timedelta(days=7)
-    for path in retained.iterdir():
-        if CHECKPOINT_NAME.fullmatch(path.name) and path.is_dir() and not path.is_symlink():
-            captured = datetime.datetime.strptime(path.name[:16], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
-            if captured < cutoff:
-                shutil.rmtree(path)
-    sync_directory(retained)
 
 
 def publish(args, directory):
-    cache = directory / "encrypted-objects"
+    runtime = Path(args.runtime_directory)
+    protected_directory(runtime)
+    epoch_path = Path(args.replica).parent / "epoch.json"
+    epoch = load_epoch(epoch_path, datetime.datetime.now(UTC), PUBLICATION_ALLOWANCE_SECONDS)
+    cache = directory / "epochs" / epoch
     protected_directory(cache)
-    with tempfile.TemporaryDirectory(prefix=".capture-", dir=directory) as temporary:
+    # Bulk capture is shared with local expiration; credentials must remain in
+    # this unit's private runtime mount, hidden from every peer service.
+    with tempfile.TemporaryDirectory(prefix=".capture-", dir=directory) as temporary, \
+            tempfile.TemporaryDirectory(prefix=".config-", dir=runtime) as private:
         staging = Path(temporary)
-        config = runtime_config(args, staging, cache)
+        config = runtime_config(args, Path(private), cache, epoch)
+        validate_lifecycle(args, config)
         confirmed, confirmed_at = confirm_replica(args)
         captured, inventory = capture(args, staging, confirmed)
         logical = encrypt_objects(args, config, captured, inventory, staging)
         encoded = encoded_paths(args, config, logical)
-        send_objects(args, config, cache, encoded, staging)
+        send_objects(args, config, cache, encoded, staging, epoch)
         # Existing remote ciphertext can have a different valid nonce (for
         # example after local cache eviction). Verify plaintext equivalence
         # using the remote nonce and B2 hash before selecting this checkpoint.
@@ -258,38 +253,26 @@ def publish(args, directory):
         manifest_name = "checkpoints/" + name + ".json"
         rclone(args, config, "copyto", "--immutable", str(captured / "checkpoint.json"), "localcrypt:" + manifest_name)
         manifest_path, latest_path = encoded_paths(args, config, [manifest_name, "latest.json"])
-        destination = f"maincopy-b2:{args.bucket}/{args.prefix}/"
+        destination = b2_destination(args) + "/epochs/" + epoch + "/"
         # B2 publishes a completed upload atomically. Publish the versioned
         # manifest and then replace latest only after every object succeeded.
         rclone(args, config, "copyto", "--immutable", "--checksum", str(cache / manifest_path), destination + manifest_path)
-        rclone(args, config, "copyto", "--checksum", str(cache / manifest_path), destination + latest_path)
-        retain_checkpoint(directory, name, cache, encoded, manifest_path, latest_path)
+        # The root selector has no subscriber data. Its authenticated contents
+        # select one complete epoch; objects never cross that epoch boundary.
+        selector = staging / "selection.json"
+        atomic_json(selector, {"format": SELECTION_FORMAT, "epoch": epoch, "checkpoint": name})
+        rclone(args, config, "copyto", str(selector), "localcrypt:latest.json")
+        # Recheck wall-clock expiry immediately before publishing a selector.
+        if load_epoch(epoch_path, datetime.datetime.now(UTC)) != epoch:
+            raise BackupFailure("backup epoch changed during publication")
+        retain_checkpoint(directory, name, epoch, cache, encoded, manifest_path, latest_path)
+        rclone(args, config, "copyto", "--checksum", str(cache / latest_path), b2_destination(args) + "/" + latest_path)
         # Retained checkpoint hardlinks preserve old ciphertext independently.
         keep = set(encoded)
         for path in cache.rglob("*"):
             if path.is_file() and str(path.relative_to(cache)) not in keep:
                 path.unlink()
         return confirmed_at
-
-
-def cleanup_staging(directory):
-    with os.scandir(directory) as entries:
-        count = 0
-        for entry in entries:
-            if re.fullmatch(r"\.capture-[a-z0-9_]{8}", entry.name):
-                count += 1
-                if count > 1024 or not entry.is_dir(follow_symlinks=False):
-                    raise BackupFailure("stale checkpoint staging validation")
-                shutil.rmtree(entry.path)
-    retained = directory / "checkpoints"
-    if retained.exists():
-        protected_directory(retained)
-        with os.scandir(retained) as entries:
-            for entry in entries:
-                if entry.name.startswith(".pending-") and CHECKPOINT_NAME.fullmatch(entry.name[9:]):
-                    if not entry.is_dir(follow_symlinks=False):
-                        raise BackupFailure("pending checkpoint validation")
-                    shutil.rmtree(entry.path)
 
 
 def interrupted(_signal, _frame):
@@ -299,12 +282,15 @@ def interrupted(_signal, _frame):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_arguments(parser)
-    for name in ("directory", "replica", "artifacts", "status-file", "socket", "database"):
+    for name in ("directory", "runtime-directory", "replica", "artifacts", "status-file", "socket", "database"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--cleanup-only", action="store_true")
+    parser.add_argument("--remote-retention-days", type=int, default=9)
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGALRM, interrupted)
+    signal.alarm(PUBLICATION_ALLOWANCE_SECONDS)
     started = time.monotonic()
     os.umask(0o077)
     directory = Path(args.directory)
@@ -312,8 +298,7 @@ def main():
     protected_directory(report.parent)
     try:
         protected_directory(directory)
-        with (directory / ".checkpoint.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with checkpoint_lock(directory):
             cleanup_staging(directory)
             if args.cleanup_only:
                 return

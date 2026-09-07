@@ -57,6 +57,48 @@ let
       listenAddresses = [ "0.0.0.0" ];
     };
   };
+  mailSettings = {
+    mode = "ses";
+    sender = "news@example.test";
+    region = "us-east-1";
+    configurationSet = "maincopy-newsletter";
+    credentialFile = "/run/secrets/mail-ses.json";
+    controlSigningKeyFile = "/run/secrets/mail-controls";
+    subscriptions = {
+      operatorName = "Maincopy fixture";
+      postalAddress = "123 Fixture Street, Test City";
+      purpose = "Receive published articles.";
+      privacyUrl = "https://site.example.test/privacy/";
+      contactAddress = "contact@example.test";
+    };
+  };
+  pausedMail = evaluate {
+    runtimeDirectory = "mail-fixture";
+    backup = {
+      enable = true;
+      keyFile = "/run/secrets/backup-crypt";
+      credentialsFile = "/run/secrets/backup-b2";
+    };
+    mail = mailSettings;
+  };
+  activeMail = evaluate {
+    mail = lib.recursiveUpdate mailSettings {
+      subscriptions.mode = "enabled";
+      feedback = {
+        queueUrl = "https://sqs.us-east-1.amazonaws.com/123456789012/maincopy-feedback";
+        topicArn = "arn:aws:sns:us-east-1:123456789012:maincopy-feedback";
+      };
+    };
+    source = {
+      managed = true;
+      credentials.mail = {
+        privateKeyFile = "/run/secrets/source-key";
+        knownHostsFile = "/run/secrets/source-hosts";
+      };
+    };
+  };
+  hostValue =
+    configuration: configuration.environment.etc."maincopy/maincopy.toml".source.drvAttrs.value;
   rejected = settings: !(lib.all (entry: entry.assertion) (evaluate settings).assertions);
   typedRejected =
     optionPath: settings:
@@ -68,6 +110,91 @@ in
 assert lib.all (entry: entry.assertion) minimal.assertions;
 assert lib.all (entry: entry.assertion) complete.assertions;
 assert lib.all (entry: entry.assertion) internet.assertions;
+assert lib.all (entry: entry.assertion) pausedMail.assertions;
+assert lib.all (entry: entry.assertion) activeMail.assertions;
+assert minimal.services.maincopy.mail.mode == "disabled";
+assert (hostValue minimal).mail == { mode = "disabled"; };
+assert minimal.systemd.services.maincopy.serviceConfig.LoadCredential == [ ];
+assert pausedMail.services.maincopy.mail.subscriptions.mode == "paused";
+assert pausedMail.services.maincopy.mail.feedback == null;
+assert
+  (hostValue pausedMail).mail == {
+    mode = "ses";
+    sender = "news@example.test";
+    region = "us-east-1";
+    configuration_set = "maincopy-newsletter";
+    credential_file = "/run/mail-fixture/private/credentials/mail-ses";
+    control_signing_key_file = "/run/mail-fixture/private/credentials/mail-controls";
+    max_campaign_recipients = 2000;
+    max_daily_messages = 5000;
+    max_daily_confirmation_messages = 100;
+    send_interval_milliseconds = 1000;
+    subscriptions = {
+      mode = "paused";
+      operator_name = "Maincopy fixture";
+      postal_address = "123 Fixture Street, Test City";
+      purpose = "Receive published articles.";
+      privacy_url = "https://site.example.test/privacy/";
+      contact_address = "contact@example.test";
+    };
+  };
+assert (hostValue activeMail).mail.subscriptions.mode == "enabled";
+assert
+  (hostValue activeMail).mail.feedback == {
+    queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/maincopy-feedback";
+    topic_arn = "arn:aws:sns:us-east-1:123456789012:maincopy-feedback";
+  };
+assert
+  pausedMail.systemd.services.maincopy.serviceConfig.LoadCredential == [
+    "mail-controls:/run/secrets/mail-controls"
+    "mail-ses:/run/secrets/mail-ses.json"
+  ];
+assert builtins.length activeMail.systemd.services.maincopy.serviceConfig.LoadCredential == 4;
+assert
+  builtins.length (lib.unique activeMail.systemd.services.maincopy.serviceConfig.LoadCredential) == 4;
+assert builtins.elem "/run/credentials/maincopy.service"
+  pausedMail.systemd.services.maincopy.serviceConfig.BindReadOnlyPaths;
+assert builtins.elem "/run/mail-fixture:ro"
+  pausedMail.systemd.services.maincopy-backup.serviceConfig.TemporaryFileSystem;
+assert builtins.elem "/run/mail-fixture:ro"
+  pausedMail.systemd.services.maincopy-litestream.serviceConfig.TemporaryFileSystem;
+assert builtins.elem "/run/mail-fixture:ro"
+  pausedMail.systemd.services.maincopy-backup-expire-remote.serviceConfig.TemporaryFileSystem;
+assert pausedMail.systemd.services.maincopy.serviceConfig.TimeoutStopSec == "180s";
+assert rejected { mail.mode = "ses"; };
+assert rejected {
+  mail = lib.recursiveUpdate mailSettings { subscriptions.mode = "enabled"; };
+};
+assert rejected {
+  mail = mailSettings // {
+    maxDailyMessages = 99;
+  };
+};
+assert typedRejected [ "mail" "credentialFile" ] {
+  mail = mailSettings // {
+    credentialFile = "/nix/store/visible-mail-secret";
+  };
+};
+assert typedRejected [ "mail" "credentialFile" ] {
+  mail = mailSettings // {
+    credentialFile = ./module-eval.nix;
+  };
+};
+assert typedRejected [ "mail" "controlSigningKeyFile" ] {
+  mail = mailSettings // {
+    controlSigningKeyFile = "/run/secrets/../mail-controls";
+  };
+};
+assert typedRejected [ "mail" "sendIntervalMilliseconds" ] {
+  mail = mailSettings // {
+    sendIntervalMilliseconds = 99;
+  };
+};
+assert typedRejected [ "mail" "subscriptions" "privacyUrl" ] {
+  mail = lib.recursiveUpdate mailSettings {
+    subscriptions.privacyUrl = "http://example.test/privacy/";
+  };
+};
 assert minimal.systemd.services.maincopy.serviceConfig.User == "maincopy";
 assert minimal.systemd.services.maincopy-gateway.serviceConfig.User == "maincopy-gateway";
 assert minimal.systemd.services.maincopy.serviceConfig.UMask == "0077";
@@ -139,11 +266,52 @@ assert builtins.elem "/var/lib/maincopy-backup-status"
   complete.systemd.services.maincopy.serviceConfig.ReadOnlyPaths;
 assert
   complete.systemd.services.maincopy-backup.serviceConfig.BindReadOnlyPaths == [
-    "/var/lib/maincopy-litestream/replica"
+    "/var/lib/maincopy-litestream"
     "/run/maincopy-litestream/private"
     "-/var/lib/maincopy/content-candidates"
     "/run/credentials/maincopy-backup.service"
   ];
+assert complete.systemd.services.maincopy-litestream.serviceConfig.Restart == "always";
+assert complete.systemd.services.maincopy-litestream.serviceConfig.RuntimeMaxSec == 85800;
+assert
+  complete.systemd.services.maincopy-litestream.serviceConfig.RuntimeDirectoryPreserve == "restart";
+assert lib.hasInfix "/backup_epochs.py prepare"
+  complete.systemd.services.maincopy-litestream.serviceConfig.ExecStartPre;
+assert lib.hasInfix
+  "/bin/flock --exclusive --nonblock --no-fork /var/lib/maincopy-litestream/.native.lock"
+  complete.systemd.services.maincopy-litestream.serviceConfig.ExecStart;
+assert builtins.elem "/var/lib/maincopy-backup/.checkpoint.lock"
+  complete.systemd.services.maincopy-litestream.serviceConfig.BindPaths;
+assert !(complete.systemd.services.maincopy-backup-expire-local.serviceConfig ? LoadCredential);
+assert
+  complete.systemd.services.maincopy-backup-expire-local.serviceConfig.RestrictAddressFamilies
+  == [ "AF_UNIX" ];
+assert
+  builtins.length complete.systemd.services.maincopy-backup-expire-remote.serviceConfig.LoadCredential
+  == 1;
+assert builtins.elem "/var/lib/maincopy-backup:ro"
+  complete.systemd.services.maincopy-backup-expire-remote.serviceConfig.TemporaryFileSystem;
+assert
+  complete.systemd.services.maincopy-backup-expire-remote.serviceConfig.BindPaths
+  == [ "/var/lib/maincopy-backup/.checkpoint.lock" ];
+assert
+  complete.systemd.services.maincopy-backup-expire-remote.serviceConfig.ReadWritePaths
+  == [ "/run/maincopy-backup-expire/private" ];
+assert lib.hasInfix "--runtime-directory"
+  complete.systemd.services.maincopy-backup.serviceConfig.ExecStart;
+assert lib.hasInfix "--runtime-directory"
+  complete.systemd.services.maincopy-backup-expire-remote.serviceConfig.ExecStart;
+assert complete.systemd.timers.maincopy-backup-expire-local.timerConfig.OnUnitInactiveSec == "1h";
+assert complete.services.maincopy.backup.localRetentionDays == 7;
+assert complete.services.maincopy.backup.remoteRetentionDays == 9;
+assert rejected {
+  backup = {
+    enable = true;
+    keyFile = "/run/secrets/key";
+    credentialsFile = "/run/secrets/b2";
+    remoteRetentionDays = 8;
+  };
+};
 assert complete.systemd.timers.maincopy-backup.timerConfig.OnUnitInactiveSec == "60s";
 assert complete.services.maincopy.backup.staleAfterSeconds == 300;
 assert typedRejected [ "public" "bind" ] { public.bind = "999.0.0.1"; };

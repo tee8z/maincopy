@@ -9,9 +9,9 @@ use tokio::{
 };
 
 use maincopy_shared::source::{
-    BeginSourceSyncResponse, ListSourceSyncsResponse, ReconfigureSourceRequest,
-    SourceDeployKeyResponse, SourceStatusResponse, SourceSyncAdmission, SourceSyncFailureCode,
-    SourceSyncId, SourceSyncOutcome, SourceSyncResource, SourceSyncStage,
+    BeginSourceSyncResponse, ListSourceSyncsResponse, ManagedSourceConfiguration,
+    ReconfigureSourceRequest, SourceDeployKeyResponse, SourceStatusResponse, SourceSyncAdmission,
+    SourceSyncFailureCode, SourceSyncId, SourceSyncOutcome, SourceSyncResource, SourceSyncStage,
 };
 use markdown_compiler::{
     ContentCandidateStore, ContentCandidateStoreError, ContentTreeDigest, DiscoveredContentTree,
@@ -437,12 +437,20 @@ impl ManagedSourceEngine {
             (installed.configuration_version == configuration.version)
                 .then_some(&installed.source_commit)
         });
-        let (mut sync, outcome) = self.fetch_operation(sync, installed_commit).await?;
+        let (mut sync, outcome) = self
+            .fetch_operation(sync, configuration, installed_commit)
+            .await?;
 
         match outcome {
             GitSyncOutcome::NoChange { source_commit } => {
-                self.prepare_no_change(sync, source_commit, installation, load_startup_candidate)
-                    .await
+                self.prepare_no_change(
+                    sync,
+                    configuration,
+                    source_commit,
+                    installation,
+                    load_startup_candidate,
+                )
+                .await
             }
             GitSyncOutcome::Candidate(candidate) => {
                 let prepared = self
@@ -456,15 +464,9 @@ impl ManagedSourceEngine {
     async fn fetch_operation(
         &self,
         sync: StoredSourceSync,
+        configuration: &ManagedSourceConfiguration,
         installed_commit: Option<&SourceCommit>,
     ) -> Result<(StoredSourceSync, GitSyncOutcome), ManagedSourceSyncError> {
-        let stored = self
-            .handle
-            .store
-            .configuration_revision(sync.configuration_version)
-            .await?
-            .ok_or(ManagedSourceSyncError::ConfigurationUnavailable)?;
-        let configuration = &stored.configuration;
         let sync = self.advance(&sync, SourceSyncProgress::Fetching).await?;
         let outcome = match self
             .git
@@ -501,6 +503,7 @@ impl ManagedSourceEngine {
     async fn prepare_no_change(
         &self,
         mut sync: StoredSourceSync,
+        configuration: &ManagedSourceConfiguration,
         source_commit: SourceCommit,
         installation: Option<InstalledSource>,
         load_startup_candidate: bool,
@@ -518,7 +521,12 @@ impl ManagedSourceEngine {
             "no-change source has no installed candidate",
         ))?;
         let (effective_commit, tree) = self
-            .load_or_recover_candidate(&sync, &source_commit, installed.content_digest)
+            .load_or_recover_candidate(
+                &sync,
+                configuration,
+                &source_commit,
+                installed.content_digest,
+            )
             .await?;
         if effective_commit != source_commit {
             let prepared = self.compile_tree(&mut sync, effective_commit, tree).await?;
@@ -537,6 +545,7 @@ impl ManagedSourceEngine {
     async fn load_or_recover_candidate(
         &self,
         sync: &StoredSourceSync,
+        configuration: &ManagedSourceConfiguration,
         source_commit: &SourceCommit,
         content_digest: ContentTreeDigest,
     ) -> Result<(SourceCommit, DiscoveredContentTree), ManagedSourceSyncError> {
@@ -545,13 +554,6 @@ impl ManagedSourceEngine {
         {
             return Ok((source_commit.clone(), tree));
         }
-        let stored = self
-            .handle
-            .store
-            .configuration_revision(sync.configuration_version)
-            .await?
-            .ok_or(ManagedSourceSyncError::ConfigurationUnavailable)?;
-        let configuration = &stored.configuration;
         match self
             .git
             .synchronize(

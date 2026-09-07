@@ -3,6 +3,8 @@
 import argparse
 import base64
 import ctypes
+import datetime
+import fcntl
 from contextlib import closing
 import hashlib
 import importlib.util
@@ -17,6 +19,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import patch
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--scripts", required=True)
@@ -25,7 +28,9 @@ parser.add_argument("--rclone", required=True)
 options, remaining = parser.parse_known_args()
 sys.argv[1:] = remaining
 sys.path.insert(0, options.scripts)
-from backup_common import BackupFailure, encoded_paths, manifest_inventory, protected_directory, rclone, run, runtime_config
+from backup_common import UTC, BackupFailure, checkpoint_lock, encoded_paths, manifest_inventory, protected_directory, rclone, run, runtime_config
+from backup_epochs import (EPOCH_FORMAT, epoch_record, expire_local, expire_remote, load_epoch,
+                           prepare_epoch, selection, validate_lifecycle)
 spec = importlib.util.spec_from_file_location("backup", str(Path(options.scripts) / "checkpoint-backup.py"))
 backup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(backup)
@@ -128,6 +133,94 @@ sys.exit(module.main())
                     pending.unlink()
 
 
+class EpochAdmission(unittest.TestCase):
+    def test_upload_window_and_rotation_reject_stale_future_and_legacy_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            now = datetime.datetime(2026, 9, 7, tzinfo=UTC)
+            native = root / "native"
+            name = prepare_epoch(native, 3600, now)
+            record = native / "active/epoch.json"
+            self.assertEqual(load_epoch(record, now, 600), name)
+            for instant in (now - datetime.timedelta(seconds=1), now + datetime.timedelta(seconds=3000)):
+                with self.assertRaises(BackupFailure):
+                    load_epoch(record, instant, 600)
+            with self.assertRaises(BackupFailure):
+                prepare_epoch(native, 3600, now - datetime.timedelta(seconds=1))
+            legacy = root / "legacy"
+            (legacy / "replica").mkdir(parents=True)
+            with self.assertRaises(BackupFailure):
+                prepare_epoch(legacy, 86400, now)
+            self.assertTrue((legacy / "replica").exists())
+            record.unlink()
+            record.symlink_to(root / "absent")
+            with self.assertRaises(OSError):
+                prepare_epoch(native, 3600, now)
+
+    def test_expiration_removes_stopped_active_epoch_without_leaving_invalid_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory, native = root / "backup", root / "native"
+            protected_directory(directory)
+            then = datetime.datetime(2026, 1, 1, tzinfo=UTC)
+            name = prepare_epoch(native, 86400, then)
+            (native / "active/replica/private-history").write_bytes(b"retired database bytes")
+            expire_local(directory, native, then + datetime.timedelta(days=9), 7)
+            self.assertFalse((native / "active").exists())
+            self.assertFalse((native / "retired" / name).exists())
+            replacement = prepare_epoch(native, 86400, then + datetime.timedelta(days=9))
+            self.assertNotEqual(replacement, name)
+            self.assertEqual(epoch_record(native / "active/epoch.json")[0], replacement)
+
+    def test_clock_jump_cannot_expire_running_native_replica(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory, native = root / "backup", root / "native"
+            protected_directory(directory)
+            then = datetime.datetime(2026, 1, 1, tzinfo=UTC)
+            name = prepare_epoch(native, 86400, then)
+            with (native / ".native.lock").open("wb") as running:
+                fcntl.flock(running, fcntl.LOCK_EX)
+                expire_local(directory, native, then + datetime.timedelta(days=9), 7)
+                self.assertEqual(epoch_record(native / "active/epoch.json")[0], name)
+            expire_local(directory, native, then + datetime.timedelta(days=9), 7)
+            self.assertFalse((native / "active").exists())
+
+    def test_interrupted_stale_replica_deletion_remains_recoverable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory, native = root / "backup", root / "native"
+            protected_directory(directory)
+            then = datetime.datetime(2026, 1, 1, tzinfo=UTC)
+            name = prepare_epoch(native, 86400, then)
+            destination = native / "retired" / name
+
+            def interrupted_delete(path):
+                self.assertEqual(path, destination)
+                (path / "epoch.json").unlink()
+                raise BackupFailure("simulated expiration deadline")
+
+            with patch("backup_epochs.shutil.rmtree", interrupted_delete):
+                with self.assertRaises(BackupFailure):
+                    expire_local(directory, native, then + datetime.timedelta(days=9), 7)
+            self.assertFalse((native / "active").exists())
+            self.assertTrue(destination.exists())
+            replacement = prepare_epoch(native, 86400, then + datetime.timedelta(days=9))
+            expire_local(directory, native, then + datetime.timedelta(days=9), 7)
+            self.assertFalse(destination.exists())
+            self.assertEqual(epoch_record(native / "active/epoch.json")[0], replacement)
+
+    def test_epoch_selection_rejects_paths_wrong_versions_and_crossing_names(self):
+        valid = "20260907T000000Z-11111111-1111-4111-8111-111111111111"
+        good = {"format": "maincopy-backup-selection-v1", "epoch": valid, "checkpoint": valid}
+        self.assertEqual(selection(good), (valid, valid))
+        for mutation in ({"epoch": "../outside"}, {"format": "unsupported"},
+                         {"checkpoint": "20260907T000000Z-11111111-1111-1111-8111-111111111111"},
+                         {"unexpected": True}):
+            with self.assertRaises(BackupFailure):
+                selection(good | mutation)
+
+
 class CheckpointOperations(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -140,14 +233,17 @@ class CheckpointOperations(unittest.TestCase):
         self.archive.write_bytes(b"immutable candidate")
         self.database = self.root / "live.db"
         self.connection = sqlite3.connect(self.database)
+        self.connection.execute("PRAGMA secure_delete=ON")
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("CREATE TABLE evidence(value TEXT)")
         self.connection.execute("CREATE TABLE required_artifacts(digest TEXT)")
         self.connection.execute("INSERT INTO evidence VALUES ('first complete checkpoint')")
         self.connection.commit()
-        self.replica = self.root / "replica"
+        self.replica_root = self.root / "native"
+        self.epoch = prepare_epoch(self.replica_root, 86400, datetime.datetime.now(UTC))
+        self.replica = self.replica_root / "active/replica"
         configuration = self.root / "litestream.yml"
-        configuration.write_text(f"socket:\n  enabled: true\n  path: {self.root}/control.sock\nlogging:\n  level: error\ndbs:\n  - path: {self.database}\n    monitor-interval: 50ms\n    meta-path: {self.root}/metadata\n    replica:\n      type: file\n      path: {self.replica}\n      sync-interval: 50ms\n")
+        configuration.write_text(f"socket:\n  enabled: true\n  path: {self.root}/control.sock\nlogging:\n  level: error\ndbs:\n  - path: {self.database}\n    monitor-interval: 50ms\n    meta-path: {self.replica_root}/active/metadata\n    replica:\n      type: file\n      path: {self.replica}\n      sync-interval: 50ms\n")
         self.replication_log = (self.root / "replication.log").open("wb")
         self.start_replication(configuration)
         self.wait_for_plan()
@@ -158,27 +254,38 @@ class CheckpointOperations(unittest.TestCase):
         self.offsite = self.root / "offsite"
         self.offsite.mkdir()
         self.fail_transfer = self.root / "fail-transfer"
+        self.bad_lifecycle = self.root / "bad-lifecycle"
         self.rclone = self.program("rclone-fixture", f'''
-            import configparser, os, pathlib, sys, tempfile
+            import configparser, json, os, pathlib, sys, tempfile
             args = sys.argv[1:]
             assert "fixture-secret-key" not in " ".join(args)
             network = any(value.startswith("maincopy-b2:") for value in args)
             if network:
                 if pathlib.Path({str(self.fail_transfer)!r}).exists():
                     sys.exit(41)
+                if "lifecycle" in args:
+                    print(json.dumps([] if pathlib.Path({str(self.bad_lifecycle)!r}).exists() else [{{"fileNamePrefix":"", "daysFromUploadingToHiding":9, "daysFromHidingToDeleting":1, "daysFromStartingToCancelingUnfinishedLargeFiles":1}}]))
+                    sys.exit(0)
+                if "backend" in args and "cleanup" in args:
+                    assert "/epochs/" in args[args.index("cleanup") + 1]
+                    sys.exit(0)
                 if "--files-from" in args:
                     listing = pathlib.Path(args[args.index("--files-from") + 1]).read_text().splitlines()
                     source = pathlib.Path(args[-2])
                     for name in listing:
                         assert (source / name).read_bytes().startswith(b"RCLONE\\x00\\x00")
-                else:
+                elif "copyto" in args:
                     assert pathlib.Path(args[-2]).read_bytes().startswith(b"RCLONE\\x00\\x00")
                 args = [{str(self.offsite)!r} + value.split("maincopy-b2:fixture-bucket/maincopy", 1)[1] if value.startswith("maincopy-b2:") else value for value in args]
             if "--config" in args:
                 config_path = pathlib.Path(args[args.index("--config") + 1])
                 config = configparser.ConfigParser(interpolation=None)
                 config.read(config_path)
-                config["offsitecrypt"]["remote"] = {str(self.offsite)!r}
+                for remote in ("offsitecrypt", "selectioncrypt"):
+                    if remote in config:
+                        target = config[remote]["remote"]
+                        if target.startswith("maincopy-b2:fixture-bucket/maincopy"):
+                            config[remote]["remote"] = {str(self.offsite)!r} + target.split("maincopy-b2:fixture-bucket/maincopy", 1)[1]
                 with config_path.open("w") as output:
                     config.write(output)
             os.execv({options.rclone!r}, [{options.rclone!r}, *args])
@@ -214,7 +321,8 @@ class CheckpointOperations(unittest.TestCase):
         ''')
         self.args = argparse.Namespace(config=str(self.root / "host.toml"), directory=str(self.state),
             maincopyd=str(self.maincopyd), litestream=options.litestream, rclone=str(self.rclone),
-            key=str(self.key), credentials=str(self.credentials), bucket="fixture-bucket", prefix="maincopy",
+            runtime_directory=str(self.root / "publisher-runtime"),
+            key=str(self.key), credentials=str(self.credentials), bucket="fixture-bucket", prefix="maincopy", remote_retention_days=9,
             replica=str(self.replica), socket=str(self.root / "control.sock"), database=str(self.database), artifacts=str(self.artifacts), status_file=str(self.state / "backup-status.json"))
 
     def stop_replication(self):
@@ -318,9 +426,9 @@ class CheckpointOperations(unittest.TestCase):
     def test_corrupt_cached_ciphertext_cannot_publish_a_checkpoint(self):
         self.assertEqual(self.execute_backup().returncode, 0)
         with tempfile.TemporaryDirectory(dir=self.root) as temporary:
-            config = runtime_config(self.args, Path(temporary), self.state / "encrypted-objects")
+            config = runtime_config(self.args, Path(temporary), self.state / "epochs" / self.epoch)
             encoded = encoded_paths(self.args, config, ["objects/" + hashlib.sha256(self.archive.read_bytes()).hexdigest()])[0]
-        cache_file = self.state / "encrypted-objects" / encoded
+        cache_file = self.state / "epochs" / self.epoch / encoded
         with cache_file.open("r+b") as output:
             output.seek(-1, 2)
             original = output.read(1)
@@ -333,7 +441,7 @@ class CheckpointOperations(unittest.TestCase):
 
     def test_retained_checkpoints_share_ciphertext_and_prune_only_old_directories(self):
         self.assertEqual(self.execute_backup().returncode, 0)
-        cache = self.state / "encrypted-objects"
+        cache = self.state / "epochs" / self.epoch
         with tempfile.TemporaryDirectory(dir=self.root) as temporary:
             config = runtime_config(self.args, Path(temporary), cache)
             encoded = encoded_paths(self.args, config, ["objects/" + hashlib.sha256(self.archive.read_bytes()).hexdigest()])[0]
@@ -346,11 +454,144 @@ class CheckpointOperations(unittest.TestCase):
         unrelated = retained / "operator-notes"
         unrelated.mkdir()
         self.assertEqual(self.execute_backup().returncode, 0)
+        # Cleanup is a separate job: a successful upload is not its trigger.
+        self.assertTrue(old.exists())
+        with checkpoint_lock(self.state):
+            expire_local(self.state, self.replica_root, datetime.datetime.now(UTC), 7)
         self.assertFalse(old.exists())
         self.assertTrue(unrelated.exists())
         links = [path for path in retained.rglob("*") if path.is_file() and path.stat().st_ino == inode]
         self.assertEqual(len(links), 2)
         self.assertGreaterEqual(source.stat().st_nlink, 3)
+
+    def test_new_epoch_uses_fresh_native_pages_without_deleted_address_history(self):
+        address = b"retired-newsletter-recipient-unique@example.test"
+        self.connection.execute("CREATE TABLE private_fixture(address TEXT)")
+        self.connection.execute("INSERT INTO private_fixture VALUES (?)", (address.decode(),))
+        self.connection.commit()
+        self.wait_for_plan()
+        self.assertEqual(self.execute_backup().returncode, 0)
+        first = self.epoch
+        self.assertTrue(any(address in path.read_bytes() for path in self.replica.rglob("*.ltx")))
+        self.stop_replication()
+        self.connection.execute("DELETE FROM private_fixture")
+        self.connection.commit()
+        with checkpoint_lock(self.state):
+            self.epoch = prepare_epoch(self.replica_root, 86400, datetime.datetime.now(UTC))
+        self.assertNotEqual(self.epoch, first)
+        self.assertTrue((self.replica_root / "retired" / first / "metadata").is_dir())
+        self.assertTrue((self.replica_root / "retired" / first / "replica").is_dir())
+        (self.root / "control.sock").unlink(missing_ok=True)
+        self.start_replication(self.root / "litestream.yml")
+        self.wait_for_plan()
+        self.assertFalse(any(address in path.read_bytes() for path in self.replica.rglob("*.ltx")))
+        self.assertEqual(self.execute_backup().returncode, 0)
+        self.assertEqual(self.recover("fresh-epoch"), "first complete checkpoint")
+        with closing(sqlite3.connect(self.root / "fresh-epoch/database.sqlite3")) as restored:
+            self.assertEqual(restored.execute("SELECT count(*) FROM private_fixture").fetchone()[0], 0)
+        # The old native plan can contain deleted pages, but no object in the
+        # new encrypted recovery namespace can reference the old epoch.
+        self.assertEqual({path.name for path in (self.offsite / "epochs").iterdir()}, {first, self.epoch})
+        self.assertTrue((self.state / "epochs" / first).is_dir())
+        self.assertTrue((self.state / "epochs" / self.epoch).is_dir())
+
+    def test_lifecycle_mismatch_prevents_capture_and_publication(self):
+        self.bad_lifecycle.touch()
+        result = self.execute_backup()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("lifecycle policy", result.stderr)
+        self.assertEqual(list(self.offsite.iterdir()), [])
+        self.assertFalse(list(self.state.glob(".capture-*")))
+
+    def test_publisher_keeps_secret_configuration_out_of_shared_capture_and_cleans_it(self):
+        original = backup.validate_lifecycle
+        paths = []
+
+        def inspect_configuration(args, config):
+            paths.append(config)
+            self.assertTrue(config.is_relative_to(Path(args.runtime_directory)))
+            self.assertFalse(config.is_relative_to(self.state))
+            self.assertIn("fixture-secret-key", config.read_text())
+            self.assertFalse(list(self.state.rglob("rclone.conf")))
+            return original(args, config)
+
+        with patch.object(backup, "validate_lifecycle", inspect_configuration):
+            backup.publish(self.args, self.state)
+        self.assertTrue(paths)
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.bad_lifecycle.touch()
+        with patch.object(backup, "validate_lifecycle", inspect_configuration):
+            with self.assertRaises(BackupFailure):
+                backup.publish(self.args, self.state)
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.assertFalse(list(Path(self.args.runtime_directory).iterdir()))
+
+    def test_remote_expiration_uses_only_private_runtime_credential_staging(self):
+        self.assertEqual(self.execute_backup().returncode, 0)
+        runtime = self.root / "expiry-runtime"
+        seen = self.root / "expiry-config-paths"
+        probe = self.program("expiry-config-probe", f"""
+            import configparser, os, pathlib, sys
+            args = sys.argv[1:]
+            config_path = pathlib.Path(args[args.index("--config") + 1])
+            assert config_path.is_relative_to(pathlib.Path({str(runtime)!r}))
+            config = configparser.ConfigParser(interpolation=None)
+            config.read(config_path)
+            assert config.sections() == ["maincopy-b2"]
+            with pathlib.Path({str(seen)!r}).open("a") as output:
+                print(config_path, file=output)
+            os.execv({str(self.rclone)!r}, [{str(self.rclone)!r}, *args])
+        """)
+        command = [sys.executable, str(Path(options.scripts) / "backup_epochs.py"),
+                   "expire-remote", "--directory", str(self.state), "--replica-root", str(self.replica_root),
+                   "--runtime-directory", str(runtime), "--rclone", str(probe), "--credentials", str(self.credentials),
+                   "--bucket", "fixture-bucket", "--prefix", "maincopy"]
+        for fails in (False, True):
+            if fails:
+                self.bad_lifecycle.touch()
+            result = subprocess.run(command, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, int(fails), result.stderr)
+            self.assertTrue(seen.exists())
+            self.assertTrue(all(not Path(path).exists() for path in seen.read_text().splitlines()))
+            self.assertFalse(list(runtime.iterdir()))
+            self.assertFalse(list(self.state.rglob("rclone.conf")))
+
+    def test_independent_local_expiration_needs_neither_credentials_nor_upload(self):
+        self.assertEqual(self.execute_backup().returncode, 0)
+        old = "20200101T000000Z-11111111-1111-4111-8111-111111111111"
+        paths = [self.state / "checkpoints" / old, self.state / "epochs" / old,
+                 self.replica_root / "retired" / old]
+        for path in paths:
+            path.mkdir(parents=True)
+            (path / "old-bytes").write_bytes(b"retired history")
+        abandoned = self.state / ".capture-12345678"
+        abandoned.mkdir()
+        (abandoned / "old-plaintext").write_bytes(b"interrupted private replay")
+        self.fail_transfer.touch()
+        self.key.unlink()
+        self.credentials.unlink()
+        result = subprocess.run([sys.executable, str(Path(options.scripts) / "backup_epochs.py"),
+                                 "expire-local", "--directory", str(self.state),
+                                 "--replica-root", str(self.replica_root)], capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.assertFalse(abandoned.exists())
+        self.assertTrue((self.replica_root / "active/replica").is_dir())
+        self.assertTrue((self.state / "epochs" / self.epoch).is_dir())
+
+    def test_remote_expiration_selects_only_closed_old_epoch_prefixes(self):
+        self.assertEqual(self.execute_backup().returncode, 0)
+        old = "20200101T000000Z-11111111-1111-4111-8111-111111111111"
+        path = self.offsite / "epochs" / old
+        path.mkdir()
+        (path / "ciphertext").write_bytes(b"obsolete encrypted version fixture")
+        self.args.retention_days = 7
+        with tempfile.TemporaryDirectory(dir=self.root) as temporary:
+            config = runtime_config(self.args, Path(temporary), self.state / "epochs" / self.epoch)
+            expire_remote(self.args, config, datetime.datetime.now(UTC))
+        self.assertFalse(path.exists())
+        self.assertTrue((self.offsite / "epochs" / self.epoch).is_dir())
+        self.assertEqual(self.recover("after-expiration"), "first complete checkpoint")
 
     def test_stopped_replica_cannot_refresh_an_old_complete_checkpoint(self):
         self.assertEqual(self.execute_backup().returncode, 0)

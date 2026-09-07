@@ -362,6 +362,7 @@ pub(crate) fn page_response(
                             a href="/admin" { strong { "Maincopy" } }
                             nav class="actions" aria-label="Administration" {
                                 a href="/admin" { "Posts" }
+                                a href="/admin/mail" { "Mail" }
                                 a href="/admin/source" { "Source" }
                                 a href="/admin/profile" { "Profile" }
                                 a href="/admin/tips" { "Tips" }

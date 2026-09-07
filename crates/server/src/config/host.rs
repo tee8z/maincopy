@@ -16,6 +16,7 @@ use markdown_compiler::{
 use serde::Deserialize;
 
 use crate::admin::origin::{AdminBind, AdminOrigin};
+use crate::domain::mail::config::{MailConfiguration, MailConfigurationCandidate};
 
 use super::diagnostic::{
     ConfigurationDiagnostic, ConfigurationErrors, ConfigurationValidationCode, DiagnosticCollector,
@@ -261,6 +262,7 @@ pub struct HostConfiguration {
     source: SourceConfiguration,
     identity_startup_bootstrap: IdentityStartupBootstrap,
     backup: Option<BackupStatusConfiguration>,
+    mail: MailConfiguration,
 }
 
 /// Read-only settings borrowed from validated host configuration.
@@ -278,6 +280,7 @@ pub struct HostConfigurationView<'configuration> {
     pub source: SourceConfigurationView<'configuration>,
     pub identity_startup_bootstrap: IdentityStartupBootstrap,
     pub backup: Option<BackupStatusConfigurationView<'configuration>>,
+    pub(crate) mail: &'configuration MailConfiguration,
 }
 
 impl HostConfiguration {
@@ -286,6 +289,7 @@ impl HostConfiguration {
             content_root: &self.content_root,
             state_root: &self.state_root,
             runtime_root: &self.runtime_root,
+            mail: &self.mail,
             content_limits: self.content_limits,
             public_bind: self.public_bind,
             admin_bind: self.admin_bind,
@@ -385,6 +389,7 @@ struct HostCandidate {
     source: SourceCandidate,
     identity: IdentityCandidate,
     backup: Option<BackupCandidate>,
+    mail: MailConfigurationCandidate,
 }
 
 #[derive(Default, Deserialize)]
@@ -607,6 +612,15 @@ fn finalize_host(
     let backup = candidate
         .backup
         .and_then(|backup| validate_backup(backup, file_base, &mut diagnostics));
+    let mail = match candidate.mail.validate(file_base) {
+        Ok(mail) => mail,
+        Err(errors) => {
+            for diagnostic in errors.diagnostics() {
+                diagnostics.push(diagnostic.clone());
+            }
+            MailConfiguration::Disabled
+        }
+    };
     diagnostics.into_result()?;
     match (
         content_root,
@@ -651,6 +665,7 @@ fn finalize_host(
             source,
             identity_startup_bootstrap: candidate.identity.startup_bootstrap,
             backup,
+            mail,
         }),
         _ => Err(single_error(host_diagnostic(
             "$document",
@@ -1388,6 +1403,37 @@ mod tests {
         assert_eq!(config.view().database.writer_queue_capacity.get(), 128);
         assert_eq!(config.view().database.read_pool_size.get(), 4);
         assert_eq!(config.view().content_limits, ContentTreeLimits::default());
+        assert_eq!(config.view().mail, &MailConfiguration::Disabled);
+    }
+
+    #[test]
+    fn mail_host_settings_fail_closed_without_loading_secret_files() {
+        let root = tempdir().unwrap();
+        let path = write_config(root.path(), "maincopy.toml", "[mail]\nmode = 'disabled'\n");
+        assert_eq!(
+            loader(root.path()).load(&path).unwrap().view().mail,
+            &MailConfiguration::Disabled
+        );
+        let path = write_config(
+            root.path(),
+            "maincopy.toml",
+            "[mail]\nmode = 'disabled'\nsender = 'sender@example.com'\n",
+        );
+        assert!(loader(root.path()).load(&path).is_err());
+        let path = write_config(
+            root.path(),
+            "maincopy.toml",
+            "[mail]\nmode = 'ses'\nsender = 'Sender@EXAMPLE.COM'\nregion = 'us-east-1'\nconfiguration_set = 'newsletter'\ncredential_file = 'secrets/credential.json'\ncontrol_signing_key_file = 'secrets/control.key'\n",
+        );
+        let configuration = loader(root.path()).load(&path).unwrap();
+        let MailConfiguration::Ses(mail) = configuration.view().mail else {
+            panic!("fixture selects SES configuration");
+        };
+        assert_eq!(mail.view().sender.as_str(), "Sender@example.com");
+        assert_eq!(
+            mail.view().credential_file.path(),
+            root.path().join("secrets/credential.json")
+        );
     }
 
     #[test]

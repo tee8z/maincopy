@@ -10,6 +10,10 @@ use crate::{
     database::DatabaseStore,
     domain::{
         auth::store::{AuthStore, invalidate_restored_credentials},
+        mail::{
+            store::{CampaignStore, quarantine_restored_campaigns},
+            subscriber::store::{SubscriberStore, discard_restored_subscribers},
+        },
         profile::store::ProfileStore,
         publication::store::PublicationStore,
         source::store::SourceStore,
@@ -87,9 +91,19 @@ pub(crate) async fn inspect(path: &Path) -> Result<RestoreInspection, RestoreErr
         AuthStore::new(readers.clone(), mutations.clone()),
         ProfileStore::new(readers.clone(), mutations.clone()),
         PublicationStore::new(readers.clone(), mutations.clone()),
-        SourceStore::new(readers.clone(), mutations),
+        SourceStore::new(readers.clone(), mutations.clone()),
+        CampaignStore::new(readers.clone(), mutations.clone()),
+        SubscriberStore::new(readers.clone(), mutations),
         health,
     );
+    if let Err(error) = store.mail.validate_all().await {
+        readers.close().await;
+        return Err(error.into());
+    }
+    if let Err(error) = store.subscribers.validate_all().await {
+        readers.close().await;
+        return Err(error.into());
+    }
     Ok(RestoreInspection {
         store,
         schema,
@@ -144,6 +158,8 @@ pub(crate) fn binary_schema() -> RestoreSchema {
 
 pub(crate) async fn accept(path: &Path, restore_id: Uuid) -> Result<(), RestoreError> {
     let mut connection = SqliteConnectOptions::new()
+        .disable_statement_logging()
+        .pragma("secure_delete", "ON")
         .filename(path)
         .create_if_missing(false)
         .foreign_keys(true)
@@ -151,13 +167,27 @@ pub(crate) async fn accept(path: &Path, restore_id: Uuid) -> Result<(), RestoreE
         .connect()
         .await?;
     let result = async {
+        let secure_delete: i64 = sqlx::query_scalar("PRAGMA secure_delete")
+            .fetch_one(&mut connection)
+            .await?;
+        if secure_delete != 1 {
+            return Err(RestoreError::Integrity);
+        }
         let mut transaction = connection.begin().await?;
-        invalidate_restored_credentials(&mut transaction, restore_id, OffsetDateTime::now_utc())
-            .await?;
+        let now = OffsetDateTime::now_utc();
+        invalidate_restored_credentials(&mut transaction, restore_id, now).await?;
+        quarantine_restored_campaigns(&mut transaction, restore_id, now).await?;
+        discard_restored_subscribers(&mut transaction, restore_id).await?;
         transaction.commit().await?;
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut connection)
+        // SQLite reports a busy checkpoint as a successful PRAGMA result.
+        // Offline acceptance owns the database and must physically truncate the
+        // WAL before a new replication epoch can begin.
+        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut connection)
             .await?;
+        if checkpoint != (0, 0, 0) {
+            return Err(RestoreError::CheckpointIncomplete);
+        }
         Ok::<(), RestoreError>(())
     }
     .await;

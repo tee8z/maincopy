@@ -160,6 +160,10 @@ mod tests {
     fn router(limits: RequestLimits) -> Router {
         Router::new()
             .route("/posts/{slug}", get(|| async { "public page" }))
+            .route(
+                "/email/unsubscribe/{token}",
+                get(|| async { "removal control" }),
+            )
             .layer(middleware::from_fn_with_state(limits, bounded_request))
     }
 
@@ -320,6 +324,11 @@ mod tests {
                 "/posts/private-slug",
                 StatusCode::METHOD_NOT_ALLOWED,
             ),
+            (
+                Method::GET,
+                "/email/unsubscribe/private-control?address=private-reader",
+                StatusCode::OK,
+            ),
             (Method::GET, "/private-path", StatusCode::NOT_FOUND),
         ] {
             assert_eq!(
@@ -342,6 +351,7 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.contains("public request completed"));
         assert!(text.contains("route=\"/posts/{slug}\""));
+        assert!(text.contains("route=\"/email/unsubscribe/{token}\""));
         assert!(text.contains("method=\"HEAD\""));
         assert!(text.contains("status=405"));
         assert!(text.contains("route=\"unmatched\""));
