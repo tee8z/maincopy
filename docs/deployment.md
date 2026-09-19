@@ -2,6 +2,7 @@
 
 Use `nixosModules.default` for a single instance with Caddy, private administration, and optional encrypted Backblaze B2 backups.
 See [email setup](email-delivery.md) for SES and [monitoring](observability.md) for Prometheus and Grafana.
+See the [NixOS integration contract](nixos-integration.md) for module ownership, host mounts, and managed Git credential references.
 
 ## Configure the host
 
