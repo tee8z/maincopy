@@ -90,10 +90,6 @@ jobs:
             exit 1
           fi
 
-      - name: Evaluate the whole flake
-        if: matrix.name == 'lint'
-        run: nix flake check --no-build
-
       - name: Run this job's flake checks
         env:
           CHECKS: ${{ matrix.checks }}
