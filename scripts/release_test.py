@@ -37,6 +37,11 @@ def artifacts(directory):
     manifest = identity()
     for name in release.artifact_names(manifest):
         (directory / name).write_text(name + "\n")
+    for system in release.SYSTEMS:
+        archive = directory / release.binary_archive_name("1.2.3", system)
+        (directory / release.binary_checksum_name("1.2.3", system)).write_text(
+            release.checksum_line(archive)
+        )
     manifest["crates"] = {
         name: release.checksum(directory / f"{name}-1.2.3.crate")
         for name in release.PACKAGES
@@ -58,6 +63,14 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(release.verify_artifacts(directory)[0], manifest)
             (directory / "Cargo.lock").write_text("changed")
             with self.assertRaisesRegex(release.ReleaseError, "SHA256SUMS differs"):
+                release.verify_artifacts(directory)
+
+    def test_binary_archive_checksum_file_must_match_its_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            artifacts(directory)
+            (directory / "maincopy-1.2.3-x86_64-linux.tar.gz").write_text("changed")
+            with self.assertRaisesRegex(release.ReleaseError, "sha256 differs"):
                 release.verify_artifacts(directory)
 
     def test_extra_missing_and_symlink_artifacts_are_rejected(self):
@@ -98,6 +111,10 @@ class ArtifactTests(unittest.TestCase):
                 archive = directory / "maincopy-1.2.3-aarch64-linux.tar.gz"
                 digests.append(release.checksum(archive))
             self.assertEqual(digests[0], digests[1])
+            self.assertEqual(
+                (directory / "maincopy-1.2.3-aarch64-linux.tar.gz.sha256").read_text(),
+                f"{digests[1]}  maincopy-1.2.3-aarch64-linux.tar.gz\n",
+            )
             with tarfile.open(archive) as contents:
                 members = {member.name: member for member in contents.getmembers()}
             prefix = "maincopy-1.2.3-aarch64-linux"

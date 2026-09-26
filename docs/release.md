@@ -117,8 +117,8 @@ Before approving the `release` environment, check:
 - External acceptance is complete for the intended release features.
 - Crate ownership, environment restrictions, and immutable releases are configured.
 - The `release-candidate` artifact contains the expected source, five crate archives,
-  two Linux binary archives, lockfiles, dependency inventories, release.json,
-  release-notes.md, and SHA256SUMS.
+  two Linux binary archives with their `.sha256` files, lockfiles, dependency
+  inventories, release.json, release-notes.md, and SHA256SUMS.
 
 Download and extract `release-candidate`, then verify its manifest:
 
@@ -180,8 +180,12 @@ Commit the host lockfile and check its resolved commit against release.json.
 Nix does not verify the release's GPG signer for consumers.
 Follow [deployment](deployment.md) for host configuration, credentials, and backups.
 
-The binary archives hold `bin/maincopy`, `bin/maincopyd`, `bin/maincopy-mermaid`,
-`bin/maincopy-ssh`, `bin/markdowncompiler`, and the license. They link against
+Each binary archive, `maincopy-X.Y.Z-<system>.tar.gz`, has one top-level
+directory, `maincopy-X.Y.Z-<system>/`, holding `bin/maincopy`, `bin/maincopyd`,
+`bin/maincopy-mermaid`, `bin/maincopy-ssh`, `bin/markdowncompiler`, and `LICENSE`.
+`maincopyd` finds `maincopy-mermaid` and `maincopy-ssh` beside itself, so keep
+`bin/` together; the web assets are compiled into `maincopyd`. Each archive has
+a `maincopy-X.Y.Z-<system>.tar.gz.sha256` beside it. They link against
 glibc 2.39 or newer. Unlike the Nix package, `maincopyd` is not wrapped: set
 `MAINCOPY_GIT_EXECUTABLE` and `MAINCOPY_SSH_EXECUTABLE` yourself.
 
@@ -189,8 +193,8 @@ glibc 2.39 or newer. Unlike the Nix package, `maincopyd` is not wrapped: set
 release_version=X.Y.Z
 system=x86_64-linux # or aarch64-linux
 curl -fsSLO "https://github.com/tee8z/maincopy/releases/download/v$release_version/maincopy-$release_version-$system.tar.gz"
-curl -fsSLO "https://github.com/tee8z/maincopy/releases/download/v$release_version/SHA256SUMS"
-sha256sum --check --ignore-missing SHA256SUMS
+curl -fsSLO "https://github.com/tee8z/maincopy/releases/download/v$release_version/maincopy-$release_version-$system.tar.gz.sha256"
+sha256sum --check "maincopy-$release_version-$system.tar.gz.sha256"
 ~~~
 
 For Cargo installation, use the same exact version for each executable crate:

@@ -414,7 +414,7 @@ def prepare(identity_path, directory, target):
     (directory / "release-notes.md").write_text(
         f"Maincopy {version}\n\nSigned tag: `{identity['tag']}`\nCommit: `{identity['commit']}`\n\n"
         f"All five crates are published on crates.io. Nix: `nix run github:{REPOSITORY}/{identity['tag']}#maincopy -- --help`.\n\n"
-        f"Linux binaries: `maincopy-{version}-<system>.tar.gz` for {' and '.join(SYSTEMS)} (glibc 2.39 or newer). "
+        f"Linux binaries: `maincopy-{version}-<system>.tar.gz`, each with a `.sha256`, for {' and '.join(SYSTEMS)} (glibc 2.39 or newer). "
         "The attached SHA256SUMS covers the source, crate archives, binary archives, lockfiles, and dependency inventories. "
         "See docs/release.md in the source archive for installation and verification.\n\n"
         + notes
@@ -424,6 +424,15 @@ def prepare(identity_path, directory, target):
 
 def binary_archive_name(version, system):
     return f"maincopy-{version}-{system}.tar.gz"
+
+
+def binary_checksum_name(version, system):
+    """The archive's own checksum file, in `sha256sum --check` format."""
+    return binary_archive_name(version, system) + ".sha256"
+
+
+def checksum_line(path):
+    return f"{checksum(path)}  {path.name}\n"
 
 
 def elf_machine(path):
@@ -482,6 +491,9 @@ def package_binaries(directory, system, binaries):
             info = normalize(tar.gettarinfo(str(path), arcname=name), mode)
             with path.open("rb") as stream:
                 tar.addfile(info, stream)
+    (directory / binary_checksum_name(version, system)).write_text(
+        checksum_line(archive)
+    )
 
 
 def artifact_names(identity):
@@ -496,6 +508,7 @@ def artifact_names(identity):
         *(f"{name}-{version}.crate" for name in PACKAGES),
         *(f"nix-closure-{system}.json" for system in SYSTEMS),
         *(binary_archive_name(version, system) for system in SYSTEMS),
+        *(binary_checksum_name(version, system) for system in SYSTEMS),
     }
 
 
@@ -519,6 +532,13 @@ def verify_artifacts(directory, sealed=True):
         == hashes[f"maincopy-{identity['version']}-source.tar.gz"],
         "source checksum differs from prepared manifest",
     )
+    for system in SYSTEMS:
+        archive = binary_archive_name(identity["version"], system)
+        require(
+            (directory / binary_checksum_name(identity["version"], system)).read_text()
+            == f"{hashes[archive]}  {archive}\n",
+            f"{archive}.sha256 differs from the binary archive",
+        )
     lines = "".join(f"{digest}  {name}\n" for name, digest in hashes.items())
     if sealed:
         require(
