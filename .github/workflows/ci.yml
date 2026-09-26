@@ -7,18 +7,37 @@ on:
       - master
   workflow_dispatch:
 
+# Pull requests cancel their older runs. A push to master always runs to the
+# end, because only master's runs save the Nix store the others restore.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 permissions:
   contents: read
 
 jobs:
+  # The flake's checks, split across runners so they build in parallel instead
+  # of queueing on one. Each job restores the Nix store that master's build job
+  # saved, so the compiled dependencies are substituted rather than rebuilt.
+  # The lint job fails if a check is added to the flake but to no job here.
   nix:
-    name: Nix checks and build
+    name: Nix ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: build
+            checks: build package-binaries deployment-module deployment-vm
+            saves: true
+          - name: tests
+            checks: tests
+          - name: clippy
+            checks: clippy
+          - name: lint
+            checks: formatting nix-formatting browser-signin development-gateway
 
     steps:
       - name: Check out repository
@@ -27,15 +46,15 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
 
-      # The Nix store, keyed on what changes the dependency builds. Only a
-      # push to master saves it; pull requests and releases restore it.
+      # Only the build job on master saves: it holds the dependencies and the
+      # workspace every other job needs.
       - name: Cache the Nix store
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
           primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'nix/**') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-          purge: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ matrix.saves == true && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          purge: ${{ matrix.saves == true && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           purge-prefixes: nix-${{ runner.os }}-${{ runner.arch }}-
           purge-created: 0
           purge-primary-key: never
@@ -48,7 +67,6 @@ jobs:
 
       - name: Allow the Nix test sandbox to create user namespaces
         run: |
-          # Ubuntu's packaged profiles do not cover Bubblewrap in the Nix store.
           sudo tee /etc/apparmor.d/maincopy-nix-bwrap > /dev/null <<'EOF'
           abi <abi/4.0>,
           include <tunables/global>
@@ -58,13 +76,38 @@ jobs:
           EOF
           sudo apparmor_parser -r /etc/apparmor.d/maincopy-nix-bwrap
 
-      - name: Run flake checks
-        run: nix flake check --print-build-logs
+      - name: Every flake check belongs to one job
+        if: matrix.name == 'lint'
+        env:
+          ASSIGNED: build package-binaries deployment-module deployment-vm tests clippy formatting nix-formatting browser-signin development-gateway
+        run: |
+          flake=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames | jq -r '.[]' | sort)
+          read -ra jobs <<<"$ASSIGNED"
+          assigned=$(printf '%s\n' "${jobs[@]}" | sort)
+          if [ "$flake" != "$assigned" ]; then
+            echo "Flake checks and CI jobs differ (< flake, > jobs):" >&2
+            diff <(echo "$flake") <(echo "$assigned") >&2 || true
+            exit 1
+          fi
+
+      - name: Evaluate the whole flake
+        if: matrix.name == 'lint'
+        run: nix flake check --no-build
+
+      - name: Run this job's flake checks
+        env:
+          CHECKS: ${{ matrix.checks }}
+        run: |
+          targets=()
+          for check in $CHECKS; do targets+=(".#checks.x86_64-linux.$check"); done
+          nix build --no-link --print-build-logs "${targets[@]}"
 
       - name: Verify release signatures, checksums, and interrupted publication
+        if: matrix.name == 'build'
         run: nix develop --no-update-lock-file --command python3 scripts/release_test.py
 
       - name: Build Maincopy
+        if: matrix.name == 'build'
         run: nix build --print-build-logs
 
   windows:
