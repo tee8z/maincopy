@@ -12,6 +12,12 @@ on:
         type: boolean
         required: false
         default: true
+  # A push to master runs the compile jobs as a warm pass: they save the caches
+  # a release restores, so a release (a hotfix too) compiles only the
+  # workspace's own crates. A warm pass seals and publishes nothing.
+  push:
+    branches:
+      - master
 
 permissions:
   contents: read
@@ -21,27 +27,89 @@ defaults:
     shell: bash
     working-directory: candidate
 
-# Publication is never cancelled halfway through a dependency chain.
+# Publication is never cancelled halfway through a dependency chain; a newer
+# master push replaces an older warm pass.
 concurrency:
-  group: maincopy-release-${{ inputs.dry_run && github.ref || inputs.tag }}
-  cancel-in-progress: false
+  group: maincopy-release-${{ github.event_name == 'push' && 'warm' || (inputs.dry_run && format('dry-run-{0}', github.ref)) || inputs.tag }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   RELEASE_TAG: ${{ inputs.tag }}
-  RELEASE_DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+  # Warm passes and dry runs describe the checked-out commit and never publish.
+  RELEASE_DRY_RUN: ${{ (github.event_name == 'push' || inputs.dry_run) && '1' || '' }}
   # A dry run checks out the dispatched commit; a release, its signed tag.
-  RELEASE_REF: ${{ inputs.dry_run && github.sha || inputs.tag }}
+  RELEASE_REF: ${{ (github.event_name == 'push' || inputs.dry_run) && github.sha || inputs.tag }}
   RELEASE_GPG_PUBLIC_KEY: ${{ vars.RELEASE_GPG_PUBLIC_KEY }}
   RELEASE_GPG_FINGERPRINT: ${{ vars.RELEASE_GPG_FINGERPRINT }}
   CARGO_BUILD_JOBS: '4'
+  CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
-  prepare:
-    if: github.ref == 'refs/heads/master' || inputs.dry_run
-    name: Verify signed source and prepare all five crates
+  prepare-release:
+    if: github.event_name == 'push' || inputs.dry_run || github.ref == 'refs/heads/master'
+    name: Verify signed source and pin the toolchain
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.toolchain.outputs.rust }}
+    steps:
+      - name: Check out trusted automation from the dispatched master revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Check out the candidate without executing it
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify tag, signer, commit, and versions
+        run: python3 ../automation/scripts/release.py verify-tag ${RELEASE_DRY_RUN:+--dry-run} ${RELEASE_TAG:+--tag "$RELEASE_TAG"} --output "$RUNNER_TEMP/identity.json"
+      # The native binaries use the Rust release the flake pins, without
+      # waiting for Nix: rust-overlay's stable "latest" at the locked revision.
+      - name: Read the flake's pinned Rust version
+        id: toolchain
+        run: |
+          revision=$(python3 -c 'import json; print(json.load(open("flake.lock"))["nodes"]["rust-overlay"]["locked"]["rev"])')
+          rust=$(curl -fsSL --retry 3 "https://raw.githubusercontent.com/oxalica/rust-overlay/$revision/manifests/stable/default.nix" \
+            | sed -n 's/^ *latest = "\([0-9.]*\)";$/\1/p')
+          [[ $rust =~ ^1\.[0-9]+\.[0-9]+$ ]] || { echo "Could not read the pinned Rust version" >&2; exit 1; }
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "Rust $rust (rust-overlay $revision)" >> "$GITHUB_STEP_SUMMARY"
+
+  release-tests:
+    if: github.event_name != 'push'
+    name: Test release boundaries
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out trusted automation from the dispatched master revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Check out the candidate without executing it
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+      - name: Test release boundaries with the locked Cargo toolchain
+        run: nix develop --no-update-lock-file --command python3 ../automation/scripts/release_test.py
+
+  crates:
+    name: Prepare source, crate archives, and Rust inventory
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Check out trusted automation from the dispatched master revision
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -59,38 +127,108 @@ jobs:
       - name: Verify tag, signer, commit, and versions
         run: python3 ../automation/scripts/release.py verify-tag ${RELEASE_DRY_RUN:+--dry-run} ${RELEASE_TAG:+--tag "$RELEASE_TAG"} --output "$RUNNER_TEMP/identity.json"
       - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
-      - uses: DeterminateSystems/flakehub-cache-action@83293488abfd33fbfb2ab084097467491c029962 # v3.22.2
+      # Compiled dependencies of the package verification come from the cache
+      # the master warm pass writes; nothing else saves it. The key follows the
+      # flake lock, which pins the toolchain. Packaged crates are never reused.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          use-gha-cache: enabled
-          diagnostic-endpoint: ''
-      - name: Test release boundaries with the locked Cargo toolchain
-        run: nix develop --no-update-lock-file --command python3 ../automation/scripts/release_test.py
+          workspaces: candidate -> target
+          shared-key: release-crates
+          key: ${{ hashFiles('candidate/flake.lock') }}
+          save-if: ${{ github.event_name == 'push' }}
       - name: Prepare source, verified crate archives, and Rust inventory
         run: |
           nix develop --no-update-lock-file --command python3 ../automation/scripts/release.py prepare \
             --identity "$RUNNER_TEMP/identity.json" \
             --output "$RUNNER_TEMP/prepared" \
-            --target-dir "$RUNNER_TEMP/cargo-prepare"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+            --target-dir target
+      - if: github.event_name != 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-prepared
           path: ${{ runner.temp }}/prepared/
           if-no-files-found: error
           retention-days: 30
 
-  nix:
-    if: github.ref == 'refs/heads/master' || inputs.dry_run
-    name: Nix checks (${{ matrix.system }})
+  # Native executables for the Linux binary archives. They compile in parallel
+  # with the crate and Nix jobs; the candidate job packages them.
+  binaries:
+    name: Build Linux binaries (${{ matrix.system }})
+    needs: prepare-release
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out the candidate without executing it
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          path: candidate
+          persist-credentials: false
+      # The build needs the space only well after it has started.
+      - name: Free disk space in the background
+        run: |
+          nohup sudo sh -c 'rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; apt-get clean' \
+            >/dev/null 2>&1 &
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ needs.prepare-release.outputs.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: candidate -> target
+          shared-key: release-${{ matrix.target }}
+          save-if: ${{ github.event_name == 'push' }}
+      - name: Build locked release executables
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --workspace --bins --target "$TARGET"
+      - name: Stage the executables for packaging
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          for name in maincopy maincopyd maincopy-mermaid maincopy-ssh markdowncompiler; do
+            cp "target/$TARGET/release/$name" "$RUNNER_TEMP/bin/"
+          done
+          # The oldest glibc the executables need, for the release notes' claim.
+          objdump -T "$RUNNER_TEMP"/bin/* | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+      - if: github.event_name != 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.system }}
+          path: ${{ runner.temp }}/bin/
+          if-no-files-found: error
+          retention-days: 30
+
+  # The Nix package for each system, which includes its test suite, and its
+  # closure inventory. The flake checks (clippy, formatting, the NixOS VM
+  # test) run in CI; publication requires CI to pass on the tagged commit.
+  nix:
+    name: Nix package (${{ matrix.system }})
+    needs: prepare-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - system: x86_64-linux
             runner: ubuntu-24.04
+            # CI's flake check on master saves this system's store, a superset.
+            save-store: false
           - system: aarch64-linux
             runner: ubuntu-24.04-arm
+            save-store: true
     steps:
       - name: Check out trusted automation from the dispatched master revision
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -107,41 +245,18 @@ jobs:
           persist-credentials: false
       - name: Verify signed source
         run: python3 ../automation/scripts/release.py verify-tag ${RELEASE_DRY_RUN:+--dry-run} ${RELEASE_TAG:+--tag "$RELEASE_TAG"} --output "$RUNNER_TEMP/identity.json"
-      - name: Verify native architecture and working KVM access
-        env:
-          RELEASE_SYSTEM: ${{ matrix.system }}
-        run: |
-          python3 - "$RELEASE_SYSTEM" <<'PY'
-          import fcntl
-          import platform
-          import sys
-
-          expected = {"x86_64-linux": "x86_64", "aarch64-linux": "aarch64"}[sys.argv[1]]
-          if platform.machine() != expected:
-              raise SystemExit("Runner architecture does not match the required Nix system")
-          try:
-              with open("/dev/kvm", "r+b", buffering=0) as device:
-                  # Linux KVM_GET_API_VERSION is available on both architectures.
-                  if fcntl.ioctl(device.fileno(), 0xAE00) != 12:
-                      raise SystemExit("Runner does not expose supported KVM API version 12")
-          except OSError as error:
-              raise SystemExit(f"Runner cannot access working /dev/kvm: {error.strerror}") from None
-          print(f"Runner preflight passed: {sys.argv[1]}, KVM API 12")
-          PY
       - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
-      - uses: DeterminateSystems/flakehub-cache-action@83293488abfd33fbfb2ab084097467491c029962 # v3.22.2
+      # The Nix store, keyed on what changes the dependency builds. Only a
+      # master warm pass saves it.
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
-          use-gha-cache: enabled
-          diagnostic-endpoint: ''
-      - name: Verify Nix advertises the required VM builder features
-        run: |
-          release_features=" $(nix config show system-features) "
-          for release_feature in kvm nixos-test; do
-            if [[ "$release_features" != *" $release_feature "* ]]; then
-              printf 'Nix builder lacks required feature: %s\n' "$release_feature" >&2
-              exit 1
-            fi
-          done
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('candidate/flake.lock', 'candidate/Cargo.lock', 'candidate/**/Cargo.toml', 'candidate/flake.nix', 'candidate/nix/**') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
+          save: ${{ github.event_name == 'push' && matrix.save-store }}
+          purge: ${{ github.event_name == 'push' && matrix.save-store }}
+          purge-prefixes: nix-${{ runner.os }}-${{ runner.arch }}-
+          purge-created: 0
+          purge-primary-key: never
       - name: Permit the existing Bubblewrap test sandbox
         run: |
           sudo tee /etc/apparmor.d/maincopy-nix-bwrap > /dev/null <<'EOF'
@@ -152,29 +267,31 @@ jobs:
           }
           EOF
           sudo apparmor_parser -r /etc/apparmor.d/maincopy-nix-bwrap
-      - name: Check and build the committed source archive
+      - name: Build and test the committed source archive
         env:
           RELEASE_SYSTEM: ${{ matrix.system }}
         run: |
           mkdir "$RUNNER_TEMP/release-source" "$RUNNER_TEMP/nix-inventory"
           git archive HEAD | tar -x -C "$RUNNER_TEMP/release-source"
-          nix flake check --no-update-lock-file --print-build-logs "path:$RUNNER_TEMP/release-source"
           nix build --no-update-lock-file --no-link --print-out-paths --print-build-logs \
             "path:$RUNNER_TEMP/release-source#packages.$RELEASE_SYSTEM.default" > "$RUNNER_TEMP/nix-output"
           release_output="$(cat "$RUNNER_TEMP/nix-output")"
           python3 ../automation/scripts/release.py nix-inventory --output-path "$release_output" \
             --system "$RELEASE_SYSTEM" --output "$RUNNER_TEMP/nix-inventory"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - if: github.event_name != 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-nix-${{ matrix.system }}
           path: ${{ runner.temp }}/nix-inventory/
           if-no-files-found: error
           retention-days: 30
 
+  # Only downloading, archiving, and hashing: a small runner, once every
+  # build has finished.
   candidate:
-    if: github.ref == 'refs/heads/master' || inputs.dry_run
-    name: Seal candidate checksums for review
-    needs: [prepare, nix]
+    if: github.event_name != 'push'
+    name: Package binaries and seal candidate checksums for review
+    needs: [prepare-release, release-tests, crates, binaries, nix]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -196,9 +313,18 @@ jobs:
           pattern: release-*
           path: ${{ runner.temp }}/candidate
           merge-multiple: true
-      - name: Verify identity and seal the complete candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bin-*
+          path: ${{ runner.temp }}/bin
+      - name: Verify identity, package the binaries, and seal the complete candidate
         run: |
           python3 ../automation/scripts/release.py verify-tag ${RELEASE_DRY_RUN:+--dry-run} ${RELEASE_TAG:+--tag "$RELEASE_TAG"} --output "$RUNNER_TEMP/identity.json"
+          for system in x86_64-linux aarch64-linux; do
+            # Artifacts don't keep file modes; the archive sets them.
+            python3 ../automation/scripts/release.py binaries --artifacts "$RUNNER_TEMP/candidate" \
+              --system "$system" --bin-dir "$RUNNER_TEMP/bin/bin-$system"
+          done
           python3 ../automation/scripts/release.py seal --artifacts "$RUNNER_TEMP/candidate"
           python3 ../automation/scripts/release.py check --artifacts "$RUNNER_TEMP/candidate"
           cat "$RUNNER_TEMP/candidate/SHA256SUMS" >> "$GITHUB_STEP_SUMMARY"
@@ -210,11 +336,12 @@ jobs:
           retention-days: 30
 
   publish:
-    if: github.ref == 'refs/heads/master' && !inputs.dry_run
+    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && github.ref == 'refs/heads/master'
     name: Publish crates and complete GitHub Release after approval
     needs: candidate
     environment: release
     permissions:
+      actions: read
       contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -238,13 +365,32 @@ jobs:
           path: ${{ runner.temp }}/candidate
       - name: Reverify signed identity and reviewed bytes
         run: |
-          python3 ../automation/scripts/release.py verify-tag ${RELEASE_DRY_RUN:+--dry-run} ${RELEASE_TAG:+--tag "$RELEASE_TAG"} --output "$RUNNER_TEMP/identity.json"
+          python3 ../automation/scripts/release.py verify-tag --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/identity.json"
           python3 ../automation/scripts/release.py check --artifacts "$RUNNER_TEMP/candidate"
+      # The flake checks (clippy, formatting, deployment module and VM tests)
+      # are CI's; the release does not repeat them. Waits while CI still runs.
+      - name: Require a passing CI run for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          # shellcheck disable=SC2016 # jq variables, not shell ones
+          summary='.workflow_runs as $runs
+            | if any($runs[]; .conclusion == "success") then "success"
+              elif any($runs[]; .status != "completed") or ($runs | length) == 0 then "pending"
+              else "failure" end'
+          for attempt in $(seq 1 90); do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$commit&per_page=100" --jq "$summary")
+            case $state in
+              success) echo "CI passed for $commit"; exit 0 ;;
+              failure) echo "CI failed for $commit; fix it before publishing" >&2; exit 1 ;;
+            esac
+            echo "CI for $commit has not finished (attempt $attempt); waiting"
+            sleep 30
+          done
+          echo "CI did not finish for $commit within 45 minutes" >&2
+          exit 1
       - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
-      - uses: DeterminateSystems/flakehub-cache-action@83293488abfd33fbfb2ab084097467491c029962 # v3.22.2
-        with:
-          use-gha-cache: enabled
-          diagnostic-endpoint: ''
       - name: Publish missing versions with Cargo checksum authorization
         env:
           MAINCOPY_RELEASE_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

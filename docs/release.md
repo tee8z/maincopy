@@ -1,7 +1,8 @@
 # Releases
 
-A release publishes all five workspace crates to crates.io and exposes the signed
-GitHub tag as a Nix flake. The owner selects the version.
+A release publishes all five workspace crates to crates.io, attaches Linux
+binary archives for x86_64 and arm64, and exposes the signed GitHub tag as a Nix
+flake. The owner selects the version.
 
 The [workflow](../.github/workflows/release.yml) accepts an existing tag through a
 manual dispatch from `master`. It prepares artifacts, waits for owner approval,
@@ -20,7 +21,7 @@ Complete these repository and registry settings before the first dispatch:
 | `CARGO_REGISTRY_TOKEN` environment secret | Supply a crates.io token authorized for all five package names. Verify namespace availability or ownership before approval. |
 | Immutable releases | Enable this GitHub repository setting before publication. |
 | Actions permissions | Permit the publication job's `contents: write` permission. |
-| Builders | Use hosted `ubuntu-24.04` for x86_64 and the ARM64 runner below. Both architecture checks are required. |
+| Builders | Hosted `ubuntu-24.04` (x86_64) and `ubuntu-24.04-arm` (arm64) runners. No self-hosted runner is needed. |
 
 The workflow verifies the annotated tag and target commit against the configured
 GPG fingerprint. SSH signatures are not accepted. The tag must match the
@@ -36,22 +37,41 @@ If access is denied, confirm the setting in the repository UI before approval.
 See GitHub's [environment rules](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
 and [immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
 
-## Provision the ARM64 release runner
+## What the workflow builds
 
-Register a dedicated Ubuntu 24.04 ARM64 runner with these labels:
-`[self-hosted, linux, ARM64, maincopy-release-kvm]`.
+These jobs run in parallel once the source is verified:
 
-The host needs working hardware or nested KVM. Make `/dev/kvm` accessible to the
-runner account and Nix build users. Advertise `kvm` and `nixos-test` as Nix system
-features. Provide capacity for the 3 GiB guest and Rust/Nix builds.
+- **Release tests** run the release-script tests with the locked toolchain.
+- **Crates** package the source archive and all five crates with
+  `cargo publish --dry-run`, and record the Rust dependency inventory.
+- **Binaries** compile the five executables natively on each architecture with
+  the Rust version the flake pins.
+- **Nix** builds the package, including its test suite, on both architectures and
+  records each closure inventory.
 
-Install Git, Python 3, GPG, and passwordless sudo for the workflow's Nix and
-AppArmor setup. Use a fresh, ephemeral environment for each trusted release run.
-Restrict access through repository or runner-group controls; labels only select
-runners. Do not share this runner with untrusted pull requests or production credentials.
+A small final job packages the binaries into reproducible archives and seals
+the candidate's `SHA256SUMS`.
 
-Both architectures run `nix flake check`, including `deployment-vm`, and build
-the package. Missing KVM or runner capacity blocks publication.
+The flake checks (Clippy, formatting, the deployment module, and the
+`deployment-vm` NixOS test, which needs KVM) run in CI on x86_64. Hosted arm64
+runners have no KVM, so the VM test runs only there. The publication job
+waits for a passing CI run on the tagged commit before it uploads anything.
+
+Each push to `master` runs the compile jobs as a warm pass. They save the Cargo
+and Nix caches, and nothing else writes them: pull requests cannot change what
+a release links. A release restores them and compiles only the workspace's own
+crates. A warm pass seals and publishes nothing.
+
+## Rehearse a release
+
+A dry run checks out the dispatched commit instead of a signed tag, runs every
+job above, and uploads the sealed candidate for inspection. Its identity is
+marked `dry_run`, and both publication paths refuse it. It needs no tag,
+repository variable, or environment:
+
+~~~bash
+gh workflow run release.yml --repo tee8z/maincopy --ref <branch> -f dry_run=true
+~~~
 
 ## Prepare and sign the candidate
 
@@ -81,7 +101,7 @@ git verify-commit "$release_commit"
 git tag -s "$release_tag" "$release_commit" -m "Maincopy $release_version"
 git verify-tag "$release_tag"
 git push origin "$release_tag"
-gh workflow run release.yml --repo tee8z/maincopy --ref master -f tag="$release_tag"
+gh workflow run release.yml --repo tee8z/maincopy --ref master -f tag="$release_tag" -f dry_run=false
 ~~~
 
 Check the displayed signer against the approved fingerprint. Stop if verification
@@ -92,11 +112,13 @@ or replacing it. The dispatch starts preparation; publication still requires app
 
 Before approving the `release` environment, check:
 
-- Signature and version verification, Cargo package verification, and both Nix jobs passed.
+- Signature and version verification, Cargo package verification, both binary
+  builds, and both Nix jobs passed, and CI passed on the tagged commit.
 - External acceptance is complete for the intended release features.
 - Crate ownership, environment restrictions, and immutable releases are configured.
 - The `release-candidate` artifact contains the expected source, five crate archives,
-  lockfiles, dependency inventories, release.json, release-notes.md, and SHA256SUMS.
+  two Linux binary archives, lockfiles, dependency inventories, release.json,
+  release-notes.md, and SHA256SUMS.
 
 Download and extract `release-candidate`, then verify its manifest:
 
@@ -157,6 +179,19 @@ inputs.maincopy.url = "github:tee8z/maincopy/vX.Y.Z";
 Commit the host lockfile and check its resolved commit against release.json.
 Nix does not verify the release's GPG signer for consumers.
 Follow [deployment](deployment.md) for host configuration, credentials, and backups.
+
+The binary archives hold `bin/maincopy`, `bin/maincopyd`, `bin/maincopy-mermaid`,
+`bin/maincopy-ssh`, `bin/markdowncompiler`, and the license. They link against
+glibc 2.39 or newer. Unlike the Nix package, `maincopyd` is not wrapped: set
+`MAINCOPY_GIT_EXECUTABLE` and `MAINCOPY_SSH_EXECUTABLE` yourself.
+
+~~~bash
+release_version=X.Y.Z
+system=x86_64-linux # or aarch64-linux
+curl -fsSLO "https://github.com/tee8z/maincopy/releases/download/v$release_version/maincopy-$release_version-$system.tar.gz"
+curl -fsSLO "https://github.com/tee8z/maincopy/releases/download/v$release_version/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+~~~
 
 For Cargo installation, use the same exact version for each executable crate:
 
