@@ -26,6 +26,15 @@ PACKAGES = (
     "maincopy-server",
 )
 SYSTEMS = ("x86_64-linux", "aarch64-linux")
+# Executables in each Linux binary archive, and the ELF machine each runs on.
+BINARIES = (
+    "maincopy",
+    "maincopyd",
+    "maincopy-mermaid",
+    "maincopy-ssh",
+    "markdowncompiler",
+)
+ELF_MACHINES = {"x86_64-linux": 62, "aarch64-linux": 183}
 REPOSITORY = "tee8z/maincopy"
 CREDENTIAL_POLICY = "maincopy-release-v1"
 JSON_LIMIT = 8 * 1024 * 1024
@@ -352,8 +361,10 @@ def prepare(identity_path, directory, target):
             ) as compressed,
         ):
             shutil.copyfileobj(archive, compressed)
-    # A fresh target avoids accidentally publishing an older successful dry run.
-    require(not target.exists(), "release Cargo target must be new")
+    # Compiled dependencies may come from a cache, but never packaged crates:
+    # removing them avoids accidentally publishing an older successful dry run.
+    shutil.rmtree(target / "package", ignore_errors=True)
+    require(not (target / "package").exists(), "stale packaged crates remain")
     command(
         [
             "cargo",
@@ -403,11 +414,74 @@ def prepare(identity_path, directory, target):
     (directory / "release-notes.md").write_text(
         f"Maincopy {version}\n\nSigned tag: `{identity['tag']}`\nCommit: `{identity['commit']}`\n\n"
         f"All five crates are published on crates.io. Nix: `nix run github:{REPOSITORY}/{identity['tag']}#maincopy -- --help`.\n\n"
-        "The attached SHA256SUMS covers the source, crate archives, lockfiles, and dependency inventories. "
+        f"Linux binaries: `maincopy-{version}-<system>.tar.gz` for {' and '.join(SYSTEMS)} (glibc 2.39 or newer). "
+        "The attached SHA256SUMS covers the source, crate archives, binary archives, lockfiles, and dependency inventories. "
         "See docs/release.md in the source archive for installation and verification.\n\n"
         + notes
         + "\n"
     )
+
+
+def binary_archive_name(version, system):
+    return f"maincopy-{version}-{system}.tar.gz"
+
+
+def elf_machine(path):
+    with path.open("rb") as stream:
+        header = stream.read(20)
+    require(
+        len(header) == 20
+        and header[:4] == b"\x7fELF"
+        and header[4] == 2  # 64-bit
+        and header[5] == 1,  # little-endian
+        f"{path.name} is not a 64-bit little-endian ELF executable",
+    )
+    return int.from_bytes(header[18:20], "little")
+
+
+def package_binaries(directory, system, binaries):
+    """Archive one system's executables reproducibly beside the candidate."""
+    require(system in SYSTEMS, "unsupported binary system")
+    identity = read_json(directory / "release.json")
+    validate_identity(identity)
+    version = identity["version"]
+    require(
+        {path.name for path in binaries.iterdir()} == set(BINARIES),
+        "binary set differs from the released executables",
+    )
+    prefix = f"maincopy-{version}-{system}"
+    archive = directory / binary_archive_name(version, system)
+    require(not archive.exists(), "binary archive already exists")
+    entries = [(f"{prefix}/LICENSE", Path("LICENSE"), 0o644)]
+    for name in BINARIES:
+        path = binaries / name
+        checksum(path)
+        require(
+            elf_machine(path) == ELF_MACHINES[system],
+            f"{name} was not built for {system}",
+        )
+        entries.append((f"{prefix}/bin/{name}", path, 0o755))
+
+    def normalize(info, mode):
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        info.mtime = 0
+        info.mode = mode
+        return info
+
+    with (
+        archive.open("wb") as destination,
+        gzip.GzipFile(filename="", fileobj=destination, mode="wb", mtime=0) as compressed,
+        tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as tar,
+    ):
+        for directory_name in (prefix, f"{prefix}/bin"):
+            info = tarfile.TarInfo(directory_name)
+            info.type = tarfile.DIRTYPE
+            tar.addfile(normalize(info, 0o755))
+        for name, path, mode in entries:
+            info = normalize(tar.gettarinfo(str(path), arcname=name), mode)
+            with path.open("rb") as stream:
+                tar.addfile(info, stream)
 
 
 def artifact_names(identity):
@@ -421,6 +495,7 @@ def artifact_names(identity):
         f"maincopy-{version}-source.tar.gz",
         *(f"{name}-{version}.crate" for name in PACKAGES),
         *(f"nix-closure-{system}.json" for system in SYSTEMS),
+        *(binary_archive_name(version, system) for system in SYSTEMS),
     }
 
 
@@ -728,6 +803,10 @@ def main():
         child.add_argument("--artifacts", required=True, type=Path)
         if name == "publish-crates":
             child.add_argument("--target-dir", required=True, type=Path)
+    binaries = subcommands.add_parser("binaries")
+    binaries.add_argument("--artifacts", required=True, type=Path)
+    binaries.add_argument("--system", required=True)
+    binaries.add_argument("--bin-dir", required=True, type=Path)
     inventory = subcommands.add_parser("nix-inventory")
     inventory.add_argument("--output-path", required=True)
     inventory.add_argument("--system", required=True)
@@ -764,6 +843,8 @@ def main():
             identity,
             lambda url, **options: request_json(url, token=token, **options),
         )
+    elif args.operation == "binaries":
+        package_binaries(args.artifacts, args.system, args.bin_dir)
     elif args.operation == "nix-inventory":
         nix_inventory(args.output_path, args.system, args.output)
 

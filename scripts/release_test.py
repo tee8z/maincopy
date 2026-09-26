@@ -9,6 +9,7 @@ import os
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -75,6 +76,47 @@ class ArtifactTests(unittest.TestCase):
             lock.symlink_to("flake.lock")
             with self.assertRaisesRegex(release.ReleaseError, "regular file"):
                 release.verify_artifacts(directory)
+
+    def test_binary_archives_are_reproducible_and_architecture_checked(self):
+        def elf(path, machine):
+            header = b"\x7fELF\x02\x01" + bytes(12) + machine.to_bytes(2, "little")
+            path.write_bytes(header + b"fixture")
+            path.chmod(0o644)  # artifact downloads drop the executable bit
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in release.BINARIES:
+                elf(binaries / name, release.ELF_MACHINES["aarch64-linux"])
+            digests = []
+            for attempt in ("first", "second"):
+                directory = root / attempt
+                directory.mkdir()
+                release.write_json(directory / "release.json", identity())
+                release.package_binaries(directory, "aarch64-linux", binaries)
+                archive = directory / "maincopy-1.2.3-aarch64-linux.tar.gz"
+                digests.append(release.checksum(archive))
+            self.assertEqual(digests[0], digests[1])
+            with tarfile.open(archive) as contents:
+                members = {member.name: member for member in contents.getmembers()}
+            prefix = "maincopy-1.2.3-aarch64-linux"
+            self.assertEqual(
+                set(members),
+                {prefix, f"{prefix}/bin", f"{prefix}/LICENSE"}
+                | {f"{prefix}/bin/{name}" for name in release.BINARIES},
+            )
+            self.assertEqual(members[f"{prefix}/bin/maincopyd"].mode, 0o755)
+            self.assertEqual(members[f"{prefix}/bin/maincopyd"].mtime, 0)
+
+            wrong = root / "wrong"
+            wrong.mkdir()
+            release.write_json(wrong / "release.json", identity())
+            with self.assertRaisesRegex(release.ReleaseError, "not built for"):
+                release.package_binaries(wrong, "x86_64-linux", binaries)
+            (binaries / "maincopy").unlink()
+            with self.assertRaisesRegex(release.ReleaseError, "binary set"):
+                release.package_binaries(wrong, "aarch64-linux", binaries)
 
     def test_dry_run_candidate_can_never_publish(self):
         calls = []
