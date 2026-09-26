@@ -26,6 +26,15 @@ PACKAGES = (
     "maincopy-server",
 )
 SYSTEMS = ("x86_64-linux", "aarch64-linux")
+# Executables in each Linux binary archive, and the ELF machine each runs on.
+BINARIES = (
+    "maincopy",
+    "maincopyd",
+    "maincopy-mermaid",
+    "maincopy-ssh",
+    "markdowncompiler",
+)
+ELF_MACHINES = {"x86_64-linux": 62, "aarch64-linux": 183}
 REPOSITORY = "tee8z/maincopy"
 CREDENTIAL_POLICY = "maincopy-release-v1"
 JSON_LIMIT = 8 * 1024 * 1024
@@ -211,6 +220,32 @@ def verify_tag(tag):
     }
 
 
+def dry_run_identity():
+    """Describe the checked-out commit for a rehearsal that never publishes."""
+    version = workspace_version()
+    require(
+        not output(["git", "status", "--porcelain", "--untracked-files=normal"]),
+        "release checkout must be clean",
+    )
+    commit = output(["git", "rev-parse", "HEAD"])
+    return {
+        "format": "maincopy-release-v1",
+        "version": version,
+        "tag": f"v{version}",
+        "commit": commit,
+        # No signed tag exists yet; the commit stands in for its object.
+        "tag_object": commit,
+        "dry_run": True,
+    }
+
+
+def require_publishable(identity):
+    require(
+        not identity.get("dry_run"),
+        "a dry-run candidate is unsigned and can never be published",
+    )
+
+
 def validate_identity(identity):
     require(
         identity.get("format") == "maincopy-release-v1",
@@ -243,6 +278,8 @@ def confirm_checkout(identity):
         output(["git", "rev-parse", "HEAD"]) == identity["commit"],
         "prepared commit differs from checkout",
     )
+    if identity.get("dry_run"):
+        return
     require(
         output(["git", "rev-parse", f"refs/tags/{identity['tag']}"])
         == identity["tag_object"],
@@ -324,8 +361,10 @@ def prepare(identity_path, directory, target):
             ) as compressed,
         ):
             shutil.copyfileobj(archive, compressed)
-    # A fresh target avoids accidentally publishing an older successful dry run.
-    require(not target.exists(), "release Cargo target must be new")
+    # Compiled dependencies may come from a cache, but never packaged crates:
+    # removing them avoids accidentally publishing an older successful dry run.
+    shutil.rmtree(target / "package", ignore_errors=True)
+    require(not (target / "package").exists(), "stale packaged crates remain")
     command(
         [
             "cargo",
@@ -375,10 +414,85 @@ def prepare(identity_path, directory, target):
     (directory / "release-notes.md").write_text(
         f"Maincopy {version}\n\nSigned tag: `{identity['tag']}`\nCommit: `{identity['commit']}`\n\n"
         f"All five crates are published on crates.io. Nix: `nix run github:{REPOSITORY}/{identity['tag']}#maincopy -- --help`.\n\n"
-        "The attached SHA256SUMS covers the source, crate archives, lockfiles, and dependency inventories. "
+        f"Linux binaries: `maincopy-{version}-<system>.tar.gz`, each with a `.sha256`, for {' and '.join(SYSTEMS)} (glibc 2.39 or newer). "
+        "The attached SHA256SUMS covers the source, crate archives, binary archives, lockfiles, and dependency inventories. "
         "See docs/release.md in the source archive for installation and verification.\n\n"
         + notes
         + "\n"
+    )
+
+
+def binary_archive_name(version, system):
+    return f"maincopy-{version}-{system}.tar.gz"
+
+
+def binary_checksum_name(version, system):
+    """The archive's own checksum file, in `sha256sum --check` format."""
+    return binary_archive_name(version, system) + ".sha256"
+
+
+def checksum_line(path):
+    return f"{checksum(path)}  {path.name}\n"
+
+
+def elf_machine(path):
+    with path.open("rb") as stream:
+        header = stream.read(20)
+    require(
+        len(header) == 20
+        and header[:4] == b"\x7fELF"
+        and header[4] == 2  # 64-bit
+        and header[5] == 1,  # little-endian
+        f"{path.name} is not a 64-bit little-endian ELF executable",
+    )
+    return int.from_bytes(header[18:20], "little")
+
+
+def package_binaries(directory, system, binaries):
+    """Archive one system's executables reproducibly beside the candidate."""
+    require(system in SYSTEMS, "unsupported binary system")
+    identity = read_json(directory / "release.json")
+    validate_identity(identity)
+    version = identity["version"]
+    require(
+        {path.name for path in binaries.iterdir()} == set(BINARIES),
+        "binary set differs from the released executables",
+    )
+    prefix = f"maincopy-{version}-{system}"
+    archive = directory / binary_archive_name(version, system)
+    require(not archive.exists(), "binary archive already exists")
+    entries = [(f"{prefix}/LICENSE", Path("LICENSE"), 0o644)]
+    for name in BINARIES:
+        path = binaries / name
+        checksum(path)
+        require(
+            elf_machine(path) == ELF_MACHINES[system],
+            f"{name} was not built for {system}",
+        )
+        entries.append((f"{prefix}/bin/{name}", path, 0o755))
+
+    def normalize(info, mode):
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        info.mtime = 0
+        info.mode = mode
+        return info
+
+    with (
+        archive.open("wb") as destination,
+        gzip.GzipFile(filename="", fileobj=destination, mode="wb", mtime=0) as compressed,
+        tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as tar,
+    ):
+        for directory_name in (prefix, f"{prefix}/bin"):
+            info = tarfile.TarInfo(directory_name)
+            info.type = tarfile.DIRTYPE
+            tar.addfile(normalize(info, 0o755))
+        for name, path, mode in entries:
+            info = normalize(tar.gettarinfo(str(path), arcname=name), mode)
+            with path.open("rb") as stream:
+                tar.addfile(info, stream)
+    (directory / binary_checksum_name(version, system)).write_text(
+        checksum_line(archive)
     )
 
 
@@ -393,6 +507,8 @@ def artifact_names(identity):
         f"maincopy-{version}-source.tar.gz",
         *(f"{name}-{version}.crate" for name in PACKAGES),
         *(f"nix-closure-{system}.json" for system in SYSTEMS),
+        *(binary_archive_name(version, system) for system in SYSTEMS),
+        *(binary_checksum_name(version, system) for system in SYSTEMS),
     }
 
 
@@ -416,6 +532,13 @@ def verify_artifacts(directory, sealed=True):
         == hashes[f"maincopy-{identity['version']}-source.tar.gz"],
         "source checksum differs from prepared manifest",
     )
+    for system in SYSTEMS:
+        archive = binary_archive_name(identity["version"], system)
+        require(
+            (directory / binary_checksum_name(identity["version"], system)).read_text()
+            == f"{hashes[archive]}  {archive}\n",
+            f"{archive}.sha256 differs from the binary archive",
+        )
     lines = "".join(f"{digest}  {name}\n" for name, digest in hashes.items())
     if sealed:
         require(
@@ -530,6 +653,7 @@ def credential_configuration():
 
 def publish_crates(directory, target):
     identity, _ = verify_artifacts(directory)
+    require_publishable(identity)
     confirm_checkout(identity)
     require(
         output(["cargo", "--version"]) == identity["cargo"],
@@ -588,6 +712,7 @@ def verify_asset(asset, path):
 
 
 def publish_github(directory, identity, api):
+    require_publishable(identity)
     base = f"https://api.github.com/repos/{REPOSITORY}"
     tag = identity["tag"]
     reference = api(f"{base}/git/ref/tags/{tag}")
@@ -682,7 +807,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="operation", required=True)
     verify = subcommands.add_parser("verify-tag")
-    verify.add_argument("--tag", required=True)
+    verify.add_argument("--tag")
+    verify.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="describe the unsigned checkout for a rehearsal instead of a signed tag",
+    )
     verify.add_argument("--output", required=True, type=Path)
     preparation = subcommands.add_parser("prepare")
     preparation.add_argument("--identity", required=True, type=Path)
@@ -693,13 +823,21 @@ def main():
         child.add_argument("--artifacts", required=True, type=Path)
         if name == "publish-crates":
             child.add_argument("--target-dir", required=True, type=Path)
+    binaries = subcommands.add_parser("binaries")
+    binaries.add_argument("--artifacts", required=True, type=Path)
+    binaries.add_argument("--system", required=True)
+    binaries.add_argument("--bin-dir", required=True, type=Path)
     inventory = subcommands.add_parser("nix-inventory")
     inventory.add_argument("--output-path", required=True)
     inventory.add_argument("--system", required=True)
     inventory.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     if args.operation == "verify-tag":
-        write_json(args.output, verify_tag(args.tag))
+        if args.dry_run:
+            write_json(args.output, dry_run_identity())
+        else:
+            require(args.tag, "a release needs --tag, or --dry-run for a rehearsal")
+            write_json(args.output, verify_tag(args.tag))
     elif args.operation == "prepare":
         prepare(args.identity, args.output, args.target_dir)
     elif args.operation == "seal":
@@ -712,6 +850,7 @@ def main():
         publish_crates(args.artifacts, args.target_dir)
     elif args.operation == "publish-github":
         identity, _ = verify_artifacts(args.artifacts)
+        require_publishable(identity)
         confirm_checkout(identity)
         require(
             not unpublished_packages(identity),
@@ -724,6 +863,8 @@ def main():
             identity,
             lambda url, **options: request_json(url, token=token, **options),
         )
+    elif args.operation == "binaries":
+        package_binaries(args.artifacts, args.system, args.bin_dir)
     elif args.operation == "nix-inventory":
         nix_inventory(args.output_path, args.system, args.output)
 

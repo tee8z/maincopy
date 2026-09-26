@@ -376,7 +376,9 @@ fn offline_source_repair_reports_conflicts_and_preserves_the_current_version() {
         let conflict = run_source_configuration(&root, "deploy", expected_version);
         assert_eq!(
             conflict.status.code(),
-            Some(ProcessExit::Conflict.code().into())
+            Some(ProcessExit::Conflict.code().into()),
+            "stderr: {}",
+            String::from_utf8_lossy(&conflict.stderr)
         );
         assert!(
             String::from_utf8_lossy(&conflict.stderr)

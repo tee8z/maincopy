@@ -32,7 +32,7 @@ The final release needs fresh evidence for its exact candidate.
 1. Prepare the home server and connect SES, DNS, signers, monitoring, and encrypted B2 backups.
 2. Complete deployed acceptance and publish the first release.
 
-Release account and ARM64 runner setup can proceed alongside host preparation.
+Release account setup can proceed alongside host preparation.
 Update this plan when an integrated batch passes its final quality gate.
 
 ## Email
@@ -85,7 +85,7 @@ Follow [release](release.md) for the maintained publication procedure.
 - Select the version and finalize the [changelog](../CHANGELOG.md#unreleased).
 - Configure crates.io ownership/token, the trusted signer, protected release
   environment, and immutable GitHub Releases.
-- Provision the dedicated ARM64 KVM runner and pass both Linux architecture gates.
+- Pass both Linux architecture builds with a release dry run.
 - Prepare consistent versions, package archives, signed tag, notices, and verified artifacts.
 - Complete acceptance for the exact candidate before registry or public release uploads.
 

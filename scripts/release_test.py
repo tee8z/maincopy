@@ -9,6 +9,7 @@ import os
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -36,6 +37,11 @@ def artifacts(directory):
     manifest = identity()
     for name in release.artifact_names(manifest):
         (directory / name).write_text(name + "\n")
+    for system in release.SYSTEMS:
+        archive = directory / release.binary_archive_name("1.2.3", system)
+        (directory / release.binary_checksum_name("1.2.3", system)).write_text(
+            release.checksum_line(archive)
+        )
     manifest["crates"] = {
         name: release.checksum(directory / f"{name}-1.2.3.crate")
         for name in release.PACKAGES
@@ -59,6 +65,14 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError, "SHA256SUMS differs"):
                 release.verify_artifacts(directory)
 
+    def test_binary_archive_checksum_file_must_match_its_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            artifacts(directory)
+            (directory / "maincopy-1.2.3-x86_64-linux.tar.gz").write_text("changed")
+            with self.assertRaisesRegex(release.ReleaseError, "sha256 differs"):
+                release.verify_artifacts(directory)
+
     def test_extra_missing_and_symlink_artifacts_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -75,6 +89,73 @@ class ArtifactTests(unittest.TestCase):
             lock.symlink_to("flake.lock")
             with self.assertRaisesRegex(release.ReleaseError, "regular file"):
                 release.verify_artifacts(directory)
+
+    def test_binary_archives_are_reproducible_and_architecture_checked(self):
+        def elf(path, machine):
+            header = b"\x7fELF\x02\x01" + bytes(12) + machine.to_bytes(2, "little")
+            path.write_bytes(header + b"fixture")
+            path.chmod(0o644)  # artifact downloads drop the executable bit
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in release.BINARIES:
+                elf(binaries / name, release.ELF_MACHINES["aarch64-linux"])
+            digests = []
+            for attempt in ("first", "second"):
+                directory = root / attempt
+                directory.mkdir()
+                release.write_json(directory / "release.json", identity())
+                release.package_binaries(directory, "aarch64-linux", binaries)
+                archive = directory / "maincopy-1.2.3-aarch64-linux.tar.gz"
+                digests.append(release.checksum(archive))
+            self.assertEqual(digests[0], digests[1])
+            self.assertEqual(
+                (directory / "maincopy-1.2.3-aarch64-linux.tar.gz.sha256").read_text(),
+                f"{digests[1]}  maincopy-1.2.3-aarch64-linux.tar.gz\n",
+            )
+            with tarfile.open(archive) as contents:
+                members = {member.name: member for member in contents.getmembers()}
+            prefix = "maincopy-1.2.3-aarch64-linux"
+            self.assertEqual(
+                set(members),
+                {prefix, f"{prefix}/bin", f"{prefix}/LICENSE"}
+                | {f"{prefix}/bin/{name}" for name in release.BINARIES},
+            )
+            self.assertEqual(members[f"{prefix}/bin/maincopyd"].mode, 0o755)
+            self.assertEqual(members[f"{prefix}/bin/maincopyd"].mtime, 0)
+
+            wrong = root / "wrong"
+            wrong.mkdir()
+            release.write_json(wrong / "release.json", identity())
+            with self.assertRaisesRegex(release.ReleaseError, "not built for"):
+                release.package_binaries(wrong, "x86_64-linux", binaries)
+            (binaries / "maincopy").unlink()
+            with self.assertRaisesRegex(release.ReleaseError, "binary set"):
+                release.package_binaries(wrong, "aarch64-linux", binaries)
+
+    def test_dry_run_candidate_can_never_publish(self):
+        calls = []
+        with self.assertRaisesRegex(release.ReleaseError, "dry-run"):
+            release.publish_github(
+                Path("."),
+                identity() | {"dry_run": True},
+                lambda *arguments, **options: calls.append(arguments),
+            )
+        self.assertEqual(calls, [])
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            artifacts(directory)
+            rehearsal = release.read_json(directory / "release.json")
+            release.write_json(
+                directory / "release.json", rehearsal | {"dry_run": True}
+            )
+            (directory / "SHA256SUMS").unlink()
+            _, lines = release.verify_artifacts(directory, sealed=False)
+            (directory / "SHA256SUMS").write_text(lines)
+            with self.assertRaisesRegex(release.ReleaseError, "dry-run"):
+                release.publish_crates(directory, directory / "target")
 
     def test_partial_registry_retry_skips_only_matching_versions(self):
         manifest = identity()
@@ -695,6 +776,10 @@ class SignedTagTests(unittest.TestCase):
                     release.verify_tag("v1.2.3")["commit"],
                     run("git", "rev-parse", "HEAD"),
                 )
+                rehearsal = release.dry_run_identity()
+                self.assertTrue(rehearsal["dry_run"])
+                self.assertEqual(rehearsal["commit"], run("git", "rev-parse", "HEAD"))
+                release.validate_identity(rehearsal)
                 with (
                     patch.dict(os.environ, RELEASE_GPG_FINGERPRINT="0" * 40),
                     self.assertRaisesRegex(

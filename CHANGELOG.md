@@ -18,4 +18,4 @@ for remaining validation and deployment work.
 - Back up continuously with Litestream and server-encrypted Backblaze B2 checkpoints,
   bounded retention, and verified restore that cannot reactivate old subscriber consent.
 - Publish versioned crates and a GitHub release backed by a signed tag, usable
-  as a pinned Nix flake.
+  as a pinned Nix flake, with Linux binary archives for x86_64 and arm64.
