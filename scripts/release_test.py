@@ -76,6 +76,28 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError, "regular file"):
                 release.verify_artifacts(directory)
 
+    def test_dry_run_candidate_can_never_publish(self):
+        calls = []
+        with self.assertRaisesRegex(release.ReleaseError, "dry-run"):
+            release.publish_github(
+                Path("."),
+                identity() | {"dry_run": True},
+                lambda *arguments, **options: calls.append(arguments),
+            )
+        self.assertEqual(calls, [])
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            artifacts(directory)
+            rehearsal = release.read_json(directory / "release.json")
+            release.write_json(
+                directory / "release.json", rehearsal | {"dry_run": True}
+            )
+            (directory / "SHA256SUMS").unlink()
+            _, lines = release.verify_artifacts(directory, sealed=False)
+            (directory / "SHA256SUMS").write_text(lines)
+            with self.assertRaisesRegex(release.ReleaseError, "dry-run"):
+                release.publish_crates(directory, directory / "target")
+
     def test_partial_registry_retry_skips_only_matching_versions(self):
         manifest = identity()
         existing = {release.PACKAGES[0]: "c" * 64}
@@ -695,6 +717,10 @@ class SignedTagTests(unittest.TestCase):
                     release.verify_tag("v1.2.3")["commit"],
                     run("git", "rev-parse", "HEAD"),
                 )
+                rehearsal = release.dry_run_identity()
+                self.assertTrue(rehearsal["dry_run"])
+                self.assertEqual(rehearsal["commit"], run("git", "rev-parse", "HEAD"))
+                release.validate_identity(rehearsal)
                 with (
                     patch.dict(os.environ, RELEASE_GPG_FINGERPRINT="0" * 40),
                     self.assertRaisesRegex(

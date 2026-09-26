@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing signed release tag to prepare or retry
+        description: Existing signed release tag to prepare or retry (empty for a dry run)
         type: string
-        required: true
+        required: false
+      dry_run:
+        description: Rehearse on the dispatched commit without a tag; nothing is published
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -18,11 +23,14 @@ defaults:
 
 # Publication is never cancelled halfway through a dependency chain.
 concurrency:
-  group: maincopy-release-${{ inputs.tag }}
+  group: maincopy-release-${{ inputs.dry_run && github.ref || inputs.tag }}
   cancel-in-progress: false
 
 env:
   RELEASE_TAG: ${{ inputs.tag }}
+  RELEASE_DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+  # A dry run checks out the dispatched commit; a release, its signed tag.
+  RELEASE_REF: ${{ inputs.dry_run && github.sha || inputs.tag }}
   RELEASE_GPG_PUBLIC_KEY: ${{ vars.RELEASE_GPG_PUBLIC_KEY }}
   RELEASE_GPG_FINGERPRINT: ${{ vars.RELEASE_GPG_FINGERPRINT }}
   CARGO_BUILD_JOBS: '4'
@@ -30,7 +38,7 @@ env:
 
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' || inputs.dry_run
     name: Verify signed source and prepare all five crates
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -44,12 +52,12 @@ jobs:
       - name: Check out the candidate without executing it
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
           path: candidate
           fetch-depth: 0
           persist-credentials: false
       - name: Verify tag, signer, commit, and versions
-        run: python3 ../automation/scripts/release.py verify-tag --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/identity.json"
+        run: python3 ../automation/scripts/release.py verify-tag ${RELEASE_DRY_RUN:+--dry-run} ${RELEASE_TAG:+--tag "$RELEASE_TAG"} --output "$RUNNER_TEMP/identity.json"
       - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
       - uses: DeterminateSystems/flakehub-cache-action@83293488abfd33fbfb2ab084097467491c029962 # v3.22.2
         with:
@@ -71,7 +79,7 @@ jobs:
           retention-days: 30
 
   nix:
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' || inputs.dry_run
     name: Nix checks (${{ matrix.system }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -82,7 +90,7 @@ jobs:
           - system: x86_64-linux
             runner: ubuntu-24.04
           - system: aarch64-linux
-            runner: [self-hosted, linux, ARM64, maincopy-release-kvm]
+            runner: ubuntu-24.04-arm
     steps:
       - name: Check out trusted automation from the dispatched master revision
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -93,12 +101,12 @@ jobs:
       - name: Check out the candidate without executing it
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
           path: candidate
           fetch-depth: 0
           persist-credentials: false
       - name: Verify signed source
-        run: python3 ../automation/scripts/release.py verify-tag --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/identity.json"
+        run: python3 ../automation/scripts/release.py verify-tag ${RELEASE_DRY_RUN:+--dry-run} ${RELEASE_TAG:+--tag "$RELEASE_TAG"} --output "$RUNNER_TEMP/identity.json"
       - name: Verify native architecture and working KVM access
         env:
           RELEASE_SYSTEM: ${{ matrix.system }}
@@ -164,7 +172,7 @@ jobs:
           retention-days: 30
 
   candidate:
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' || inputs.dry_run
     name: Seal candidate checksums for review
     needs: [prepare, nix]
     runs-on: ubuntu-24.04
@@ -179,7 +187,7 @@ jobs:
       - name: Check out the candidate without executing it
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -190,7 +198,7 @@ jobs:
           merge-multiple: true
       - name: Verify identity and seal the complete candidate
         run: |
-          python3 ../automation/scripts/release.py verify-tag --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/identity.json"
+          python3 ../automation/scripts/release.py verify-tag ${RELEASE_DRY_RUN:+--dry-run} ${RELEASE_TAG:+--tag "$RELEASE_TAG"} --output "$RUNNER_TEMP/identity.json"
           python3 ../automation/scripts/release.py seal --artifacts "$RUNNER_TEMP/candidate"
           python3 ../automation/scripts/release.py check --artifacts "$RUNNER_TEMP/candidate"
           cat "$RUNNER_TEMP/candidate/SHA256SUMS" >> "$GITHUB_STEP_SUMMARY"
@@ -202,7 +210,7 @@ jobs:
           retention-days: 30
 
   publish:
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' && !inputs.dry_run
     name: Publish crates and complete GitHub Release after approval
     needs: candidate
     environment: release
@@ -220,7 +228,7 @@ jobs:
       - name: Check out the candidate without executing it
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -230,7 +238,7 @@ jobs:
           path: ${{ runner.temp }}/candidate
       - name: Reverify signed identity and reviewed bytes
         run: |
-          python3 ../automation/scripts/release.py verify-tag --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/identity.json"
+          python3 ../automation/scripts/release.py verify-tag ${RELEASE_DRY_RUN:+--dry-run} ${RELEASE_TAG:+--tag "$RELEASE_TAG"} --output "$RUNNER_TEMP/identity.json"
           python3 ../automation/scripts/release.py check --artifacts "$RUNNER_TEMP/candidate"
       - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
       - uses: DeterminateSystems/flakehub-cache-action@83293488abfd33fbfb2ab084097467491c029962 # v3.22.2

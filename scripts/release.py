@@ -211,6 +211,32 @@ def verify_tag(tag):
     }
 
 
+def dry_run_identity():
+    """Describe the checked-out commit for a rehearsal that never publishes."""
+    version = workspace_version()
+    require(
+        not output(["git", "status", "--porcelain", "--untracked-files=normal"]),
+        "release checkout must be clean",
+    )
+    commit = output(["git", "rev-parse", "HEAD"])
+    return {
+        "format": "maincopy-release-v1",
+        "version": version,
+        "tag": f"v{version}",
+        "commit": commit,
+        # No signed tag exists yet; the commit stands in for its object.
+        "tag_object": commit,
+        "dry_run": True,
+    }
+
+
+def require_publishable(identity):
+    require(
+        not identity.get("dry_run"),
+        "a dry-run candidate is unsigned and can never be published",
+    )
+
+
 def validate_identity(identity):
     require(
         identity.get("format") == "maincopy-release-v1",
@@ -243,6 +269,8 @@ def confirm_checkout(identity):
         output(["git", "rev-parse", "HEAD"]) == identity["commit"],
         "prepared commit differs from checkout",
     )
+    if identity.get("dry_run"):
+        return
     require(
         output(["git", "rev-parse", f"refs/tags/{identity['tag']}"])
         == identity["tag_object"],
@@ -530,6 +558,7 @@ def credential_configuration():
 
 def publish_crates(directory, target):
     identity, _ = verify_artifacts(directory)
+    require_publishable(identity)
     confirm_checkout(identity)
     require(
         output(["cargo", "--version"]) == identity["cargo"],
@@ -588,6 +617,7 @@ def verify_asset(asset, path):
 
 
 def publish_github(directory, identity, api):
+    require_publishable(identity)
     base = f"https://api.github.com/repos/{REPOSITORY}"
     tag = identity["tag"]
     reference = api(f"{base}/git/ref/tags/{tag}")
@@ -682,7 +712,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="operation", required=True)
     verify = subcommands.add_parser("verify-tag")
-    verify.add_argument("--tag", required=True)
+    verify.add_argument("--tag")
+    verify.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="describe the unsigned checkout for a rehearsal instead of a signed tag",
+    )
     verify.add_argument("--output", required=True, type=Path)
     preparation = subcommands.add_parser("prepare")
     preparation.add_argument("--identity", required=True, type=Path)
@@ -699,7 +734,11 @@ def main():
     inventory.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     if args.operation == "verify-tag":
-        write_json(args.output, verify_tag(args.tag))
+        if args.dry_run:
+            write_json(args.output, dry_run_identity())
+        else:
+            require(args.tag, "a release needs --tag, or --dry-run for a rehearsal")
+            write_json(args.output, verify_tag(args.tag))
     elif args.operation == "prepare":
         prepare(args.identity, args.output, args.target_dir)
     elif args.operation == "seal":
@@ -712,6 +751,7 @@ def main():
         publish_crates(args.artifacts, args.target_dir)
     elif args.operation == "publish-github":
         identity, _ = verify_artifacts(args.artifacts)
+        require_publishable(identity)
         confirm_checkout(identity)
         require(
             not unpublished_packages(identity),
