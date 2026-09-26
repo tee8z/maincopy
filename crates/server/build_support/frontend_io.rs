@@ -116,9 +116,11 @@ mod supported {
         stat.st_dev as u64
     }
 
+    // st_nlink is u64 on x86_64 Linux but u32 on aarch64 Linux.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::useless_conversion)]
     fn stat_links(stat: &Stat) -> u64 {
-        stat.st_nlink
+        u64::from(stat.st_nlink)
     }
 
     #[cfg(target_os = "macos")]
