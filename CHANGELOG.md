@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-Initial release in preparation. See the [implementation plan](docs/implementation.md)
-for remaining validation and deployment work.
+Initial release. See the [implementation plan](docs/implementation.md) for remaining
+validation work.
 
 - Publish Markdown from Git with private previews, immediate or scheduled releases,
   and control over when updated articles become public.
