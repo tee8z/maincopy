@@ -170,13 +170,9 @@ async fn create_owner(router: &Router, browser: &BrowserSession) -> String {
 async fn mail_history_observes_policy_changes_and_latched_feedback_without_rebuilding_the_router() {
     let mut harness = ProtectedAdminHarness::start_with_password().await;
     let binding = binding();
-    let view = binding.configuration.view();
     let mut policy = SubscriberPolicy {
         configuration_binding: binding.configuration_binding,
         mode: SubscriberMode::Enabled,
-        max_daily_messages: view.max_daily_messages,
-        max_daily_confirmations: view.max_daily_confirmation_messages,
-        max_campaign_recipients: view.max_campaign_recipients,
     };
     harness.runtime.mail.access = MailUiAccess::ReviewOnly(binding);
     let router = harness.router();
@@ -504,7 +500,7 @@ async fn reviewed_public_draft_retries_and_cancellation_work_while_sending_is_un
     let markup = text(response).await;
     assert!(markup.contains("Reviewed &lt;public&gt; title"));
     assert!(!markup.contains("<script>description"));
-    assert!(markup.contains("sending is not ready"));
+    assert!(markup.contains("Delivery is not ready"));
     let body = draft_body(&markup);
     let id = CampaignId(Uuid::parse_str(&input(&markup, "proposed_id")).unwrap());
     // A later private candidate must not leak into the public announcement.
@@ -606,7 +602,7 @@ async fn reviewed_public_draft_retries_and_cancellation_work_while_sending_is_un
     assert!(matches!(cancelled.state, CampaignState::Cancelled { .. }));
     assert_eq!(u64::from(cancelled.version), 2);
     let current = text(get(&unavailable, &browser, &path).await).await;
-    assert!(current.contains("This campaign is cancelled"));
+    assert!(current.contains("This article update is cancelled"));
     assert!(!current.contains("Approve sending"));
     drop((router, unavailable));
     harness.stop().await;
@@ -775,10 +771,6 @@ fn newsletter_body_with_privacy(
         ("purpose", "New articles and personal updates."),
         ("privacy_url", privacy_url),
         ("contact_address", "contact@example.com"),
-        ("max_campaign_recipients", "20"),
-        ("max_daily_messages", "100"),
-        ("max_daily_confirmation_messages", "25"),
-        ("send_interval_milliseconds", "1000"),
     ] {
         form.append_pair(name, value);
     }
@@ -979,9 +971,7 @@ async fn saving_newsletter_settings_updates_live_admission_and_all_new_configura
         initial_policy.configuration_binding
     );
     assert_eq!(durable, current.subscriber_policy());
-    assert_eq!(durable.max_daily_messages, 100);
-    assert_eq!(durable.max_daily_confirmations, 25);
-    assert_eq!(durable.max_campaign_recipients, 20);
+
     let policy = current.configuration.view().subscriptions.unwrap().view();
     assert_eq!(policy.operator_name, "A <newsletter>");
     assert_eq!(policy.postal_address, None);

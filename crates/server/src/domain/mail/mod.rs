@@ -1,4 +1,4 @@
-//! Owner-reviewed newsletter campaign content.
+//! Newsletter consent, article notifications, and delivery.
 
 mod announcement;
 pub(crate) mod campaign;

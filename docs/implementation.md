@@ -38,7 +38,7 @@ Update this plan when an integrated batch passes its final quality gate.
 ## Email
 
 Consent and attempts use the existing database. Double opt-in, removal routes,
-Owner campaign screens, SES dispatch, feedback recovery, and consent reset are implemented.
+Automatic article notifications, newsletter settings, a built-in privacy notice, SES dispatch, feedback recovery, and consent reset are implemented.
 Restore retires consent; finite backup epochs bound retained history.
 The code simplification pass and README, changelog, and operational documentation cleanup are complete.
 

@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 
 use crate::domain::mail::{
     announcement::announcement_content_digest,
-    campaign::{CampaignApproval, CampaignFence, CampaignLease},
+    campaign::{CampaignApproval, CampaignAuthority, CampaignFence, CampaignLease},
     config::{MailConfiguration, MailConfigurationCandidate},
     ses::SesCredentials,
     subscriber::SubscriberPolicy,
@@ -74,7 +74,7 @@ fn campaign(binding: &MailReviewBinding) -> Campaign {
         version: CampaignVersion::INITIAL,
         content: content(),
         configuration_binding: binding.configuration_binding,
-        created_by: UserId::from_uuid(Uuid::new_v4()),
+        created_by: CampaignAuthority::Owner(UserId::from_uuid(Uuid::new_v4())),
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
         state: CampaignState::Draft,
@@ -83,7 +83,7 @@ fn campaign(binding: &MailReviewBinding) -> Campaign {
 
 fn approval() -> CampaignApproval {
     CampaignApproval {
-        owner: UserId::from_uuid(Uuid::new_v4()),
+        owner: CampaignAuthority::Owner(UserId::from_uuid(Uuid::new_v4())),
         approved_at: OffsetDateTime::UNIX_EPOCH,
         instance_version: 1,
         audience_cutoff: 0,
@@ -123,7 +123,7 @@ fn stored_announcement_and_provider_metadata_are_safe_to_inspect() {
     assert!(preview.contains("href=\"https://example.com/posts/article\""));
     let provider = provider_panel(&binding()).into_string();
     assert!(provider.contains("Newsletter@example.com"));
-    assert!(provider.contains("2000"));
+    assert!(provider.contains("every eligible active subscriber"));
     assert!(!provider.contains("credentials.json"));
     assert!(!provider.contains("control.key"));
     assert!(!provider.contains("AKIDEXAMPLE"));
@@ -267,7 +267,7 @@ fn unavailable_mail_still_allows_cancellation_and_exact_approval_receipt_recover
         true,
     )
     .into_string();
-    assert!(controls.contains("Cancel campaign"));
+    assert!(controls.contains("Cancel article update"));
     assert!(!controls.contains("Approve sending"));
     campaign.state = CampaignState::Queued {
         approval: approval(),
@@ -308,7 +308,7 @@ fn unavailable_mail_still_allows_cancellation_and_exact_approval_receipt_recover
             true
         )
         .into_string()
-        .contains("Cancel campaign")
+        .contains("Cancel article update")
     );
 }
 
@@ -434,7 +434,8 @@ fn published_article_selection_has_a_bounded_continuation() {
         .collect::<Vec<_>>();
     let markup = published_choices(&posts).into_string();
     assert!(markup.contains("A &lt;public&gt; title"));
-    assert_eq!(markup.matches("/review\"").count(), PAGE_SIZE);
+    assert_eq!(markup.matches("<code>").count(), PAGE_SIZE);
+    assert!(!markup.contains("/review"));
     assert!(markup.contains(&format!("post_after={}", posts[PAGE_SIZE - 1].post_id)));
     assert!(!markup.contains(posts[PAGE_SIZE].post_id.as_str()));
 }
@@ -445,7 +446,7 @@ fn unknown_mutation_and_receipt_conflicts_give_distinct_recovery_instructions() 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(unknown.contains("same session"));
     assert!(unknown.contains("original operation ID"));
-    assert!(unknown.contains("Do not create another campaign"));
+    assert!(unknown.contains("Do not create another article update"));
     let (status, conflict) = command_error(CampaignCommandError::IdempotencyConflict);
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(conflict.contains("different form or browser session"));
@@ -466,16 +467,12 @@ async fn parse_form<T: DeserializeOwned>(body: &str) -> Result<T, FormRejection>
 }
 
 fn healthy_status(binding: &MailReviewBinding) -> SubscriberStatus {
-    let config = binding.configuration.view();
     SubscriberStatus {
         control_version: 1,
         mail_epoch: Some(Uuid::from_u128(1)),
         policy: Some(SubscriberPolicy {
             configuration_binding: binding.configuration_binding,
             mode: SubscriberMode::Enabled,
-            max_daily_messages: config.max_daily_messages,
-            max_daily_confirmations: config.max_daily_confirmation_messages,
-            max_campaign_recipients: config.max_campaign_recipients,
         }),
         feedback_health: FeedbackHealth::Healthy,
         last_feedback_ok_at: Some(OffsetDateTime::UNIX_EPOCH),
@@ -543,7 +540,7 @@ fn sending_capability_never_overrides_live_pause_feedback_or_configuration() {
         let controls =
             campaign_controls(&campaign, &access, &readiness, "csrf", true).into_string();
         assert!(!controls.contains("Approve sending"), "{reason}");
-        assert!(controls.contains("Cancel campaign"), "{reason}");
+        assert!(controls.contains("Cancel article update"), "{reason}");
     }
 }
 

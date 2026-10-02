@@ -108,9 +108,6 @@ impl EffectiveMailSettings {
         SubscriberPolicy {
             configuration_binding: self.configuration_binding,
             mode,
-            max_daily_messages: view.max_daily_messages,
-            max_daily_confirmations: view.max_daily_confirmation_messages,
-            max_campaign_recipients: view.max_campaign_recipients,
         }
     }
 }

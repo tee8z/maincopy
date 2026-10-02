@@ -4,7 +4,7 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use super::{PublicState, connection::PublicListener, public_router};
+use super::connection::PublicListener;
 
 /// Bound public HTTP server and its request-facing dependencies.
 pub(crate) struct PublicServer {
@@ -14,10 +14,6 @@ pub(crate) struct PublicServer {
 }
 
 impl PublicServer {
-    pub(crate) async fn bind(bind: SocketAddr, state: PublicState) -> io::Result<Self> {
-        Self::bind_router(bind, public_router(state)).await
-    }
-
     pub(crate) async fn bind_router(bind: SocketAddr, router: Router) -> io::Result<Self> {
         let listener = TcpListener::bind(bind).await?;
         let local_addr = listener.local_addr()?;
@@ -46,7 +42,7 @@ mod tests {
         domain::publication::PublicLedgerProjection,
         frontend_assets::embedded_manifest,
         render::{SiteSnapshotReader, compile_content_catalog, render_site_shell},
-        web::Readiness,
+        web::{PublicState, Readiness, public_router},
     };
     use markdown_compiler::{ContentTreeLimits, discover_content_tree, prepare_content};
 
@@ -67,9 +63,12 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_listener_serves_the_public_router() {
         let cancellation = CancellationToken::new();
-        let server = PublicServer::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), public_state())
-            .await
-            .unwrap();
+        let server = PublicServer::bind_router(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            public_router(public_state()),
+        )
+        .await
+        .unwrap();
         let address = server.local_addr;
         let serving = tokio::spawn(server.serve(cancellation.clone()));
         let client = reqwest::Client::builder()
@@ -106,7 +105,9 @@ mod tests {
         reservation.set_reuseaddr(true).unwrap();
         reservation.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
         let address = reservation.local_addr().unwrap();
-        let server = PublicServer::bind(address, public_state()).await.unwrap();
+        let server = PublicServer::bind_router(address, public_router(public_state()))
+            .await
+            .unwrap();
         assert_eq!(server.local_addr, address);
         let serving = tokio::spawn(server.serve(cancellation.clone()));
         tokio::task::yield_now().await;

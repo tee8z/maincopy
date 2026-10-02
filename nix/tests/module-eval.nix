@@ -142,9 +142,6 @@ assert
     configuration_set = "maincopy-newsletter";
     credential_file = "/run/mail-fixture/private/credentials/mail-ses";
     control_signing_key_file = "/run/mail-fixture/private/credentials/mail-controls";
-    max_campaign_recipients = 2000;
-    max_daily_messages = 5000;
-    max_daily_confirmation_messages = 100;
     send_interval_milliseconds = 1000;
     subscriptions = {
       mode = "paused";
@@ -181,11 +178,6 @@ assert pausedMail.systemd.services.maincopy.serviceConfig.TimeoutStopSec == "180
 assert rejected { mail.mode = "ses"; };
 assert rejected {
   mail = lib.recursiveUpdate mailSettings { subscriptions.mode = "enabled"; };
-};
-assert rejected {
-  mail = mailSettings // {
-    maxDailyMessages = 99;
-  };
 };
 assert typedRejected [ "mail" "credentialFile" ] {
   mail = mailSettings // {

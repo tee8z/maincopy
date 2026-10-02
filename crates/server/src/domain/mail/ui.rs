@@ -244,7 +244,7 @@ async fn require_owner(browser: RequiredBrowserSession, request: Request, next: 
         Ok(_) => admin_ui::error_response(
             StatusCode::FORBIDDEN,
             "Owner access required",
-            "Only a currently enabled Owner can inspect campaigns or manage newsletter settings.",
+            "Only a currently enabled Owner can inspect article updates or manage newsletter settings.",
             browser.request_id,
         ),
         Err(_) => UiError::Unavailable.response(browser.request_id),
@@ -299,13 +299,14 @@ async fn history(
         let readiness = SubscriberReadiness::load(&state.subscribers).await;
         let projection = state.publications.read();
         let posts = published_page(&projection, query.post_after.as_ref())?;
-        Ok(admin_ui::page_response(StatusCode::OK, "Mail campaigns", PageKind::Authenticated, html! {
-            h1 { "Mail campaigns" }
+        Ok(admin_ui::page_response(StatusCode::OK, "Newsletter", PageKind::Authenticated, html! {
+            h1 { "Newsletter" }
             p { a href="/admin/mail/settings" { "Newsletter settings" } }
             (availability_panel(&state.access, &readiness))
             section class="panel" {
-                h2 { "Review a published article" }
-                p { "Each campaign uses the current public revision. Saving a draft does not send email." }
+                h2 { "Article updates" }
+                p { "While the newsletter is enabled, publishing a new article queues one update for everyone subscribed at publication. Edits and restarts do not send it again." }
+                p { "Existing articles are listed below for reference." }
                 (published_choices(&posts))
             }
             (campaign_history(&page))
@@ -345,7 +346,7 @@ fn published_choices(posts: &[PublishedChoice<'_>]) -> Markup {
     html! {
         @if posts.is_empty() { p class="muted" { "No more published articles." } }
         @for post in posts.iter().take(PAGE_SIZE) {
-            p { a href=(format!("/admin/mail/posts/{}/review", post.post_id)) { (post.title) } " · " code { (post.post_id) } }
+            p { (post.title) " · " code { (post.post_id) } }
         }
         @if posts.len() > PAGE_SIZE {
             a href=(format!("/admin/mail?post_after={}", posts[PAGE_SIZE - 1].post_id)) { "More published articles" }
@@ -356,8 +357,8 @@ fn published_choices(posts: &[PublishedChoice<'_>]) -> Markup {
 fn campaign_history(page: &CampaignPage) -> Markup {
     html! {
         section class="panel" {
-            h2 { "Campaign history" }
-            @if page.items.is_empty() { p class="muted" { "No more campaigns." } }
+            h2 { "Delivery history" }
+            @if page.items.is_empty() { p class="muted" { "No more article updates." } }
             @for campaign in &page.items {
                 p {
                     a href=(campaign_path(campaign.campaign_id)) { (&campaign.content.subject) }
@@ -365,7 +366,7 @@ fn campaign_history(page: &CampaignPage) -> Markup {
                 }
             }
             @if let Some(cursor) = page.next_cursor {
-                a href=(format!("/admin/mail?after={}", cursor.0)) { "More campaigns" }
+                a href=(format!("/admin/mail?after={}", cursor.0)) { "More article updates" }
             }
         }
     }
@@ -474,9 +475,9 @@ async fn inspect(
         let id = campaign_id(path)?;
         let campaign = load_campaign(&state.campaigns, id).await?;
         let readiness = SubscriberReadiness::load(&state.subscribers).await;
-        Ok(admin_ui::page_response(StatusCode::OK, "Campaign", PageKind::Authenticated, html! {
-            h1 { "Campaign" }
-            p { a href="/admin/mail" { "Campaign history" } }
+        Ok(admin_ui::page_response(StatusCode::OK, "Article update", PageKind::Authenticated, html! {
+            h1 { "Article update" }
+            p { a href="/admin/mail" { "Delivery history" } }
             p { "ID: " code { (id.0) } " · Version " (u64::from(campaign.version)) }
             p { "Created " (timestamp(campaign.created_at)) " · Updated " (timestamp(campaign.updated_at)) }
             (state_panel(&campaign.state))
@@ -599,16 +600,16 @@ fn availability_panel(access: &MailUiAccess, readiness: &SubscriberReadiness) ->
         section class="panel" {
             h2 { "Mail availability" }
             @match access {
-                MailUiAccess::Unavailable => { p class="notice" { "Mail configuration is unavailable. Existing campaigns can still be inspected or cancelled." } }
+                MailUiAccess::Unavailable => { p class="notice" { "Mail configuration is unavailable. Existing article updates can still be inspected or cancelled." } }
                 MailUiAccess::ReviewOnly(binding) => {
-                    p class="notice" { "Review only. Drafts can be saved; sending is not ready and approval is disabled." }
+                    p class="notice" { "Delivery is not ready. Newsletter details and previous deliveries remain available." }
                     (provider_panel(binding))
                 }
                 MailUiAccess::DispatchReady(binding) => {
                     @if readiness.require_ready(&binding.configuration_binding).is_ok() {
-                        p { "Sending is ready. Approving a draft authorizes this announcement to be sent." }
+                        p { "Sending is ready. Publishing a new article will notify its active subscribers." }
                     } @else {
-                        p class="notice" { "Sending is not ready. New approvals are disabled until the active mail policy and delivery feedback are ready." }
+                        p class="notice" { "Sending is waiting for the newsletter to be enabled and delivery feedback to be ready." }
                     }
                     (provider_panel(binding))
                 }
@@ -662,7 +663,7 @@ fn provider_panel(binding: &MailReviewBinding) -> Markup {
     html! {
         p { "Provider: Amazon SES · Sender: " (view.sender.as_str()) " · Region: " (view.region) }
         p { "Configuration set: " (view.configuration_set) }
-        p { "Maximum recipients per campaign: " (view.max_campaign_recipients) " · Daily message budget: " (view.max_daily_messages) }
+        p { "Article notifications include every eligible active subscriber." }
         @if let Some(policy)=view.subscriptions {
             @let policy=policy.view();
             dl {
@@ -734,7 +735,7 @@ fn campaign_controls(
     );
     html! {
         section class="panel" {
-            h2 { "Campaign controls" }
+            h2 { "Delivery controls" }
             (freshness_notice(fresh))
             @if matches!(campaign.state, CampaignState::Draft) {
                 @if access.approval_binding(campaign, readiness).is_ok() {
@@ -754,7 +755,7 @@ fn campaign_controls(
                     input type="hidden" name="_csrf" value=(csrf);
                     input type="hidden" name="idempotency_key" value=(Uuid::new_v4());
                     input type="hidden" name="expected_version" value=(u64::from(campaign.version));
-                    button type="submit" disabled[!fresh] { "Cancel campaign" }
+                    button type="submit" disabled[!fresh] { "Cancel article update" }
                 }
             }
         }
@@ -762,7 +763,7 @@ fn campaign_controls(
 }
 
 fn freshness_notice(fresh: bool) -> Markup {
-    html! { @if !fresh { p class="notice" { "Sign out and sign in again before changing this campaign. Your session is no longer fresh." } } }
+    html! { @if !fresh { p class="notice" { "Sign out and sign in again before changing this article update. Your session is no longer fresh." } } }
 }
 
 fn state_panel(state: &CampaignState) -> Markup {
@@ -772,15 +773,15 @@ fn state_panel(state: &CampaignState) -> Markup {
             @match state {
                 CampaignState::Draft => { p { "This draft has not been approved." } }
                 CampaignState::Queued { .. } => { p { "Approved and waiting to send. Delivery has not been confirmed." } }
-                CampaignState::Claimed { .. } => { p { "This campaign is being sent. Final counts are not available yet." } }
+                CampaignState::Claimed { .. } => { p { "This article update is being sent. Final counts are not available yet." } }
                 CampaignState::Cancelling { .. } => { p { "Cancellation was requested. Messages already being submitted may still be sent; final counts are not available yet." } }
                 CampaignState::Completed { counts, .. } => { p { "Sending completed. Accepted means the provider accepted submission, not that a message reached an inbox." } (counts_panel(*counts)) }
-                CampaignState::Cancelled { counts, .. } => { p { "This campaign is cancelled. Previously submitted messages cannot be recalled." } (counts_panel(*counts)) }
+                CampaignState::Cancelled { counts, .. } => { p { "This article update is cancelled. Previously submitted messages cannot be recalled." } (counts_panel(*counts)) }
                 CampaignState::Unknown { counts, .. } => { p class="notice" { "Some submission outcomes are unknown. Do not resend automatically; reconcile the original attempts first." } (counts_panel(*counts)) }
                 CampaignState::Quarantined { progress, reason, .. } => {
                     @match reason {
-                        CampaignQuarantine::Restore { .. } => { p class="notice" { "Sending is paused for review after restore. Restored campaigns are never automatically resumed." } }
-                        CampaignQuarantine::FeedbackReset {..} => { p class="notice" { "The subscriber list was reset after a feedback gap. This campaign will not resume." } }
+                        CampaignQuarantine::Restore { .. } => { p class="notice" { "Sending is paused for review after restore. Restored article updates are never automatically resumed." } }
+                        CampaignQuarantine::FeedbackReset {..} => { p class="notice" { "The subscriber list was reset after a feedback gap. This article update will not resume." } }
                         CampaignQuarantine::Interrupted => { p class="notice" { "Sending was interrupted and is paused for review. Check the original attempts before considering any further action." } }
                     }
                     @match progress {
@@ -810,13 +811,13 @@ fn mutation_response(request_id: RequestId, result: Result<Campaign, UiError>) -
 
 #[derive(Debug, Error)]
 enum UiError {
-    #[error("the campaign form or route is invalid")]
+    #[error("the article update form or route is invalid")]
     InvalidInput,
-    #[error("the campaign form exceeds its byte bound")]
+    #[error("the article update form exceeds its byte bound")]
     TooLarge,
-    #[error("the campaign or public article does not exist")]
+    #[error("the article update or public article does not exist")]
     NotFound,
-    #[error("campaign state is unavailable")]
+    #[error("article update state is unavailable")]
     Unavailable,
     #[error("the reviewed content changed")]
     ReviewChanged,
@@ -828,7 +829,7 @@ enum UiError {
     DispatchUnavailable,
     #[error("prepare the public announcement")]
     Announcement(#[source] AnnouncementError),
-    #[error("apply the campaign mutation")]
+    #[error("apply the article update mutation")]
     Mutation(#[source] CampaignMutationError),
     #[error("apply the subscriber recovery mutation")]
     SubscriberMutation(#[source] SubscriberMutationError),
@@ -839,7 +840,7 @@ impl UiError {
         let (status, message) = self.description();
         admin_ui::error_response(
             status,
-            "Mail campaign request not completed",
+            "Mail article update request not completed",
             message,
             request_id,
         )
@@ -849,19 +850,19 @@ impl UiError {
         match self {
             Self::InvalidInput => (
                 StatusCode::BAD_REQUEST,
-                "The campaign form or address is invalid. Return to the campaign page and review the current values.",
+                "The article update form or address is invalid. Return to the article update page and review the current values.",
             ),
             Self::TooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "The campaign form exceeds the request limit.",
+                "The article update form exceeds the request limit.",
             ),
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
-                "The campaign or published article was not found.",
+                "The article update or published article was not found.",
             ),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Campaign state is unavailable. Retry this read before submitting another operation.",
+                "Article update state is unavailable. Retry this read before submitting another operation.",
             ),
             Self::ReviewChanged => (
                 StatusCode::CONFLICT,
@@ -873,7 +874,7 @@ impl UiError {
             ),
             Self::ConfigurationUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Mail configuration is unavailable. Existing campaigns can still be inspected or cancelled.",
+                "Mail configuration is unavailable. Existing article updates can still be inspected or cancelled.",
             ),
             Self::DispatchUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -891,9 +892,7 @@ fn announcement_error(error: AnnouncementError) -> (StatusCode, &'static str) {
         AnnouncementError::NotPublished => UiError::NotFound.description(),
         AnnouncementError::PublicationChanged => UiError::ReviewChanged.description(),
         AnnouncementError::RevisionUnavailable => UiError::Unavailable.description(),
-        AnnouncementError::InvalidSubject
-        | AnnouncementError::DescriptionTooLong
-        | AnnouncementError::BodyTooLong => (
+        AnnouncementError::InvalidSubject | AnnouncementError::BodyTooLong => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "The published title or description cannot fit the announcement template. Correct and publish the article before reviewing it again.",
         ),
@@ -904,7 +903,7 @@ fn mutation_error(error: CampaignMutationError) -> (StatusCode, &'static str) {
     match error {
         CampaignMutationError::Admission(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "The campaign operation was not admitted. Retry the original form with its original operation ID.",
+            "The article update operation was not admitted. Retry the original form with its original operation ID.",
         ),
         CampaignMutationError::Command(command) => command_error(command),
     }
@@ -914,7 +913,7 @@ fn command_error(error: CampaignCommandError) -> (StatusCode, &'static str) {
     match error {
         CampaignCommandError::Forbidden => (
             StatusCode::FORBIDDEN,
-            "A fresh Owner session is required. Sign out and sign in again before changing a campaign.",
+            "A fresh Owner session is required. Sign out and sign in again before changing a article update.",
         ),
         CampaignCommandError::ApprovalRevoked => (
             StatusCode::FORBIDDEN,
@@ -925,11 +924,11 @@ fn command_error(error: CampaignCommandError) -> (StatusCode, &'static str) {
         | CampaignCommandError::InvalidTransition
         | CampaignCommandError::StaleClaim => (
             StatusCode::CONFLICT,
-            "The campaign changed. Inspect its current state before choosing another action.",
+            "The article update changed. Inspect its current state before choosing another action.",
         ),
         CampaignCommandError::ActiveCampaign => (
             StatusCode::CONFLICT,
-            "Another campaign is active. Inspect or cancel it before creating a draft.",
+            "Another article update is active. Inspect or cancel it before creating a draft.",
         ),
         CampaignCommandError::PublicationChanged => UiError::ReviewChanged.description(),
         CampaignCommandError::ConfigurationChanged => UiError::ConfigurationChanged.description(),
@@ -937,15 +936,15 @@ fn command_error(error: CampaignCommandError) -> (StatusCode, &'static str) {
         CampaignCommandError::InvalidValue => UiError::InvalidInput.description(),
         CampaignCommandError::Capacity => (
             StatusCode::CONFLICT,
-            "The campaign history limit has been reached. Contact the server operator.",
+            "The article update history limit has been reached. Contact the server operator.",
         ),
         CampaignCommandError::IdempotencyConflict => (
             StatusCode::CONFLICT,
-            "This operation ID belongs to a different form or browser session. Inspect campaign history before starting a new operation.",
+            "This operation ID belongs to a different form or browser session. Inspect article update history before starting a new operation.",
         ),
         CampaignCommandError::OutcomeUnknown => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "The operation outcome is unknown. Inspect campaign history, or retry the original form in the same session with its original operation ID. Do not create another campaign to recover this request.",
+            "The operation outcome is unknown. Inspect article update history, or retry the original form in the same session with its original operation ID. Do not create another article update to recover this request.",
         ),
     }
 }

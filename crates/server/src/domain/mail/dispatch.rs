@@ -420,7 +420,8 @@ impl MailDispatcher {
         // outcome even during shutdown. Transport uncertainty is never retried.
         match self.client.send(&message).await {
             Ok(SendOutcome::Accepted(id)) => SubmissionOutcome::Accepted(id),
-            Ok(SendOutcome::Rejected(_) | SendOutcome::Retryable(_)) => SubmissionOutcome::Rejected,
+            Ok(SendOutcome::Rejected(_)) => SubmissionOutcome::Rejected,
+            Ok(SendOutcome::Retryable(_)) => SubmissionOutcome::Retryable,
             Ok(SendOutcome::Unknown) | Err(SesError::Unknown | SesError::InvalidResponse) => {
                 SubmissionOutcome::Unknown
             }

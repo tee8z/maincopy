@@ -110,6 +110,7 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             "canonical_publications",
             "instance_identity",
             "login_challenges",
+            "mail_article_notifications",
             "mail_attempts",
             "mail_campaign_finishes",
             "mail_campaign_receipts",
@@ -892,6 +893,7 @@ async fn application_schema_has_no_triggers_and_only_expected_explicit_indexes()
             "mail_active_address_idx",
             "mail_active_mailbox_idx",
             "mail_campaign_active_idx",
+            "mail_campaign_draft_idx",
             "mail_campaign_recipient_idx",
             "mail_confirmation_queue_idx",
             "mail_enrollment_audience_idx",
@@ -961,6 +963,8 @@ async fn identifiers_and_hashes_use_blob_storage() {
             "instance_identity.instance_id:BLOB",
             "login_challenges.challenge_digest:BLOB",
             "login_challenges.challenge_id:BLOB",
+            "mail_article_notifications.post_id:BLOB",
+            "mail_article_notifications.publication_id:BLOB",
             "mail_attempts.attempt_fence:BLOB",
             "mail_attempts.attempt_id:BLOB",
             "mail_attempts.campaign_fence:BLOB",
@@ -1057,7 +1061,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 221);
+    assert_eq!(compact_definitions.matches("check(").count(), 217);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",
@@ -1252,4 +1256,46 @@ fn retained_migrations_run_inside_transactions() {
             path.display()
         );
     }
+}
+
+#[tokio::test]
+async fn newsletter_upgrade_marks_existing_articles_without_queueing_archive_email() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("v11/maincopy.db");
+    prepare_database_file(&path).unwrap();
+    let mut connection = SqliteConnectOptions::new()
+        .filename(&path)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA application_id = 1296257113")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    MIGRATOR.run_to(11, &mut connection).await.unwrap();
+    let post = [1_u8; 16];
+    let revision = [2_u8; 32];
+    sqlx::query("INSERT INTO post_revisions VALUES (?,?,'publishable',0,'existing',NULL)")
+        .bind(post.as_slice())
+        .bind(revision.as_slice())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO canonical_publications(publication_id,command_kind,stable_post_id,pinned_post_digest,content_tree_digest,accepted_preview_digest,state,version,scheduled_at_ns,activation_at_ns,published_at_ns,current_published_digest) VALUES(?,'immediate',?,?,?,?,'published',3,0,0,0,?)")
+        .bind([3_u8;16].as_slice()).bind(post.as_slice()).bind(revision.as_slice())
+        .bind([4_u8;32].as_slice()).bind([5_u8;32].as_slice()).bind(revision.as_slice())
+        .execute(&mut connection).await.unwrap();
+    connection.close().await.unwrap();
+    let mut upgraded = bootstrap(configuration(&path)).await.unwrap();
+    let marked: Vec<Vec<u8>> = sqlx::query_scalar("SELECT post_id FROM mail_article_notifications")
+        .fetch_all(&mut upgraded._writer)
+        .await
+        .unwrap();
+    assert_eq!(marked, vec![post.to_vec()]);
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM mail_campaigns")
+        .fetch_one(&mut upgraded._writer)
+        .await
+        .unwrap();
+    assert_eq!(queued, 0);
+    upgraded.close().await.unwrap();
 }

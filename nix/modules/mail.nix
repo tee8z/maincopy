@@ -64,21 +64,6 @@ in
         configurationSet = optional resourceType "SES configuration set that publishes tagged delivery feedback.";
         credentialFile = optional pathType "Protected runtime JSON file containing the SES access key, secret key, and optional session token.";
         controlSigningKeyFile = optional pathType "Protected runtime file containing the stable 64-character lowercase hexadecimal subscriber-control key.";
-        maxCampaignRecipients = mkOption {
-          type = types.ints.between 1 100000;
-          default = 2000;
-          description = "Maximum recipients admitted for one approved campaign.";
-        };
-        maxDailyMessages = mkOption {
-          type = types.ints.between 1 1000000;
-          default = 5000;
-          description = "Persisted daily admission budget across newsletters and confirmations.";
-        };
-        maxDailyConfirmationMessages = mkOption {
-          type = types.ints.between 1 1000000;
-          default = 100;
-          description = "Confirmation admission budget within the total daily budget.";
-        };
         sendIntervalMilliseconds = mkOption {
           type = types.ints.between 100 60000;
           default = 1000;
@@ -131,10 +116,6 @@ in
       message = "Maincopy SES requires sender, region, configurationSet, credentialFile, and controlSigningKeyFile.";
     }
     {
-      assertion = !enabled || settings.maxDailyConfirmationMessages <= settings.maxDailyMessages;
-      message = "Maincopy confirmation messages must fit within the total daily mail budget.";
-    }
-    {
       assertion =
         !enabled || subscriptions == null || subscriptions.mode != "enabled" || feedback != null;
       message = "Maincopy enabled subscriptions require authenticated feedback configuration.";
@@ -150,9 +131,7 @@ in
       configuration_set = settings.configurationSet;
       credential_file = "${runtimeDir}/credentials/mail-ses";
       control_signing_key_file = "${runtimeDir}/credentials/mail-controls";
-      max_campaign_recipients = settings.maxCampaignRecipients;
-      max_daily_messages = settings.maxDailyMessages;
-      max_daily_confirmation_messages = settings.maxDailyConfirmationMessages;
+
       send_interval_milliseconds = settings.sendIntervalMilliseconds;
     }
     // lib.optionalAttrs (subscriptions != null) {

@@ -1,4 +1,4 @@
-//! Consent, budgets, and recipient attempts share the existing site transaction.
+//! Consent, delivery, and recipient attempts share the existing site transaction.
 
 use sqlx::{
     FromRow as _, QueryBuilder, Row as _, Sqlite, SqlitePool, Transaction, sqlite::SqliteRow,
@@ -34,7 +34,7 @@ use crate::{
 // copies are outside Maincopy's zeroizing domain values. Borrowed decodes avoid
 // another ordinary owned copy of mailbox, nonce, and provider identifiers.
 const ENROLLMENTS: &str = "SELECT CASE WHEN length(enrollment_id)=16 THEN enrollment_id END AS enrollment_id,CASE WHEN length(generation)=16 THEN generation END AS generation,CASE WHEN length(mailbox_digest)=32 THEN mailbox_digest END AS mailbox_digest,CASE WHEN length(CAST(address AS BLOB))<=254 THEN address END AS address,CASE WHEN length(state)<=7 THEN state END AS state,CASE WHEN length(nonce_digest)=32 THEN nonce_digest END AS nonce_digest,nonce_expires_at,pending_expires_at,created_at,confirmed_at,confirmed_sequence,confirmation_requested_at,retire_at,(address IS NULL OR length(CAST(address AS BLOB))<=254) AND (mailbox_digest IS NULL OR length(mailbox_digest)=32) AND (nonce_digest IS NULL OR length(nonce_digest)=32) AS valid_widths FROM mail_enrollments";
-const ATTEMPTS: &str = "SELECT CASE WHEN length(mail_epoch)=16 THEN mail_epoch END AS mail_epoch,CASE WHEN length(feedback_source)=32 THEN feedback_source END AS feedback_source,CASE WHEN length(attempt_id)=16 THEN attempt_id END AS attempt_id,CASE WHEN length(attempt_fence)=16 THEN attempt_fence END AS attempt_fence,CASE WHEN length(enrollment_id)=16 THEN enrollment_id END AS enrollment_id,CASE WHEN length(generation)=16 THEN generation END AS generation,CASE WHEN length(campaign_id)=16 THEN campaign_id END AS campaign_id,CASE WHEN length(campaign_fence)=16 THEN campaign_fence END AS campaign_fence,CASE WHEN length(kind)<=12 THEN kind END AS kind,CASE WHEN length(outcome)<=9 THEN outcome END AS outcome,CASE WHEN length(recipient_binding)=32 THEN recipient_binding END AS recipient_binding,CASE WHEN length(configuration_binding)=32 THEN configuration_binding END AS configuration_binding,CASE WHEN length(CAST(provider_message_id AS BLOB))<=256 THEN provider_message_id END AS provider_message_id,instance_version,budget_day,created_at,admitted_at,finished_at,retire_at,(provider_message_id IS NULL OR length(CAST(provider_message_id AS BLOB))<=256) AND (campaign_id IS NULL OR length(campaign_id)=16) AND (campaign_fence IS NULL OR length(campaign_fence)=16) AS valid_widths FROM mail_attempts";
+const ATTEMPTS: &str = "SELECT CASE WHEN length(mail_epoch)=16 THEN mail_epoch END AS mail_epoch,CASE WHEN length(feedback_source)=32 THEN feedback_source END AS feedback_source,CASE WHEN length(attempt_id)=16 THEN attempt_id END AS attempt_id,CASE WHEN length(attempt_fence)=16 THEN attempt_fence END AS attempt_fence,CASE WHEN length(enrollment_id)=16 THEN enrollment_id END AS enrollment_id,CASE WHEN length(generation)=16 THEN generation END AS generation,CASE WHEN length(campaign_id)=16 THEN campaign_id END AS campaign_id,CASE WHEN length(campaign_fence)=16 THEN campaign_fence END AS campaign_fence,CASE WHEN length(kind)<=12 THEN kind END AS kind,CASE WHEN length(outcome)<=9 THEN outcome END AS outcome,CASE WHEN length(recipient_binding)=32 THEN recipient_binding END AS recipient_binding,CASE WHEN length(configuration_binding)=32 THEN configuration_binding END AS configuration_binding,CASE WHEN length(CAST(provider_message_id AS BLOB))<=256 THEN provider_message_id END AS provider_message_id,instance_version,budget_day,created_at,admitted_at,finished_at,retire_at,retry_after,(provider_message_id IS NULL OR length(CAST(provider_message_id AS BLOB))<=256) AND (campaign_id IS NULL OR length(campaign_id)=16) AND (campaign_fence IS NULL OR length(campaign_fence)=16) AS valid_widths FROM mail_attempts";
 
 #[derive(Clone)]
 pub(crate) struct SubscriberStore {
@@ -145,7 +145,7 @@ impl SubscriberStore {
             addressed_enrollments: addressed as u64,
             retained_enrollments: retained as u64,
         };
-        let row = sqlx::query("SELECT control_version,mail_epoch,configuration_binding,length(configuration_binding) AS binding_bytes,mode,enrollment_sequence,max_daily_messages,max_daily_confirmations,max_campaign_recipients,last_feedback_ok_at,feedback_gap FROM mail_control_state WHERE singleton=1").fetch_optional(&self.readers).await?;
+        let row = sqlx::query("SELECT control_version,mail_epoch,configuration_binding,length(configuration_binding) AS binding_bytes,mode,enrollment_sequence,last_feedback_ok_at,feedback_gap FROM mail_control_state WHERE singleton=1").fetch_optional(&self.readers).await?;
         if let Some(row) = row {
             let control = ControlStatusRow::from_row(&row)?;
             status.control_version = u64::try_from(control.control_version)
@@ -445,8 +445,8 @@ impl SubscriberStore {
         limit: usize,
     ) -> Result<Vec<ConfirmationHandle>, SubscriberLoadError> {
         bounded_limit(limit)?;
-        sqlx::query("SELECT attempt.attempt_id,attempt.enrollment_id,attempt.generation,enrollment.pending_expires_at FROM mail_attempts AS attempt JOIN mail_enrollments AS enrollment ON enrollment.enrollment_id=attempt.enrollment_id AND enrollment.generation=attempt.generation WHERE attempt.kind = 'confirmation' AND attempt.outcome = 'queued' AND enrollment.state='pending' AND attempt.configuration_binding=? ORDER BY attempt.created_at,attempt.attempt_id LIMIT ?")
-            .bind(configuration_binding.as_slice()).bind(limit as i64).fetch_all(&self.readers).await?.into_iter().map(|row| Ok(ConfirmationHandle {
+        sqlx::query("SELECT attempt.attempt_id,attempt.enrollment_id,attempt.generation,enrollment.pending_expires_at FROM mail_attempts AS attempt JOIN mail_enrollments AS enrollment ON enrollment.enrollment_id=attempt.enrollment_id AND enrollment.generation=attempt.generation WHERE attempt.kind = 'confirmation' AND attempt.outcome = 'queued' AND enrollment.state='pending' AND attempt.configuration_binding=? AND attempt.retry_after<=? ORDER BY attempt.created_at,attempt.attempt_id LIMIT ?")
+            .bind(configuration_binding.as_slice()).bind(OffsetDateTime::now_utc().unix_timestamp()).bind(limit as i64).fetch_all(&self.readers).await?.into_iter().map(|row| Ok(ConfirmationHandle {
                 attempt_id: row_uuid(&row,"attempt_id")?, enrollment: row_uuid(&row,"enrollment_id")?, generation: row_uuid(&row,"generation")?,
                 pending_expires_at: stored_time(row.try_get("pending_expires_at")?)?,
             })).collect()
@@ -470,9 +470,9 @@ impl SubscriberStore {
             | CampaignState::Unknown { .. }
             | CampaignState::Quarantined { .. } => return Ok(Vec::new()),
         };
-        sqlx::query("SELECT enrollment_id,generation FROM mail_enrollments AS enrollment WHERE state = 'active' AND confirmed_sequence <= ? AND enrollment_id > ? AND NOT EXISTS (SELECT 1 FROM mail_attempts WHERE campaign_id = ? AND enrollment_id = enrollment.enrollment_id AND generation = enrollment.generation) AND (SELECT count(*) FROM mail_attempts WHERE campaign_id=?) < (SELECT max_campaign_recipients FROM mail_control_state WHERE singleton=1) ORDER BY enrollment_id LIMIT ?")
+        sqlx::query("SELECT enrollment_id,generation FROM mail_enrollments AS enrollment WHERE state = 'active' AND confirmed_sequence <= ? AND enrollment_id > ? AND NOT EXISTS (SELECT 1 FROM mail_attempts WHERE campaign_id = ? AND enrollment_id = enrollment.enrollment_id AND generation = enrollment.generation AND outcome != 'queued') ORDER BY enrollment_id LIMIT ?")
             .bind(i64::try_from(cutoff).map_err(|_| SubscriberLoadError::CorruptStoredState)?)
-            .bind(after.unwrap_or(Uuid::nil()).as_bytes().as_slice()).bind(campaign.campaign_id.0.as_bytes().as_slice()).bind(campaign.campaign_id.0.as_bytes().as_slice()).bind(limit as i64)
+            .bind(after.unwrap_or(Uuid::nil()).as_bytes().as_slice()).bind(campaign.campaign_id.0.as_bytes().as_slice()).bind(limit as i64)
             .fetch_all(&self.readers).await?.into_iter().map(|row| Ok(RecipientHandle {
                 enrollment: row_uuid(&row,"enrollment_id")?, generation: row_uuid(&row,"generation")?,
             })).collect()
@@ -491,7 +491,7 @@ impl SubscriberStore {
         {
             return Err(SubscriberLoadError::CorruptStoredState);
         }
-        let valid:bool=sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM mail_control_state WHERE singleton!=1 OR length(control_binding)!=32 OR (configuration_binding IS NOT NULL AND length(configuration_binding)!=32) OR mode NOT IN ('enabled','paused') OR (mode='enabled' AND configuration_binding IS NULL) OR enrollment_sequence<0 OR max_daily_messages NOT BETWEEN 1 AND 1000000 OR max_daily_confirmations NOT BETWEEN 1 AND max_daily_messages OR max_campaign_recipients NOT BETWEEN 1 AND 100000 OR feedback_gap NOT IN (0,1) OR (feedback_gap=1 AND last_feedback_ok_at IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM mail_enrollments WHERE confirmed_sequence>(SELECT enrollment_sequence FROM mail_control_state)) AND NOT EXISTS(SELECT 1 FROM mail_attempts WHERE instance_version>(SELECT version FROM instance_identity)) AND NOT EXISTS(SELECT 1 FROM mail_daily_budget WHERE total<0 OR total>1000000 OR confirmations<0 OR confirmations>total OR day NOT BETWEEN -4371587 AND 2932896)").fetch_one(&mut *transaction).await?;
+        let valid:bool=sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM mail_control_state WHERE singleton!=1 OR length(control_binding)!=32 OR (configuration_binding IS NOT NULL AND length(configuration_binding)!=32) OR mode NOT IN ('enabled','paused') OR (mode='enabled' AND configuration_binding IS NULL) OR enrollment_sequence<0 OR feedback_gap NOT IN (0,1) OR (feedback_gap=1 AND last_feedback_ok_at IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM mail_enrollments WHERE confirmed_sequence>(SELECT enrollment_sequence FROM mail_control_state)) AND NOT EXISTS(SELECT 1 FROM mail_attempts WHERE instance_version>(SELECT version FROM instance_identity)) AND NOT EXISTS(SELECT 1 FROM mail_daily_budget WHERE total<0 OR confirmations<0 OR confirmations>total OR day NOT BETWEEN -4371587 AND 2932896)").fetch_one(&mut *transaction).await?;
         if !valid {
             return Err(SubscriberLoadError::CorruptStoredState);
         }
@@ -611,17 +611,6 @@ fn stored_optional_time(value: Option<i64>) -> Result<Option<OffsetDateTime>, Su
     value.map(stored_time).transpose()
 }
 
-fn validate_policy(value: &SubscriberPolicy) -> Result<(), SubscriberCommandError> {
-    if !(1..=1_000_000).contains(&value.max_daily_messages)
-        || !(1..=value.max_daily_messages).contains(&value.max_daily_confirmations)
-        || !(1..=100_000).contains(&value.max_campaign_recipients)
-    {
-        Err(SubscriberCommandError::InvalidValue)
-    } else {
-        Ok(())
-    }
-}
-
 fn bounded_limit(limit: usize) -> Result<(), SubscriberLoadError> {
     if (1..=PAGE_SIZE).contains(&limit) {
         Ok(())
@@ -666,9 +655,7 @@ struct Policy {
     binding: Option<[u8; 32]>,
     enabled: bool,
     sequence: u64,
-    daily: i64,
-    confirmations: i64,
-    campaign: i64,
+
     feedback_at: Option<i64>,
 }
 
@@ -678,9 +665,7 @@ struct PolicyRow<'r> {
     binding_bytes: Option<i64>,
     mode: &'r str,
     enrollment_sequence: i64,
-    max_daily_messages: i64,
-    max_daily_confirmations: i64,
-    max_campaign_recipients: i64,
+
     last_feedback_ok_at: Option<i64>,
 }
 
@@ -702,11 +687,7 @@ impl PolicyRow<'_> {
         let value = SubscriberPolicy {
             configuration_binding: binding.unwrap_or_default(),
             mode,
-            max_daily_messages: self.max_daily_messages as u64,
-            max_daily_confirmations: self.max_daily_confirmations as u64,
-            max_campaign_recipients: self.max_campaign_recipients as u64,
         };
-        validate_policy(&value).map_err(|_| SubscriberLoadError::CorruptStoredState)?;
         if self.binding_bytes.is_some_and(|width| width != 32)
             || (mode == SubscriberMode::Enabled && binding.is_none())
         {
@@ -740,7 +721,7 @@ impl ControlStatusRow {
 }
 
 async fn policy(transaction: &mut Transaction<'_, Sqlite>) -> Result<Policy, SubscriberApplyError> {
-    let row = sqlx::query("SELECT configuration_binding,length(configuration_binding) AS binding_bytes,mode,enrollment_sequence,max_daily_messages,max_daily_confirmations,max_campaign_recipients,CASE WHEN feedback_gap=0 THEN last_feedback_ok_at END AS last_feedback_ok_at FROM mail_control_state WHERE singleton=1")
+    let row = sqlx::query("SELECT configuration_binding,length(configuration_binding) AS binding_bytes,mode,enrollment_sequence,CASE WHEN feedback_gap=0 THEN last_feedback_ok_at END AS last_feedback_ok_at FROM mail_control_state WHERE singleton=1")
         .fetch_optional(&mut **transaction).await?.ok_or(SubscriberCommandError::ControlsUnavailable)?;
     let stored = PolicyRow::from_row(&row)?;
     let configured = stored.configured().map_err(load_error)?;
@@ -750,9 +731,7 @@ async fn policy(transaction: &mut Transaction<'_, Sqlite>) -> Result<Policy, Sub
         enabled: configured.is_some_and(|value| value.mode == SubscriberMode::Enabled),
         sequence: u64::try_from(stored.enrollment_sequence)
             .map_err(|_| SubscriberApplyError::CorruptStoredState)?,
-        daily: stored.max_daily_messages,
-        confirmations: stored.max_daily_confirmations,
-        campaign: stored.max_campaign_recipients,
+
         feedback_at: stored.last_feedback_ok_at,
     })
 }
@@ -795,7 +774,7 @@ pub(crate) async fn initialize_controls(
         sqlx::query("UPDATE mail_control_state SET control_binding=?,mode='paused',last_feedback_ok_at=NULL WHERE singleton=1").bind(binding.as_slice()).execute(&mut **transaction).await?;
     } else {
         sqlx::query(
-            "INSERT INTO mail_control_state (singleton,control_binding,mail_epoch,control_version,configuration_binding,mode,enrollment_sequence,max_daily_messages,max_daily_confirmations,max_campaign_recipients,last_feedback_ok_at,feedback_gap) VALUES (1,?,?,1,NULL,'paused',0,5000,100,2000,NULL,0)",
+            "INSERT INTO mail_control_state (singleton,control_binding,mail_epoch,control_version,configuration_binding,mode,enrollment_sequence,last_feedback_ok_at,feedback_gap) VALUES (1,?,?,1,NULL,'paused',0,NULL,0)",
         )
         .bind(binding.as_slice()).bind(Uuid::new_v4().as_bytes().as_slice())
         .execute(&mut **transaction)
@@ -809,14 +788,13 @@ pub(crate) async fn set_policy(
     value: SubscriberPolicy,
     now: i64,
 ) -> Result<(), SubscriberApplyError> {
-    validate_policy(&value)?;
     cancel_obsolete_confirmations(transaction, value.configuration_binding, now).await?;
     let mode = match value.mode {
         SubscriberMode::Paused => "paused",
         SubscriberMode::Enabled => "enabled",
     };
-    let changed = sqlx::query("UPDATE mail_control_state SET control_version=control_version+1,configuration_binding=?,mode=?,max_daily_messages=?,max_daily_confirmations=?,max_campaign_recipients=?,last_feedback_ok_at=NULL WHERE singleton=1")
-        .bind(value.configuration_binding.as_slice()).bind(mode).bind(value.max_daily_messages as i64).bind(value.max_daily_confirmations as i64).bind(value.max_campaign_recipients as i64).execute(&mut **transaction).await?.rows_affected();
+    let changed = sqlx::query("UPDATE mail_control_state SET control_version=control_version+1,configuration_binding=?,mode=?,last_feedback_ok_at=NULL WHERE singleton=1")
+        .bind(value.configuration_binding.as_slice()).bind(mode).execute(&mut **transaction).await?.rows_affected();
     if changed != 1 {
         return Err(SubscriberCommandError::ControlsUnavailable.into());
     }
@@ -865,7 +843,7 @@ pub(crate) async fn require_campaign_configuration(
     binding: [u8; 32],
     now: OffsetDateTime,
 ) -> Result<(), CampaignApplyError> {
-    let policy = require_enabled(transaction, binding, now.unix_timestamp())
+    require_enabled(transaction, binding, now.unix_timestamp())
         .await
         .map_err(|error| match error {
             SubscriberApplyError::Operation(error) => CampaignApplyError::Operation(error),
@@ -891,13 +869,6 @@ pub(crate) async fn require_campaign_configuration(
                 | SubscriberCommandError::OutcomeUnknown,
             ) => CampaignApplyError::CorruptStoredState,
         })?;
-    let audience: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM mail_enrollments WHERE state='active'")
-            .fetch_one(&mut **transaction)
-            .await?;
-    if audience > policy.campaign {
-        return Err(CampaignCommandError::InvalidValue.into());
-    }
     Ok(())
 }
 
@@ -1317,18 +1288,14 @@ pub(crate) async fn audience_cutoff(
     u64::try_from(sequence.unwrap_or(0)).map_err(|_| CampaignApplyError::CorruptStoredState)
 }
 
-async fn reserve_budget(
+async fn record_admission(
     transaction: &mut Transaction<'_, Sqlite>,
-    policy: &Policy,
     day: i64,
     confirmation: bool,
-) -> Result<bool, SubscriberApplyError> {
-    sqlx::query("INSERT INTO mail_daily_budget VALUES (?,0,0) ON CONFLICT(day) DO NOTHING")
-        .bind(day)
-        .execute(&mut **transaction)
-        .await?;
-    Ok(sqlx::query("UPDATE mail_daily_budget SET total=total+1,confirmations=confirmations+? WHERE day=? AND total < ? AND confirmations+? <= ?")
-        .bind(i64::from(confirmation)).bind(day).bind(policy.daily).bind(i64::from(confirmation)).bind(policy.confirmations).execute(&mut **transaction).await?.rows_affected() == 1)
+) -> Result<(), SubscriberApplyError> {
+    sqlx::query("INSERT INTO mail_daily_budget VALUES (?,1,?) ON CONFLICT(day) DO UPDATE SET total=total+1,confirmations=confirmations+excluded.confirmations")
+        .bind(day).bind(i64::from(confirmation)).execute(&mut **transaction).await?;
+    Ok(())
 }
 
 async fn instance_version(
@@ -1576,7 +1543,7 @@ pub(crate) async fn request_enrollment(
     command: RequestEnrollment,
     now: i64,
 ) -> Result<EnrollmentRequestResult, SubscriberApplyError> {
-    let policy = require_enabled(transaction, command.configuration_binding, now).await?;
+    require_enabled(transaction, command.configuration_binding, now).await?;
     for id in [
         command.enrollment,
         command.generation,
@@ -1607,9 +1574,7 @@ pub(crate) async fn request_enrollment(
         return Ok(EnrollmentRequestResult::Unchanged);
     }
     let day = now.div_euclid(86_400);
-    if !reserve_budget(transaction, &policy, day, true).await? {
-        return Ok(EnrollmentRequestResult::Unchanged);
-    }
+    record_admission(transaction, day, true).await?;
     if let Some(prior) = prior {
         remove_enrollment(transaction, prior.id, now).await?;
     }
@@ -1741,6 +1706,7 @@ struct Attempt {
     day: i64,
     created_at: i64,
     admitted_at: Option<i64>,
+    retry_after: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1752,6 +1718,7 @@ struct AttemptRow<'r> {
     budget_day: i64,
     created_at: i64,
     retire_at: i64,
+    retry_after: i64,
     admitted_at: Option<i64>,
     finished_at: Option<i64>,
     valid_widths: bool,
@@ -1761,6 +1728,10 @@ impl AttemptRow<'_> {
     fn validate_times(&self) -> Result<(), SubscriberLoadError> {
         let created = stored_time(self.created_at)?;
         let retired = stored_time(self.retire_at)?;
+        stored_time(self.retry_after)?;
+        if self.retry_after < 0 {
+            return Err(SubscriberLoadError::CorruptStoredState);
+        }
         let admitted = stored_optional_time(self.admitted_at)?;
         let finished = stored_optional_time(self.finished_at)?;
         let day = self
@@ -1815,7 +1786,7 @@ impl AttemptRow<'_> {
                 "campaign",
                 Some(campaign),
                 Some(_),
-                "admitted" | "accepted" | "rejected" | "unknown",
+                "queued" | "admitted" | "accepted" | "rejected" | "unknown" | "cancelled",
             ) => Ok(Some(campaign)),
             _ => Err(SubscriberLoadError::CorruptStoredState),
         }
@@ -1841,6 +1812,7 @@ fn attempt(row: SqliteRow) -> Result<Attempt, SubscriberLoadError> {
     }
     stored.validate_times()?;
     Ok(Attempt {
+        retry_after: row.try_get("retry_after")?,
         mail_epoch: row_uuid(&row, "mail_epoch")?,
         feedback_source: row_bytes(&row, "feedback_source")?,
         id: row_uuid(&row, "attempt_id")?,
@@ -1883,7 +1855,7 @@ pub(crate) async fn claim_confirmation(
     command: ClaimConfirmation,
     now: i64,
 ) -> Result<DeliveryAdmission, SubscriberApplyError> {
-    let policy = require_enabled(transaction, command.configuration_binding, now).await?;
+    require_enabled(transaction, command.configuration_binding, now).await?;
     let Some(attempt) = load_attempt(transaction, command.attempt_id).await? else {
         return Ok(DeliveryAdmission::Unavailable);
     };
@@ -1893,6 +1865,9 @@ pub(crate) async fn claim_confirmation(
     }
     if attempt.outcome != AttemptOutcome::Queued {
         return Ok(DeliveryAdmission::AlreadyRecorded(attempt.outcome));
+    }
+    if attempt.retry_after > now {
+        return Ok(DeliveryAdmission::Deferred);
     }
     let Some(enrollment) = load_enrollment(transaction, attempt.enrollment).await? else {
         return Err(SubscriberApplyError::CorruptStoredState);
@@ -1913,8 +1888,8 @@ pub(crate) async fn claim_confirmation(
         return Ok(DeliveryAdmission::Unavailable);
     }
     let day = now.div_euclid(86_400);
-    if attempt.day != day && !reserve_budget(transaction, &policy, day, true).await? {
-        return Ok(DeliveryAdmission::Deferred);
+    if attempt.day != day {
+        record_admission(transaction, day, true).await?;
     }
     sqlx::query(
         "UPDATE mail_enrollments SET nonce_digest=?,nonce_expires_at=? WHERE enrollment_id=?",
@@ -1924,9 +1899,11 @@ pub(crate) async fn claim_confirmation(
     .bind(enrollment.id.as_bytes().as_slice())
     .execute(&mut **transaction)
     .await?;
+    let fence = Uuid::new_v4();
     sqlx::query(
-        "UPDATE mail_attempts SET outcome='admitted',admitted_at=?,budget_day=? WHERE attempt_id=?",
+        "UPDATE mail_attempts SET outcome='admitted',attempt_fence=?,admitted_at=?,budget_day=? WHERE attempt_id=?",
     )
+    .bind(fence.as_bytes().as_slice())
     .bind(now)
     .bind(day)
     .bind(attempt.id.as_bytes().as_slice())
@@ -1936,7 +1913,7 @@ pub(crate) async fn claim_confirmation(
         .into_permit(
             attempt.mail_epoch,
             attempt.id,
-            attempt.fence,
+            fence,
             None,
             stored_time(now).map_err(load_error)?,
         )
@@ -1968,7 +1945,7 @@ pub(crate) async fn admit_campaign_recipient(
     now: OffsetDateTime,
 ) -> Result<DeliveryAdmission, SubscriberApplyError> {
     let seconds = now.unix_timestamp();
-    let policy = require_enabled(transaction, command.configuration_binding, seconds).await?;
+    require_enabled(transaction, command.configuration_binding, seconds).await?;
     for id in [command.enrollment, command.generation, command.attempt_id] {
         random_uuid(id)?;
     }
@@ -1981,8 +1958,14 @@ pub(crate) async fn admit_campaign_recipient(
     )
     .await
     .map_err(campaign_error)?;
-    if let Some(existing) = load_campaign_attempt(transaction, &command).await? {
-        return Ok(DeliveryAdmission::AlreadyRecorded(existing.outcome));
+    let existing = load_campaign_attempt(transaction, &command).await?;
+    if let Some(attempt) = &existing {
+        if attempt.outcome != AttemptOutcome::Queued {
+            return Ok(DeliveryAdmission::AlreadyRecorded(attempt.outcome));
+        }
+        if attempt.retry_after > seconds {
+            return Ok(DeliveryAdmission::Deferred);
+        }
     }
     if load_attempt(transaction, command.attempt_id)
         .await?
@@ -2003,10 +1986,12 @@ pub(crate) async fn admit_campaign_recipient(
     if suppressed(transaction, digest, seconds).await? {
         return Ok(DeliveryAdmission::Unavailable);
     }
-    match reserve_campaign_budget(transaction, &policy, command.campaign_id, seconds).await? {
-        CampaignBudgetAdmission::Granted => {}
-        CampaignBudgetAdmission::RecipientLimit => return Ok(DeliveryAdmission::Unavailable),
-        CampaignBudgetAdmission::Deferred => return Ok(DeliveryAdmission::Deferred),
+    if let Some(attempt) = existing {
+        return retry_campaign_recipient(transaction, command, enrollment, attempt, now).await;
+    }
+    match reserve_delivery_capacity(transaction, seconds).await? {
+        DeliveryCapacity::Granted => {}
+        DeliveryCapacity::Deferred => return Ok(DeliveryAdmission::Deferred),
     }
     let day = seconds.div_euclid(86_400);
     let fence = Uuid::new_v4();
@@ -2027,36 +2012,53 @@ pub(crate) async fn admit_campaign_recipient(
         .map(DeliveryAdmission::Ready)
 }
 
-enum CampaignBudgetAdmission {
+async fn retry_campaign_recipient(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: AdmitCampaignRecipient,
+    enrollment: Enrollment,
+    attempt: Attempt,
+    now: OffsetDateTime,
+) -> Result<DeliveryAdmission, SubscriberApplyError> {
+    let fence = Uuid::new_v4();
+    let (mail_epoch, feedback_source) = current_delivery_identity(transaction).await?;
+    if attempt.mail_epoch != mail_epoch
+        || attempt.instance_version != instance_version(transaction).await?
+    {
+        return Err(SubscriberCommandError::AttemptConflict.into());
+    }
+    sqlx::query("UPDATE mail_attempts SET outcome='admitted',attempt_fence=?,campaign_fence=?,configuration_binding=?,feedback_source=?,admitted_at=?,budget_day=? WHERE attempt_id=? AND outcome='queued'")
+        .bind(fence.as_bytes().as_slice()).bind(command.campaign_fence.0.as_bytes().as_slice())
+        .bind(command.configuration_binding.as_slice()).bind(feedback_source.as_slice()).bind(now.unix_timestamp())
+        .bind(now.unix_timestamp().div_euclid(86_400)).bind(attempt.id.as_bytes().as_slice()).execute(&mut **transaction).await?;
+    enrollment
+        .into_permit(
+            mail_epoch,
+            attempt.id,
+            fence,
+            Some(command.campaign_id),
+            now,
+        )
+        .map(DeliveryAdmission::Ready)
+}
+
+enum DeliveryCapacity {
     Granted,
-    RecipientLimit,
     Deferred,
 }
 
-async fn reserve_campaign_budget(
+async fn reserve_delivery_capacity(
     transaction: &mut Transaction<'_, Sqlite>,
-    policy: &Policy,
-    campaign_id: CampaignId,
     seconds: i64,
-) -> Result<CampaignBudgetAdmission, SubscriberApplyError> {
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM mail_attempts WHERE campaign_id=?")
-        .bind(campaign_id.0.as_bytes().as_slice())
-        .fetch_one(&mut **transaction)
-        .await?;
-    if count >= policy.campaign {
-        return Ok(CampaignBudgetAdmission::RecipientLimit);
-    }
+) -> Result<DeliveryCapacity, SubscriberApplyError> {
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM mail_attempts")
         .fetch_one(&mut **transaction)
         .await?;
     if total >= MAX_ATTEMPTS {
-        return Ok(CampaignBudgetAdmission::Deferred);
+        return Ok(DeliveryCapacity::Deferred);
     }
     let day = seconds.div_euclid(86_400);
-    if !reserve_budget(transaction, policy, day, false).await? {
-        return Ok(CampaignBudgetAdmission::Deferred);
-    }
-    Ok(CampaignBudgetAdmission::Granted)
+    record_admission(transaction, day, false).await?;
+    Ok(DeliveryCapacity::Granted)
 }
 
 pub(in crate::domain::mail) fn auth_error(error: AuthApplyError) -> SubscriberApplyError {
@@ -2319,12 +2321,18 @@ pub(crate) async fn finish_attempt(
         }
         return Ok(existing.outcome);
     }
+    if matches!(command.outcome, SubmissionOutcome::Retryable) {
+        sqlx::query("UPDATE mail_attempts SET outcome='queued',admitted_at=NULL,finished_at=NULL,retry_after=? WHERE attempt_id=?")
+            .bind(now.saturating_add(60)).bind(existing.id.as_bytes().as_slice()).execute(&mut **transaction).await?;
+        return Ok(AttemptOutcome::Queued);
+    }
     let (outcome, kind, provider) = match &command.outcome {
         SubmissionOutcome::Accepted(message) => {
             (AttemptOutcome::Accepted, "accepted", Some(message.as_str()))
         }
         SubmissionOutcome::Rejected => (AttemptOutcome::Rejected, "rejected", None),
         SubmissionOutcome::Unknown => (AttemptOutcome::Unknown, "unknown", None),
+        SubmissionOutcome::Retryable => return Err(SubscriberApplyError::CorruptStoredState),
     };
     sqlx::query(
         "UPDATE mail_attempts SET outcome=?,provider_message_id=?,finished_at=? WHERE attempt_id=?",
@@ -2450,6 +2458,16 @@ pub(crate) async fn quarantine_interrupted(
     Ok(sqlx::query("UPDATE mail_attempts SET outcome='unknown',finished_at=max(admitted_at,?) WHERE outcome='admitted'").bind(now).execute(&mut **transaction).await?.rows_affected())
 }
 
+pub(crate) async fn quarantine_campaign_attempts(
+    transaction: &mut Transaction<'_, Sqlite>,
+    campaign: CampaignId,
+    now: OffsetDateTime,
+) -> Result<(), CampaignApplyError> {
+    sqlx::query("UPDATE mail_attempts SET outcome='unknown',finished_at=max(admitted_at,?) WHERE campaign_id=? AND outcome='admitted'")
+        .bind(now.unix_timestamp()).bind(campaign.0.as_bytes().as_slice()).execute(&mut **transaction).await?;
+    Ok(())
+}
+
 pub(crate) async fn campaign_counts(
     transaction: &mut Transaction<'_, Sqlite>,
     campaign: CampaignId,
@@ -2510,7 +2528,7 @@ pub(crate) async fn cleanup(
     }
     // Retiring recipient history must close campaign admission first; otherwise
     // deleting uniqueness evidence could authorize a second delivery.
-    let campaigns=sqlx::query("SELECT DISTINCT attempt.campaign_id FROM mail_attempts AS attempt JOIN mail_campaigns AS campaign ON campaign.campaign_id=attempt.campaign_id WHERE attempt.retire_at<=? AND campaign.state IN ('claimed','cancelling') LIMIT 100")
+    let campaigns=sqlx::query("SELECT DISTINCT attempt.campaign_id FROM mail_attempts AS attempt JOIN mail_campaigns AS campaign ON campaign.campaign_id=attempt.campaign_id WHERE attempt.retire_at<=? AND campaign.state IN ('queued','claimed','cancelling') LIMIT 100")
         .bind(now).fetch_all(&mut **transaction).await?;
     for row in campaigns {
         let id = CampaignId(
@@ -2606,7 +2624,7 @@ mod tests {
             initialize_controls(&mut transaction, [9; 32])
                 .await
                 .unwrap();
-            set_policy(&mut transaction, configured(100), NOW)
+            set_policy(&mut transaction, configured(), NOW)
                 .await
                 .unwrap();
             observe(&mut transaction, NOW).await.unwrap();
@@ -2664,13 +2682,10 @@ mod tests {
         .await
     }
 
-    fn configured(limit: u64) -> SubscriberPolicy {
+    fn configured() -> SubscriberPolicy {
         SubscriberPolicy {
             configuration_binding: CONFIG,
             mode: SubscriberMode::Enabled,
-            max_daily_messages: limit,
-            max_daily_confirmations: limit,
-            max_campaign_recipients: 100,
         }
     }
 
@@ -2814,7 +2829,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(cleared.address.is_none() && cleared.digest.is_none() && cleared.nonce.is_none());
-        set_policy(&mut transaction, configured(100), NOW)
+        set_policy(&mut transaction, configured(), NOW)
             .await
             .unwrap();
         observe(&mut transaction, NOW + 5).await.unwrap();
@@ -2957,10 +2972,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_and_daily_budgets_are_writer_authoritative_without_membership_disclosure() {
+    async fn readiness_and_per_address_cooldowns_do_not_block_unrelated_subscribers() {
         let mut fixture = Fixture::new().await;
         let mut transaction = fixture.connection.begin().await.unwrap();
-        set_policy(&mut transaction, configured(1), NOW)
+        set_policy(&mut transaction, configured(), NOW)
             .await
             .unwrap();
         assert!(matches!(
@@ -2977,12 +2992,7 @@ mod tests {
                 .unwrap(),
             EnrollmentRequestResult::Unchanged
         );
-        assert_eq!(
-            request_enrollment(&mut transaction, request("b@example.com", 2), NOW + 1)
-                .await
-                .unwrap(),
-            EnrollmentRequestResult::Unchanged
-        );
+        let additional = enroll(&mut transaction, "b@example.com", 2, NOW + 1).await;
         let tomorrow = NOW + 86_400;
         observe(&mut transaction, tomorrow).await.unwrap();
         assert!(matches!(
@@ -2999,7 +3009,7 @@ mod tests {
         )
         .await
         .unwrap();
-        set_policy(&mut transaction, configured(100), NOW)
+        set_policy(&mut transaction, configured(), NOW)
             .await
             .unwrap();
         observe(&mut transaction, tomorrow).await.unwrap();
@@ -3015,6 +3025,9 @@ mod tests {
                 .unwrap(),
             ControlOutcome::Changed
         );
+        remove(&mut transaction, manage(&additional), tomorrow)
+            .await
+            .unwrap();
         transaction.commit().await.unwrap();
         let status = fixture.store.status().await.unwrap();
         assert_eq!(
@@ -3027,12 +3040,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmation_reservations_charge_the_actual_send_day_before_claiming() {
+    async fn confirmations_crossing_midnight_do_not_exclude_other_subscribers() {
         let mut fixture = Fixture::new().await;
         let mut transaction = fixture.connection.begin().await.unwrap();
         let midnight = NOW.div_euclid(86_400) * 86_400 + 86_400;
         observe(&mut transaction, midnight - 1).await.unwrap();
-        set_policy(&mut transaction, configured(1), NOW)
+        set_policy(&mut transaction, configured(), NOW)
             .await
             .unwrap();
         observe(&mut transaction, midnight - 1).await.unwrap();
@@ -3043,21 +3056,21 @@ mod tests {
             claim_confirmation(&mut transaction, claim(&yesterday, 3), midnight + 2)
                 .await
                 .unwrap(),
-            DeliveryAdmission::Deferred
+            DeliveryAdmission::Ready(_)
         ));
         let today_permit = ready(
             claim_confirmation(&mut transaction, claim(&today, 4), midnight + 2)
                 .await
                 .unwrap(),
         );
-        drop(today_permit);
+        assert_eq!(today_permit.enrollment, today.enrollment);
         assert!(
             load_enrollment(&mut transaction, yesterday.enrollment)
                 .await
                 .unwrap()
                 .unwrap()
                 .nonce
-                .is_none()
+                .is_some()
         );
         transaction.commit().await.unwrap();
         fixture.store.validate_all().await.unwrap();
@@ -3237,7 +3250,7 @@ mod tests {
                 .unwrap(),
         );
         drop(permit);
-        let mut next = configured(100);
+        let mut next = configured();
         next.configuration_binding = [8; 32];
         set_policy(&mut transaction, next, NOW + 2).await.unwrap();
         let retired = load_enrollment(&mut transaction, queued.enrollment)
@@ -3900,7 +3913,7 @@ mod tests {
     async fn pending_expiry_reports_work_until_a_bounded_backlog_is_drained() {
         let mut fixture = Fixture::new().await;
         let mut transaction = fixture.connection.begin().await.unwrap();
-        set_policy(&mut transaction, configured(200), NOW)
+        set_policy(&mut transaction, configured(), NOW)
             .await
             .unwrap();
         observe(&mut transaction, NOW).await.unwrap();

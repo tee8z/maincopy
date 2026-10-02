@@ -23,10 +23,8 @@ use crate::{
         auth::store::AdminMutationKey,
         mail::{
             config::{
-                DEFAULT_CAMPAIGN_RECIPIENTS, DEFAULT_DAILY_CONFIRMATION_MESSAGES,
-                DEFAULT_DAILY_MESSAGES, DEFAULT_SEND_INTERVAL_MILLISECONDS, NewsletterSettings,
-                NewsletterSettingsCandidate, SubscriptionCandidate, SubscriptionMode,
-                SubscriptionPolicy,
+                NewsletterSettings, NewsletterSettingsCandidate, SubscriptionCandidate,
+                SubscriptionMode, SubscriptionPolicy,
             },
             privacy::notice_url,
             settings::{SettingsActivation, StoredMailSettings, UpdateMailSettings},
@@ -50,19 +48,11 @@ pub(super) struct SettingsForm {
     purpose: String,
     privacy_url: String,
     contact_address: String,
-    max_campaign_recipients: u64,
-    max_daily_messages: u64,
-    max_daily_confirmation_messages: u64,
-    send_interval_milliseconds: u64,
 }
 
 struct EditorValues {
     version: u64,
     policy: Option<SubscriptionPolicy>,
-    campaign: u64,
-    daily: u64,
-    confirmations: u64,
-    interval: u64,
 }
 
 impl EditorValues {
@@ -72,10 +62,6 @@ impl EditorValues {
             return Self {
                 version: stored.version,
                 policy: Some(view.subscriptions.clone()),
-                campaign: view.max_campaign_recipients,
-                daily: view.max_daily_messages,
-                confirmations: view.max_daily_confirmation_messages,
-                interval: view.send_interval_milliseconds,
             };
         }
         match access {
@@ -84,19 +70,11 @@ impl EditorValues {
                 Self {
                     version: 0,
                     policy: view.subscriptions.cloned(),
-                    campaign: view.max_campaign_recipients,
-                    daily: view.max_daily_messages,
-                    confirmations: view.max_daily_confirmation_messages,
-                    interval: view.send_interval.as_millis() as u64,
                 }
             }
             MailUiAccess::Unavailable => Self {
                 version: 0,
                 policy: None,
-                campaign: DEFAULT_CAMPAIGN_RECIPIENTS,
-                daily: DEFAULT_DAILY_MESSAGES,
-                confirmations: DEFAULT_DAILY_CONFIRMATION_MESSAGES,
-                interval: DEFAULT_SEND_INTERVAL_MILLISECONDS,
             },
         }
     }
@@ -138,8 +116,8 @@ async fn edit_page(
         PageKind::Authenticated,
         html! {
             h1 { "Newsletter settings" }
-            p { a href="/admin/mail" { "Return to mail campaigns" } }
-            p { "Manage signup and the public details shown to readers. Saving settings does not send a newsletter." }
+            p { a href="/admin/mail" { "Return to newsletter" } }
+            p { "Manage signup and the public details shown to readers. While enabled, new articles are emailed automatically. Resuming delivery also resumes waiting updates." }
             @if binding.is_none() {
                 p class="notice" { "You can save your newsletter details now. Signup stays paused until the email service is configured." }
             }
@@ -151,8 +129,7 @@ async fn edit_page(
                 input type="hidden" name="expected_control_version" value=(binding.map_or(0, |_| status.control_version));
                 input type="hidden" name="configuration_binding" value=(binding.map_or_else(String::new, |binding| hex(&binding.configuration_binding)));
                 (details_fields(&values, enable_available, notice_url(&state.publications.read().catalog.publication.site.base_url).as_str()))
-                (limit_fields(&values))
-                p { "Changing public details or sending limits requires fresh approval for affected campaigns and retires unsent confirmation requests. Unsubscribe links keep working." }
+                p { "Changing public details updates future messages and retires unsent confirmation requests. Readers can sign up again. Unsubscribe links keep working." }
                 button type="submit" disabled[!fresh] { "Save settings" }
             }
         },
@@ -193,27 +170,6 @@ fn details_fields(
                 input id="privacy-url" name="privacy_url" type="url" value=(policy.map_or("", |policy| if policy.privacy_url.as_str() == default_privacy_url { "" } else { policy.privacy_url.as_str() })) maxlength="2048" placeholder=(default_privacy_url);
             }
             p class="muted" { "Leave this blank to use the " a href=(default_privacy_url) { "built-in newsletter privacy notice" } ", which uses the public details above. Enter an HTTPS URL only if you want to use your own notice." }
-        }
-    }
-}
-
-fn limit_fields(values: &EditorValues) -> Markup {
-    html! {
-        fieldset {
-            legend { "Sending limits" }
-            p { label for="campaign-limit" { "Maximum recipients per campaign" }
-                input id="campaign-limit" name="max_campaign_recipients" type="number" value=(values.campaign) min="1" max="100000" required;
-            }
-            p { label for="daily-limit" { "Maximum messages per day" }
-                input id="daily-limit" name="max_daily_messages" type="number" value=(values.daily) min="1" max="1000000" required;
-            }
-            p { label for="confirmation-limit" { "Maximum confirmation emails per day" }
-                input id="confirmation-limit" name="max_daily_confirmation_messages" type="number" value=(values.confirmations) min="1" max="1000000" required;
-            }
-            p class="muted" { "Confirmations count toward the total daily message limit. Saving settings does not reset messages already counted today." }
-            p { label for="send-interval" { "Minimum time between messages (milliseconds)" }
-                input id="send-interval" name="send_interval_milliseconds" type="number" value=(values.interval) min="100" max="60000" required;
-            }
         }
     }
 }
@@ -289,10 +245,6 @@ fn validated_settings(form: SettingsForm) -> Result<NewsletterSettings, Settings
             privacy_url: form.privacy_url,
             contact_address: form.contact_address,
         },
-        max_campaign_recipients: form.max_campaign_recipients,
-        max_daily_messages: form.max_daily_messages,
-        max_daily_confirmation_messages: form.max_daily_confirmation_messages,
-        send_interval_milliseconds: form.send_interval_milliseconds,
     }
     .validate()
     .map_err(SettingsError::Validation)

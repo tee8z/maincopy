@@ -25,7 +25,7 @@ flowchart LR
 | Article Markdown, frontmatter, site metadata, and authored assets | Git/content root |
 | Release schedules, public revisions, slug and alias claims | Application SQLite database |
 | Accounts, roles, profiles, sessions, agent grants, audit, and source settings | Application SQLite database |
-| Subscriber consent, suppression, attempts, campaign approvals, and budgets | Dedicated tables in the same database |
+| Subscriber consent, suppression, attempts, article notifications, and delivery totals | Dedicated tables in the same database |
 | Listeners, paths, source mode, provider settings, and secret references | Host configuration |
 | SSH, TLS, SES, mail control, and backup secrets | Protected host files |
 | Human and agent Nostr private keys | Their devices or protected client credential store |
@@ -128,7 +128,7 @@ for human and agent commands.
 | Content, sync, preview, release | Yes | Yes | Yes |
 | Profiles, tips, users, credentials, audit | Yes | Yes | No |
 | Roles and source/instance configuration | Yes | No | No |
-| Mail campaigns and consent recovery | Owner browser; fresh for mutations | No | No |
+| Newsletter settings, delivery controls, and consent recovery | Owner browser; fresh for mutations | No | No |
 
 Account and credential changes also enforce authority over the target account.
 

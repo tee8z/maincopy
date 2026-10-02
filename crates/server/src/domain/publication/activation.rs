@@ -18,6 +18,7 @@ use crate::{
         auth::store::{
             AuthCommandError, AuthMutationError, AuthStore, SetUserStatus, UserMutationResult,
         },
+        mail::campaign::CampaignContent,
         profile::{
             ProfileCommandError, ProfileLoadError, ProfileMutationError, ProfileStore,
             SetTipRecipient, StoredTipRecipientSetting, StoredUserProfile, TipRecipientProjection,
@@ -1637,6 +1638,19 @@ impl PublicationCoordinator {
             return Err(PublicationActivationError::DurableStateMismatch);
         }
         require_candidate_digest(&candidate, &begun.candidate_site_digest)?;
+        let catalog = self.catalog_for_content_digest(&begun.content_digest)?;
+        let newsletter = CampaignContent::for_publication(
+            &catalog,
+            &candidate.snapshot,
+            &selected.stable_post_id,
+            &selected.revision,
+            begun
+                .site
+                .version
+                .checked_add(1)
+                .ok_or(PublicationActivationError::DurableStateMismatch)?,
+        )
+        .map_err(|_| PublicationActivationError::DurableStateMismatch)?;
         self.activator
             .activate(&begun.site.digest, candidate.snapshot)
             .map_err(|_| PublicationActivationError::SnapshotActivationConflict)?;
@@ -1647,6 +1661,7 @@ impl PublicationCoordinator {
             .store
             .finish_publication(FinishPublication {
                 publication_id: begun.publication_id,
+                newsletter: Some(newsletter),
                 expected_publication_version: publication_version,
                 expected_site: begun.site,
                 candidate_site_digest: begun.candidate_site_digest,
