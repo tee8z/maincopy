@@ -176,19 +176,36 @@ time {
 }
 
 .tip-cta {
-  border-block-start: 1px solid var(--border);
-  margin-block-start: 2.5rem;
-  padding-block-start: 1.5rem;
+  align-items: baseline;
+  color: var(--muted-foreground);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.875rem;
+  gap: 0.5rem 1rem;
+  margin-block-start: 2rem;
 }
 
 .tip-action {
-  background: var(--accent);
-  border-radius: 0.25rem;
-  color: var(--accent-contrast);
-  display: inline-block;
-  font-weight: 700;
-  padding: 0.6rem 0.9rem;
-  text-decoration: none;
+  color: inherit;
+  text-underline-offset: 0.2em;
+}
+
+.tip-details {
+  max-inline-size: 100%;
+  min-inline-size: 0;
+}
+
+.tip-details summary {
+  cursor: pointer;
+}
+
+.tip-details-content {
+  padding-block-start: 0.5rem;
+}
+
+.tip-recipient {
+  margin-block: 0 0.75rem;
+  overflow-wrap: anywhere;
 }
 
 .tip-recipient code {
@@ -203,7 +220,7 @@ time {
 
 .tip-qr {
   display: block;
-  inline-size: min(14rem, 100%);
+  inline-size: min(10rem, 100%);
 }
 
 .maincopy-post-navigation {

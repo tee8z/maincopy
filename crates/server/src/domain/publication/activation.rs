@@ -2349,8 +2349,6 @@ mod tests {
                  description = \"Activation tips tests.\"\n\
                  [author]\n\
                  name = \"Example Author\"\n\
-                 [tips]\n\
-                 enabled = true\n\
                  [assets]\n\
                  allowed_https_origins = []\n"
                     .to_owned(),
@@ -2710,15 +2708,9 @@ mod tests {
             })
             .await
             .unwrap();
-        coordinator
-            .set_tip_recipient(SetTipRecipient {
-                expected_version: ProfileVersion::new(1).unwrap(),
-                recipient_user_id: Some(recipient),
-                occurred_at: fixture_time(2_300),
-                audit: mutation_audit(owner, 3),
-            })
-            .await
-            .unwrap();
+        let setting = coordinator.profiles.active_tip_recipient().await.unwrap();
+        assert_eq!(setting.recipient_user_id, Some(recipient));
+        assert_eq!(setting.version, ProfileVersion::new(2).unwrap());
         assert!(coordinator.tip_recipient.is_some());
         TipStatusUsers {
             owner,

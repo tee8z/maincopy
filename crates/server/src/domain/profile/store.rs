@@ -462,6 +462,51 @@ pub(crate) async fn apply_update_profile(
         }
     }
 
+    // Browser administrators can enable their site's first recipient with one
+    // profile save. Keep agent scope boundaries and existing recipients intact.
+    if command.tips_enabled
+        && command.lightning_address.is_some()
+        && matches!(
+            command.audit.principal,
+            AuditPrincipalReference::BrowserSession { .. }
+        )
+    {
+        let setting = sqlx::query_as::<_, TipRecipientSettingRow>(
+            "SELECT recipient_user_id, version, updated_at_ns \
+             FROM site_tip_recipient WHERE singleton = 1",
+        )
+        .fetch_one(&mut **transaction)
+        .await?;
+        if setting.recipient_user_id.is_none() {
+            map_auth_apply(
+                require_principal_scope(
+                    transaction,
+                    &command.audit.principal,
+                    AdminScope::LightningManage,
+                    command.occurred_at,
+                )
+                .await,
+            )?;
+            if updated_at_ns < setting.updated_at_ns {
+                return Err(ProfileCommandError::InvalidValue.into());
+            }
+            let current_version = positive_version(setting.version)
+                .map_err(|_| ProfileApplyError::CorruptStoredState)?;
+            let next_version = checked_next_version(current_version)?;
+            let selected = sqlx::query(
+                "UPDATE site_tip_recipient SET recipient_user_id = ?, version = ?, updated_at_ns = ? \
+                 WHERE singleton = 1 AND version = ? AND recipient_user_id IS NULL",
+            )
+            .bind(command.user_id.as_uuid().as_bytes().as_slice())
+            .bind(i64::from(next_version))
+            .bind(updated_at_ns)
+            .bind(setting.version)
+            .execute(&mut **transaction)
+            .await?;
+            require_one_row(selected.rows_affected())?;
+        }
+    }
+
     let result = StoredUserProfile {
         user_id: command.user_id,
         display_name: command.display_name,

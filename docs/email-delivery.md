@@ -1,6 +1,6 @@
 # Email operations and privacy
 
-Status: email delivery is implemented. Admin-managed newsletter settings await build and regression validation. Production capture and sending remain disabled pending provider acceptance.
+Status: email delivery is implemented. Newsletter details and sending limits are managed in the admin portal. Production capture and sending remain disabled pending provider acceptance.
 
 Use this guide to configure SES, operate the mailing list, and recover interrupted delivery.
 [Implementation](implementation.md) records remaining acceptance. [Deployment](deployment.md) covers the host; [backup and restore](backup-restore.md) covers encrypted checkpoints.
