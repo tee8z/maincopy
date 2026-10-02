@@ -28,6 +28,7 @@ use crate::{
                 NewsletterSettingsCandidate, SubscriptionCandidate, SubscriptionMode,
                 SubscriptionPolicy,
             },
+            privacy::notice_url,
             settings::{SettingsActivation, StoredMailSettings, UpdateMailSettings},
             subscriber::{SubscriberCommandError, store::SubscriberMutationError},
         },
@@ -149,7 +150,7 @@ async fn edit_page(
                 input type="hidden" name="expected_version" value=(values.version);
                 input type="hidden" name="expected_control_version" value=(binding.map_or(0, |_| status.control_version));
                 input type="hidden" name="configuration_binding" value=(binding.map_or_else(String::new, |binding| hex(&binding.configuration_binding)));
-                (details_fields(&values, enable_available))
+                (details_fields(&values, enable_available, notice_url(&state.publications.read().catalog.publication.site.base_url).as_str()))
                 (limit_fields(&values))
                 p { "Changing public details or sending limits requires fresh approval for affected campaigns and retires unsent confirmation requests. Unsubscribe links keep working." }
                 button type="submit" disabled[!fresh] { "Save settings" }
@@ -158,7 +159,11 @@ async fn edit_page(
     ))
 }
 
-fn details_fields(values: &EditorValues, enable_available: bool) -> Markup {
+fn details_fields(
+    values: &EditorValues,
+    enable_available: bool,
+    default_privacy_url: &str,
+) -> Markup {
     let policy = values.policy.as_ref().map(SubscriptionPolicy::view);
     let enabled =
         enable_available && policy.is_some_and(|policy| policy.mode == SubscriptionMode::Enabled);
@@ -184,10 +189,10 @@ fn details_fields(values: &EditorValues, enable_available: bool) -> Markup {
             p { label for="newsletter-purpose" { "What readers are subscribing to" }
                 textarea id="newsletter-purpose" name="purpose" rows="3" maxlength="2000" required { (policy.map_or("", |policy| policy.purpose)) }
             }
-            p { label for="privacy-url" { "Privacy notice URL" }
-                input id="privacy-url" name="privacy_url" type="url" value=(policy.map_or("", |policy| policy.privacy_url.as_str())) maxlength="2048" placeholder="https://" required;
+            p { label for="privacy-url" { "Custom privacy notice URL (optional)" }
+                input id="privacy-url" name="privacy_url" type="url" value=(policy.map_or("", |policy| if policy.privacy_url.as_str() == default_privacy_url { "" } else { policy.privacy_url.as_str() })) maxlength="2048" placeholder=(default_privacy_url);
             }
-            p class="muted" { "These details appear on signup pages and in emails. The privacy notice must use HTTPS." }
+            p class="muted" { "Leave this blank to use the " a href=(default_privacy_url) { "built-in newsletter privacy notice" } ", which uses the public details above. Enter an HTTPS URL only if you want to use your own notice." }
         }
     }
 }
@@ -231,7 +236,11 @@ async fn save_settings(
     state: &MailUiState,
     form: Result<Form<SettingsForm>, FormRejection>,
 ) -> Result<Response, SettingsError> {
-    let form = decode_form(form).map_err(SettingsError::Form)?;
+    let mut form = decode_form(form).map_err(SettingsError::Form)?;
+    if form.privacy_url.is_empty() {
+        form.privacy_url =
+            notice_url(&state.publications.read().catalog.publication.site.base_url).to_string();
+    }
     let operation =
         AdminMutationKey(canonical_uuid(&form.idempotency_key).map_err(SettingsError::Form)?);
     let expected_version = form.expected_version;

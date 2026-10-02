@@ -189,7 +189,7 @@ async fn bounded_body(request: Request, next: Next) -> Response {
     }
 }
 
-async fn private_response(request: Request, next: Next) -> Response {
+pub(super) async fn private_response(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
@@ -544,7 +544,7 @@ fn policy_notice(policy: Option<&SubscriptionPolicy>) -> Markup {
     }
 }
 
-fn page(status: StatusCode, title: &str, content: Markup) -> Response {
+pub(super) fn page(status: StatusCode, title: &str, content: Markup) -> Response {
     // Content includes only public policy and static text. Forms deliberately
     // omit action: the browser posts to the current token URL without copying
     // the bearer value into a response, hidden field or third-party resource.

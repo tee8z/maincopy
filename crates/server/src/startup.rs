@@ -37,6 +37,7 @@ use crate::{
             config::MailConfiguration,
             dispatch::MailDispatcher,
             feedback::FeedbackWorker,
+            privacy,
             retention::MailRetention,
             runtime::{PreparedMail, prepare_mail},
             ui::MailUiState,
@@ -1270,12 +1271,22 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         snapshots,
         readiness: readiness.clone(),
     };
+    let privacy_routes = privacy::router(database.subscribers.clone(), mail);
     let public_server = match mail_routes {
         Some(routes) => {
-            PublicServer::bind_router(public_bind, public_router_with_routes(public_state, routes))
-                .await
+            PublicServer::bind_router(
+                public_bind,
+                public_router_with_routes(public_state, routes.merge(privacy_routes)),
+            )
+            .await
         }
-        None => PublicServer::bind(public_bind, public_state).await,
+        None => {
+            PublicServer::bind_router(
+                public_bind,
+                public_router_with_routes(public_state, privacy_routes),
+            )
+            .await
+        }
     }
     .map_err(|error| startup_failure(StartupStage::Listeners, "bind the public listener", error))?;
     tracing::info!(bind = %public_server.local_addr, "public listener bound");

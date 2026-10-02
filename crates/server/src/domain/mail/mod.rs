@@ -9,6 +9,7 @@ pub(crate) mod dispatch;
 pub(crate) mod feedback;
 mod identity;
 mod message;
+pub(crate) mod privacy;
 pub(crate) mod public;
 pub(crate) mod retention;
 pub(crate) mod runtime;

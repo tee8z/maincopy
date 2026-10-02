@@ -69,7 +69,10 @@ Keep the provider and control key configured while addresses exist. Pause signup
 
 1. Sign in with a fresh Owner session.
 2. Open **Mail → Newsletter settings**.
-3. Enter the public operator name, monitored contact email, newsletter purpose, and HTTPS privacy notice URL.
+3. Enter the public operator name, monitored contact email, and newsletter purpose.
+   Leave the optional privacy notice URL blank to use `/email/privacy` on your public site.
+   Maincopy serves this notice from the saved details, including while delivery is paused
+   or provider credentials are not configured. Supply an HTTPS URL to use your own notice.
 4. Enter a postal address only if you want or need to publish one.
 5. Set campaign, daily message, confirmation, and pacing limits.
 6. Save with signup and sending **Paused** until provider acceptance is complete.
