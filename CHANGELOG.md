@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 0.1.3
+## 0.1.4
 
 - Recover v0.1.0 published snapshots when upgrading the frontend. Verify the
   retained content against the frozen v0.1.0 frontend before installing the new
