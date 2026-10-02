@@ -20,6 +20,7 @@ use crate::domain::auth::store::{
 };
 use crate::domain::mail::{
     campaign::Campaign,
+    settings::UpdateMailSettings,
     store::{
         ApproveCampaign, CampaignCommandError, CampaignStore, CancelCampaign, ClaimCampaign,
         CreateCampaign, FinishCampaign, RenewCampaignClaim,
@@ -111,6 +112,10 @@ impl MutationSender {
 }
 
 pub(crate) enum Mutation {
+    UpdateMailSettings {
+        command: UpdateMailSettings,
+        respond_to: oneshot::Sender<Result<u64, SubscriberCommandError>>,
+    },
     BeginMailFeedbackPoll {
         binding: [u8; 32],
         run_id: uuid::Uuid,

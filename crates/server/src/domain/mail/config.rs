@@ -1,4 +1,5 @@
-//! Host-owned mail settings. Valid configuration is not dispatch authorization:
+//! Host provider configuration and validated public newsletter settings.
+//! Valid configuration is not dispatch authorization:
 //! startup must also admit protected credentials and a current subscriber authority.
 
 use std::{
@@ -19,13 +20,13 @@ mod subscriptions;
 use crate::config::{
     ConfigurationDiagnostic, ConfigurationErrors, ConfigurationValidationCode, SecretFileReference,
 };
-use subscriptions::SubscriptionCandidate;
+pub(super) use subscriptions::SubscriptionCandidate;
 pub(crate) use subscriptions::{SubscriptionMode, SubscriptionPolicy};
 
-const DEFAULT_CAMPAIGN_RECIPIENTS: u64 = 2_000;
-const DEFAULT_DAILY_MESSAGES: u64 = 5_000;
-const DEFAULT_DAILY_CONFIRMATION_MESSAGES: u64 = 100;
-const DEFAULT_SEND_INTERVAL_MILLISECONDS: u64 = 1_000;
+pub(super) const DEFAULT_CAMPAIGN_RECIPIENTS: u64 = 2_000;
+pub(super) const DEFAULT_DAILY_MESSAGES: u64 = 5_000;
+pub(super) const DEFAULT_DAILY_CONFIRMATION_MESSAGES: u64 = 100;
+pub(super) const DEFAULT_SEND_INTERVAL_MILLISECONDS: u64 = 1_000;
 const MAX_CAMPAIGN_RECIPIENTS: u64 = 100_000;
 const MAX_DAILY_MESSAGES: u64 = 1_000_000;
 
@@ -123,7 +124,9 @@ impl SesMailConfiguration {
             let view = policy.view();
             for value in [
                 view.operator_name,
-                view.postal_address,
+                // Keep existing bindings unchanged when an address is supplied.
+                // An omitted address uses the otherwise-invalid empty value.
+                view.postal_address.unwrap_or_default(),
                 view.purpose,
                 view.privacy_url.as_str(),
                 view.contact_address.as_str(),
@@ -301,32 +304,50 @@ impl SesCandidate {
     }
 
     fn limits(&self, diagnostics: &mut Vec<ConfigurationDiagnostic>) -> Option<MailLimits> {
-        let campaign = bounded_limit(
+        MailLimits::validate(
             self.max_campaign_recipients
                 .unwrap_or(DEFAULT_CAMPAIGN_RECIPIENTS),
+            self.max_daily_messages.unwrap_or(DEFAULT_DAILY_MESSAGES),
+            self.max_daily_confirmation_messages
+                .unwrap_or(DEFAULT_DAILY_CONFIRMATION_MESSAGES),
+            self.send_interval_milliseconds
+                .unwrap_or(DEFAULT_SEND_INTERVAL_MILLISECONDS),
+            diagnostics,
+        )
+    }
+}
+
+impl MailLimits {
+    fn validate(
+        campaign: u64,
+        daily: u64,
+        confirmation: u64,
+        interval: u64,
+        diagnostics: &mut Vec<ConfigurationDiagnostic>,
+    ) -> Option<Self> {
+        let campaign = bounded_limit(
+            campaign,
             1,
             MAX_CAMPAIGN_RECIPIENTS,
             "mail.max_campaign_recipients",
             diagnostics,
         );
         let daily = bounded_limit(
-            self.max_daily_messages.unwrap_or(DEFAULT_DAILY_MESSAGES),
+            daily,
             1,
             MAX_DAILY_MESSAGES,
             "mail.max_daily_messages",
             diagnostics,
         );
         let confirmation = bounded_limit(
-            self.max_daily_confirmation_messages
-                .unwrap_or(DEFAULT_DAILY_CONFIRMATION_MESSAGES),
+            confirmation,
             1,
             MAX_DAILY_MESSAGES,
             "mail.max_daily_confirmation_messages",
             diagnostics,
         );
         let interval = bounded_limit(
-            self.send_interval_milliseconds
-                .unwrap_or(DEFAULT_SEND_INTERVAL_MILLISECONDS),
+            interval,
             100,
             60_000,
             "mail.send_interval_milliseconds",
@@ -356,6 +377,7 @@ impl SesCandidate {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct MailLimits {
     campaign: u64,
     daily: u64,
@@ -437,6 +459,74 @@ fn in_nix_store(path: &Path) -> bool {
         }
     }
     normalized.starts_with("/nix/store")
+}
+
+/// Validated, public newsletter settings owned by the administration portal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NewsletterSettings {
+    subscriptions: SubscriptionPolicy,
+    limits: MailLimits,
+}
+
+pub(super) struct NewsletterSettingsCandidate {
+    pub subscriptions: SubscriptionCandidate,
+    pub max_campaign_recipients: u64,
+    pub max_daily_messages: u64,
+    pub max_daily_confirmation_messages: u64,
+    pub send_interval_milliseconds: u64,
+}
+
+pub(super) struct NewsletterSettingsView<'settings> {
+    pub subscriptions: &'settings SubscriptionPolicy,
+    pub max_campaign_recipients: u64,
+    pub max_daily_messages: u64,
+    pub max_daily_confirmation_messages: u64,
+    pub send_interval_milliseconds: u64,
+}
+
+impl NewsletterSettingsCandidate {
+    pub(super) fn validate(self) -> Result<NewsletterSettings, ConfigurationErrors> {
+        let mut diagnostics = Vec::new();
+        let subscriptions = self.subscriptions.validate(&mut diagnostics);
+        let limits = MailLimits::validate(
+            self.max_campaign_recipients,
+            self.max_daily_messages,
+            self.max_daily_confirmation_messages,
+            self.send_interval_milliseconds,
+            &mut diagnostics,
+        );
+        match (subscriptions, limits) {
+            (Some(subscriptions), Some(limits)) => Ok(NewsletterSettings {
+                subscriptions,
+                limits,
+            }),
+            _ => Err(ConfigurationErrors::from_diagnostics(diagnostics)),
+        }
+    }
+}
+
+impl NewsletterSettings {
+    pub(super) fn view(&self) -> NewsletterSettingsView<'_> {
+        NewsletterSettingsView {
+            subscriptions: &self.subscriptions,
+            max_campaign_recipients: self.limits.campaign,
+            max_daily_messages: self.limits.daily,
+            max_daily_confirmation_messages: self.limits.confirmation,
+            send_interval_milliseconds: self.limits.interval_milliseconds,
+        }
+    }
+}
+
+impl SesMailConfiguration {
+    pub(super) fn with_newsletter_settings(&self, settings: &NewsletterSettings) -> Self {
+        let mut configuration = self.clone();
+        configuration.subscriptions = Some(settings.subscriptions.clone());
+        configuration.max_campaign_recipients = settings.limits.campaign;
+        configuration.max_daily_messages = settings.limits.daily;
+        configuration.max_daily_confirmation_messages = settings.limits.confirmation;
+        configuration.send_interval = Duration::from_millis(settings.limits.interval_milliseconds);
+        configuration
+    }
 }
 
 #[cfg(test)]
@@ -699,6 +789,37 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
 "#;
 
     #[test]
+    fn subscriptions_allow_omitting_the_postal_address_but_require_a_new_approval() {
+        let credentials = SesCredentials::parse(CREDENTIAL).unwrap();
+        let source = format!("{SES}{SUBSCRIPTIONS}{FEEDBACK}");
+        let with_address = configured(&source);
+        let without_address =
+            configured(&source.replace("postal_address = \"PO Box 123, Example City\"\n", ""));
+        assert_eq!(
+            with_address
+                .view()
+                .subscriptions
+                .unwrap()
+                .view()
+                .postal_address,
+            Some("PO Box 123, Example City")
+        );
+        assert_eq!(
+            without_address
+                .view()
+                .subscriptions
+                .unwrap()
+                .view()
+                .postal_address,
+            None
+        );
+        assert_ne!(
+            with_address.provider_binding(&credentials),
+            without_address.provider_binding(&credentials)
+        );
+    }
+
+    #[test]
     fn enabled_capture_requires_feedback_but_paused_controls_remain_configurable() {
         let paused = configured(&format!("{SES}{SUBSCRIPTIONS}"));
         assert_eq!(
@@ -750,7 +871,13 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
     fn invalid_public_disclosures_are_rejected_without_echoing_untrusted_values() {
         for (before, after, field) in [
             ("Example Publication", "", "operator_name"),
+            ("PO Box 123, Example City", "", "postal_address"),
             ("PO Box 123, Example City", " ", "postal_address"),
+            (
+                "PO Box 123, Example City",
+                "\\tprivate-marker",
+                "postal_address",
+            ),
             ("New articles from Example.", "\\tprivate-marker", "purpose"),
             (
                 "https://example.com/privacy",

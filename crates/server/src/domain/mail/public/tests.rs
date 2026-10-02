@@ -195,9 +195,10 @@ mod subscriber_routes {
                 store::{BootstrapIdentity, ConfiguredLoginProviders, NewHumanCredential},
             },
             mail::{
-                config::{MailConfiguration, MailConfigurationCandidate},
+                config::{MailConfiguration, MailConfigurationCandidate, SesMailConfiguration},
                 control::EncodedControlToken,
                 runtime::{MailStartupError, prepare_mail},
+                ses::SesCredentials,
                 subscriber::{
                     BeginFeedbackRun, ClaimConfirmation, ConfirmationHandle, DeliveryAdmission,
                     FeedbackObservation, RecordFeedbackObservation, SubscriberMode,
@@ -294,7 +295,6 @@ mod subscriber_routes {
             drop(file);
             let controls = Arc::new(MailControls::load(&control_path, instance).unwrap());
             let configuration = configuration(root.path(), "enabled");
-            let public_policy = configuration.view().subscriptions.unwrap().clone();
             let credentials = SesCredentials::parse(
                 br#"{"access_key_id":"AKIDEXAMPLE","secret_access_key":"1234567890123456"}"#,
             )
@@ -312,15 +312,13 @@ mod subscriber_routes {
                 .unwrap();
             drop(credential_file);
             let state = PublicMailState::new(
-                configuration,
-                &credentials,
-                public_policy,
+                MailSettingsSource::new(configuration, Arc::new(credentials)),
                 PublicationBaseUrl::parse("https://example.com").unwrap(),
                 controls,
                 store.subscribers.clone(),
             );
             let policy = SubscriberPolicy {
-                configuration_binding: state.configuration_binding,
+                configuration_binding: state.settings.resolve(None).configuration_binding,
                 mode: SubscriberMode::Enabled,
                 max_daily_messages: 100,
                 max_daily_confirmations: 100,
@@ -336,7 +334,7 @@ mod subscriber_routes {
                 .subscribers
                 .begin_feedback_run(BeginFeedbackRun {
                     provider_now: OffsetDateTime::now_utc(),
-                    configuration_binding: state.configuration_binding,
+                    configuration_binding: state.settings.resolve(None).configuration_binding,
                     source_binding: [6; 32],
                     retention_seconds: 1_209_600,
                 })
@@ -345,7 +343,7 @@ mod subscriber_routes {
             state
                 .subscribers
                 .record_feedback_observation(RecordFeedbackObservation {
-                    configuration_binding: state.configuration_binding,
+                    configuration_binding: state.settings.resolve(None).configuration_binding,
                     run_id: run.run_id,
                     source_binding: [6; 32],
                     retention_seconds: 1_209_600,
@@ -381,7 +379,7 @@ mod subscriber_routes {
                 enrollment: Uuid::new_v4(),
                 generation: Uuid::new_v4(),
                 confirmation_attempt: Uuid::new_v4(),
-                configuration_binding: self.state.configuration_binding,
+                configuration_binding: self.state.settings.resolve(None).configuration_binding,
             };
             let attempt_id = command.confirmation_attempt;
             assert_eq!(
@@ -394,7 +392,7 @@ mod subscriber_routes {
             );
             self.state
                 .subscribers
-                .queued_confirmations(self.state.configuration_binding, 100)
+                .queued_confirmations(self.state.settings.resolve(None).configuration_binding, 100)
                 .await
                 .unwrap()
                 .into_iter()
@@ -417,7 +415,7 @@ mod subscriber_routes {
                         &nonce,
                     )),
                     expires_at,
-                    configuration_binding: self.state.configuration_binding,
+                    configuration_binding: self.state.settings.resolve(None).configuration_binding,
                 })
                 .await
                 .unwrap();
@@ -527,10 +525,14 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
         .unwrap()
     }
 
-    fn subscribe_body(address: &str) -> String {
+    fn subscribe_body(address: &str, binding: [u8; 32]) -> String {
         url::form_urlencoded::Serializer::new(String::new())
             .append_pair("address", address)
             .append_pair("consent", "yes")
+            .append_pair(
+                "configuration_binding",
+                blake3::Hash::from_bytes(binding).to_hex().as_str(),
+            )
             .finish()
     }
 
@@ -560,7 +562,10 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
             .oneshot(request(
                 Method::POST,
                 SUBSCRIBE_ROUTE,
-                subscribe_body("reader@example.net"),
+                subscribe_body(
+                    "reader@example.net",
+                    fixture.state.settings.resolve(None).configuration_binding,
+                ),
                 true,
             ))
             .await
@@ -581,7 +586,7 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
             .state
             .subscribers
             .record_feedback_health(
-                fixture.state.configuration_binding,
+                fixture.state.settings.resolve(None).configuration_binding,
                 FeedbackHealth::Unavailable,
             )
             .await
@@ -595,6 +600,33 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
                 .await
                 .contains("name=\"address\"")
         );
+        assert_eq!(
+            fixture
+                .state
+                .subscribers
+                .status()
+                .await
+                .unwrap()
+                .addressed_enrollments,
+            0
+        );
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn signup_rejects_a_form_for_different_newsletter_settings_without_enrollment() {
+        let fixture = Fixture::start().await;
+        let app = fixture.router();
+        let response = app
+            .oneshot(request(
+                Method::POST,
+                SUBSCRIBE_ROUTE,
+                subscribe_body("reader@example.net", [0; 32]),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(
             fixture
                 .state
@@ -641,7 +673,10 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
             fixture
                 .state
                 .subscribers
-                .queued_confirmations(fixture.state.configuration_binding, 10)
+                .queued_confirmations(
+                    fixture.state.settings.resolve(None).configuration_binding,
+                    10
+                )
                 .await
                 .unwrap()
                 .is_empty()
@@ -651,7 +686,10 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
             .oneshot(request(
                 Method::POST,
                 SUBSCRIBE_ROUTE,
-                subscribe_body("reader@example.net"),
+                subscribe_body(
+                    "reader@example.net",
+                    fixture.state.settings.resolve(None).configuration_binding,
+                ),
                 true,
             ))
             .await
@@ -663,7 +701,10 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
             .oneshot(request(
                 Method::POST,
                 SUBSCRIBE_ROUTE,
-                subscribe_body("READER@EXAMPLE.NET"),
+                subscribe_body(
+                    "READER@EXAMPLE.NET",
+                    fixture.state.settings.resolve(None).configuration_binding,
+                ),
                 true,
             ))
             .await
@@ -675,7 +716,10 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
             fixture
                 .state
                 .subscribers
-                .queued_confirmations(fixture.state.configuration_binding, 10)
+                .queued_confirmations(
+                    fixture.state.settings.resolve(None).configuration_binding,
+                    10
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -779,11 +823,15 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
             ControlOutcome::Changed
         );
         let mut paused = fixture.state.clone();
-        paused.policy = configuration(fixture.root.path(), "paused")
-            .view()
-            .subscriptions
-            .unwrap()
-            .clone();
+        paused.settings = MailSettingsSource::new(
+            configuration(fixture.root.path(), "paused"),
+            Arc::new(
+                SesCredentials::parse(
+                    br#"{"access_key_id":"AKIDEXAMPLE","secret_access_key":"1234567890123456"}"#,
+                )
+                .unwrap(),
+            ),
+        );
         fixture
             .state
             .subscribers
@@ -800,7 +848,10 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
                 .oneshot(request(
                     Method::POST,
                     SUBSCRIBE_ROUTE,
-                    subscribe_body("paused@example.net"),
+                    subscribe_body(
+                        "paused@example.net",
+                        fixture.state.settings.resolve(None).configuration_binding
+                    ),
                     true
                 ))
                 .await
@@ -842,7 +893,7 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
             .state
             .subscribers
             .record_feedback_observation(RecordFeedbackObservation {
-                configuration_binding: fixture.state.configuration_binding,
+                configuration_binding: fixture.state.settings.resolve(None).configuration_binding,
                 run_id: fixture.feedback_run,
                 source_binding: [6; 32],
                 retention_seconds: 1_209_600,

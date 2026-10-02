@@ -22,6 +22,7 @@ use crate::{
     domain::mail::{
         campaign::{Campaign, CampaignCounts, CampaignState},
         identity::EmailAddress,
+        settings::{StoredMailSettings, UpdateMailSettings, store as settings_store},
         store::{
             CampaignApplyError, CampaignCommandError, quarantine_recipient_history,
             quarantine_reset_campaigns, reconcile_campaign_acceptance, require_campaign_admission,
@@ -75,6 +76,27 @@ impl SubscriberStore {
             readers,
             mutations: MutationSender::new(mutations),
         }
+    }
+
+    pub(in crate::domain::mail) async fn mail_settings(
+        &self,
+    ) -> Result<Option<StoredMailSettings>, SubscriberLoadError> {
+        settings_store::load(&self.readers).await
+    }
+
+    pub(in crate::domain::mail) async fn update_mail_settings(
+        &self,
+        command: UpdateMailSettings,
+    ) -> Result<u64, SubscriberMutationError> {
+        self.mutations
+            .send(
+                |respond_to| Mutation::UpdateMailSettings {
+                    command,
+                    respond_to,
+                },
+                SubscriberCommandError::OutcomeUnknown,
+            )
+            .await
     }
 
     pub(crate) async fn initialize_controls(
@@ -2037,7 +2059,7 @@ async fn reserve_campaign_budget(
     Ok(CampaignBudgetAdmission::Granted)
 }
 
-fn auth_error(error: AuthApplyError) -> SubscriberApplyError {
+pub(in crate::domain::mail) fn auth_error(error: AuthApplyError) -> SubscriberApplyError {
     match error {
         AuthApplyError::Operation(error) => SubscriberApplyError::Operation(error),
         AuthApplyError::CorruptStoredState => SubscriberApplyError::CorruptStoredState,
@@ -2207,6 +2229,9 @@ async fn rotate_consent_epoch(
         .await?;
     // The reset does not refund budgets or erase hard-bounce/complaint suppression.
     // No restored or retired generation can be reconstructed by a later result.
+    sqlx::query("UPDATE mail_settings SET mode='paused',version=version+1")
+        .execute(&mut **transaction)
+        .await?;
     sqlx::query("UPDATE mail_control_state SET mail_epoch=?,control_version=?,mode='paused',feedback_gap=0,last_feedback_ok_at=NULL,last_feedback_observed_at=NULL,feedback_run=NULL,feedback_poll=NULL,feedback_poll_signed_at=NULL,feedback_recover_after=NULL,feedback_quiet_since=NULL,feedback_provider_at=NULL,feedback_clock_regressed=0,feedback_source=NULL,feedback_retention=NULL WHERE singleton=1").bind(result.new_epoch.as_bytes().as_slice()).bind(version).execute(&mut **transaction).await?;
     Ok(result)
 }

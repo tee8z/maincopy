@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Manage newsletter details, signup mode, and sending limits in the Owner admin
+  portal, with durable settings and live updates. Keep provider credentials in
+  protected host configuration.
+- Make the public postal address optional for mailing lists. Omitted addresses
+  leave no empty fields in signup information, campaign review, or message footers.
+
 ## 0.1.1
 
 - Replace the large article tip panel with a muted link and collapsed Lightning

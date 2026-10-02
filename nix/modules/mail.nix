@@ -97,7 +97,7 @@ in
                   description = "Pause new admission while keeping confirmation and removal controls available.";
                 };
                 operatorName = publicField 200 "Public mailing-list operator name.";
-                postalAddress = publicField 500 "Public physical postal address included in every message.";
+                postalAddress = optional (boundedText 500) "Optional public physical postal address included in signup information and every message.";
                 purpose = publicField 2000 "Public explanation of the mailing list and consent purpose.";
                 privacyUrl = mkOption {
                   type = types.addCheck (boundedText 2048) (value: lib.hasPrefix "https://" value);
@@ -106,7 +106,7 @@ in
                 contactAddress = publicField 254 "Monitored public ASCII contact mailbox.";
               };
             })
-            "Public consent disclosures; null provides campaign review without subscriber capture or removal routes.";
+            "Initial public newsletter settings. Saved settings in Admin → Mail → Newsletter settings take precedence; null leaves signup paused until configured there.";
         feedback = optional (types.submodule {
           options = {
             queueUrl = publicField 256 "Canonical regional HTTPS URL for the dedicated standard SQS queue.";
@@ -159,9 +159,11 @@ in
       subscriptions = {
         inherit (subscriptions) mode purpose;
         operator_name = subscriptions.operatorName;
-        postal_address = subscriptions.postalAddress;
         privacy_url = subscriptions.privacyUrl;
         contact_address = subscriptions.contactAddress;
+      }
+      // lib.optionalAttrs (subscriptions.postalAddress != null) {
+        postal_address = subscriptions.postalAddress;
       };
     }
     // lib.optionalAttrs (feedback != null) {

@@ -31,6 +31,7 @@ use crate::domain::auth::store::{
     remove_human_credential, replace_agent_scopes, replace_user_roles, revoke_agent_credential,
     revoke_browser_session, set_user_status,
 };
+use crate::domain::mail::settings::store as mail_settings_store;
 use crate::domain::mail::store::{
     CampaignApplyError, CampaignCommandError, CampaignStore, approve_campaign, cancel_campaign,
     claim_campaign, create_campaign, finish_campaign, quarantine_interrupted_campaigns,
@@ -332,6 +333,13 @@ async fn apply_mutation(
     mutation: Mutation,
 ) -> Result<AppliedMutation, FailedMutation> {
     match mutation {
+        Mutation::UpdateMailSettings {
+            command,
+            respond_to,
+        } => subscriber_response(
+            respond_to,
+            mail_settings_store::update(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
         Mutation::BeginMailFeedbackPoll {
             binding,
             run_id,

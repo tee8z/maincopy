@@ -11,11 +11,16 @@ use crate::domain::mail::{
     announcement::announcement_content_digest,
     campaign::{CampaignApproval, CampaignFence, CampaignLease},
     config::{MailConfiguration, MailConfigurationCandidate},
+    ses::SesCredentials,
     subscriber::SubscriberPolicy,
 };
 
 fn binding() -> MailReviewBinding {
-    let candidate: MailConfigurationCandidate = toml::from_str(
+    configured_binding("")
+}
+
+fn configured_binding(extra: &str) -> MailReviewBinding {
+    let candidate: MailConfigurationCandidate = toml::from_str(&format!(
         r#"
 mode = "ses"
 sender = "Newsletter@EXAMPLE.COM"
@@ -23,8 +28,9 @@ region = "us-east-1"
 configuration_set = "newsletter"
 credential_file = "secrets/credentials.json"
 control_signing_key_file = "secrets/control.key"
+{extra}
 "#,
-    )
+    ))
     .unwrap();
     let root = tempfile::tempdir().unwrap();
     let MailConfiguration::Ses(configuration) = candidate.validate(root.path()).unwrap() else {
@@ -34,7 +40,7 @@ control_signing_key_file = "secrets/control.key"
         br#"{"access_key_id":"AKIDEXAMPLE","secret_access_key":"1234567890123456"}"#,
     )
     .unwrap();
-    MailReviewBinding::from_configuration(*configuration, &credentials)
+    MailReviewBinding::from_configuration(*configuration, std::sync::Arc::new(credentials))
 }
 
 fn content() -> CampaignContent {

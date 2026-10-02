@@ -12,11 +12,12 @@ use uuid::Uuid;
 
 use super::{
     campaign::{Campaign, CampaignFence, CampaignId, CampaignState},
-    config::{SesMailConfiguration, SubscriptionMode, SubscriptionPolicy},
+    config::SubscriptionMode,
     control::{ControlClaims, ControlTokenError},
     controls::MailControls,
     message::{Confirmation, MessagePreparationError, Newsletter, unsubscribe_link},
     ses::{EmailMessage, SendOutcome, SesClient, SesError},
+    settings::EffectiveMailSettings,
     store::{
         CampaignCommandError, CampaignLoadError, CampaignMutationError, CampaignStore,
         ClaimCampaign, FinishCampaign, FinishIntent, RenewCampaignClaim,
@@ -39,8 +40,7 @@ pub(crate) struct MailDispatcher {
     client: SesClient,
     controls: Arc<MailControls>,
     origin: PublicationBaseUrl,
-    configuration_binding: [u8; 32],
-    policy: SubscriptionPolicy,
+    settings: EffectiveMailSettings,
     interval: Duration,
     claim: Option<(CampaignId, CampaignFence)>,
 }
@@ -51,9 +51,7 @@ pub(super) struct DispatchResources {
     pub client: SesClient,
     pub controls: Arc<MailControls>,
     pub origin: PublicationBaseUrl,
-    pub configuration_binding: [u8; 32],
-    pub configuration: SesMailConfiguration,
-    pub policy: SubscriptionPolicy,
+    pub settings: EffectiveMailSettings,
 }
 
 impl MailDispatcher {
@@ -64,9 +62,8 @@ impl MailDispatcher {
             client: resources.client,
             controls: resources.controls,
             origin: resources.origin,
-            configuration_binding: resources.configuration_binding,
-            interval: resources.configuration.view().send_interval,
-            policy: resources.policy,
+            interval: resources.settings.configuration.view().send_interval,
+            settings: resources.settings,
             claim: None,
         }
     }
@@ -83,17 +80,39 @@ impl MailDispatcher {
                 () = cancellation.cancelled() => return Ok(()),
                 _ = ticks.tick() => {}
             }
+            let interval = self.interval;
             if let Err(error) = self.tick(&cancellation).await
                 && !error.deferred()
             {
                 return Err(error);
             }
+            if interval != self.interval {
+                ticks = tokio::time::interval_at(
+                    tokio::time::Instant::now() + self.interval,
+                    self.interval,
+                );
+                ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            }
         }
     }
 
     async fn tick(&mut self, cancellation: &CancellationToken) -> Result<(), DispatchError> {
+        self.settings = self.settings.source.load(&self.subscribers).await?;
+        let interval = self.settings.configuration.view().send_interval;
+        if interval != self.interval {
+            // Wait a full new interval before admission when pacing changes.
+            self.interval = interval;
+            return Ok(());
+        }
         let campaign = self.current_campaign().await?;
-        if self.policy.view().mode == SubscriptionMode::Paused || cancellation.is_cancelled() {
+        if !self
+            .settings
+            .configuration
+            .view()
+            .subscriptions
+            .is_some_and(|policy| policy.view().mode == SubscriptionMode::Enabled)
+            || cancellation.is_cancelled()
+        {
             return Ok(());
         }
         if self.confirmation(cancellation).await? {
@@ -109,7 +128,13 @@ impl MailDispatcher {
     /// is processed even when feedback or configured capture is paused.
     async fn current_campaign(&mut self) -> Result<Option<Campaign>, DispatchError> {
         let Some((id, fence)) = self.claim else {
-            if self.policy.view().mode == SubscriptionMode::Paused {
+            if !self
+                .settings
+                .configuration
+                .view()
+                .subscriptions
+                .is_some_and(|policy| policy.view().mode == SubscriptionMode::Enabled)
+            {
                 return Ok(None);
             }
             let Some(active) = self.campaigns.active_campaign().await? else {
@@ -130,7 +155,7 @@ impl MailDispatcher {
             let campaign = self
                 .campaigns
                 .claim(ClaimCampaign {
-                    configuration_binding: self.configuration_binding,
+                    configuration_binding: self.settings.configuration_binding,
                     lease_seconds: LEASE_SECONDS,
                     now: OffsetDateTime::now_utc(),
                 })
@@ -162,7 +187,7 @@ impl MailDispatcher {
                         .renew_claim(RenewCampaignClaim {
                             campaign_id: id,
                             fence,
-                            configuration_binding: self.configuration_binding,
+                            configuration_binding: self.settings.configuration_binding,
                             expires_at: now + time::Duration::seconds(i64::from(LEASE_SECONDS)),
                         })
                         .await;
@@ -211,7 +236,7 @@ impl MailDispatcher {
     async fn confirmation(&self, cancellation: &CancellationToken) -> Result<bool, DispatchError> {
         let Some(handle) = self
             .subscribers
-            .queued_confirmations(self.configuration_binding, 1)
+            .queued_confirmations(self.settings.configuration_binding, 1)
             .await?
             .pop()
         else {
@@ -235,7 +260,7 @@ impl MailDispatcher {
                     &nonce,
                 )),
                 expires_at,
-                configuration_binding: self.configuration_binding,
+                configuration_binding: self.settings.configuration_binding,
             })
             .await?;
         match admission {
@@ -290,7 +315,9 @@ impl MailDispatcher {
             &self.origin,
             &confirm,
             unsubscribe_link(&self.origin, &manage)?,
-            &self.policy,
+            self.settings.configuration.view().subscriptions.ok_or(
+                SubscriberMutationError::Command(SubscriberCommandError::Paused),
+            )?,
         )?)
     }
 
@@ -315,7 +342,9 @@ impl MailDispatcher {
         let body = Newsletter::render(
             &campaign.content,
             unsubscribe_link(&self.origin, &manage)?,
-            &self.policy,
+            self.settings.configuration.view().subscriptions.ok_or(
+                SubscriberMutationError::Command(SubscriberCommandError::Paused),
+            )?,
         )?;
         if cancellation.is_cancelled() {
             return Ok(());
@@ -328,7 +357,7 @@ impl MailDispatcher {
                 enrollment: handle.enrollment,
                 generation: handle.generation,
                 attempt_id: Uuid::new_v4(),
-                configuration_binding: self.configuration_binding,
+                configuration_binding: self.settings.configuration_binding,
             })
             .await;
         if matches!(

@@ -118,6 +118,8 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             "mail_control_state",
             "mail_daily_budget",
             "mail_enrollments",
+            "mail_settings",
+            "mail_settings_receipts",
             "mail_suppressions",
             "nip98_replay_events",
             "post_revisions",
@@ -992,6 +994,9 @@ async fn identifiers_and_hashes_use_blob_storage() {
             "mail_enrollments.generation:BLOB",
             "mail_enrollments.mailbox_digest:BLOB",
             "mail_enrollments.nonce_digest:BLOB",
+            "mail_settings_receipts.audit_event_id:BLOB",
+            "mail_settings_receipts.command_fingerprint:BLOB",
+            "mail_settings_receipts.idempotency_key:BLOB",
             "mail_suppressions.mailbox_digest:BLOB",
             "nip98_replay_events.agent_credential_id:BLOB",
             "nip98_replay_events.event_id:BLOB",
@@ -1052,7 +1057,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 205);
+    assert_eq!(compact_definitions.matches("check(").count(), 221);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",

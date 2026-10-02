@@ -16,6 +16,7 @@ use super::*;
 use crate::{
     database::store::Mutation,
     domain::mail::{
+        config::{MailConfiguration, MailConfigurationCandidate},
         feedback::{
             FeedbackConfiguration, FeedbackRejection,
             tests::{dead_attributes, source_attributes},
@@ -27,6 +28,34 @@ use crate::{
 };
 
 const BINDING: [u8; 32] = [7; 32];
+
+fn settings_fixture() -> EffectiveMailSettings {
+    let candidate: MailConfigurationCandidate = toml::from_str(
+        r#"
+mode = "ses"
+sender = "sender@example.com"
+region = "us-east-1"
+configuration_set = "maincopy-newsletter"
+credential_file = "/unused/ses.json"
+control_signing_key_file = "/unused/control.key"
+"#,
+    )
+    .unwrap();
+    let MailConfiguration::Ses(configuration) =
+        candidate.validate(std::path::Path::new("/unused")).unwrap()
+    else {
+        panic!("SES fixture");
+    };
+    let credentials = SesCredentials::parse(
+        br#"{"access_key_id":"AKIDEXAMPLE","secret_access_key":"1234567890123456"}"#,
+    )
+    .unwrap();
+    let mut settings =
+        EffectiveMailSettings::from_configuration(*configuration, Arc::new(credentials));
+    settings.configuration_binding = BINDING;
+    settings
+}
+
 const CAMPAIGN: &str = "11111111-1111-4111-8111-111111111111";
 const EPOCH: &str = "44444444-4444-4444-8444-444444444444";
 const ATTEMPT: &str = "22222222-2222-4222-8222-222222222222";
@@ -173,7 +202,7 @@ impl Harness {
             .connect_lazy("sqlite::memory:")
             .unwrap();
         let subscribers = SubscriberStore::new(readers, sender.clone());
-        let worker = FeedbackWorker::new(client, controls, subscribers, BINDING);
+        let worker = FeedbackWorker::new(client, controls, subscribers, settings_fixture());
         Self {
             root,
             worker,

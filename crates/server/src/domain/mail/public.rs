@@ -33,12 +33,12 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::{
-    config::{SesMailConfiguration, SubscriptionMode, SubscriptionPolicy},
+    config::{SubscriptionMode, SubscriptionPolicy},
     control::{ControlClaims, ControlPurpose},
     controls::MailControls,
     identity::EmailAddress,
     message::UNSUBSCRIBE_ROUTE,
-    ses::SesCredentials,
+    settings::MailSettingsSource,
     subscriber::{
         ConfirmEnrollment, ControlOutcome, EnrollmentRequestResult, FeedbackHealth,
         ManageEnrollment, RequestEnrollment, SubscriberCommandError, SubscriberDigest,
@@ -56,28 +56,31 @@ const PRIVATE_CSP: &str = "default-src 'none'; script-src 'none'; object-src 'no
 /// The writer independently checks the current policy before accepting signup.
 #[derive(Clone)]
 pub(crate) struct PublicMailState {
-    policy: SubscriptionPolicy,
+    settings: MailSettingsSource,
     origin: PublicationBaseUrl,
-    configuration_binding: [u8; 32],
     controls: Arc<MailControls>,
     subscribers: SubscriberStore,
 }
 
 impl PublicMailState {
     pub(super) fn new(
-        configuration: SesMailConfiguration,
-        credentials: &SesCredentials,
-        policy: SubscriptionPolicy,
+        settings: MailSettingsSource,
         origin: PublicationBaseUrl,
         controls: Arc<MailControls>,
         subscribers: SubscriberStore,
     ) -> Self {
         Self {
-            policy,
+            settings,
             origin,
-            configuration_binding: configuration.provider_binding(credentials),
             controls,
             subscribers,
+        }
+    }
+
+    async fn current_policy_notice(&self) -> Markup {
+        match self.settings.load(&self.subscribers).await {
+            Ok(settings) => policy_notice(settings.configuration.view().subscriptions),
+            Err(_) => html! { p { "Newsletter contact information is temporarily unavailable." } },
         }
     }
 }
@@ -87,6 +90,7 @@ impl PublicMailState {
 struct SubscribeForm {
     address: SecretString,
     consent: OptIn,
+    configuration_binding: String,
 }
 
 #[derive(Deserialize)]
@@ -225,24 +229,34 @@ fn require_browser_origin(state: &PublicMailState, headers: &HeaderMap) -> Resul
 }
 
 async fn subscribe_page(State(state): State<PublicMailState>) -> Result<Response, PublicError> {
+    let settings = state
+        .settings
+        .load(&state.subscribers)
+        .await
+        .map_err(|_| PublicError::Unavailable)?;
     let status = state
         .subscribers
         .status()
         .await
         .map_err(|_| PublicError::Unavailable)?;
-    let enabled = state.policy.view().mode == SubscriptionMode::Enabled
+    let enabled = settings
+        .configuration
+        .view()
+        .subscriptions
+        .is_some_and(|policy| policy.view().mode == SubscriptionMode::Enabled)
         && status.feedback_health == FeedbackHealth::Healthy
         && status.policy.is_some_and(|policy| {
             policy.mode == SubscriberMode::Enabled
-                && policy.configuration_binding == state.configuration_binding
+                && policy.configuration_binding == settings.configuration_binding
         });
     Ok(page(
         StatusCode::OK,
         "Subscribe to article announcements",
         html! {
-            (policy_notice(&state.policy))
+            (policy_notice(settings.configuration.view().subscriptions))
             @if enabled {
                 form method="post" {
+                    input type="hidden" name="configuration_binding" value=(blake3::Hash::from_bytes(settings.configuration_binding).to_hex().as_str());
                     p { label for="mail-address" { "Email address" } }
                     p { input id="mail-address" name="address" type="email" maxlength="254" autocomplete="email" required; }
                     p { label {
@@ -264,13 +278,31 @@ async fn request_subscription(
     form: Result<Form<SubscribeForm>, FormRejection>,
 ) -> Result<Response, PublicError> {
     require_browser_origin(&state, &headers)?;
-    if matches!(state.policy.view().mode, SubscriptionMode::Paused) {
+    let settings = state
+        .settings
+        .load(&state.subscribers)
+        .await
+        .map_err(|_| PublicError::Unavailable)?;
+    if !settings
+        .configuration
+        .view()
+        .subscriptions
+        .is_some_and(|policy| policy.view().mode == SubscriptionMode::Enabled)
+    {
         return Err(PublicError::Paused);
     }
     let Form(SubscribeForm {
         address,
         consent: OptIn::Requested,
+        configuration_binding,
     }) = form.map_err(form_error)?;
+    if configuration_binding
+        != blake3::Hash::from_bytes(settings.configuration_binding)
+            .to_hex()
+            .as_str()
+    {
+        return Err(PublicError::PolicyChanged);
+    }
     let address =
         EmailAddress::parse(address.expose_secret()).map_err(|_| PublicError::InvalidAddress)?;
     let mailbox_digest = SubscriberDigest::from_bytes(state.controls.mailbox_digest(&address));
@@ -282,11 +314,14 @@ async fn request_subscription(
             enrollment: Uuid::new_v4(),
             generation: Uuid::new_v4(),
             confirmation_attempt: Uuid::new_v4(),
-            configuration_binding: state.configuration_binding,
+            configuration_binding: settings.configuration_binding,
         })
         .await
         .map_err(|error| match error {
             SubscriberMutationError::Command(SubscriberCommandError::Paused) => PublicError::Paused,
+            SubscriberMutationError::Command(SubscriberCommandError::ConfigurationChanged) => {
+                PublicError::PolicyChanged
+            }
             SubscriberMutationError::Admission(_) | SubscriberMutationError::Command(_) => {
                 PublicError::Unavailable
             }
@@ -297,7 +332,7 @@ async fn request_subscription(
             "Request received",
             html! {
                 p { "If this address can subscribe, a confirmation email will be sent. Follow the link in that email to confirm your request." }
-                (policy_notice(&state.policy))
+                (policy_notice(settings.configuration.view().subscriptions))
             },
         )),
     }
@@ -312,7 +347,7 @@ async fn confirm_page(
         StatusCode::OK,
         "Confirm your subscription",
         html! {
-            (policy_notice(&state.policy))
+            (state.current_policy_notice().await)
             p { "Opening this page does not subscribe you. Confirm below only if you requested these article announcements." }
             form method="post" {
                 button type="submit" name="action" value="confirm" { "Confirm subscription" }
@@ -359,7 +394,7 @@ async fn confirm_subscription(
             "Confirmation processed",
             html! {
                 p { "If this invitation is current, your subscription is now confirmed. An expired or replaced invitation cannot activate a subscription." }
-                (policy_notice(&state.policy))
+                (state.current_policy_notice().await)
             },
         )),
     }
@@ -380,7 +415,7 @@ async fn removal_page(
             form method="post" {
                 button type="submit" name="action" value="remove" { "Unsubscribe and remove my address" }
             }
-            (policy_notice(&state.policy))
+            (state.current_policy_notice().await)
         },
     ))
 }
@@ -423,7 +458,7 @@ async fn remove_subscription(
             html! {
                 p { "This link no longer authorizes future mail. A newer signup is unaffected. Messages already being submitted may still arrive." }
                 p { "Backup and provider copies follow the retention policy." }
-                (policy_notice(&state.policy))
+                (state.current_policy_notice().await)
             },
         )),
     }
@@ -492,11 +527,16 @@ fn verify_token(
         .map_err(|_| PublicError::InvalidLink)
 }
 
-fn policy_notice(policy: &SubscriptionPolicy) -> Markup {
+fn policy_notice(policy: Option<&SubscriptionPolicy>) -> Markup {
+    let Some(policy) = policy else {
+        return html! { p { "Newsletter signup is not configured yet." } };
+    };
     let view = policy.view();
     html! {
         p { "Operator: " (view.operator_name) }
-        p { "Postal address: " (view.postal_address) }
+        @if let Some(address) = view.postal_address {
+            p { "Postal address: " (address) }
+        }
         p { (view.purpose) }
         p { "Your address is stored by this site and processed by Amazon SES to deliver confirmation and announcement emails." }
         p { "Contact: " (view.contact_address.as_str()) }
@@ -540,6 +580,8 @@ enum PublicError {
     InvalidLink,
     #[error("the subscription form exceeds the byte bound")]
     TooLarge,
+    #[error("the newsletter settings changed after the signup form was displayed")]
+    PolicyChanged,
     #[error("new subscription requests are paused")]
     Paused,
     #[error("the subscriber operation is unavailable or its outcome is not confirmed")]
@@ -569,6 +611,10 @@ impl IntoResponse for PublicError {
             Self::TooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "This form exceeds the request limit.",
+            ),
+            Self::PolicyChanged => (
+                StatusCode::CONFLICT,
+                "The newsletter details changed. Reload the signup page, review the current details, and submit again.",
             ),
             Self::Paused => (
                 StatusCode::SERVICE_UNAVAILABLE,

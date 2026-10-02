@@ -13,6 +13,7 @@ pub(crate) mod public;
 pub(crate) mod retention;
 pub(crate) mod runtime;
 mod ses;
+pub(crate) mod settings;
 pub(crate) mod store;
 pub(crate) mod subscriber;
 pub(crate) mod ui;

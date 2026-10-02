@@ -14,14 +14,17 @@ use time::OffsetDateTime;
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
-use super::{CampaignId, CampaignState, MailUiAccess, binding};
+use super::{CampaignId, CampaignState, MailUiAccess, binding, configured_binding};
 use crate::{
     admin::test_support::{ADMIN_AUTHORITY, ADMIN_ORIGIN, BrowserSession, ProtectedAdminHarness},
     content_fixtures::{content_tree, post, publication},
     domain::{
-        mail::subscriber::{
-            BeginFeedbackRun, FeedbackHealth, FeedbackObservation, RecordFeedbackObservation,
-            SubscriberMode, SubscriberPolicy,
+        mail::{
+            config::SubscriptionMode,
+            subscriber::{
+                BeginFeedbackRun, FeedbackHealth, FeedbackObservation, RecordFeedbackObservation,
+                SubscriberMode, SubscriberPolicy,
+            },
         },
         publication::activation::PublishNow,
     },
@@ -31,6 +34,11 @@ use crate::{
 const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
 const REVIEW_PATH: &str = "/admin/mail/posts/11111111-1111-4111-8111-111111111111/review";
 const FIXTURE_PASSWORD: &str = "another correct horse battery staple";
+const NEWSLETTER_FEEDBACK: &str = r#"
+[feedback]
+queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/newsletter"
+topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
+"#;
 
 async fn get(router: &Router, browser: &BrowserSession, path: &str) -> Response {
     router
@@ -273,13 +281,15 @@ async fn mail_routes_require_a_browser_and_recheck_the_current_owner_role() {
         .await
         .unwrap();
     assert_eq!(agent.status(), StatusCode::FORBIDDEN);
-    for method in [Method::GET, Method::POST] {
-        let response = router
-            .clone()
-            .oneshot(harness.request(method, "/admin/mail/recovery", Bytes::new(), None))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    for path in ["/admin/mail/recovery", "/admin/mail/settings"] {
+        for method in [Method::GET, Method::POST] {
+            let response = router
+                .clone()
+                .oneshot(harness.request(method, path, Bytes::new(), None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
     }
     let owner = harness.password_login(&router).await;
     for path in [
@@ -336,6 +346,11 @@ async fn mail_routes_require_a_browser_and_recheck_the_current_owner_role() {
         get(&router, &second, "/admin/mail").await.status(),
         StatusCode::FORBIDDEN
     );
+    assert_eq!(
+        get(&router, &second, "/admin/mail/settings").await.status(),
+        StatusCode::FORBIDDEN
+    );
+
     assert_eq!(
         get(&router, &second, REVIEW_PATH).await.status(),
         StatusCode::FORBIDDEN
@@ -643,26 +658,30 @@ async fn changed_public_review_and_tampered_binding_cannot_create_campaigns() {
 #[tokio::test]
 async fn feedback_reset_requires_explicit_owner_confirmation_and_recovers_the_original_receipt() {
     let mut harness = ProtectedAdminHarness::start_with_password().await;
-    let binding = binding();
-    let view = binding.configuration.view();
-    let policy = SubscriberPolicy {
-        configuration_binding: binding.configuration_binding,
-        mode: SubscriberMode::Enabled,
-        max_daily_messages: view.max_daily_messages,
-        max_daily_confirmations: view.max_daily_confirmation_messages,
-        max_campaign_recipients: view.max_campaign_recipients,
-    };
-    harness.runtime.mail.access = MailUiAccess::ReviewOnly(binding);
+    let binding = configured_binding(NEWSLETTER_FEEDBACK);
+    let policy = binding.subscriber_policy();
+    let source = binding.source.clone();
+    harness.runtime.mail.access = MailUiAccess::DispatchReady(binding);
     let router = harness.router();
     let browser = harness.password_login(&router).await;
     let subscribers = &harness.runtime.mail.subscribers;
     subscribers.initialize_controls([4; 32]).await.unwrap();
     subscribers.set_policy(policy).await.unwrap();
+    let settings = text(get(&router, &browser, "/admin/mail/settings").await).await;
+    let settings_body = newsletter_body(&settings, "enabled", &input(&settings, "idempotency_key"));
+    assert_eq!(
+        submit(&router, &browser, "/admin/mail/settings", settings_body)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let enabled = source.load(subscribers).await.unwrap();
+    assert_eq!(enabled.subscriber_policy().mode, SubscriberMode::Enabled);
     let available = text(get(&router, &browser, "/admin/mail/recovery").await).await;
     assert!(!available.contains("name=\"confirmation\""));
     subscribers
         .record_feedback_health(
-            policy.configuration_binding,
+            enabled.configuration_binding,
             FeedbackHealth::ReconciliationRequired,
         )
         .await
@@ -702,6 +721,18 @@ async fn feedback_reset_requires_explicit_owner_confirmation_and_recovers_the_or
     let after = subscribers.status().await.unwrap();
     assert_ne!(before.mail_epoch, after.mail_epoch);
     assert_eq!(after.policy.unwrap().mode, SubscriberMode::Paused);
+    let saved = subscribers.mail_settings().await.unwrap().unwrap();
+    assert_eq!(saved.version, 2);
+    assert_eq!(
+        saved.settings.view().subscriptions.view().mode,
+        SubscriptionMode::Paused
+    );
+    let restarted = configured_binding(NEWSLETTER_FEEDBACK)
+        .source
+        .load(subscribers)
+        .await
+        .unwrap();
+    assert_eq!(restarted.subscriber_policy().mode, SubscriberMode::Paused);
     assert_eq!(
         submit(&router, &browser, "/admin/mail/recovery", body)
             .await
@@ -709,5 +740,173 @@ async fn feedback_reset_requires_explicit_owner_confirmation_and_recovers_the_or
         StatusCode::OK
     );
     assert_eq!(subscribers.status().await.unwrap(), after);
+    assert_eq!(
+        subscribers.mail_settings().await.unwrap().unwrap().version,
+        2
+    );
+    harness.stop().await;
+}
+
+fn newsletter_body(markup: &str, mode: &str, operation: &str) -> Bytes {
+    let mut form = url::form_urlencoded::Serializer::new(String::new());
+    for name in [
+        "_csrf",
+        "expected_version",
+        "expected_control_version",
+        "configuration_binding",
+    ] {
+        form.append_pair(name, &input(markup, name));
+    }
+    for (name, value) in [
+        ("idempotency_key", operation),
+        ("mode", mode),
+        ("operator_name", "A <newsletter>"),
+        ("postal_address", ""),
+        ("purpose", "New articles and personal updates."),
+        ("privacy_url", "https://example.com/privacy"),
+        ("contact_address", "contact@example.com"),
+        ("max_campaign_recipients", "20"),
+        ("max_daily_messages", "100"),
+        ("max_daily_confirmation_messages", "25"),
+        ("send_interval_milliseconds", "1000"),
+    ] {
+        form.append_pair(name, value);
+    }
+    Bytes::from(form.finish())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn newsletter_settings_can_be_saved_offline_with_receipts_and_stale_edit_protection() {
+    let harness = ProtectedAdminHarness::start_with_password().await;
+    let router = harness.router();
+    let owner = harness.password_login(&router).await;
+    let markup = text(get(&router, &owner, "/admin/mail/settings").await).await;
+    assert!(markup.contains("Postal address (optional)"));
+    assert_eq!(input(&markup, "expected_version"), "0");
+    let operation = input(&markup, "idempotency_key");
+    let enabled = newsletter_body(&markup, "enabled", &operation);
+    assert_eq!(
+        submit(&router, &owner, "/admin/mail/settings", enabled)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let body = newsletter_body(&markup, "paused", &operation);
+    let bad_csrf = String::from_utf8(body.to_vec())
+        .unwrap()
+        .replace("_csrf=", "_csrf=invalid");
+    assert_eq!(
+        submit(
+            &router,
+            &owner,
+            "/admin/mail/settings",
+            Bytes::from(bad_csrf)
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        harness
+            .runtime
+            .mail
+            .subscribers
+            .mail_settings()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        submit(&router, &owner, "/admin/mail/settings", body.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        submit(&router, &owner, "/admin/mail/settings", body)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let stale = newsletter_body(&markup, "paused", &Uuid::new_v4().to_string());
+    assert_eq!(
+        submit(&router, &owner, "/admin/mail/settings", stale)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let saved = harness
+        .runtime
+        .mail
+        .subscribers
+        .mail_settings()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.version, 1);
+    let policy = saved.settings.view().subscriptions.view();
+    assert_eq!(policy.operator_name, "A <newsletter>");
+    assert_eq!(policy.postal_address, None);
+    assert!(
+        harness
+            .runtime
+            .mail
+            .subscribers
+            .status()
+            .await
+            .unwrap()
+            .policy
+            .is_none()
+    );
+    let reloaded = harness.router();
+    let markup = text(get(&reloaded, &owner, "/admin/mail/settings").await).await;
+    assert_eq!(input(&markup, "expected_version"), "1");
+    assert!(markup.contains("A &lt;newsletter&gt;"));
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saving_newsletter_settings_updates_live_admission_and_all_new_configuration_snapshots() {
+    let mut harness = ProtectedAdminHarness::start_with_password().await;
+    let initial = binding();
+    let initial_policy = initial.subscriber_policy();
+    let source = initial.source.clone();
+    harness.runtime.mail.access = MailUiAccess::DispatchReady(initial);
+    let subscribers = harness.runtime.mail.subscribers.clone();
+    subscribers.initialize_controls([4; 32]).await.unwrap();
+    subscribers.set_policy(initial_policy).await.unwrap();
+    let router = harness.router();
+    let owner = harness.password_login(&router).await;
+    let markup = text(get(&router, &owner, "/admin/mail/settings").await).await;
+    let body = newsletter_body(&markup, "paused", &input(&markup, "idempotency_key"));
+    assert_eq!(
+        submit(&router, &owner, "/admin/mail/settings", body)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let current = source.load(&subscribers).await.unwrap();
+    let durable = subscribers.status().await.unwrap().policy.unwrap();
+    assert_ne!(
+        current.configuration_binding,
+        initial_policy.configuration_binding
+    );
+    assert_eq!(durable, current.subscriber_policy());
+    assert_eq!(durable.max_daily_messages, 100);
+    assert_eq!(durable.max_daily_confirmations, 25);
+    assert_eq!(durable.max_campaign_recipients, 20);
+    let policy = current.configuration.view().subscriptions.unwrap().view();
+    assert_eq!(policy.operator_name, "A <newsletter>");
+    assert_eq!(policy.postal_address, None);
+    let fresh_source = binding().source;
+    let reloaded = fresh_source.load(&subscribers).await.unwrap();
+    assert_eq!(
+        reloaded.configuration_binding,
+        current.configuration_binding
+    );
+    assert_eq!(reloaded.version, 1);
+    let history = text(get(&router, &owner, "/admin/mail").await).await;
+    assert!(history.contains("A &lt;newsletter&gt;"));
+    assert!(!history.contains("Postal address in email"));
     harness.stop().await;
 }
