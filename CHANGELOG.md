@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.1.5
+
+- Send each newly published article once to its active newsletter subscribers.
+  Queue multiple articles, preserve delivery progress across restarts, and exclude
+  existing articles from upgrade notifications.
+- Remove recipient and daily message caps from newsletter settings. Retain
+  delivery pacing and signup abuse protection, and share delivery time fairly
+  between article updates and confirmation emails.
+- Retry explicit provider throttling with a delay. Preserve uncertain delivery
+  outcomes to avoid duplicate messages.
+- Provide a built-in privacy notice at `/email/privacy`. Leave the optional
+  privacy notice URL blank to use the built-in page.
+
 ## 0.1.4
 
 - Recover v0.1.0 published snapshots when upgrading the frontend. Verify the
