@@ -45,7 +45,9 @@ struct ProfileForm {
     display_name: Option<ProfileDisplayName>,
     #[serde(deserialize_with = "optional_text")]
     lightning_address: Option<LightningAddress>,
-    tips_enabled: bool,
+    // Older open forms may still submit this explicit choice. New forms use
+    // the presence of an address, so setup requires only one field.
+    tips_enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -127,7 +129,6 @@ async fn show_profile(
 fn profile_form(browser: &BrowserFormSession, profile: Option<&StoredUserProfile>) -> Markup {
     let display_name = profile.and_then(|profile| profile.display_name.as_ref());
     let address = profile.and_then(|profile| profile.lightning_address.as_ref());
-    let tips_enabled = profile.is_some_and(|profile| profile.tips_enabled);
     html! {
         form method="post" action="/admin/profile" {
             input type="hidden" name="_csrf" value=(browser.csrf_token.expose_secret());
@@ -143,10 +144,9 @@ fn profile_form(browser: &BrowserFormSession, profile: Option<&StoredUserProfile
             input id="lightning_address" name="lightning_address" type="text" maxlength="320"
                 placeholder="name@example.com" value=(address.map_or("", LightningAddress::as_str));
             p class="muted" { "Leave either field empty to clear it. Use a lowercase Lightning Address." }
-            label for="tips_enabled" { "Accept tips when selected as the site recipient" }
-            select id="tips_enabled" name="tips_enabled" required {
-                option value="false" selected[!tips_enabled] { "No" }
-                option value="true" selected[tips_enabled] { "Yes" }
+            p class="muted" {
+                "Saving a Lightning Address enables tips and selects you if the site has no recipient. "
+                "Clear the address to stop accepting tips."
             }
             button type="submit" { "Save profile" }
         }
@@ -167,8 +167,10 @@ async fn save_profile(
                     user_id: principal.user_id,
                     precondition: ProfilePrecondition::from(form.expected_version),
                     display_name: form.display_name,
+                    tips_enabled: form
+                        .tips_enabled
+                        .unwrap_or(form.lightning_address.is_some()),
                     lightning_address: form.lightning_address,
-                    tips_enabled: form.tips_enabled,
                     occurred_at: OffsetDateTime::now_utc(),
                     audit: principal
                         .mutation_audit(request_id, AdminMutationKey(form.operation_id)),
@@ -216,7 +218,7 @@ async fn show_tip_recipient(
             section class="panel" {
                 h1 { "Active tip recipient" }
                 @if let Some(recipient) = recipient {
-                    p { "Tips are available for articles that enable them. Recipient: "
+                    p { "Tips are enabled. Recipient: "
                         strong { (recipient.as_view().address) }
                     }
                 } @else if setting.recipient_user_id.is_some() {

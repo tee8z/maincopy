@@ -60,7 +60,6 @@ async fn browser_profiles_and_tip_selection_preserve_versions_replay_and_restart
         ("operation_id", operation_id(&page)),
         ("display_name", "Alice <Writer>"),
         ("lightning_address", "alice@example.test"),
-        ("tips_enabled", "true"),
     ];
     let response =
         browser_request(&harness, &session, Method::POST, "/admin/profile", &create).await;
@@ -70,23 +69,24 @@ async fn browser_profiles_and_tip_selection_preserve_versions_replay_and_restart
     assert_eq!(profile["version"], 1);
     assert_eq!(profile["display_name"], "Alice <Writer>");
     let page = browser_page(&harness, &session, "/admin/tips").await;
-    assert!(page.contains("No tip recipient is selected"));
-    let response = browser_request(
-        &harness,
-        &session,
-        Method::POST,
-        "/admin/tips",
-        &[
-            ("operation_id", operation_id(&page)),
-            ("expected_version", "1"),
-            ("user_id", &harness.owner_user_id),
-        ],
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    let page = browser_page(&harness, &session, "/admin/tips").await;
+    assert_eq!(profile["tips_enabled"], true);
     assert!(page.contains("alice@example.test"));
-    assert!(page.contains("Tips are available"));
+    assert!(page.contains("Tips are enabled"));
+    let setting = response_json(harness.get(ACTIVE_TIP_RECIPIENT_PATH).await).await;
+    assert_eq!(setting["user_id"], harness.owner_user_id);
+    assert_eq!(setting["version"], 2);
+
+    // Retrying the same form must not select the recipient or bump versions twice.
+    assert_eq!(
+        browser_request(&harness, &session, Method::POST, "/admin/profile", &create)
+            .await
+            .status(),
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        response_json(harness.get(ACTIVE_TIP_RECIPIENT_PATH).await).await,
+        setting
+    );
 
     // Restart the real daemon with the same SQLite ledger and content artifacts.
     harness.daemon.stop();
@@ -99,7 +99,7 @@ async fn browser_profiles_and_tip_selection_preserve_versions_replay_and_restart
     let (_, session) = password_login(&harness.client, &harness.admin_url).await;
     let page = browser_page(&harness, &session, "/admin/tips").await;
     assert!(page.contains("alice@example.test"));
-    assert!(page.contains("Tips are available"));
+    assert!(page.contains("Tips are enabled"));
 
     let page = browser_page(&harness, &session, "/admin/profile").await;
     assert!(page.contains("Alice &lt;Writer&gt;"));
@@ -132,7 +132,6 @@ async fn browser_profiles_and_tip_selection_preserve_versions_replay_and_restart
         ("expected_version", "1"),
         ("display_name", ""),
         ("lightning_address", ""),
-        ("tips_enabled", "false"),
     ];
     assert_eq!(
         browser_request(&harness, &session, Method::POST, "/admin/profile", &update)
@@ -176,6 +175,68 @@ async fn browser_profiles_and_tip_selection_preserve_versions_replay_and_restart
     );
     let releases = response_json(harness.get("/api/admin/v1/releases").await).await;
     assert_eq!(releases["releases"], json!([]));
+    harness.stop();
+}
+
+#[tokio::test]
+async fn saving_a_browser_profile_does_not_replace_another_selected_recipient() {
+    let harness = AdminProcessHarness::start().await;
+    let (_, session) = password_login(&harness.client, &harness.admin_url).await;
+    let cookie = Zeroizing::new(format!(
+        "{SESSION_COOKIE_NAME}={}; {CSRF_COOKIE_NAME}={}",
+        session.cookie.as_str(),
+        session.csrf.as_str()
+    ));
+    let response = harness.client.post(format!("{}{ADMIN_USERS_PATH}", harness.admin_url))
+        .header(HOST, ADMIN_AUTHORITY)
+        .header(ORIGIN, ADMIN_ORIGIN)
+        .header(COOKIE, cookie.as_str())
+        .header(CSRF_HEADER_NAME, session.csrf.as_str())
+        .header(CONTENT_TYPE, "application/json")
+        .header(IDEMPOTENCY_KEY_HEADER, Uuid::new_v4().to_string())
+        .body(serde_json::to_vec(&json!({
+            "status": "enabled",
+            "roles": ["administrator"],
+            "credentials": [{ "provider": "password", "username": "second-admin", "password": OWNER_PASSWORD }],
+        })).unwrap())
+        .send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let other = response_json(response).await;
+    let page = browser_page(&harness, &session, "/admin/tips").await;
+    let response = browser_request(
+        &harness,
+        &session,
+        Method::POST,
+        "/admin/tips",
+        &[
+            ("operation_id", operation_id(&page)),
+            ("expected_version", "1"),
+            ("user_id", other["user_id"].as_str().unwrap()),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let selected = response_json(harness.get(ACTIVE_TIP_RECIPIENT_PATH).await).await;
+
+    let page = browser_page(&harness, &session, "/admin/profile").await;
+    assert!(!page.contains("name=\"tips_enabled\""));
+    let response = browser_request(
+        &harness,
+        &session,
+        Method::POST,
+        "/admin/profile",
+        &[
+            ("operation_id", operation_id(&page)),
+            ("display_name", "Owner"),
+            ("lightning_address", "owner@example.test"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response_json(harness.get(ACTIVE_TIP_RECIPIENT_PATH).await).await,
+        selected
+    );
     harness.stop();
 }
 

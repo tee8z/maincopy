@@ -10,11 +10,10 @@ use markdown_compiler::identity::{
     finalize_preview_digest, finalize_site_snapshot,
 };
 use markdown_compiler::{
-    AssetDigest, AssetRevisionReference, DefaultPostTipPolicy, DigestedAsset, DraftStatus,
-    LogicalAssetPath, PostAlias, PostDescription, PostId, PostRevisionDigest, PostSlug, PostTag,
-    PostTipPolicy, PostTitle, PreviewDigest, PublicationSettings, ResolvedLocalAssetStore,
-    ResolvedPostAssets, ResolvedSiteAssets, RevisionIdentityError, SiteShellRendererIdentity,
-    SiteSnapshotDigest,
+    AssetDigest, AssetRevisionReference, DigestedAsset, DraftStatus, LogicalAssetPath, PostAlias,
+    PostDescription, PostId, PostRevisionDigest, PostSlug, PostTag, PostTipPolicy, PostTitle,
+    PreviewDigest, PublicationSettings, ResolvedLocalAssetStore, ResolvedPostAssets,
+    ResolvedSiteAssets, RevisionIdentityError, SiteShellRendererIdentity, SiteSnapshotDigest,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use qrcode::{QrCode, types::Color};
@@ -310,7 +309,7 @@ fn render_bound_preview(
         HeadAssetProjection::Preview(preview_asset_endpoint),
     )?;
     let page = PostPageView::from_rendered(rendered, published_at);
-    let tips_enabled = page.tips_enabled(&catalog.publication);
+    let tips_enabled = page.tips_enabled();
     let tip_handoff = if tips_enabled {
         tip_recipient.map(TipHandoff::new).transpose()?
     } else {
@@ -1731,15 +1730,10 @@ impl<'post> PostPageView<'post> {
         }
     }
 
-    fn tips_enabled(self, publication: &PublicationSettings) -> bool {
-        match self.tips {
-            PostTipPolicy::Enabled => true,
-            PostTipPolicy::Disabled => false,
-            PostTipPolicy::InheritPublication => match publication.tips {
-                DefaultPostTipPolicy::Enabled => true,
-                DefaultPostTipPolicy::Disabled => false,
-            },
-        }
+    fn tips_enabled(self) -> bool {
+        // The active admin recipient enables tips. Content can opt an individual
+        // article out, but publication.toml is no longer a second enable switch.
+        !matches!(self.tips, PostTipPolicy::Disabled)
     }
 }
 
@@ -1809,23 +1803,21 @@ fn render_tip_qr(code: &QrCode, address: &str, lnurl: &str) -> Markup {
 
 fn render_tip_cta(handoff: &TipHandoff<'_>) -> Markup {
     let view = handoff.recipient.as_view();
-    let recipient = view.display_name.unwrap_or(view.address);
     html! {
-        aside class="tip-cta" aria-labelledby="tip-heading" {
-            h2 id="tip-heading" { "Enjoyed this article?" }
-            p { "Send a tip to " (recipient) "." }
-            p {
-                a class="tip-action" href=(view.wallet_link) { "Tip with Lightning" }
+        aside class="tip-cta" aria-label="Tip the author" {
+            a class="tip-action" href=(view.wallet_link) { "Leave a tip" }
+            details class="tip-details" {
+                summary { "Lightning address" }
+                div class="tip-details-content" {
+                    p class="tip-recipient" {
+                        code { (view.address) }
+                        " "
+                        button type="button" class="tip-copy" hidden
+                            data-copy-lightning-address=(view.address) { "Copy" }
+                    }
+                    (handoff.qr.clone())
+                }
             }
-            p class="tip-recipient" {
-                "Lightning Address: " code { (view.address) }
-                " "
-                button type="button" class="tip-copy" hidden
-                    data-copy-lightning-address=(view.address) { "Copy" }
-            }
-            (handoff.qr.clone())
-            p { "Your wallet will ask for the amount and apply the recipient service's limits." }
-            p { "Tips are voluntary and are handled by your wallet and the recipient's Lightning service." }
         }
     }
 }
@@ -1875,7 +1867,7 @@ fn render_post(
         image: image.as_deref(),
     })
     .map_err(|error| SiteSnapshotBuildError::metadata(post.post_id, error))?;
-    let tips_enabled = post.tips_enabled(publication);
+    let tips_enabled = post.tips_enabled();
     let content = html! {
         div class="maincopy-post-page" {
             article class="maincopy-post" {
@@ -2138,8 +2130,8 @@ mod tests {
     use super::*;
     use crate::{frontend_assets::embedded_manifest, render::compile_content_catalog};
     use markdown_compiler::{
-        LogicalAssetPath, PostCollection, ResolvedPostAssets, ResolvedSiteAssets, digest_asset,
-        prepare_content,
+        DefaultPostTipPolicy, LogicalAssetPath, PostCollection, ResolvedPostAssets,
+        ResolvedSiteAssets, digest_asset, prepare_content,
     };
 
     use crate::content_fixtures::{asset, content_tree, post, publication};
@@ -2633,22 +2625,23 @@ mod tests {
     }
 
     #[test]
-    fn tip_handoff_renders_exact_accessible_copy_and_escapes_the_display_name() {
+    fn tip_handoff_keeps_payment_details_collapsed_and_the_wallet_link_accessible() {
         let projection = tip_projection(Some("Alice <Writer> & Company"), "alice@example.com");
         let handoff = TipHandoff::new(&projection).unwrap();
         let html = render_tip_cta(&handoff).into_string();
 
-        assert!(html.contains("<h2 id=\"tip-heading\">Enjoyed this article?</h2>"));
-        assert!(html.contains("Send a tip to Alice &lt;Writer&gt; &amp; Company."));
-        assert!(html.contains(">Tip with Lightning</a>"));
-        assert!(html.contains("Lightning Address: <code>alice@example.com</code>"));
-        assert!(html.contains(
-            "<button type=\"button\" class=\"tip-copy\" hidden data-copy-lightning-address=\"alice@example.com\">Copy</button>"
-        ));
-        assert!(html.contains(
-            "Your wallet will ask for the amount and apply the recipient service's limits."
-        ));
-        assert!(html.contains("Tips are voluntary"));
+        assert!(html.contains("aria-label=\"Tip the author\""));
+        assert!(html.contains(">Leave a tip</a>"));
+        assert!(
+            html.contains("<details class=\"tip-details\"><summary>Lightning address</summary>")
+        );
+        assert!(!html.contains("<details class=\"tip-details\" open"));
+        assert!(html.contains("<code>alice@example.com</code>"));
+        assert!(html.contains("data-copy-lightning-address=\"alice@example.com\""));
+        assert!(!html.contains("<h2"));
+        assert!(!html.contains("Enjoyed this article"));
+        assert!(!html.contains("Your wallet will"));
+        assert!(!html.contains("Tips are voluntary"));
         assert!(html.contains("role=\"img\""));
         assert!(
             html.contains("aria-label=\"QR code for tipping alice@example.com with Lightning\"")
@@ -2668,7 +2661,7 @@ mod tests {
         let second = TipHandoff::new(&projection).unwrap();
         let html = render_tip_cta(&first).into_string();
 
-        assert!(html.contains("Send a tip to alice@example.com."));
+        assert!(html.contains("<code>alice@example.com</code>"));
         assert!(html.contains(&format!("href=\"{}\"", view.wallet_link)));
         assert!(html.contains(&format!("data-lnurl=\"{}\"", view.lnurl)));
         assert_eq!(first.qr.0, second.qr.0);
@@ -2691,7 +2684,7 @@ mod tests {
     }
 
     #[test]
-    fn authored_tip_policy_controls_the_profile_handoff() {
+    fn admin_recipient_enables_tips_without_publication_config_and_post_opt_out_is_respected() {
         let fixture = fixture();
         let rendered = fixture
             .catalog
@@ -2724,7 +2717,25 @@ mod tests {
         )
         .unwrap()
         .into_string();
-        assert!(!inherited_disabled.contains("class=\"tip-cta\""));
+        assert!(inherited_disabled.contains("class=\"tip-cta\""));
+
+        let no_recipient = render_post(
+            &PageRenderer::new(
+                &publication,
+                embedded_manifest(),
+                &fixture.catalog.site_assets,
+                HeadAssetProjection::Identity,
+            )
+            .unwrap(),
+            page,
+            &canonical_url,
+            ArticleBody::Omitted,
+            PostNavigation::default(),
+            None,
+        )
+        .unwrap()
+        .into_string();
+        assert!(!no_recipient.contains("class=\"tip-cta\""));
 
         page.tips = PostTipPolicy::Enabled;
         let post_enabled = render_post(
@@ -3643,13 +3654,13 @@ mod tests {
         let snapshot = build_snapshot(&fixture, &ledger).unwrap();
         assert_eq!(
             snapshot.digest.to_string(),
-            "site-b3-v1-d58571601459e2f96420e12d8d9e85b15181c181de9767199f45a8d7138e8b66"
+            "site-b3-v1-e2ca3929e130f171853f453a2a84f75269189f72248b71f140c29d6c0bd83707"
         );
         assert_eq!(
             snapshot.presentation_digest,
             PresentationDigest([
-                39, 95, 147, 214, 124, 121, 50, 143, 144, 211, 77, 97, 90, 187, 16, 237, 128, 32,
-                116, 127, 146, 53, 247, 251, 54, 131, 33, 62, 98, 255, 165, 144,
+                144, 142, 140, 43, 94, 223, 157, 114, 58, 121, 199, 23, 180, 6, 248, 69, 106, 246,
+                16, 11, 105, 240, 25, 201, 164, 33, 13, 65, 103, 186, 156, 82,
             ])
         );
     }

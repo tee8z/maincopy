@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.1.1
+
+- Replace the large article tip panel with a muted link and collapsed Lightning
+  address, copy control, and QR code.
+- Enable tips when an administrator saves a Lightning address. Select that user
+  automatically when the site has no recipient; clearing the address disables tips.
+- Control site tips from the admin profile instead of `publication.toml`.
+  Existing publication-level tip flags no longer control visibility; article
+  frontmatter can still use `tips = false` to hide tips on that article.
+
+## 0.1.0
+
 Initial release. See the [implementation plan](docs/implementation.md) for remaining
 validation work.
 
