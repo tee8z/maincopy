@@ -78,9 +78,13 @@ let
       identity.startup_bootstrap = "require_existing";
       mail = mail.hostConfig;
     }
-    // lib.optionalAttrs cfg.backup.enable {
+    // lib.optionalAttrs (cfg.backup.enable || cfg.backup.externalStatusFile != null) {
       backup = {
-        status_file = "/var/lib/maincopy-backup-status/backup-status.json";
+        status_file =
+          if cfg.backup.externalStatusFile != null then
+            cfg.backup.externalStatusFile
+          else
+            "/var/lib/maincopy-backup-status/backup-status.json";
         stale_after_seconds = cfg.backup.staleAfterSeconds;
       };
     }

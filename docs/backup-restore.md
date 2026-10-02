@@ -118,6 +118,21 @@ Slow uploads cannot make old data look newly captured.
 Unconfigured backups also report degraded health. Backup failure does not stop public reads.
 [Metrics](observability.md) expose `maincopy_backup_healthy` and `maincopy_backup_last_success_timestamp_seconds`.
 
+An external backup publisher can report the same health contract without enabling native B2 services:
+
+```nix
+services.maincopy.backup = {
+  externalStatusFile = "/var/lib/maincopy-external-backup/status.json";
+  staleAfterSeconds = 93600; # Daily backup plus two hours for completion.
+};
+```
+
+The publisher must protect the database and retained content artifacts together.
+Write the report atomically as `maincopy`, with mode `0600`, after complete remote publication succeeds.
+Use the captured recovery-point time for `last_success_at`, not the upload completion time.
+Keep the previous timestamp and report `degraded` if publication fails.
+An external report cannot be configured with the native B2 publisher.
+
 ## Portable full-snapshot export
 
 For a manual encrypted bundle, provision an age recipient file and retain its private key offline.

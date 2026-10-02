@@ -148,6 +148,7 @@ in
 {
   options.services.maincopy.backup = {
     enable = lib.mkEnableOption "continuous Litestream replication with encrypted complete checkpoints to Backblaze B2";
+    externalStatusFile = fileOption "Protected status report from an external complete off-site backup publisher. The report must belong to maincopy with mode 0600. Advance success only after the database and retained content artifacts are remotely recoverable. Mutually exclusive with the native B2 publisher.";
     keyFile = fileOption "Protected canonical base64 encoding of 32 random bytes for rclone crypt. Keep an independently recoverable copy. Only systemd credentials and protected runtime configuration contain the key.";
     credentialsFile = fileOption "Protected rclone configuration containing only [maincopy-b2], type=b2, account, and key. Use a dedicated bucket-scoped application key.";
     bucket = lib.mkOption {
@@ -192,285 +193,295 @@ in
       description = "Maximum age of a complete off-site checkpoint, including upload and manifest publication.";
     };
   };
-  config = lib.mkIf (cfg.enable && backup.enable) {
-    assertions = [
-      {
-        assertion = backup.keyFile != null && backup.credentialsFile != null;
-        message = "Maincopy encrypted checkpoints require protected runtime crypt-key and B2 credential files.";
-      }
-      {
-        assertion = backup.remoteRetentionDays >= backup.localRetentionDays + 2;
-        message = "Maincopy remote lifecycle must preserve the finite epoch dependency window beyond local retention.";
-      }
-    ];
-    environment.systemPackages = [
-      litestream
-      pkgs.rclone
-      restore
-    ];
-    systemd.tmpfiles.rules = [
-      "d ${backupDir} 0700 maincopy maincopy -"
-      "f ${backupDir}/.checkpoint.lock 0600 maincopy maincopy -"
-      "d ${replicaDir} 0700 maincopy maincopy -"
-      "d /run/maincopy-backup-expire 0700 maincopy maincopy -"
-      "d /var/lib/maincopy-backup-status 0700 maincopy maincopy -"
-      "d /run/maincopy-backup 0700 maincopy maincopy -"
-      "d /run/maincopy-litestream 0700 maincopy maincopy -"
-    ];
-    environment.etc."maincopy/litestream.yml".source = litestreamConfig;
-    systemd.services.maincopy = {
-      wants = [
-        "maincopy-litestream.service"
-        "maincopy-backup.timer"
-        "maincopy-backup-expire-local.timer"
-        "maincopy-backup-expire-remote.timer"
+  config = lib.mkMerge [
+    (lib.mkIf cfg.enable {
+      assertions = [
+        {
+          assertion = !backup.enable || backup.externalStatusFile == null;
+          message = "Maincopy must use either native B2 checkpoints or an external backup status publisher, not both.";
+        }
       ];
-      # Stop the application first, then let Litestream flush its final WAL.
-      after = [ "maincopy-litestream.service" ];
-      serviceConfig = {
-        # Empty mounts remain effective even when peers create or recreate
-        # their host directories after this namespace has already started.
-        TemporaryFileSystem = [
-          "${backupDir}:ro"
-          "${replicaDir}:ro"
-          "/run/credentials:ro"
-          "/run/maincopy-backup:ro"
-          "/run/maincopy-backup-expire:ro"
-          "/run/maincopy-litestream:ro"
-        ];
-        ReadOnlyPaths = [ "/var/lib/maincopy-backup-status" ];
-        BindReadOnlyPaths = lib.optional (
-          cfg.source.credentials != { } || cfg.mail.mode == "ses"
-        ) "/run/credentials/maincopy.service";
-      };
-    };
-    systemd.services.maincopy-initialize = lib.mkIf (cfg.initialOwnerPublicKey != null) {
-      conflicts = [
-        "maincopy-litestream.service"
-        "maincopy-backup.service"
-        "maincopy-backup.timer"
-        "maincopy-backup-expire-local.timer"
-        "maincopy-backup-expire-remote.timer"
-        "maincopy-backup-expire-local.service"
-        "maincopy-backup-expire-remote.service"
+    })
+    (lib.mkIf (cfg.enable && backup.enable) {
+      assertions = [
+        {
+          assertion = backup.keyFile != null && backup.credentialsFile != null;
+          message = "Maincopy encrypted checkpoints require protected runtime crypt-key and B2 credential files.";
+        }
+        {
+          assertion = backup.remoteRetentionDays >= backup.localRetentionDays + 2;
+          message = "Maincopy remote lifecycle must preserve the finite epoch dependency window beyond local retention.";
+        }
       ];
-      # Stop the timer too, so it cannot reactivate the conflicting uploader
-      # during bootstrap. Normal daemon startup pulls the timer back in.
-      after = [
-        "maincopy-litestream.service"
-        "maincopy-backup.service"
-        "maincopy-backup.timer"
-        "maincopy-backup-expire-local.timer"
-        "maincopy-backup-expire-remote.timer"
-        "maincopy-backup-expire-local.service"
-        "maincopy-backup-expire-remote.service"
+      environment.systemPackages = [
+        litestream
+        pkgs.rclone
+        restore
       ];
-    };
-    systemd.services.maincopy-litestream = {
-      description = "Maincopy local Litestream replica";
-      wantedBy = [ "multi-user.target" ];
-      before = [ "maincopy.service" ];
-      unitConfig.ConditionPathExists = "${databaseDir}/maincopy.db";
-      serviceConfig = isolation // {
-        # Reviewed exception: SQLite enforces owner UID and mode 0600. This
-        # separate, isolated unit shares only the dedicated database owner UID.
-        User = "maincopy";
-        Group = "maincopy";
-        StateDirectory = "maincopy-litestream";
-        StateDirectoryMode = "0700";
-        RuntimeDirectory = "maincopy-litestream/private";
-        RuntimeDirectoryPreserve = "restart";
-        RuntimeDirectoryMode = "0700";
-        WorkingDirectory = replicaDir;
-        TemporaryFileSystem = [
-          "${stateDir}:ro"
-          "/run/${cfg.runtimeDirectory}:ro"
-          "/run/credentials:ro"
-          "/run/maincopy-backup:ro"
-          "/run/maincopy-backup-expire:ro"
-          "${backupDir}:ro"
-        ];
-        BindPaths = [
-          databaseDir
-          "${backupDir}/.checkpoint.lock"
-        ];
-        ReadWritePaths = [
-          databaseDir
-          replicaDir
-          "/run/maincopy-litestream/private"
-        ];
-        RestrictAddressFamilies = [ "AF_UNIX" ];
-        # Litestream best-effort mirrors the database owner on replica files.
-        # The dedicated UID already owns them: deny changes without killing
-        # those optional calls, and keep every other privileged call blocked.
-        SystemCallFilter = isolation.SystemCallFilter ++ [ "~@chown:EPERM" ];
-        # A simple wrapper lets Maincopy consume pending restore acceptance
-        # before native Litestream can create WAL/SHM or change database bytes.
-        Type = "simple";
-        ExecStartPre = "${pkgs.python3}/bin/python3 ${../scripts}/backup_epochs.py prepare ${lib.escapeShellArgs epochArguments}";
-        # Keep native state protected from expiry even after a wall-clock jump.
-        # --no-fork preserves systemd's direct ownership of the native process.
-        ExecStart = "${pkgs.util-linux}/bin/flock --exclusive --nonblock --no-fork ${replicaDir}/.native.lock ${pkgs.python3}/bin/python3 ${../scripts}/replica-start.py --marker ${databaseDir}/maincopy.db.restore.json --timeout-seconds 180 -- ${litestream}/bin/litestream replicate -config ${litestreamConfig}";
-        # A fresh initial snapshot and new metadata/file replica are the
-        # retention boundary. Native compaction alone preserves old bases.
-        RuntimeMaxSec = backup.epochSeconds - 600;
-        Restart = "always";
-        TimeoutStartSec = "11min";
-        RestartSec = 5;
-        TimeoutStopSec = 45;
-        KillMode = "control-group";
-        MemoryMax = "1G";
-        LimitFSIZE = "20G";
-      };
-    };
-    systemd.services.maincopy-backup = {
-      description = "Publish a complete encrypted Maincopy checkpoint to Backblaze B2";
-      wants = [ "network-online.target" ];
-      after = [
-        "network-online.target"
-        "maincopy.service"
-        "maincopy-litestream.service"
+      systemd.tmpfiles.rules = [
+        "d ${backupDir} 0700 maincopy maincopy -"
+        "f ${backupDir}/.checkpoint.lock 0600 maincopy maincopy -"
+        "d ${replicaDir} 0700 maincopy maincopy -"
+        "d /run/maincopy-backup-expire 0700 maincopy maincopy -"
+        "d /var/lib/maincopy-backup-status 0700 maincopy maincopy -"
+        "d /run/maincopy-backup 0700 maincopy maincopy -"
+        "d /run/maincopy-litestream 0700 maincopy maincopy -"
       ];
-      serviceConfig = isolation // {
-        # Rust checkpoint validation requires openat2, which this systemd
-        # setting otherwise rejects unconditionally with ENOSYS.
-        RestrictSUIDSGID = false;
-        Type = "oneshot";
-        User = "maincopy";
-        Group = "maincopy";
-        StateDirectory = [
-          "maincopy-backup"
-          "maincopy-backup-status"
+      environment.etc."maincopy/litestream.yml".source = litestreamConfig;
+      systemd.services.maincopy = {
+        wants = [
+          "maincopy-litestream.service"
+          "maincopy-backup.timer"
+          "maincopy-backup-expire-local.timer"
+          "maincopy-backup-expire-remote.timer"
         ];
-        StateDirectoryMode = "0700";
-        RuntimeDirectory = "maincopy-backup/private";
-        RuntimeDirectoryMode = "0700";
-        WorkingDirectory = backupDir;
-        TemporaryFileSystem = [
-          "${stateDir}:ro"
-          "/run/${cfg.runtimeDirectory}:ro"
-          "/run/credentials:ro"
-        ];
-        InaccessiblePaths = [ "/run/maincopy-backup-expire" ];
-        BindReadOnlyPaths = [
-          # Bind the parent before taking the lock so rotation cannot leave
-          # this namespace pinned to the previous active directory inode.
-          replicaDir
-          "/run/maincopy-litestream/private"
-          "-${candidateDir}"
-          "/run/credentials/maincopy-backup.service"
-        ];
-        ReadWritePaths = [
-          backupDir
-          "/var/lib/maincopy-backup-status"
-          "/run/maincopy-backup/private"
-        ];
-        LoadCredential = [
-          "crypt-key:${if backup.keyFile == null then "/missing-crypt-key" else backup.keyFile}"
-          "b2-credentials:${
-            if backup.credentialsFile == null then "/missing-b2-credentials" else backup.credentialsFile
-          }"
-        ];
-        # Native Litestream replay uses the same optional ownership calls.
-        SystemCallFilter = isolation.SystemCallFilter ++ [ "~@chown:EPERM" ];
-        ExecStartPre = prepareCredentials;
-        ExecStart = "${pkgs.python3}/bin/python3 ${../scripts}/checkpoint-backup.py ${lib.escapeShellArgs arguments}";
-        ExecStopPost = "${pkgs.python3}/bin/python3 ${../scripts}/checkpoint-backup.py ${lib.escapeShellArgs arguments} --cleanup-only";
-        TimeoutStartSec = "10min";
-        KillMode = "control-group";
-        Nice = 10;
-        CPUWeight = 25;
-        IOWeight = 25;
-        MemoryMax = "1G";
-        LimitFSIZE = "20G";
+        # Stop the application first, then let Litestream flush its final WAL.
+        after = [ "maincopy-litestream.service" ];
+        serviceConfig = {
+          # Empty mounts remain effective even when peers create or recreate
+          # their host directories after this namespace has already started.
+          TemporaryFileSystem = [
+            "${backupDir}:ro"
+            "${replicaDir}:ro"
+            "/run/credentials:ro"
+            "/run/maincopy-backup:ro"
+            "/run/maincopy-backup-expire:ro"
+            "/run/maincopy-litestream:ro"
+          ];
+          ReadOnlyPaths = [ "/var/lib/maincopy-backup-status" ];
+          BindReadOnlyPaths = lib.optional (
+            cfg.source.credentials != { } || cfg.mail.mode == "ses"
+          ) "/run/credentials/maincopy.service";
+        };
       };
-    };
-    # Local expiry has no credentials or network dependency. A failed remote
-    # unit setup must not retain local subscriber history indefinitely.
-    systemd.services.maincopy-backup-expire-local = {
-      description = "Expire local Maincopy checkpoint epochs";
-      serviceConfig = isolation // {
-        Type = "oneshot";
-        User = "maincopy";
-        Group = "maincopy";
-        TemporaryFileSystem = [
-          "${stateDir}:ro"
-          "/run/${cfg.runtimeDirectory}:ro"
-          "/run/credentials:ro"
-          "/run/maincopy-backup:ro"
-          "/run/maincopy-backup-expire:ro"
-          "/run/maincopy-litestream:ro"
+      systemd.services.maincopy-initialize = lib.mkIf (cfg.initialOwnerPublicKey != null) {
+        conflicts = [
+          "maincopy-litestream.service"
+          "maincopy-backup.service"
+          "maincopy-backup.timer"
+          "maincopy-backup-expire-local.timer"
+          "maincopy-backup-expire-remote.timer"
+          "maincopy-backup-expire-local.service"
+          "maincopy-backup-expire-remote.service"
         ];
-        ReadWritePaths = [
-          backupDir
-          replicaDir
+        # Stop the timer too, so it cannot reactivate the conflicting uploader
+        # during bootstrap. Normal daemon startup pulls the timer back in.
+        after = [
+          "maincopy-litestream.service"
+          "maincopy-backup.service"
+          "maincopy-backup.timer"
+          "maincopy-backup-expire-local.timer"
+          "maincopy-backup-expire-remote.timer"
+          "maincopy-backup-expire-local.service"
+          "maincopy-backup-expire-remote.service"
         ];
-        RestrictAddressFamilies = [ "AF_UNIX" ];
-        ExecStart = "${pkgs.python3}/bin/python3 ${../scripts}/backup_epochs.py expire-local ${lib.escapeShellArgs epochArguments}";
-        TimeoutStartSec = "11min";
-        MemoryMax = "256M";
       };
-    };
-    systemd.services.maincopy-backup-expire-remote = {
-      description = "Expire remote Maincopy checkpoint epochs and versions";
-      wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
-      serviceConfig = isolation // {
-        Type = "oneshot";
-        User = "maincopy";
-        Group = "maincopy";
-        RuntimeDirectory = "maincopy-backup-expire/private";
-        RuntimeDirectoryMode = "0700";
-        TemporaryFileSystem = [
-          "${backupDir}:ro"
-          "${stateDir}:ro"
-          "${replicaDir}:ro"
-          "/run/${cfg.runtimeDirectory}:ro"
-          "/run/credentials:ro"
-          "/run/maincopy-backup:ro"
-          "/run/maincopy-litestream:ro"
+      systemd.services.maincopy-litestream = {
+        description = "Maincopy local Litestream replica";
+        wantedBy = [ "multi-user.target" ];
+        before = [ "maincopy.service" ];
+        unitConfig.ConditionPathExists = "${databaseDir}/maincopy.db";
+        serviceConfig = isolation // {
+          # Reviewed exception: SQLite enforces owner UID and mode 0600. This
+          # separate, isolated unit shares only the dedicated database owner UID.
+          User = "maincopy";
+          Group = "maincopy";
+          StateDirectory = "maincopy-litestream";
+          StateDirectoryMode = "0700";
+          RuntimeDirectory = "maincopy-litestream/private";
+          RuntimeDirectoryPreserve = "restart";
+          RuntimeDirectoryMode = "0700";
+          WorkingDirectory = replicaDir;
+          TemporaryFileSystem = [
+            "${stateDir}:ro"
+            "/run/${cfg.runtimeDirectory}:ro"
+            "/run/credentials:ro"
+            "/run/maincopy-backup:ro"
+            "/run/maincopy-backup-expire:ro"
+            "${backupDir}:ro"
+          ];
+          BindPaths = [
+            databaseDir
+            "${backupDir}/.checkpoint.lock"
+          ];
+          ReadWritePaths = [
+            databaseDir
+            replicaDir
+            "/run/maincopy-litestream/private"
+          ];
+          RestrictAddressFamilies = [ "AF_UNIX" ];
+          # Litestream best-effort mirrors the database owner on replica files.
+          # The dedicated UID already owns them: deny changes without killing
+          # those optional calls, and keep every other privileged call blocked.
+          SystemCallFilter = isolation.SystemCallFilter ++ [ "~@chown:EPERM" ];
+          # A simple wrapper lets Maincopy consume pending restore acceptance
+          # before native Litestream can create WAL/SHM or change database bytes.
+          Type = "simple";
+          ExecStartPre = "${pkgs.python3}/bin/python3 ${../scripts}/backup_epochs.py prepare ${lib.escapeShellArgs epochArguments}";
+          # Keep native state protected from expiry even after a wall-clock jump.
+          # --no-fork preserves systemd's direct ownership of the native process.
+          ExecStart = "${pkgs.util-linux}/bin/flock --exclusive --nonblock --no-fork ${replicaDir}/.native.lock ${pkgs.python3}/bin/python3 ${../scripts}/replica-start.py --marker ${databaseDir}/maincopy.db.restore.json --timeout-seconds 180 -- ${litestream}/bin/litestream replicate -config ${litestreamConfig}";
+          # A fresh initial snapshot and new metadata/file replica are the
+          # retention boundary. Native compaction alone preserves old bases.
+          RuntimeMaxSec = backup.epochSeconds - 600;
+          Restart = "always";
+          TimeoutStartSec = "11min";
+          RestartSec = 5;
+          TimeoutStopSec = 45;
+          KillMode = "control-group";
+          MemoryMax = "1G";
+          LimitFSIZE = "20G";
+        };
+      };
+      systemd.services.maincopy-backup = {
+        description = "Publish a complete encrypted Maincopy checkpoint to Backblaze B2";
+        wants = [ "network-online.target" ];
+        after = [
+          "network-online.target"
+          "maincopy.service"
+          "maincopy-litestream.service"
         ];
-        BindReadOnlyPaths = [ "/run/credentials/maincopy-backup-expire-remote.service" ];
-        # Remote expiration needs the publisher lock, never its plaintext
-        # capture workspace or cached recovery contents.
-        BindPaths = [ "${backupDir}/.checkpoint.lock" ];
-        ReadWritePaths = [ expiryCredentialDir ];
-        LoadCredential = [
-          "b2-credentials:${
-            if backup.credentialsFile == null then "/missing-b2-credentials" else backup.credentialsFile
-          }"
-        ];
-        ExecStartPre = expireCredentials;
-        ExecStart = "${pkgs.python3}/bin/python3 ${../scripts}/backup_epochs.py expire-remote ${lib.escapeShellArgs remoteExpiryArguments}";
-        TimeoutStartSec = "11min";
-        KillMode = "control-group";
-        MemoryMax = "256M";
+        serviceConfig = isolation // {
+          # Rust checkpoint validation requires openat2, which this systemd
+          # setting otherwise rejects unconditionally with ENOSYS.
+          RestrictSUIDSGID = false;
+          Type = "oneshot";
+          User = "maincopy";
+          Group = "maincopy";
+          StateDirectory = [
+            "maincopy-backup"
+            "maincopy-backup-status"
+          ];
+          StateDirectoryMode = "0700";
+          RuntimeDirectory = "maincopy-backup/private";
+          RuntimeDirectoryMode = "0700";
+          WorkingDirectory = backupDir;
+          TemporaryFileSystem = [
+            "${stateDir}:ro"
+            "/run/${cfg.runtimeDirectory}:ro"
+            "/run/credentials:ro"
+          ];
+          InaccessiblePaths = [ "/run/maincopy-backup-expire" ];
+          BindReadOnlyPaths = [
+            # Bind the parent before taking the lock so rotation cannot leave
+            # this namespace pinned to the previous active directory inode.
+            replicaDir
+            "/run/maincopy-litestream/private"
+            "-${candidateDir}"
+            "/run/credentials/maincopy-backup.service"
+          ];
+          ReadWritePaths = [
+            backupDir
+            "/var/lib/maincopy-backup-status"
+            "/run/maincopy-backup/private"
+          ];
+          LoadCredential = [
+            "crypt-key:${if backup.keyFile == null then "/missing-crypt-key" else backup.keyFile}"
+            "b2-credentials:${
+              if backup.credentialsFile == null then "/missing-b2-credentials" else backup.credentialsFile
+            }"
+          ];
+          # Native Litestream replay uses the same optional ownership calls.
+          SystemCallFilter = isolation.SystemCallFilter ++ [ "~@chown:EPERM" ];
+          ExecStartPre = prepareCredentials;
+          ExecStart = "${pkgs.python3}/bin/python3 ${../scripts}/checkpoint-backup.py ${lib.escapeShellArgs arguments}";
+          ExecStopPost = "${pkgs.python3}/bin/python3 ${../scripts}/checkpoint-backup.py ${lib.escapeShellArgs arguments} --cleanup-only";
+          TimeoutStartSec = "10min";
+          KillMode = "control-group";
+          Nice = 10;
+          CPUWeight = 25;
+          IOWeight = 25;
+          MemoryMax = "1G";
+          LimitFSIZE = "20G";
+        };
       };
-    };
-    systemd.timers.maincopy-backup-expire-local = {
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnBootSec = "2min";
-        OnUnitInactiveSec = "1h";
-        AccuracySec = "1s";
+      # Local expiry has no credentials or network dependency. A failed remote
+      # unit setup must not retain local subscriber history indefinitely.
+      systemd.services.maincopy-backup-expire-local = {
+        description = "Expire local Maincopy checkpoint epochs";
+        serviceConfig = isolation // {
+          Type = "oneshot";
+          User = "maincopy";
+          Group = "maincopy";
+          TemporaryFileSystem = [
+            "${stateDir}:ro"
+            "/run/${cfg.runtimeDirectory}:ro"
+            "/run/credentials:ro"
+            "/run/maincopy-backup:ro"
+            "/run/maincopy-backup-expire:ro"
+            "/run/maincopy-litestream:ro"
+          ];
+          ReadWritePaths = [
+            backupDir
+            replicaDir
+          ];
+          RestrictAddressFamilies = [ "AF_UNIX" ];
+          ExecStart = "${pkgs.python3}/bin/python3 ${../scripts}/backup_epochs.py expire-local ${lib.escapeShellArgs epochArguments}";
+          TimeoutStartSec = "11min";
+          MemoryMax = "256M";
+        };
       };
-    };
-    systemd.timers.maincopy-backup-expire-remote = {
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnBootSec = "3min";
-        OnUnitInactiveSec = "1h";
-        AccuracySec = "1s";
+      systemd.services.maincopy-backup-expire-remote = {
+        description = "Expire remote Maincopy checkpoint epochs and versions";
+        wants = [ "network-online.target" ];
+        after = [ "network-online.target" ];
+        serviceConfig = isolation // {
+          Type = "oneshot";
+          User = "maincopy";
+          Group = "maincopy";
+          RuntimeDirectory = "maincopy-backup-expire/private";
+          RuntimeDirectoryMode = "0700";
+          TemporaryFileSystem = [
+            "${backupDir}:ro"
+            "${stateDir}:ro"
+            "${replicaDir}:ro"
+            "/run/${cfg.runtimeDirectory}:ro"
+            "/run/credentials:ro"
+            "/run/maincopy-backup:ro"
+            "/run/maincopy-litestream:ro"
+          ];
+          BindReadOnlyPaths = [ "/run/credentials/maincopy-backup-expire-remote.service" ];
+          # Remote expiration needs the publisher lock, never its plaintext
+          # capture workspace or cached recovery contents.
+          BindPaths = [ "${backupDir}/.checkpoint.lock" ];
+          ReadWritePaths = [ expiryCredentialDir ];
+          LoadCredential = [
+            "b2-credentials:${
+              if backup.credentialsFile == null then "/missing-b2-credentials" else backup.credentialsFile
+            }"
+          ];
+          ExecStartPre = expireCredentials;
+          ExecStart = "${pkgs.python3}/bin/python3 ${../scripts}/backup_epochs.py expire-remote ${lib.escapeShellArgs remoteExpiryArguments}";
+          TimeoutStartSec = "11min";
+          KillMode = "control-group";
+          MemoryMax = "256M";
+        };
       };
-    };
-    systemd.timers.maincopy-backup = {
-      description = "Publish encrypted checkpoints at a one-minute target interval";
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnBootSec = "1min";
-        OnUnitInactiveSec = "${toString backup.intervalSeconds}s";
-        AccuracySec = "1s";
+      systemd.timers.maincopy-backup-expire-local = {
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnBootSec = "2min";
+          OnUnitInactiveSec = "1h";
+          AccuracySec = "1s";
+        };
       };
-    };
-  };
+      systemd.timers.maincopy-backup-expire-remote = {
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnBootSec = "3min";
+          OnUnitInactiveSec = "1h";
+          AccuracySec = "1s";
+        };
+      };
+      systemd.timers.maincopy-backup = {
+        description = "Publish encrypted checkpoints at a one-minute target interval";
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnBootSec = "1min";
+          OnUnitInactiveSec = "${toString backup.intervalSeconds}s";
+          AccuracySec = "1s";
+        };
+      };
+    })
+  ];
 }
