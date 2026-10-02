@@ -314,6 +314,13 @@ fn format_digest(
     Ok(())
 }
 
+mod v0_1_0;
+
+/// The frontend whose content identities preceded the quiet-tips release.
+pub(crate) fn previous_manifest() -> &'static FrontendAssetManifest {
+    &v0_1_0::GENERATED_FRONTEND_MANIFEST
+}
+
 include!(concat!(env!("OUT_DIR"), "/frontend_manifest.rs"));
 
 #[cfg(test)]

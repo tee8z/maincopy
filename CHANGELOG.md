@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.3
+
+- Recover v0.1.0 published snapshots when upgrading the frontend. Verify the
+  retained content against the frozen v0.1.0 frontend before installing the new
+  presentation; keep approved article revisions and publication settings pinned.
+
+## 0.1.2
+
 - Manage newsletter details, signup mode, and sending limits in the Owner admin
   portal, with durable settings and live updates. Keep provider credentials in
   protected host configuration.

@@ -2128,7 +2128,10 @@ mod tests {
     use maincopy_shared::profile::{LightningAddress, ProfileDisplayName};
 
     use super::*;
-    use crate::{frontend_assets::embedded_manifest, render::compile_content_catalog};
+    use crate::{
+        frontend_assets::{embedded_manifest, previous_manifest},
+        render::compile_content_catalog,
+    };
     use markdown_compiler::{
         DefaultPostTipPolicy, LogicalAssetPath, PostCollection, ResolvedPostAssets,
         ResolvedSiteAssets, digest_asset, prepare_content,
@@ -3662,6 +3665,24 @@ mod tests {
                 144, 142, 140, 43, 94, 223, 157, 114, 58, 121, 199, 23, 180, 6, 248, 69, 106, 246,
                 16, 11, 105, 240, 25, 201, 164, 33, 13, 65, 103, 186, 156, 82,
             ])
+        );
+    }
+
+    #[test]
+    fn previous_frontend_reproduces_the_v0_1_0_site_identity() {
+        let fixture = fixture();
+        let ledger = projection([
+            entry(&fixture, FIRST_ID, 1_000),
+            entry(&fixture, SECOND_ID, 2_000),
+        ]);
+        let previous =
+            render_site_shell(Arc::clone(&fixture.catalog), previous_manifest(), &ledger)
+                .unwrap()
+                .into_snapshot()
+                .unwrap();
+        assert_eq!(
+            previous.digest.to_string(),
+            "site-b3-v1-d58571601459e2f96420e12d8d9e85b15181c181de9767199f45a8d7138e8b66"
         );
     }
 
