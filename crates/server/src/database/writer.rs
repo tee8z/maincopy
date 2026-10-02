@@ -1322,6 +1322,7 @@ mod tests {
     ) -> FinishPublication {
         FinishPublication {
             publication_id: uuid(publication_id),
+            newsletter: None,
             expected_publication_version: 2,
             expected_site,
             candidate_site_digest: candidate,

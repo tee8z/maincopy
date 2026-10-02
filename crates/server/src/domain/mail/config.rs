@@ -23,12 +23,7 @@ use crate::config::{
 pub(super) use subscriptions::SubscriptionCandidate;
 pub(crate) use subscriptions::{SubscriptionMode, SubscriptionPolicy};
 
-pub(super) const DEFAULT_CAMPAIGN_RECIPIENTS: u64 = 2_000;
-pub(super) const DEFAULT_DAILY_MESSAGES: u64 = 5_000;
-pub(super) const DEFAULT_DAILY_CONFIRMATION_MESSAGES: u64 = 100;
 pub(super) const DEFAULT_SEND_INTERVAL_MILLISECONDS: u64 = 1_000;
-const MAX_CAMPAIGN_RECIPIENTS: u64 = 100_000;
-const MAX_DAILY_MESSAGES: u64 = 1_000_000;
 
 /// The publication's visible sender is public configuration, not a subscriber
 /// address. Subscriber EmailAddress intentionally has no Clone or Debug surface.
@@ -60,9 +55,7 @@ pub(crate) struct SesMailConfiguration {
     configuration_set: String,
     credential_file: SecretFileReference,
     control_signing_key_file: SecretFileReference,
-    max_campaign_recipients: u64,
-    max_daily_messages: u64,
-    max_daily_confirmation_messages: u64,
+
     send_interval: Duration,
     subscriptions: Option<SubscriptionPolicy>,
     feedback: Option<FeedbackConfiguration>,
@@ -76,9 +69,7 @@ pub(crate) struct SesMailConfigurationView<'configuration> {
     pub configuration_set: &'configuration str,
     pub credential_file: &'configuration SecretFileReference,
     pub control_signing_key_file: &'configuration SecretFileReference,
-    pub max_campaign_recipients: u64,
-    pub max_daily_messages: u64,
-    pub max_daily_confirmation_messages: u64,
+
     pub send_interval: Duration,
     pub subscriptions: Option<&'configuration SubscriptionPolicy>,
     pub feedback: Option<&'configuration FeedbackConfiguration>,
@@ -92,9 +83,7 @@ impl SesMailConfiguration {
             configuration_set: &self.configuration_set,
             credential_file: &self.credential_file,
             control_signing_key_file: &self.control_signing_key_file,
-            max_campaign_recipients: self.max_campaign_recipients,
-            max_daily_messages: self.max_daily_messages,
-            max_daily_confirmation_messages: self.max_daily_confirmation_messages,
+
             send_interval: self.send_interval,
             subscriptions: self.subscriptions.as_ref(),
             feedback: self.feedback.as_ref(),
@@ -105,26 +94,18 @@ impl SesMailConfiguration {
     /// Moving an unchanged credential file does not change this binding. Changing
     /// its loaded identity does. Never use this value for management links.
     pub(super) fn provider_binding(&self, credentials: &SesCredentials) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key("maincopy mail provider configuration v1");
+        let mut hasher = blake3::Hasher::new_derive_key("maincopy mail provider configuration v2");
         for value in [self.sender.as_str(), &self.region, &self.configuration_set] {
             hasher.update(&(value.len() as u64).to_le_bytes());
             hasher.update(value.as_bytes());
         }
-        for value in [
-            self.max_campaign_recipients,
-            self.max_daily_messages,
-            self.max_daily_confirmation_messages,
-            self.send_interval.as_millis() as u64,
-        ] {
-            hasher.update(&value.to_le_bytes());
-        }
+        hasher.update(&(self.send_interval.as_millis() as u64).to_le_bytes());
         credentials.bind_configuration(&mut hasher);
         hasher.update(&[u8::from(self.subscriptions.is_some())]);
         if let Some(policy) = &self.subscriptions {
             let view = policy.view();
             for value in [
                 view.operator_name,
-                // Keep existing bindings unchanged when an address is supplied.
                 // An omitted address uses the otherwise-invalid empty value.
                 view.postal_address.unwrap_or_default(),
                 view.purpose,
@@ -176,9 +157,14 @@ struct SesCandidate {
     configuration_set: String,
     credential_file: PathBuf,
     control_signing_key_file: PathBuf,
-    max_campaign_recipients: Option<u64>,
-    max_daily_messages: Option<u64>,
-    max_daily_confirmation_messages: Option<u64>,
+
+    // Accept old host files during binary-only upgrades; these caps no longer apply.
+    #[serde(rename = "max_campaign_recipients")]
+    _legacy_campaign_limit: Option<u64>,
+    #[serde(rename = "max_daily_messages")]
+    _legacy_daily_limit: Option<u64>,
+    #[serde(rename = "max_daily_confirmation_messages")]
+    _legacy_confirmation_limit: Option<u64>,
     send_interval_milliseconds: Option<u64>,
     subscriptions: Option<SubscriptionCandidate>,
     feedback: Option<FeedbackCandidate>,
@@ -209,7 +195,14 @@ impl MailConfigurationCandidate {
 impl SesCandidate {
     fn validate(self, file_base: &Path) -> Result<SesMailConfiguration, ConfigurationErrors> {
         let mut diagnostics = Vec::new();
-        let limits = self.limits(&mut diagnostics);
+        let interval = bounded_limit(
+            self.send_interval_milliseconds
+                .unwrap_or(DEFAULT_SEND_INTERVAL_MILLISECONDS),
+            100,
+            60_000,
+            "mail.send_interval_milliseconds",
+            &mut diagnostics,
+        );
         let subscriptions = self
             .subscriptions
             .and_then(|candidate| candidate.validate(&mut diagnostics));
@@ -271,7 +264,7 @@ impl SesCandidate {
             configuration_set,
             credential_file,
             control_signing_key_file,
-            limits,
+            interval,
         ) {
             (
                 Some(sender),
@@ -279,17 +272,15 @@ impl SesCandidate {
                 Some(configuration_set),
                 Some(credential_file),
                 Some(control_signing_key_file),
-                Some(limits),
+                Some(interval),
             ) => Ok(SesMailConfiguration {
                 sender,
                 region,
                 configuration_set,
                 credential_file,
                 control_signing_key_file,
-                max_campaign_recipients: limits.campaign,
-                max_daily_messages: limits.daily,
-                max_daily_confirmation_messages: limits.confirmation,
-                send_interval: Duration::from_millis(limits.interval_milliseconds),
+
+                send_interval: Duration::from_millis(interval),
                 subscriptions,
                 feedback,
             }),
@@ -302,87 +293,6 @@ impl SesCandidate {
             ])),
         }
     }
-
-    fn limits(&self, diagnostics: &mut Vec<ConfigurationDiagnostic>) -> Option<MailLimits> {
-        MailLimits::validate(
-            self.max_campaign_recipients
-                .unwrap_or(DEFAULT_CAMPAIGN_RECIPIENTS),
-            self.max_daily_messages.unwrap_or(DEFAULT_DAILY_MESSAGES),
-            self.max_daily_confirmation_messages
-                .unwrap_or(DEFAULT_DAILY_CONFIRMATION_MESSAGES),
-            self.send_interval_milliseconds
-                .unwrap_or(DEFAULT_SEND_INTERVAL_MILLISECONDS),
-            diagnostics,
-        )
-    }
-}
-
-impl MailLimits {
-    fn validate(
-        campaign: u64,
-        daily: u64,
-        confirmation: u64,
-        interval: u64,
-        diagnostics: &mut Vec<ConfigurationDiagnostic>,
-    ) -> Option<Self> {
-        let campaign = bounded_limit(
-            campaign,
-            1,
-            MAX_CAMPAIGN_RECIPIENTS,
-            "mail.max_campaign_recipients",
-            diagnostics,
-        );
-        let daily = bounded_limit(
-            daily,
-            1,
-            MAX_DAILY_MESSAGES,
-            "mail.max_daily_messages",
-            diagnostics,
-        );
-        let confirmation = bounded_limit(
-            confirmation,
-            1,
-            MAX_DAILY_MESSAGES,
-            "mail.max_daily_confirmation_messages",
-            diagnostics,
-        );
-        let interval = bounded_limit(
-            interval,
-            100,
-            60_000,
-            "mail.send_interval_milliseconds",
-            diagnostics,
-        );
-        if let (Some(daily), Some(confirmation)) = (daily, confirmation)
-            && confirmation > daily
-        {
-            diagnostics.push(ConfigurationDiagnostic::new(
-                "mail.max_daily_confirmation_messages",
-                ConfigurationValidationCode::LimitOutOfRange,
-                "confirmation messages must fit within the total daily message budget",
-            ));
-            return None;
-        }
-        match (campaign, daily, confirmation, interval) {
-            (Some(campaign), Some(daily), Some(confirmation), Some(interval_milliseconds)) => {
-                Some(MailLimits {
-                    campaign,
-                    daily,
-                    confirmation,
-                    interval_milliseconds,
-                })
-            }
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct MailLimits {
-    campaign: u64,
-    daily: u64,
-    confirmation: u64,
-    interval_milliseconds: u64,
 }
 
 fn validated_field<Value>(
@@ -465,43 +375,23 @@ fn in_nix_store(path: &Path) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NewsletterSettings {
     subscriptions: SubscriptionPolicy,
-    limits: MailLimits,
 }
 
 pub(super) struct NewsletterSettingsCandidate {
     pub subscriptions: SubscriptionCandidate,
-    pub max_campaign_recipients: u64,
-    pub max_daily_messages: u64,
-    pub max_daily_confirmation_messages: u64,
-    pub send_interval_milliseconds: u64,
 }
 
 pub(super) struct NewsletterSettingsView<'settings> {
     pub subscriptions: &'settings SubscriptionPolicy,
-    pub max_campaign_recipients: u64,
-    pub max_daily_messages: u64,
-    pub max_daily_confirmation_messages: u64,
-    pub send_interval_milliseconds: u64,
 }
 
 impl NewsletterSettingsCandidate {
     pub(super) fn validate(self) -> Result<NewsletterSettings, ConfigurationErrors> {
         let mut diagnostics = Vec::new();
-        let subscriptions = self.subscriptions.validate(&mut diagnostics);
-        let limits = MailLimits::validate(
-            self.max_campaign_recipients,
-            self.max_daily_messages,
-            self.max_daily_confirmation_messages,
-            self.send_interval_milliseconds,
-            &mut diagnostics,
-        );
-        match (subscriptions, limits) {
-            (Some(subscriptions), Some(limits)) => Ok(NewsletterSettings {
-                subscriptions,
-                limits,
-            }),
-            _ => Err(ConfigurationErrors::from_diagnostics(diagnostics)),
-        }
+        self.subscriptions
+            .validate(&mut diagnostics)
+            .map(|subscriptions| NewsletterSettings { subscriptions })
+            .ok_or_else(|| ConfigurationErrors::from_diagnostics(diagnostics))
     }
 }
 
@@ -509,10 +399,6 @@ impl NewsletterSettings {
     pub(super) fn view(&self) -> NewsletterSettingsView<'_> {
         NewsletterSettingsView {
             subscriptions: &self.subscriptions,
-            max_campaign_recipients: self.limits.campaign,
-            max_daily_messages: self.limits.daily,
-            max_daily_confirmation_messages: self.limits.confirmation,
-            send_interval_milliseconds: self.limits.interval_milliseconds,
         }
     }
 }
@@ -521,10 +407,6 @@ impl SesMailConfiguration {
     pub(super) fn with_newsletter_settings(&self, settings: &NewsletterSettings) -> Self {
         let mut configuration = self.clone();
         configuration.subscriptions = Some(settings.subscriptions.clone());
-        configuration.max_campaign_recipients = settings.limits.campaign;
-        configuration.max_daily_messages = settings.limits.daily;
-        configuration.max_daily_confirmation_messages = settings.limits.confirmation;
-        configuration.send_interval = Duration::from_millis(settings.limits.interval_milliseconds);
         configuration
     }
 }
@@ -592,9 +474,7 @@ control_signing_key_file = "../secrets/control.key"
         assert_eq!(view.sender.as_str(), "Newsletter@example.com");
         assert_eq!(view.region, "us-east-1");
         assert_eq!(view.configuration_set, "newsletter");
-        assert_eq!(view.max_campaign_recipients, 2_000);
-        assert_eq!(view.max_daily_messages, 5_000);
-        assert_eq!(view.max_daily_confirmation_messages, 100);
+
         assert_eq!(view.send_interval, Duration::from_secs(1));
         assert!(view.credential_file.path().is_absolute());
         assert!(
@@ -636,8 +516,6 @@ control_signing_key_file = "../secrets/control.key"
                 "mail.configuration_set",
                 "mail.control_signing_key_file",
                 "mail.credential_file",
-                "mail.max_campaign_recipients",
-                "mail.max_daily_confirmation_messages",
                 "mail.region",
                 "mail.send_interval_milliseconds",
                 "mail.sender"
@@ -648,48 +526,28 @@ control_signing_key_file = "../secrets/control.key"
     }
 
     #[test]
-    fn inclusive_message_and_rate_limits_reject_zero_and_excessive_values() {
-        for (field, minimum, maximum, additional) in [
-            ("max_campaign_recipients", 1, 100_000, ""),
-            (
-                "max_daily_messages",
-                1,
-                1_000_000,
-                "max_daily_confirmation_messages = 1\n",
-            ),
-            (
-                "max_daily_confirmation_messages",
-                1,
-                1_000_000,
-                "max_daily_messages = 1000000\n",
-            ),
-            ("send_interval_milliseconds", 100, 60_000, ""),
-        ] {
-            for (value, valid) in [
-                (minimum - 1, false),
-                (minimum, true),
-                (maximum, true),
-                (maximum + 1, false),
-            ] {
-                let source = format!("{SES}{field} = {value}\n{additional}");
-                let candidate: MailConfigurationCandidate = toml::from_str(&source).unwrap();
-                let directory = tempfile::tempdir().unwrap();
-                assert_eq!(
-                    candidate.validate(directory.path()).is_ok(),
-                    valid,
-                    "{field} boundary {value}"
-                );
-            }
+    fn transport_pacing_rejects_zero_and_excessive_intervals() {
+        for (value, valid) in [(99, false), (100, true), (60_000, true), (60_001, false)] {
+            let candidate: MailConfigurationCandidate =
+                toml::from_str(&format!("{SES}send_interval_milliseconds = {value}\n")).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            assert_eq!(candidate.validate(directory.path()).is_ok(), valid);
         }
     }
 
     #[test]
-    fn confirmation_budget_is_part_of_the_total_daily_budget() {
-        for (daily, valid) in [(99, false), (100, true)] {
-            let candidate: MailConfigurationCandidate =
-                toml::from_str(&format!("{SES}max_daily_messages = {daily}\n")).unwrap();
-            let directory = tempfile::tempdir().unwrap();
-            assert_eq!(candidate.validate(directory.path()).is_ok(), valid);
+    fn legacy_volume_caps_do_not_change_delivery_configuration_or_binding() {
+        let credentials = SesCredentials::parse(CREDENTIAL).unwrap();
+        let original = configured(SES);
+        for limits in [
+            "max_campaign_recipients = 1\nmax_daily_messages = 1\nmax_daily_confirmation_messages = 1\n",
+            "max_campaign_recipients = 100000\nmax_daily_messages = 5000\nmax_daily_confirmation_messages = 100\n",
+        ] {
+            let legacy = configured(&format!("{limits}{SES}"));
+            assert_eq!(
+                legacy.provider_binding(&credentials),
+                original.provider_binding(&credentials)
+            );
         }
     }
 
@@ -753,17 +611,11 @@ control_signing_key_file = "../secrets/control.key"
                 configured(&SES.replace(before, after)).provider_binding(&credentials)
             );
         }
-        for change in [
-            "max_campaign_recipients = 1999",
-            "max_daily_messages = 4999",
-            "max_daily_confirmation_messages = 99",
-            "send_interval_milliseconds = 1001",
-        ] {
-            assert_ne!(
-                original,
-                configured(&format!("{SES}{change}\n")).provider_binding(&credentials)
-            );
-        }
+        assert_ne!(
+            original,
+            configured(&format!("{SES}send_interval_milliseconds = 1001\n"))
+                .provider_binding(&credentials)
+        );
         for changed in [
             br#"{"access_key_id":"AKIDOTHER","secret_access_key":"1234567890123456"}"#.as_slice(),
             br#"{"access_key_id":"AKIDEXAMPLE","secret_access_key":"6543210987654321"}"#.as_slice(),

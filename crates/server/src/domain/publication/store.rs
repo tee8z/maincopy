@@ -14,6 +14,8 @@ use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::domain::mail::{campaign::CampaignContent, store::queue_article_notification};
+
 use crate::database::store::{
     DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError, Mutation, MutationSender,
 };
@@ -952,6 +954,8 @@ pub(crate) struct BegunPublication {
 /// Commits one candidate after the public snapshot has become visible.
 pub(crate) struct FinishPublication {
     pub publication_id: Uuid,
+    /// Required when the newsletter is enabled; omitted for publication-only callers.
+    pub newsletter: Option<CampaignContent>,
     pub expected_publication_version: u64,
     pub expected_site: SiteHead,
     pub candidate_site_digest: SiteSnapshotDigest,
@@ -2920,6 +2924,15 @@ async fn finish_activation(
     )
     .await
     .map_err(PublicationMutationError::from_startup)?;
+
+    queue_article_notification(
+        transaction,
+        publication_id,
+        published.view(),
+        command.newsletter,
+        version,
+    )
+    .await?;
 
     Ok(FinishedPublication {
         publication_id,

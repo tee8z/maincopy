@@ -54,9 +54,6 @@ pub(crate) enum FeedbackHealth {
 pub(crate) struct SubscriberPolicy {
     pub configuration_binding: [u8; 32],
     pub mode: SubscriberMode,
-    pub max_daily_messages: u64,
-    pub max_daily_confirmations: u64,
-    pub max_campaign_recipients: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,6 +252,7 @@ pub(crate) enum AttemptOutcome {
 }
 
 pub(crate) enum SubmissionOutcome {
+    Retryable,
     Accepted(MessageId),
     Rejected,
     Unknown,

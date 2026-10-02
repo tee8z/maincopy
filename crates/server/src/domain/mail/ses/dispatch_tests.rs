@@ -123,9 +123,6 @@ impl Fixture {
             .set_policy(SubscriberPolicy {
                 configuration_binding: binding,
                 mode: SubscriberMode::Enabled,
-                max_daily_messages: 10,
-                max_daily_confirmations: confirmation_budget,
-                max_campaign_recipients: 10,
             })
             .await
             .unwrap();
@@ -277,8 +274,8 @@ region = "us-east-1"
 configuration_set = "maincopy-newsletter"
 credential_file = "ses.json"
 control_signing_key_file = "control.key"
-max_campaign_recipients = 10
-max_daily_messages = 10
+max_campaign_recipients = 1
+max_daily_messages = 1
 max_daily_confirmation_messages = {budget}
 send_interval_milliseconds = 100
 [subscriptions]
@@ -495,22 +492,18 @@ async fn cancellation_drains_an_accepted_http_request_and_commits_its_reply() {
 }
 
 #[tokio::test]
-async fn confirmation_budget_prevents_capture_and_provider_requests_after_restart() {
+async fn old_daily_caps_do_not_exclude_new_subscribers_after_dispatcher_restart() {
     let mut fixture = Fixture::start(1).await;
     let first = fixture.queue("first@example.com").await;
     let task = fixture.dispatch();
     fixture.request().await.reply.send(ACCEPTED).unwrap();
     task.finish().await;
-    let (_, result) = fixture.enroll("second@example.com").await;
-    assert_eq!(result, EnrollmentRequestResult::Unchanged);
+    let second = fixture.queue("second@example.com").await;
     let task = fixture.dispatch();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(400), fixture.requests.recv())
-            .await
-            .is_err()
-    );
+    fixture.request().await.reply.send(ACCEPTED).unwrap();
     task.finish().await;
     assert_eq!(fixture.outcome(first).await, "accepted");
+    assert_eq!(fixture.outcome(second).await, "accepted");
     assert_eq!(
         fixture
             .store
@@ -519,7 +512,7 @@ async fn confirmation_budget_prevents_capture_and_provider_requests_after_restar
             .await
             .unwrap()
             .addressed_enrollments,
-        1
+        2
     );
     assert!(
         fixture
@@ -530,11 +523,5 @@ async fn confirmation_budget_prevents_capture_and_provider_requests_after_restar
             .unwrap()
             .is_empty()
     );
-    let (total, confirmations): (i64, i64) =
-        sqlx::query_as("SELECT SUM(total),SUM(confirmations) FROM mail_daily_budget")
-            .fetch_one(&mut fixture.reader)
-            .await
-            .unwrap();
-    assert_eq!((total, confirmations), (1, 1));
     fixture.finish().await;
 }

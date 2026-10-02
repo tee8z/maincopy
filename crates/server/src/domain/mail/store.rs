@@ -8,21 +8,25 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::campaign::{
-    Campaign, CampaignApproval, CampaignContent, CampaignCounts, CampaignFence, CampaignId,
-    CampaignLease, CampaignProgress, CampaignQuarantine, CampaignState, CampaignValidationError,
-    CampaignVersion, MAX_CAMPAIGN_RECORD_BYTES, MAX_CAMPAIGNS, MAX_CLAIM_SECONDS,
+    Campaign, CampaignApproval, CampaignAuthority, CampaignContent, CampaignCounts, CampaignFence,
+    CampaignId, CampaignLease, CampaignProgress, CampaignQuarantine, CampaignState,
+    CampaignValidationError, CampaignVersion, MAX_CAMPAIGN_RECORD_BYTES, MAX_CAMPAIGNS,
+    MAX_CLAIM_SECONDS,
 };
 use crate::{
     database::{
         fingerprint::CommandFingerprintBuilder,
-        store::{DatabaseAdmissionError, Mutation, MutationSender},
+        store::{DatabaseAdmissionError, DatabaseCommandError, Mutation, MutationSender},
     },
     domain::{
         auth::store::{
             AuthApplyError, AuthCommandError, MutationAuditContext, append_success_audit,
             decode_audit_principal, require_enabled_owner, require_fresh_browser_owner,
         },
-        publication::store::{PublicationMutationError, SiteHead, matches_publication_review},
+        publication::{
+            CanonicalPublicationView,
+            store::{PublicationMutationError, SiteHead, matches_publication_review},
+        },
     },
 };
 
@@ -61,14 +65,11 @@ impl CampaignStore {
 
     pub(crate) async fn active_campaign(&self) -> Result<Option<Campaign>, CampaignLoadError> {
         let mut query = QueryBuilder::new(SELECT_CAMPAIGNS);
-        query.push(" WHERE state IN ('draft','queued','claimed','cancelling') LIMIT 2");
+        query.push(" WHERE state IN ('draft','queued','claimed','cancelling') ORDER BY CASE state WHEN 'claimed' THEN 0 WHEN 'cancelling' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, rowid LIMIT 1");
         let mut rows = query
             .build_query_as::<CampaignRow>()
             .fetch_all(&self.readers)
             .await?;
-        if rows.len() > 1 {
-            return Err(CampaignLoadError::CorruptStoredState);
-        }
         rows.pop().map(CampaignRow::decode).transpose()
     }
 
@@ -541,6 +542,125 @@ fn change_fingerprint(
     fingerprint
 }
 
+/// Record first publication and its audience atomically with the public ledger.
+/// The marker survives edits, unpublishing, retention, and application restarts.
+pub(crate) async fn queue_article_notification(
+    transaction: &mut Transaction<'_, Sqlite>,
+    publication_id: Uuid,
+    publication: &CanonicalPublicationView,
+    content: Option<CampaignContent>,
+    site_version: u64,
+) -> Result<(), PublicationMutationError> {
+    let inserted = sqlx::query("INSERT INTO mail_article_notifications(post_id,publication_id) VALUES(?,?) ON CONFLICT(post_id) DO NOTHING")
+        .bind(publication.stable_post_id.as_uuid().as_bytes().as_slice())
+        .bind(publication_id.as_bytes().as_slice())
+        .execute(&mut **transaction).await.map_err(PublicationMutationError::Operation)?;
+    if inserted.rows_affected() == 0 {
+        return Ok(());
+    }
+    let policy: Option<(Vec<u8>, i64)> = sqlx::query_as("SELECT configuration_binding,enrollment_sequence FROM mail_control_state WHERE singleton=1 AND configuration_binding IS NOT NULL AND COALESCE((SELECT mode FROM mail_settings WHERE singleton=1),mode)='enabled'")
+        .fetch_optional(&mut **transaction).await.map_err(PublicationMutationError::Operation)?;
+    let Some((binding, cutoff)) = policy else {
+        return Ok(());
+    };
+    let content = content.ok_or(PublicationMutationError::Command(
+        DatabaseCommandError::InvalidValue,
+    ))?;
+    content
+        .validate()
+        .map_err(|_| PublicationMutationError::Command(DatabaseCommandError::InvalidValue))?;
+    if content.post_id != publication.stable_post_id
+        || content.revision != publication.pinned_post_digest
+        || content.site_version != site_version
+        || !matches_publication_review(
+            transaction,
+            &content.post_id,
+            &content.revision,
+            &SiteHead {
+                digest: content.snapshot.clone(),
+                version: site_version,
+            },
+        )
+        .await?
+    {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    }
+    let now = publication
+        .published_at
+        .ok_or(PublicationMutationError::CorruptStoredState)?;
+    let authority = CampaignAuthority::Publication { publication_id };
+    let campaign = Campaign {
+        campaign_id: CampaignId(publication_id),
+        version: CampaignVersion::INITIAL,
+        content,
+        configuration_binding: binding
+            .try_into()
+            .map_err(|_| PublicationMutationError::CorruptStoredState)?,
+        created_by: authority,
+        created_at: now,
+        updated_at: now,
+        state: CampaignState::Queued {
+            approval: CampaignApproval {
+                owner: authority,
+                approved_at: now,
+                instance_version: instance_version(transaction)
+                    .await
+                    .map_err(publication_error)?,
+                audience_cutoff: u64::try_from(cutoff)
+                    .map_err(|_| PublicationMutationError::CorruptStoredState)?,
+            },
+        },
+    };
+    campaign
+        .validate()
+        .map_err(|_| PublicationMutationError::CorruptStoredState)?;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM mail_campaigns")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(PublicationMutationError::Operation)?;
+    if count >= MAX_CAMPAIGNS as i64 {
+        return Err(PublicationMutationError::Command(
+            DatabaseCommandError::Rejected,
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO mail_campaigns(campaign_id,version,state,record) VALUES(?,1,'queued',?)",
+    )
+    .bind(campaign.campaign_id.0.as_bytes().as_slice())
+    .bind(encode_record(&campaign).map_err(publication_error)?)
+    .execute(&mut **transaction)
+    .await
+    .map_err(PublicationMutationError::Operation)?;
+    Ok(())
+}
+
+fn publication_error(error: CampaignApplyError) -> PublicationMutationError {
+    match error {
+        CampaignApplyError::Operation(error) => PublicationMutationError::Operation(error),
+        CampaignApplyError::Command(_) | CampaignApplyError::CorruptStoredState => {
+            PublicationMutationError::CorruptStoredState
+        }
+    }
+}
+
+async fn require_publication_authority(
+    transaction: &mut Transaction<'_, Sqlite>,
+    campaign: &Campaign,
+) -> Result<(), CampaignApplyError> {
+    let CampaignAuthority::Publication { publication_id } = campaign.created_by else {
+        return Ok(());
+    };
+    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM mail_article_notifications WHERE post_id=? AND publication_id=?)")
+        .bind(campaign.content.post_id.as_uuid().as_bytes().as_slice())
+        .bind(publication_id.as_bytes().as_slice()).fetch_one(&mut **transaction).await?;
+    if !valid || campaign.campaign_id.0 != publication_id {
+        return Err(CampaignApplyError::CorruptStoredState);
+    }
+    Ok(())
+}
+
 pub(crate) async fn create_campaign(
     transaction: &mut Transaction<'_, Sqlite>,
     command: CreateCampaign,
@@ -581,7 +701,7 @@ pub(crate) async fn create_campaign(
         version: CampaignVersion::INITIAL,
         content: command.content,
         configuration_binding: command.configuration_binding,
-        created_by: owner,
+        created_by: CampaignAuthority::Owner(owner),
         created_at: command.now,
         updated_at: command.now,
         state: CampaignState::Draft,
@@ -655,7 +775,7 @@ pub(crate) async fn approve_campaign(
     .await?;
     campaign.state = CampaignState::Queued {
         approval: CampaignApproval {
-            owner,
+            owner: CampaignAuthority::Owner(owner),
             approved_at: command.now,
             instance_version: instance_version(transaction).await?,
             audience_cutoff: subscriber_store::audience_cutoff(transaction).await?,
@@ -737,14 +857,11 @@ pub(crate) async fn claim_campaign(
         return Err(CampaignCommandError::InvalidValue.into());
     }
     let mut query = QueryBuilder::new(SELECT_CAMPAIGNS);
-    query.push(" WHERE state IN ('queued','claimed','cancelling') LIMIT 2");
+    query.push(" WHERE state IN ('queued','claimed','cancelling') ORDER BY CASE state WHEN 'queued' THEN 1 ELSE 0 END, rowid LIMIT 1");
     let mut rows = query
         .build_query_as::<CampaignRow>()
         .fetch_all(&mut **transaction)
         .await?;
-    if rows.len() > 1 {
-        return Err(CampaignApplyError::CorruptStoredState);
-    }
     let Some(row) = rows.pop() else {
         return Ok(None);
     };
@@ -769,6 +886,10 @@ pub(crate) async fn claim_campaign(
         | CampaignState::Unknown { .. }
         | CampaignState::Quarantined { .. } => return Err(CampaignApplyError::CorruptStoredState),
     };
+    require_publication_authority(transaction, &campaign).await?;
+    if matches!(campaign.created_by, CampaignAuthority::Publication { .. }) {
+        campaign.configuration_binding = command.configuration_binding;
+    }
     if campaign.configuration_binding != command.configuration_binding {
         return Err(CampaignCommandError::ConfigurationChanged.into());
     }
@@ -803,7 +924,9 @@ pub(crate) async fn renew_campaign_claim(
         return Err(CampaignCommandError::InvalidValue.into());
     }
     let mut campaign = load(transaction, command.campaign_id).await?;
-    if campaign.configuration_binding != command.configuration_binding {
+    if campaign.configuration_binding != command.configuration_binding
+        && matches!(campaign.created_by, CampaignAuthority::Owner(_))
+    {
         return Err(CampaignCommandError::ConfigurationChanged.into());
     }
     let CampaignState::Claimed { approval, lease } = &mut campaign.state else {
@@ -826,7 +949,7 @@ pub(crate) async fn renew_campaign_claim(
 }
 
 /// The subscriber store calls this inside the SAME transaction that checks
-/// consent/budgets and records a durable unique attempt. It grants no separate
+/// consent and records a durable unique attempt. It grants no separate
 /// permission that can outlive the transaction.
 pub(crate) async fn require_campaign_admission(
     transaction: &mut Transaction<'_, Sqlite>,
@@ -836,9 +959,12 @@ pub(crate) async fn require_campaign_admission(
     now: OffsetDateTime,
 ) -> Result<CampaignApproval, CampaignApplyError> {
     let campaign = load(transaction, campaign_id).await?;
-    if campaign.configuration_binding != configuration_binding {
+    if campaign.configuration_binding != configuration_binding
+        && matches!(campaign.created_by, CampaignAuthority::Owner(_))
+    {
         return Err(CampaignCommandError::ConfigurationChanged.into());
     }
+    require_publication_authority(transaction, &campaign).await?;
     let CampaignState::Claimed { approval, lease } = campaign.state else {
         return Err(CampaignCommandError::StaleClaim.into());
     };
@@ -849,14 +975,16 @@ pub(crate) async fn require_campaign_admission(
     {
         return Err(CampaignCommandError::StaleClaim.into());
     }
-    require_enabled_owner(transaction, approval.owner)
-        .await
-        .map_err(|error| match error {
-            AuthApplyError::Command(
-                AuthCommandError::NotFound | AuthCommandError::ScopeEscalation,
-            ) => CampaignCommandError::ApprovalRevoked.into(),
-            error => auth_error(error),
-        })?;
+    if let CampaignAuthority::Owner(owner) = approval.owner {
+        require_enabled_owner(transaction, owner)
+            .await
+            .map_err(|error| match error {
+                AuthApplyError::Command(
+                    AuthCommandError::NotFound | AuthCommandError::ScopeEscalation,
+                ) => CampaignCommandError::ApprovalRevoked.into(),
+                error => auth_error(error),
+            })?;
+    }
     Ok(approval)
 }
 
@@ -951,7 +1079,9 @@ pub(crate) async fn reconcile_campaign_acceptance(
 ) -> Result<(), CampaignApplyError> {
     let mut campaign = load(transaction, campaign_id).await?;
     campaign.state = match campaign.state {
-        CampaignState::Claimed { .. } | CampaignState::Cancelling { .. } => return Ok(()),
+        CampaignState::Queued { .. }
+        | CampaignState::Claimed { .. }
+        | CampaignState::Cancelling { .. } => return Ok(()),
         CampaignState::Unknown {
             approval,
             mut counts,
@@ -988,7 +1118,6 @@ pub(crate) async fn reconcile_campaign_acceptance(
             ..
         } => return Ok(()),
         CampaignState::Draft
-        | CampaignState::Queued { .. }
         | CampaignState::Completed { .. }
         | CampaignState::Cancelled { .. } => return Err(CampaignApplyError::CorruptStoredState),
     };
@@ -1027,11 +1156,10 @@ pub(crate) async fn quarantine_recipient_history(
 ) -> Result<(), CampaignApplyError> {
     let mut campaign = load(transaction, campaign_id).await?;
     let approval = match campaign.state {
-        CampaignState::Claimed { approval, .. } | CampaignState::Cancelling { approval, .. } => {
-            approval
-        }
+        CampaignState::Queued { approval }
+        | CampaignState::Claimed { approval, .. }
+        | CampaignState::Cancelling { approval, .. } => approval,
         CampaignState::Draft
-        | CampaignState::Queued { .. }
         | CampaignState::Completed { .. }
         | CampaignState::Cancelled { .. }
         | CampaignState::Unknown { .. }
@@ -1110,6 +1238,16 @@ async fn quarantine_one(
     reason: CampaignQuarantine,
     now: OffsetDateTime,
 ) -> Result<(), CampaignApplyError> {
+    if reason == CampaignQuarantine::Interrupted
+        && matches!(campaign.created_by, CampaignAuthority::Publication { .. })
+        && let CampaignState::Claimed { approval, .. } = campaign.state.clone()
+    {
+        require_publication_authority(transaction, campaign).await?;
+        subscriber_store::quarantine_campaign_attempts(transaction, campaign.campaign_id, now)
+            .await?;
+        campaign.state = CampaignState::Queued { approval };
+        return persist(transaction, campaign, now.max(campaign.updated_at)).await;
+    }
     let (approval, progress) = match campaign.state.clone() {
         CampaignState::Draft => (None, CampaignProgress::Known(CampaignCounts::default())),
         CampaignState::Queued { approval } => (
@@ -1286,9 +1424,6 @@ mod tests {
                 .set_policy(SubscriberPolicy {
                     configuration_binding: [7; 32],
                     mode: SubscriberMode::Enabled,
-                    max_daily_messages: 100,
-                    max_daily_confirmations: 100,
-                    max_campaign_recipients: 100,
                 })
                 .await
                 .unwrap();
@@ -1878,9 +2013,6 @@ mod tests {
             .set_policy(SubscriberPolicy {
                 configuration_binding: [8; 32],
                 mode: SubscriberMode::Enabled,
-                max_daily_messages: 100,
-                max_daily_confirmations: 100,
-                max_campaign_recipients: 100,
             })
             .await
             .unwrap();
@@ -2456,7 +2588,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(approval.owner, UserId::from_uuid(Uuid::from_u128(1)));
+        assert_eq!(
+            approval.owner,
+            CampaignAuthority::Owner(UserId::from_uuid(Uuid::from_u128(1)))
+        );
         for now in [at(119), at(150), at(151)] {
             assert!(matches!(
                 require_campaign_admission(
@@ -3136,5 +3271,122 @@ mod tests {
             harness.store.subscribers.validate_all().await.unwrap();
             harness.close().await;
         }
+    }
+    #[tokio::test]
+    async fn explicit_throttling_survives_restart_without_replaying_accepted_attempts() {
+        let harness = Harness::start().await;
+        let recipient = harness.recipient("retry@example.com").await;
+        let queued = harness.queued(9000).await;
+        let now = OffsetDateTime::now_utc();
+        let campaign = harness
+            .store
+            .mail
+            .claim(ClaimCampaign {
+                configuration_binding: [7; 32],
+                lease_seconds: 300,
+                now,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let attempt = harness.admit(&campaign, &recipient).await.into_attempt();
+        let attempt_id = attempt.attempt_id;
+        let old_fence = attempt.attempt_fence;
+        let epoch = attempt.mail_epoch;
+        let result = harness
+            .store
+            .subscribers
+            .finish_attempt(FinishAttempt {
+                mail_epoch: epoch,
+                attempt_id,
+                attempt_fence: old_fence,
+                outcome: SubmissionOutcome::Retryable,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, AttemptOutcome::Queued);
+        let command = AdmitCampaignRecipient {
+            campaign_id: campaign.campaign_id,
+            campaign_fence: fence(&campaign),
+            enrollment: recipient.enrollment,
+            generation: recipient.generation,
+            attempt_id: Uuid::new_v4(),
+            configuration_binding: [7; 32],
+        };
+        assert!(matches!(
+            harness
+                .store
+                .subscribers
+                .admit_campaign_recipient(command)
+                .await
+                .unwrap(),
+            DeliveryAdmission::Deferred
+        ));
+        let root = harness.close().await;
+        let mut connection = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(root.path().join("state/maincopy.db"))
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+        let mut transaction = connection.begin().await.unwrap();
+        let retry_time = now + time::Duration::seconds(61);
+        let command = AdmitCampaignRecipient {
+            campaign_id: campaign.campaign_id,
+            campaign_fence: fence(&campaign),
+            enrollment: recipient.enrollment,
+            generation: recipient.generation,
+            attempt_id: Uuid::new_v4(),
+            configuration_binding: [7; 32],
+        };
+        let DeliveryAdmission::Ready(permit) =
+            subscriber_store::admit_campaign_recipient(&mut transaction, command, retry_time)
+                .await
+                .unwrap()
+        else {
+            panic!("known rejection may be retried after its durable delay");
+        };
+        let retry = permit.into_attempt();
+        assert_eq!(retry.attempt_id, attempt_id);
+        assert_ne!(retry.attempt_fence, old_fence);
+        assert_eq!(
+            subscriber_store::finish_attempt(
+                &mut transaction,
+                FinishAttempt {
+                    mail_epoch: epoch,
+                    attempt_id,
+                    attempt_fence: retry.attempt_fence,
+                    outcome: accepted(),
+                },
+                retry_time.unix_timestamp()
+            )
+            .await
+            .unwrap(),
+            AttemptOutcome::Accepted
+        );
+        assert!(
+            subscriber_store::finish_attempt(
+                &mut transaction,
+                FinishAttempt {
+                    mail_epoch: epoch,
+                    attempt_id,
+                    attempt_fence: old_fence,
+                    outcome: SubmissionOutcome::Retryable,
+                },
+                retry_time.unix_timestamp()
+            )
+            .await
+            .is_err()
+        );
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM mail_attempts WHERE campaign_id=?")
+                .bind(queued.campaign_id.0.as_bytes().as_slice())
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1);
+        transaction.commit().await.unwrap();
+        connection.close().await.unwrap();
     }
 }

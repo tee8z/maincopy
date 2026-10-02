@@ -1,13 +1,13 @@
 # Email operations and privacy
 
-Status: email delivery is implemented. Newsletter details and sending limits are managed in the admin portal. Production capture and sending remain disabled pending provider acceptance.
+Status: email delivery is implemented. Newsletter details are managed in the admin portal. Production capture and sending remain disabled pending provider acceptance.
 
 Use this guide to configure SES, operate the mailing list, and recover interrupted delivery.
 [Implementation](implementation.md) records remaining acceptance. [Deployment](deployment.md) covers the host; [backup and restore](backup-restore.md) covers encrypted checkpoints.
 
 ## Scope and cost
 
-The first campaign announces one explicitly published article revision. An Owner reviews and authorizes its email separately from website publication.
+When the newsletter is enabled, first publication queues an article update for all subscribers active at that moment. Website publication authorizes this notification.
 SES is the selected provider. DynamoDB is excluded; mail tables use the existing application SQLite database and sole writer.
 Other providers can become concrete adapters when needed. There is no speculative adapter framework or SES contact-list dependency.
 
@@ -34,7 +34,7 @@ services.maincopy.mail = {
 };
 ```
 
-Replace the example sender and provider resources. Configure newsletter details and sending limits under **Admin → Mail → Newsletter settings**.
+Replace the example sender and provider resources. Configure newsletter details under **Admin → Mail → Newsletter settings**.
 
 Supply secret paths as strings. Never use Nix path literals or `builtins.readFile` for secret material.
 The module copies systemd credentials into private service-owned runtime files.
@@ -69,30 +69,36 @@ Keep the provider and control key configured while addresses exist. Pause signup
 
 1. Sign in with a fresh Owner session.
 2. Open **Mail → Newsletter settings**.
-3. Enter the public operator name, monitored contact email, newsletter purpose, and HTTPS privacy notice URL.
+3. Enter the public operator name, monitored contact email, and newsletter purpose.
+   Leave the optional privacy notice URL blank to use `/email/privacy` on your public site.
+   Maincopy serves this notice from the saved details, including while delivery is paused
+   or provider credentials are not configured. Supply an HTTPS URL to use your own notice.
 4. Enter a postal address only if you want or need to publish one.
-5. Set campaign, daily message, confirmation, and pacing limits.
-6. Save with signup and sending **Paused** until provider acceptance is complete.
-7. Select **Enabled** and save after acceptance.
+5. Save with signup and sending **Paused** until provider acceptance is complete.
+6. Select **Enabled** and save after acceptance.
+
+The newsletter has no recipient or daily message caps. Transport pacing remains a host setting to accommodate provider throughput.
+Legacy TOML recipient and daily caps are accepted during upgrades but do not restrict delivery.
 
 You can save paused newsletter details before configuring the provider. Enabling signup requires the configured SES feedback source.
-Sending also requires healthy feedback and separate Owner approval of each campaign.
-Postal addresses are optional in Maincopy. Leave the field empty to omit it from signup information, campaign review, and email footers.
+Sending also requires healthy feedback. Article publication queues the notification without a separate email approval.
+Postal addresses are optional in Maincopy. Leave the field empty to omit it from signup information, delivery details, and email footers.
 Supplied addresses must contain 1–500 bytes without surrounding whitespace or control characters.
 Operators remain responsible for disclosures required for their messages. See the [FTC commercial-email requirements](https://www.ftc.gov/business-guidance/resources/can-spam-act-compliance-guide-business).
 
 Settings are stored in SQLite and included in normal backups. Saving updates admission in the same transaction as the settings and audit receipt.
-New requests and delivery work read the saved settings without a service restart. Changed pacing waits a full new interval before another admission.
+New requests and delivery work read the saved settings without a service restart. Transport pacing remains host configuration.
 Feedback establishes readiness for the changed configuration before sending resumes. An already admitted message can finish with its previous settings.
-Changed details or limits require new campaign approval and retire unsent confirmation requests. Readers can submit a fresh signup request.
+Changed details apply to unsent article updates and retire unsent confirmation requests. Readers can submit a fresh signup request.
+Legacy manually approved messages remain bound to their reviewed configuration.
 Unsubscribe links remain valid. Stale admin edits and signup forms are rejected; reload the relevant page before submitting again.
 Saving settings does not reset daily usage, suppressions, or consent. Recovery and restored-data quarantine also pause saved newsletter settings.
 
-Existing `[mail.subscriptions]` and host sending limits remain defaults until the first admin save.
+Existing `[mail.subscriptions]` remains the default until the first admin save.
 After that save, stored newsletter settings take precedence across restarts. Provider identity, feedback endpoints, and secret files remain host configuration.
 In legacy Nix configuration, omit `postalAddress` or set it to `null`. In legacy TOML configuration, omit `postal_address`.
 
-This change adds database migration `0011_mail_settings.sql`. Preserve a verified pre-upgrade backup before deployment.
+Newsletter settings and automatic delivery use migrations `0011_mail_settings.sql` through `0013_article_notifications.sql`. Preserve a verified pre-upgrade backup before deployment.
 An older binary cannot open the upgraded migration ledger; follow the normal restore acceptance procedure for rollback.
 
 ## Connect SES feedback
@@ -170,7 +176,7 @@ See [SNS filtering](https://docs.aws.amazon.com/sns/latest/dg/sns-subscription-f
 
 Link readers to `/email/subscribe` after launch acceptance. Signup requires an explicit consent checkbox and email confirmation.
 Addresses are matched case-insensitively; delivery preserves the supplied spelling.
-Generic signup responses avoid revealing existing subscriptions. Confirmation requests have a one-hour cooldown and separate daily budget.
+Generic signup responses avoid revealing existing subscriptions. Confirmation requests have a one-hour cooldown per address. Other readers can continue subscribing.
 
 Pending consent expires 24 hours after signup. Confirmation links work once within that window; queued mail can arrive with less remaining validity.
 Management links remain usable without that expiry. A fresh enrollment receives a new generation; old links cannot remove the new subscription.
@@ -204,25 +210,33 @@ Global hard-bounce suppression can last up to 14 days. See [account suppression]
 SNS retries delivery to SQS for approximately 23 days during failures. This provider retention is separate from queue and Maincopy retention.
 See [SNS retry policies](https://docs.aws.amazon.com/sns/latest/dg/sns-message-delivery-retries.html).
 
-## Approve and operate campaigns
+## Article notifications
 
-Open **Mail** in the private administration screen. Use a fresh session from a currently enabled Owner.
-Publish the intended article revision first, then review its email. Review includes immutable content, sender settings, audience cutoff, and current readiness.
-Approve sending separately. Only one campaign can be active.
+Open **Mail** in the private administration screen to inspect delivery history or cancel waiting notifications.
+Set **Signup and sending** to **Enabled** after provider acceptance. First publication then queues one notification for the active subscriber list.
+Publication and notification admission share one database transaction. A durable article marker prevents edits, replays, unpublishing, and restarts from creating another notification.
+Upgrades mark existing articles without sending the archive. Articles first published while the newsletter is paused are not backfilled when it resumes.
 
-Each recipient admission rechecks consent, suppression, Owner authority, cancellation, configuration, and budgets inside the existing sole writer.
-The audience cutoff uses confirmation sequence, so later subscriptions and clock changes cannot enlarge an approved audience.
-The dispatcher commits an attempt before calling SES. Confirmation messages share the total daily budget and have their own cap.
-Default pacing permits one request per second; actual account quotas can require a slower setting.
+Email contains the article title, a short description, and its public link. Long titles and descriptions are clipped at valid UTF-8 boundaries.
+Multiple articles can wait in publication order. One dispatcher sends serially, with a default interval of one second between requests.
+Confirmation emails and article updates take turns when both queues have work. Signup traffic cannot starve article delivery.
+Each recipient admission rechecks current consent, suppression, cancellation, configuration, instance identity, and feedback readiness.
+The audience cutoff uses confirmation sequence; later signups cannot enlarge the original audience. Unsubscribing before admission excludes the reader.
 
-Accepted means SES accepted the request, not that it reached an inbox.
-A timeout or malformed response leaves an unknown outcome. Maincopy never automatically retries that attempt, including after restart.
+An explicit SES throttle or quota rejection returns that attempt to a durable queue with a 60-second delay.
+Retry admission receives a new fence and checks consent again. Provider rejection retries continue across ordinary application restarts.
+Accepted means SES accepted the request; it does not prove inbox delivery.
+A timeout or malformed response leaves an unknown outcome. Maincopy never automatically retries that recipient, including after restart.
 Authenticated feedback can establish later acceptance. Silence cannot prove rejection.
 SES has no documented client idempotency token for [SendEmail](https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html).
 
-Use campaign cancellation to stop new recipients. Cancellation drains already admitted work before finalizing aggregate outcomes.
-Select **Paused** in **Mail → Newsletter settings** to stop new admission while keeping confirmation and removal controls available.
-Configuration changes require new approval for affected work. Never route an uncertain submission through another provider.
+Ordinary restarts resume unsent recipients for publication-triggered notifications. Already admitted requests become unknown and are excluded from repeat submission.
+Restore acceptance and consent resets still quarantine notifications. Recipient-history expiry closes unfinished delivery before deleting deduplication records.
+Legacy manual drafts and approvals remain readable and cancellable, with their original authority and configuration checks.
+
+Use **Cancel article update** to stop new recipients. Cancellation drains admitted work before finalizing totals.
+Select **Paused** in newsletter settings to stop new admission while keeping confirmation and removal controls available.
+Changing public details updates unsent automatic notifications. Never route an uncertain submission through another provider.
 
 ## Recover feedback or restored data
 
@@ -253,7 +267,7 @@ If trustworthy consent/feedback continuity cannot be recovered:
 6. Select **Enabled** in newsletter settings only after the current source establishes healthy feedback readiness. Restart Maincopy if host provider settings changed.
 
 The reset removes all current enrollment and attempt eligibility, including arrivals after the review page opened.
-It quarantines unfinished campaigns and preserves aggregate history, suppression digests, and daily budgets.
+It quarantines unfinished campaigns and preserves aggregate history, suppression digests, and daily usage totals.
 It rotates a non-PII delivery epoch. Authenticated events for known retired epochs cannot affect fresh consent.
 Unknown epochs remain a conflict; timestamps cannot establish their provenance.
 Readers must voluntarily subscribe again. Never email the old list to request renewed consent.

@@ -63,7 +63,7 @@ pub(super) async fn review(
             PageKind::Authenticated,
             html! {
                 h1 { "Recover email delivery" }
-                p { a href="/admin/mail" { "Return to mail campaigns" } }
+                p { a href="/admin/mail" { "Return to newsletter" } }
                 p { "Temporary polling interruptions recover automatically after the old request can no longer hide feedback. Wait for that recovery before taking a destructive action." }
                 @if status.feedback_health == FeedbackHealth::ReconciliationRequired {
                     section class="panel" {
@@ -134,7 +134,7 @@ pub(super) async fn reset(
                 p { (reset.discarded_enrollments) " enrollment records and " (reset.discarded_attempts) " recipient attempts were removed." }
                 p { (reset.quarantined_campaigns) " unfinished campaigns were paused for review. Previously submitted messages cannot be recalled." }
                 p { "Repair the feedback source before restarting mail. Readers must subscribe and confirm again; the old list will not receive a confirmation request." }
-                p { a href="/admin/mail" { "Return to mail campaigns" } }
+                p { a href="/admin/mail" { "Return to newsletter" } }
             },
         ))
     }

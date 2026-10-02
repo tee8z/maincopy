@@ -320,9 +320,6 @@ mod subscriber_routes {
             let policy = SubscriberPolicy {
                 configuration_binding: state.settings.resolve(None).configuration_binding,
                 mode: SubscriberMode::Enabled,
-                max_daily_messages: 100,
-                max_daily_confirmations: 100,
-                max_campaign_recipients: 100,
             };
             state
                 .subscribers

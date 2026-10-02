@@ -20,7 +20,8 @@ use crate::{
     content_fixtures::{content_tree, post, publication},
     domain::{
         mail::{
-            config::SubscriptionMode,
+            config::{MailConfiguration, SubscriptionMode},
+            privacy,
             subscriber::{
                 BeginFeedbackRun, FeedbackHealth, FeedbackObservation, RecordFeedbackObservation,
                 SubscriberMode, SubscriberPolicy,
@@ -169,13 +170,9 @@ async fn create_owner(router: &Router, browser: &BrowserSession) -> String {
 async fn mail_history_observes_policy_changes_and_latched_feedback_without_rebuilding_the_router() {
     let mut harness = ProtectedAdminHarness::start_with_password().await;
     let binding = binding();
-    let view = binding.configuration.view();
     let mut policy = SubscriberPolicy {
         configuration_binding: binding.configuration_binding,
         mode: SubscriberMode::Enabled,
-        max_daily_messages: view.max_daily_messages,
-        max_daily_confirmations: view.max_daily_confirmation_messages,
-        max_campaign_recipients: view.max_campaign_recipients,
     };
     harness.runtime.mail.access = MailUiAccess::ReviewOnly(binding);
     let router = harness.router();
@@ -503,7 +500,7 @@ async fn reviewed_public_draft_retries_and_cancellation_work_while_sending_is_un
     let markup = text(response).await;
     assert!(markup.contains("Reviewed &lt;public&gt; title"));
     assert!(!markup.contains("<script>description"));
-    assert!(markup.contains("sending is not ready"));
+    assert!(markup.contains("Delivery is not ready"));
     let body = draft_body(&markup);
     let id = CampaignId(Uuid::parse_str(&input(&markup, "proposed_id")).unwrap());
     // A later private candidate must not leak into the public announcement.
@@ -605,7 +602,7 @@ async fn reviewed_public_draft_retries_and_cancellation_work_while_sending_is_un
     assert!(matches!(cancelled.state, CampaignState::Cancelled { .. }));
     assert_eq!(u64::from(cancelled.version), 2);
     let current = text(get(&unavailable, &browser, &path).await).await;
-    assert!(current.contains("This campaign is cancelled"));
+    assert!(current.contains("This article update is cancelled"));
     assert!(!current.contains("Approve sending"));
     drop((router, unavailable));
     harness.stop().await;
@@ -748,6 +745,15 @@ async fn feedback_reset_requires_explicit_owner_confirmation_and_recovers_the_or
 }
 
 fn newsletter_body(markup: &str, mode: &str, operation: &str) -> Bytes {
+    newsletter_body_with_privacy(markup, mode, operation, "https://example.com/privacy")
+}
+
+fn newsletter_body_with_privacy(
+    markup: &str,
+    mode: &str,
+    operation: &str,
+    privacy_url: &str,
+) -> Bytes {
     let mut form = url::form_urlencoded::Serializer::new(String::new());
     for name in [
         "_csrf",
@@ -763,16 +769,89 @@ fn newsletter_body(markup: &str, mode: &str, operation: &str) -> Bytes {
         ("operator_name", "A <newsletter>"),
         ("postal_address", ""),
         ("purpose", "New articles and personal updates."),
-        ("privacy_url", "https://example.com/privacy"),
+        ("privacy_url", privacy_url),
         ("contact_address", "contact@example.com"),
-        ("max_campaign_recipients", "20"),
-        ("max_daily_messages", "100"),
-        ("max_daily_confirmation_messages", "25"),
-        ("send_interval_milliseconds", "1000"),
     ] {
         form.append_pair(name, value);
     }
     Bytes::from(form.finish())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blank_privacy_url_uses_a_public_notice_with_live_settings_without_provider_credentials() {
+    let harness = ProtectedAdminHarness::start_with_password().await;
+    let admin = harness.router();
+    let owner = harness.password_login(&admin).await;
+    let subscribers = harness.runtime.mail.subscribers.clone();
+    let public = privacy::router(subscribers.clone(), &MailConfiguration::Disabled);
+    let before = get(&public, &owner, "/email/privacy").await;
+    assert_eq!(before.status(), StatusCode::OK);
+    assert!(
+        text(before)
+            .await
+            .contains("Newsletter signup is not configured yet.")
+    );
+
+    let markup = text(get(&admin, &owner, "/admin/mail/settings").await).await;
+    let expected = privacy::notice_url(
+        &harness
+            .runtime
+            .mail
+            .publications
+            .read()
+            .catalog
+            .publication
+            .site
+            .base_url,
+    );
+    assert!(markup.contains("Custom privacy notice URL (optional)"));
+    assert!(markup.contains(expected.as_str()));
+    let body =
+        newsletter_body_with_privacy(&markup, "paused", &input(&markup, "idempotency_key"), "");
+    assert_eq!(
+        submit(&admin, &owner, "/admin/mail/settings", body)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let saved = subscribers.mail_settings().await.unwrap().unwrap();
+    assert_eq!(
+        saved.settings.view().subscriptions.view().privacy_url,
+        &expected
+    );
+    let response = get(&public, &owner, "/email/privacy").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    let notice = text(response).await;
+    assert!(notice.contains("A &lt;newsletter&gt;"));
+    assert!(!notice.contains("A <newsletter>"));
+    assert!(notice.contains("contact@example.com"));
+    assert!(notice.contains("Amazon Web Services"));
+    assert!(!notice.contains("Postal address:"));
+    for path in ["/admin/mail/settings", "/email/subscribe"] {
+        assert_eq!(
+            get(&public, &owner, path).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(
+        submit(&public, &owner, "/email/privacy", Bytes::new())
+            .await
+            .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    let head = public
+        .oneshot(owner.request(Method::HEAD, "/email/privacy", Bytes::new()))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert!(text(head).await.is_empty());
+    assert_eq!(
+        subscribers.mail_settings().await.unwrap().unwrap().version,
+        1
+    );
+    assert_eq!(subscribers.status().await.unwrap().addressed_enrollments, 0);
+    harness.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -892,9 +971,7 @@ async fn saving_newsletter_settings_updates_live_admission_and_all_new_configura
         initial_policy.configuration_binding
     );
     assert_eq!(durable, current.subscriber_policy());
-    assert_eq!(durable.max_daily_messages, 100);
-    assert_eq!(durable.max_daily_confirmations, 25);
-    assert_eq!(durable.max_campaign_recipients, 20);
+
     let policy = current.configuration.view().subscriptions.unwrap().view();
     assert_eq!(policy.operator_name, "A <newsletter>");
     assert_eq!(policy.postal_address, None);

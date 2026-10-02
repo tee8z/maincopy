@@ -1,17 +1,19 @@
+use std::borrow::Cow;
+
 use markdown_compiler::{PostId, PostRevisionDigest, SiteSnapshotDigest};
 use maud::html;
 use thiserror::Error;
 
 use crate::{
     domain::publication::{CanonicalSiteUrl, activation::PublicationReadProjection},
-    render::SiteSnapshot,
+    render::{ContentCatalog, SiteSnapshot},
 };
 
 pub(super) const ANNOUNCEMENT_TEMPLATE_VERSION: u32 = 1;
 // Leave room for escaped recipient controls inside the transport's body limit.
 pub(super) const MAX_ANNOUNCEMENT_BODY_BYTES: usize = 64 * 1024;
 const MAX_SUBJECT_BYTES: usize = 512;
-const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
+const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 
 /// Common campaign bytes contain published content only. Recipient addresses
 /// and control links are added in protected memory at submission time.
@@ -46,27 +48,35 @@ impl Announcement {
         if &published.revision != expected_revision {
             return Err(AnnouncementError::PublicationChanged);
         }
-        let post = publication
-            .catalog
+        Self::from_article(&publication.catalog, snapshot, post_id, expected_revision)
+    }
+
+    pub(super) fn from_article(
+        catalog: &ContentCatalog,
+        snapshot: &SiteSnapshot,
+        post_id: &PostId,
+        expected_revision: &PostRevisionDigest,
+    ) -> Result<Self, AnnouncementError> {
+        let post = catalog
             .get(post_id, expected_revision)
             .ok_or(AnnouncementError::RevisionUnavailable)?;
         let canonical_url = snapshot
             .post_canonical_url(&post.document.metadata.slug)
             .ok_or(AnnouncementError::RevisionUnavailable)?
             .clone();
-        let subject = post.document.metadata.title.as_str();
-        let description = post.document.metadata.description.as_str();
-        validate_subject(subject)?;
-        if description.len() > MAX_DESCRIPTION_BYTES {
-            return Err(AnnouncementError::DescriptionTooLong);
-        }
+        let subject = excerpt(post.document.metadata.title.as_str(), MAX_SUBJECT_BYTES);
+        let description = excerpt(
+            post.document.metadata.description.as_str(),
+            MAX_DESCRIPTION_BYTES,
+        );
+        validate_subject(&subject)?;
         let text = format!(
             "{subject}\n\n{description}\n\nRead the article: {}\n",
             canonical_url.as_str()
         );
         let html = html! {
-            h1 { (subject) }
-            p { (description) }
+            h1 { (subject.as_ref()) }
+            p { (description.as_ref()) }
             p { a href=(canonical_url.as_str()) { "Read the article" } }
         }
         .into_string();
@@ -77,7 +87,7 @@ impl Announcement {
             post_id,
             expected_revision,
             canonical_url.as_str(),
-            subject,
+            &subject,
             &text,
             &html,
         );
@@ -86,12 +96,22 @@ impl Announcement {
             revision: expected_revision.clone(),
             snapshot: snapshot.digest.clone(),
             canonical_url,
-            subject: subject.into(),
+            subject: subject.into_owned(),
             text,
             html,
             content_digest,
         })
     }
+}
+
+/// Email is a bounded teaser. Long valid article metadata must not prevent
+/// publication, and clipping must preserve UTF-8 and leave room for escaping.
+fn excerpt(value: &str, bytes: usize) -> Cow<'_, str> {
+    if value.len() <= bytes {
+        return Cow::Borrowed(value);
+    }
+    let boundary = value.floor_char_boundary(bytes - "…".len());
+    Cow::Owned(format!("{}…", &value[..boundary]))
 }
 
 /// Both preparation and persisted-content validation use the template's exact
@@ -140,8 +160,6 @@ pub(super) enum AnnouncementError {
     RevisionUnavailable,
     #[error("the article title cannot be used as an email subject")]
     InvalidSubject,
-    #[error("the article description exceeds the email template limit")]
-    DescriptionTooLong,
     #[error("the rendered announcement exceeds the email template limit")]
     BodyTooLong,
 }
@@ -364,5 +382,19 @@ mod tests {
             validate_subject(&"é".repeat(MAX_SUBJECT_BYTES)),
             Err(AnnouncementError::InvalidSubject)
         );
+    }
+    #[test]
+    fn long_article_metadata_becomes_a_bounded_utf8_teaser() {
+        let source = PUBLIC_ARTICLE
+            .replace("A <reviewed> article", &"é".repeat(400))
+            .replace("A <script> description & summary.", &"<&>".repeat(5000));
+        let (published, snapshot, post_id, revision) = fixture(true, &source);
+        let announcement =
+            Announcement::from_published(&published, &snapshot, &post_id, &revision).unwrap();
+        assert!(announcement.subject.ends_with('…'));
+        assert!(announcement.subject.len() <= MAX_SUBJECT_BYTES);
+        assert!(announcement.html.len() <= MAX_ANNOUNCEMENT_BODY_BYTES);
+        assert!(announcement.text.contains("Read the article:"));
+        assert!(!announcement.html.contains("<script>"));
     }
 }

@@ -13,7 +13,10 @@ use super::announcement::{
     ANNOUNCEMENT_TEMPLATE_VERSION, Announcement, MAX_ANNOUNCEMENT_BODY_BYTES,
     announcement_content_digest,
 };
-use crate::domain::publication::{CanonicalSiteUrl, PublicPagePath};
+use crate::{
+    domain::publication::{CanonicalSiteUrl, PublicPagePath},
+    render::{ContentCatalog, SiteSnapshot},
+};
 
 pub(crate) const MAX_CAMPAIGNS: usize = 10_000;
 pub(crate) const MAX_CAMPAIGN_RECORD_BYTES: usize = 256 * 1024;
@@ -74,6 +77,18 @@ pub(crate) struct CampaignContent {
 }
 
 impl CampaignContent {
+    pub(crate) fn for_publication(
+        catalog: &ContentCatalog,
+        snapshot: &SiteSnapshot,
+        post_id: &PostId,
+        revision: &PostRevisionDigest,
+        site_version: u64,
+    ) -> Result<Self, CampaignValidationError> {
+        let announcement = Announcement::from_article(catalog, snapshot, post_id, revision)
+            .map_err(|_| CampaignValidationError::Content)?;
+        Self::from_announcement(announcement, site_version)
+    }
+
     pub(super) fn from_announcement(
         announcement: Announcement,
         site_version: u64,
@@ -162,10 +177,19 @@ impl CampaignCounts {
     }
 }
 
+/// Legacy Owner identifiers retain their JSON representation. Publication
+/// authority is granted only by the transaction committing a public article.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub(crate) enum CampaignAuthority {
+    Owner(UserId),
+    Publication { publication_id: Uuid },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CampaignApproval {
-    pub owner: UserId,
+    pub owner: CampaignAuthority,
     pub approved_at: OffsetDateTime,
     pub instance_version: u64,
     pub audience_cutoff: u64,
@@ -258,7 +282,7 @@ pub(crate) struct Campaign {
     pub version: CampaignVersion,
     pub content: CampaignContent,
     pub configuration_binding: [u8; 32],
-    pub created_by: UserId,
+    pub created_by: CampaignAuthority,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub state: CampaignState,
@@ -274,24 +298,24 @@ impl Campaign {
         }
         match &self.state {
             CampaignState::Draft => {
-                if self.version != CampaignVersion::INITIAL {
+                if self.version != CampaignVersion::INITIAL
+                    || matches!(self.created_by, CampaignAuthority::Publication { .. })
+                {
                     return Err(CampaignValidationError::State);
                 }
             }
-            CampaignState::Queued { approval } => {
-                approval.validate(self.created_at, self.updated_at)?
-            }
+            CampaignState::Queued { approval } => self.validate_approval(approval)?,
             CampaignState::Claimed { approval, lease }
             | CampaignState::Cancelling { approval, lease } => {
-                approval.validate(self.created_at, self.updated_at)?;
+                self.validate_approval(approval)?;
                 lease.validate(approval, self.updated_at)?;
             }
             CampaignState::Completed { approval, counts } => {
-                approval.validate(self.created_at, self.updated_at)?;
+                self.validate_approval(approval)?;
                 counts.require_resolved(Some(approval))?;
             }
             CampaignState::Unknown { approval, counts } => {
-                approval.validate(self.created_at, self.updated_at)?;
+                self.validate_approval(approval)?;
                 counts.require_unresolved()?;
             }
             CampaignState::Cancelled { approval, counts } => {
@@ -310,12 +334,33 @@ impl Campaign {
         Ok(())
     }
 
+    fn validate_approval(
+        &self,
+        approval: &CampaignApproval,
+    ) -> Result<(), CampaignValidationError> {
+        match (self.created_by, approval.owner) {
+            (CampaignAuthority::Owner(_), CampaignAuthority::Owner(_)) => {}
+            (
+                CampaignAuthority::Publication {
+                    publication_id: created,
+                },
+                CampaignAuthority::Publication {
+                    publication_id: approved,
+                },
+            ) if created == approved => {}
+            _ => return Err(CampaignValidationError::State),
+        }
+        approval.validate(self.created_at, self.updated_at)
+    }
+
     fn validate_optional_approval(
         &self,
         approval: Option<&CampaignApproval>,
     ) -> Result<(), CampaignValidationError> {
         if let Some(approval) = approval {
-            approval.validate(self.created_at, self.updated_at)?;
+            self.validate_approval(approval)?;
+        } else if matches!(self.created_by, CampaignAuthority::Publication { .. }) {
+            return Err(CampaignValidationError::State);
         }
         Ok(())
     }

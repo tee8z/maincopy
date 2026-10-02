@@ -45,16 +45,32 @@ struct CampaignFixture {
 
 impl CampaignFixture {
     async fn start() -> Self {
+        let fixture = Self::unpublished().await;
+        fixture.mail.store.subscribers.pause().await.unwrap();
+        fixture.publish("Reviewed public article").await;
+        fixture
+            .mail
+            .store
+            .subscribers
+            .set_policy(SubscriberPolicy {
+                configuration_binding: fixture.mail.binding,
+                mode: SubscriberMode::Enabled,
+            })
+            .await
+            .unwrap();
+        ready_feedback(&fixture.mail.store, fixture.mail.binding).await;
+        fixture
+    }
+
+    async fn unpublished() -> Self {
         let mail = Fixture::start(10).await;
         let session = browser_session(&mail.store, mail.owner, 20).await;
         let runtime = AdminTestRuntime::start(&mail.store).await;
-        let fixture = Self {
+        Self {
             mail,
             runtime,
             session,
-        };
-        fixture.publish("Reviewed public article").await;
-        fixture
+        }
     }
 
     fn audit(&self) -> MutationAuditContext {
@@ -62,9 +78,14 @@ impl CampaignFixture {
     }
 
     async fn publish(&self, title: &str) {
+        self.publish_article(POST_ID, title).await;
+    }
+
+    async fn publish_article(&self, id: &str, title: &str) {
+        let slug = if id == POST_ID { "article" } else { "second" };
         let tree = content_tree(
             publication("publication.toml", "[site]\ntitle = \"Dispatcher test\"\nbase_url = \"https://example.com/\"\ndescription = \"Public announcement fixture.\"\n[author]\nname = \"Test author\"\n".into()),
-            vec![post("posts/article.md", PostCollection::Posts, format!("+++\nid = \"{POST_ID}\"\ntitle = \"{title}\"\nslug = \"article\"\nauthored_at = 2026-09-01T00:00:00Z\ndescription = \"Public description & summary.\"\ndraft = false\n+++\n\nA public article.\n"))],
+            vec![post("posts/article.md", PostCollection::Posts, format!("+++\nid = \"{id}\"\ntitle = \"{title}\"\nslug = \"{slug}\"\nauthored_at = 2026-09-01T00:00:00Z\ndescription = \"Public description & summary.\"\ndraft = false\n+++\n\nA public article.\n"))],
             vec![], 0,
         );
         let handle = &self.runtime.state.publications;
@@ -74,7 +95,7 @@ impl CampaignFixture {
             .await
             .unwrap();
         let projection = handle.read();
-        let post_id = PostId::parse(POST_ID).unwrap();
+        let post_id = PostId::parse(id).unwrap();
         let preview = render_bound_post_preview(
             &projection.catalog,
             projection.frontend,
@@ -512,65 +533,25 @@ async fn removal_before_admission_excludes_a_previously_approved_recipient() {
 }
 
 #[tokio::test]
-async fn daily_budget_defers_without_spending_or_finishing_the_campaign() {
+async fn legacy_daily_caps_do_not_exclude_article_recipients() {
     let mut fixture = CampaignFixture::start().await;
     fixture.recipient(1, "first@example.com").await;
+    fixture.recipient(2, "second@example.com").await;
     let campaign = fixture.approve().await;
-    let policy = SubscriberPolicy {
-        configuration_binding: fixture.mail.binding,
-        mode: SubscriberMode::Enabled,
-        max_daily_messages: 1,
-        max_daily_confirmations: 1,
-        max_campaign_recipients: 10,
-    };
-    fixture
-        .mail
-        .store
-        .subscribers
-        .set_policy(policy)
-        .await
-        .unwrap();
-    ready_feedback(&fixture.mail.store, fixture.mail.binding).await;
     let task = fixture.mail.dispatch();
-    fixture.wait_for(campaign.campaign_id, "claimed").await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(350), fixture.mail.requests.recv())
-            .await
-            .is_err()
-    );
-    assert!(matches!(
-        fixture.current(campaign.campaign_id).await.state,
-        CampaignState::Claimed { .. }
-    ));
-    let attempts: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM mail_attempts WHERE campaign_id=?")
-            .bind(campaign.campaign_id.0.as_bytes().as_slice())
-            .fetch_one(&mut fixture.mail.reader)
-            .await
-            .unwrap();
-    assert_eq!(attempts, 0);
+    fixture.mail.request().await.reply.send(ACCEPTED).unwrap();
     fixture
         .mail
-        .store
-        .subscribers
-        .set_policy(SubscriberPolicy {
-            max_daily_messages: 2,
-            ..policy
-        })
+        .request()
         .await
+        .reply
+        .send(SECOND_ACCEPTED)
         .unwrap();
-    ready_feedback(&fixture.mail.store, fixture.mail.binding).await;
-    fixture.mail.request().await.reply.send(ACCEPTED).unwrap();
     let completed = fixture.wait_for(campaign.campaign_id, "completed").await;
     assert!(
-        matches!(completed.state, CampaignState::Completed { counts, .. } if counts.accepted == 1)
+        matches!(completed.state, CampaignState::Completed { counts, .. } if counts.accepted == 2)
     );
     task.finish().await;
-    let total: i64 = sqlx::query_scalar("SELECT SUM(total) FROM mail_daily_budget")
-        .fetch_one(&mut fixture.mail.reader)
-        .await
-        .unwrap();
-    assert_eq!(total, 2);
     fixture.finish().await;
 }
 
@@ -638,5 +619,203 @@ async fn revoking_the_approving_owners_role_stops_further_recipient_admission() 
             .await
             .unwrap();
     assert_eq!(attempts, 1);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn first_publication_notifies_the_frozen_audience_and_resumes_without_resending() {
+    let mut fixture = CampaignFixture::unpublished().await;
+    let first = fixture.recipient(1, "first@example.com").await;
+    let second = fixture.recipient(2, "second@example.com").await;
+    fixture.publish("First publication").await;
+    let campaign = fixture
+        .mail
+        .store
+        .mail
+        .active_campaign()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(campaign.state, CampaignState::Queued { ref approval } if approval.audience_cutoff == 2)
+    );
+    fixture.recipient(3, "later@example.com").await;
+    let task = fixture.mail.dispatch();
+    let request = fixture.mail.request().await;
+    let first_attempt =
+        assert_newsletter(&fixture, &request, "first@example.com", &first, &campaign);
+    task.stop.cancel();
+    request.reply.send(ACCEPTED).unwrap();
+    task.finish().await;
+    assert_eq!(fixture.mail.outcome(first_attempt).await, "accepted");
+    fixture.publish("Edited after publication").await;
+    assert_eq!(
+        fixture
+            .mail
+            .store
+            .mail
+            .list(None, 20)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    fixture
+        .mail
+        .store
+        .mail
+        .quarantine_interrupted(OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let task = fixture.mail.dispatch();
+    let request = fixture.mail.request().await;
+    assert_newsletter(&fixture, &request, "second@example.com", &second, &campaign);
+    request.reply.send(SECOND_ACCEPTED).unwrap();
+    let completed = fixture.wait_for(campaign.campaign_id, "completed").await;
+    assert!(
+        matches!(completed.state, CampaignState::Completed { counts, .. } if counts.accepted == 2)
+    );
+    task.finish().await;
+    assert!(fixture.mail.requests.try_recv().is_err());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn multiple_new_articles_wait_in_order_without_a_second_email_approval() {
+    let mut fixture = CampaignFixture::unpublished().await;
+    fixture.recipient(1, "reader@example.com").await;
+    fixture.publish("First article").await;
+    fixture
+        .publish_article("22222222-2222-4222-8222-222222222222", "Second article")
+        .await;
+    let page = fixture.mail.store.mail.list(None, 20).await.unwrap();
+    assert_eq!(page.items.len(), 2);
+    let task = fixture.mail.dispatch();
+    let request = fixture.mail.request().await;
+    assert_eq!(
+        request.body["Content"]["Simple"]["Subject"]["Data"],
+        "First article"
+    );
+    request.reply.send(ACCEPTED).unwrap();
+    let request = fixture.mail.request().await;
+    assert_eq!(
+        request.body["Content"]["Simple"]["Subject"]["Data"],
+        "Second article"
+    );
+    request.reply.send(SECOND_ACCEPTED).unwrap();
+    for campaign in page.items {
+        fixture.wait_for(campaign.campaign_id, "completed").await;
+    }
+    task.finish().await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn publishing_while_paused_is_not_backfilled_by_enabling_or_editing() {
+    let fixture = CampaignFixture::start().await;
+    fixture.recipient(1, "reader@example.com").await;
+    fixture.publish("Edited after enabling newsletter").await;
+    assert!(
+        fixture
+            .mail
+            .store
+            .mail
+            .list(None, 20)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn restart_skips_uncertain_recipient_and_continues_unsent_recipients() {
+    let mut fixture = CampaignFixture::unpublished().await;
+    fixture.recipient(1, "uncertain@example.com").await;
+    let second = fixture.recipient(2, "second@example.com").await;
+    fixture.publish("Published article").await;
+    let campaign = fixture
+        .mail
+        .store
+        .mail
+        .active_campaign()
+        .await
+        .unwrap()
+        .unwrap();
+    let task = fixture.mail.dispatch();
+    let request = fixture.mail.request().await;
+    task.stop.cancel();
+    request.reply.send("{}").unwrap();
+    task.finish().await;
+    fixture
+        .mail
+        .store
+        .mail
+        .quarantine_interrupted(OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let task = fixture.mail.dispatch();
+    let request = fixture.mail.request().await;
+    assert_newsletter(&fixture, &request, "second@example.com", &second, &campaign);
+    request.reply.send(SECOND_ACCEPTED).unwrap();
+    let finished = fixture.wait_for(campaign.campaign_id, "unknown").await;
+    assert!(
+        matches!(finished.state, CampaignState::Unknown { counts, .. } if counts == (CampaignCounts { accepted: 1, rejected: 0, unknown: 1 }))
+    );
+    task.finish().await;
+    assert!(fixture.mail.requests.try_recv().is_err());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn signup_backlog_cannot_starve_published_article_delivery() {
+    let mut fixture = CampaignFixture::unpublished().await;
+    let reader = fixture.recipient(1, "reader@example.com").await;
+    fixture.publish("Article with waiting signups").await;
+    let campaign = fixture
+        .mail
+        .store
+        .mail
+        .active_campaign()
+        .await
+        .unwrap()
+        .unwrap();
+    let first_signup = fixture.mail.queue("new-reader@example.com").await;
+    let waiting_signup = fixture.mail.queue("waiting-reader@example.com").await;
+    let task = fixture.mail.dispatch();
+    let confirmation = fixture.mail.request().await;
+    assert_eq!(confirmation.body["EmailTags"].as_array().unwrap().len(), 2);
+    confirmation.reply.send(ACCEPTED).unwrap();
+    let newsletter = fixture.mail.request().await;
+    assert_newsletter(
+        &fixture,
+        &newsletter,
+        "reader@example.com",
+        &reader,
+        &campaign,
+    );
+    task.stop.cancel();
+    newsletter.reply.send(SECOND_ACCEPTED).unwrap();
+    task.finish().await;
+    let signup_outcomes = [
+        fixture.mail.outcome(first_signup).await,
+        fixture.mail.outcome(waiting_signup).await,
+    ];
+    assert_eq!(
+        signup_outcomes
+            .iter()
+            .filter(|outcome| outcome.as_str() == "accepted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        signup_outcomes
+            .iter()
+            .filter(|outcome| outcome.as_str() == "queued")
+            .count(),
+        1
+    );
     fixture.finish().await;
 }

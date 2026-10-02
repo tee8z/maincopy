@@ -25,7 +25,7 @@ pub(in crate::domain::mail) async fn load(
     readers: &SqlitePool,
 ) -> Result<Option<StoredMailSettings>, SubscriberLoadError> {
     // Bound copies even if a damaged database bypassed its schema constraints.
-    let row = sqlx::query("SELECT version,CASE WHEN length(mode)<=7 THEN mode END AS mode,CASE WHEN length(CAST(operator_name AS BLOB))<=200 THEN operator_name END AS operator_name,CASE WHEN length(CAST(postal_address AS BLOB))<=500 THEN postal_address END AS postal_address,CASE WHEN length(CAST(purpose AS BLOB))<=2000 THEN purpose END AS purpose,CASE WHEN length(CAST(privacy_url AS BLOB))<=2048 THEN privacy_url END AS privacy_url,CASE WHEN length(CAST(contact_address AS BLOB))<=254 THEN contact_address END AS contact_address,max_campaign_recipients,max_daily_messages,max_daily_confirmation_messages,send_interval_milliseconds,(postal_address IS NULL OR length(CAST(postal_address AS BLOB))<=500) AS valid_postal_width FROM mail_settings WHERE singleton=1")
+    let row = sqlx::query("SELECT version,CASE WHEN length(mode)<=7 THEN mode END AS mode,CASE WHEN length(CAST(operator_name AS BLOB))<=200 THEN operator_name END AS operator_name,CASE WHEN length(CAST(postal_address AS BLOB))<=500 THEN postal_address END AS postal_address,CASE WHEN length(CAST(purpose AS BLOB))<=2000 THEN purpose END AS purpose,CASE WHEN length(CAST(privacy_url AS BLOB))<=2048 THEN privacy_url END AS privacy_url,CASE WHEN length(CAST(contact_address AS BLOB))<=254 THEN contact_address END AS contact_address,(postal_address IS NULL OR length(CAST(postal_address AS BLOB))<=500) AS valid_postal_width FROM mail_settings WHERE singleton=1")
         .fetch_optional(readers).await?;
     row.as_ref().map(decode).transpose()
 }
@@ -49,10 +49,6 @@ fn decode(row: &SqliteRow) -> Result<StoredMailSettings, SubscriberLoadError> {
             privacy_url: row.try_get("privacy_url")?,
             contact_address: row.try_get("contact_address")?,
         },
-        max_campaign_recipients: positive(row, "max_campaign_recipients")?,
-        max_daily_messages: positive(row, "max_daily_messages")?,
-        max_daily_confirmation_messages: positive(row, "max_daily_confirmation_messages")?,
-        send_interval_milliseconds: positive(row, "send_interval_milliseconds")?,
     }
     .validate()
     .map_err(|_| SubscriberLoadError::CorruptStoredState)?;
@@ -100,14 +96,6 @@ fn fingerprint(command: &UpdateMailSettings) -> [u8; 32] {
         fingerprint.field(value.as_bytes());
     }
     fingerprint.optional_field(policy.postal_address.map(str::as_bytes));
-    for value in [
-        view.max_campaign_recipients,
-        view.max_daily_messages,
-        view.max_daily_confirmation_messages,
-        view.send_interval_milliseconds,
-    ] {
-        fingerprint.version(value);
-    }
     fingerprint.finish()
 }
 
@@ -192,11 +180,9 @@ async fn persist(
 ) -> Result<(), SubscriberApplyError> {
     let view = command.settings.view();
     let policy = view.subscriptions.view();
-    sqlx::query("INSERT INTO mail_settings(singleton,version,mode,operator_name,postal_address,purpose,privacy_url,contact_address,max_campaign_recipients,max_daily_messages,max_daily_confirmation_messages,send_interval_milliseconds) VALUES(1,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET version=excluded.version,mode=excluded.mode,operator_name=excluded.operator_name,postal_address=excluded.postal_address,purpose=excluded.purpose,privacy_url=excluded.privacy_url,contact_address=excluded.contact_address,max_campaign_recipients=excluded.max_campaign_recipients,max_daily_messages=excluded.max_daily_messages,max_daily_confirmation_messages=excluded.max_daily_confirmation_messages,send_interval_milliseconds=excluded.send_interval_milliseconds")
+    sqlx::query("INSERT INTO mail_settings(singleton,version,mode,operator_name,postal_address,purpose,privacy_url,contact_address) VALUES(1,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET version=excluded.version,mode=excluded.mode,operator_name=excluded.operator_name,postal_address=excluded.postal_address,purpose=excluded.purpose,privacy_url=excluded.privacy_url,contact_address=excluded.contact_address")
         .bind(version).bind(mode_name(policy.mode)).bind(policy.operator_name).bind(policy.postal_address)
         .bind(policy.purpose).bind(policy.privacy_url.as_str()).bind(policy.contact_address.as_str())
-        .bind(view.max_campaign_recipients as i64).bind(view.max_daily_messages as i64)
-        .bind(view.max_daily_confirmation_messages as i64).bind(view.send_interval_milliseconds as i64)
         .execute(&mut **transaction).await?;
     Ok(())
 }
@@ -260,9 +246,6 @@ async fn apply_activation(
                 SubscriptionMode::Paused => SubscriberMode::Paused,
                 SubscriptionMode::Enabled => SubscriberMode::Enabled,
             },
-            max_daily_messages: view.max_daily_messages,
-            max_daily_confirmations: view.max_daily_confirmation_messages,
-            max_campaign_recipients: view.max_campaign_recipients,
         },
         executed_at.unix_timestamp(),
     )
