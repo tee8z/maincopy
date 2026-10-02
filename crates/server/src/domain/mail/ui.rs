@@ -28,15 +28,13 @@ use super::{
         Campaign, CampaignContent, CampaignCounts, CampaignId, CampaignProgress,
         CampaignQuarantine, CampaignState, CampaignVersion,
     },
-    config::SesMailConfiguration,
-    ses::SesCredentials,
     store::{
         ApproveCampaign, CampaignCommandError, CampaignMutationError, CampaignPage, CampaignStore,
         CancelCampaign, CreateCampaign,
     },
     subscriber::{
         FeedbackHealth, SubscriberMode, SubscriberStatus,
-        store::{SubscriberMutationError, SubscriberStore},
+        store::{SubscriberLoadError, SubscriberMutationError, SubscriberStore},
     },
 };
 use crate::{
@@ -56,6 +54,9 @@ use crate::{
 
 #[path = "ui/recovery.rs"]
 mod recovery;
+#[path = "ui/settings.rs"]
+mod settings;
+pub(crate) use super::settings::EffectiveMailSettings as MailReviewBinding;
 
 const PAGE_SIZE: usize = 20;
 const MAX_FORM_BYTES: usize = 4096;
@@ -77,25 +78,6 @@ pub(crate) enum MailUiAccess {
     Unavailable,
     ReviewOnly(MailReviewBinding),
     DispatchReady(MailReviewBinding),
-}
-
-#[derive(Clone)]
-pub(crate) struct MailReviewBinding {
-    configuration: SesMailConfiguration,
-    configuration_binding: [u8; 32],
-}
-
-impl MailReviewBinding {
-    pub(super) fn from_configuration(
-        configuration: SesMailConfiguration,
-        credentials: &SesCredentials,
-    ) -> Self {
-        let configuration_binding = configuration.provider_binding(credentials);
-        Self {
-            configuration,
-            configuration_binding,
-        }
-    }
 }
 
 impl MailUiAccess {
@@ -228,6 +210,12 @@ pub(crate) fn router(
         Router::new()
             .route("/admin/mail", get(history))
             .route(
+                "/admin/mail/settings",
+                get(settings::edit)
+                    .post(settings::save)
+                    .layer(DefaultBodyLimit::max(32768)),
+            )
+            .route(
                 "/admin/mail/recovery",
                 get(recovery::review).post(recovery::reset),
             )
@@ -251,15 +239,51 @@ async fn require_owner(browser: RequiredBrowserSession, request: Request, next: 
         Ok(Some(user))
             if user.status == UserStatus::Enabled && user.roles.contains(&UserRole::Owner) =>
         {
-            next.run(request).await
+            refresh_settings(request, next, browser.request_id).await
         }
         Ok(_) => admin_ui::error_response(
             StatusCode::FORBIDDEN,
             "Owner access required",
-            "Only a currently enabled Owner can inspect or manage mail campaigns.",
+            "Only a currently enabled Owner can inspect campaigns or manage newsletter settings.",
             browser.request_id,
         ),
         Err(_) => UiError::Unavailable.response(browser.request_id),
+    }
+}
+
+async fn refresh_settings(mut request: Request, next: Next, request_id: RequestId) -> Response {
+    let Some(mut state) = request.extensions().get::<MailUiState>().cloned() else {
+        return UiError::Unavailable.response(request_id);
+    };
+    state.access = match refresh_access(&state.access, &state.subscribers).await {
+        Ok(access) => access,
+        Err(_) if request.uri().path() == "/admin/mail/settings" => {
+            return UiError::Unavailable.response(request_id);
+        }
+        // Read failures must not prevent inspection or cancellation of existing
+        // campaigns. New settings writes and approvals still fail closed.
+        Err(_) => MailUiAccess::Unavailable,
+    };
+    request.extensions_mut().insert(state);
+    next.run(request).await
+}
+
+async fn refresh_access(
+    access: &MailUiAccess,
+    subscribers: &SubscriberStore,
+) -> Result<MailUiAccess, SubscriberLoadError> {
+    match access {
+        MailUiAccess::Unavailable => Ok(MailUiAccess::Unavailable),
+        MailUiAccess::ReviewOnly(binding) => binding
+            .source
+            .load(subscribers)
+            .await
+            .map(MailUiAccess::ReviewOnly),
+        MailUiAccess::DispatchReady(binding) => binding
+            .source
+            .load(subscribers)
+            .await
+            .map(MailUiAccess::DispatchReady),
     }
 }
 
@@ -277,6 +301,7 @@ async fn history(
         let posts = published_page(&projection, query.post_after.as_ref())?;
         Ok(admin_ui::page_response(StatusCode::OK, "Mail campaigns", PageKind::Authenticated, html! {
             h1 { "Mail campaigns" }
+            p { a href="/admin/mail/settings" { "Newsletter settings" } }
             (availability_panel(&state.access, &readiness))
             section class="panel" {
                 h2 { "Review a published article" }

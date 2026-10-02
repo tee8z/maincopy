@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::task::spawn_blocking;
 
 use super::{
-    config::{MailConfiguration, SesMailConfiguration, SubscriptionMode, SubscriptionPolicy},
+    config::{MailConfiguration, SubscriptionMode},
     controls::{ControlKeyError, MailControls},
     dispatch::{DispatchResources, MailDispatcher},
     feedback::{FeedbackClient, FeedbackWorker},
@@ -17,10 +17,8 @@ use super::{
     message::{MessagePreparationError, validate_origin},
     public::{self as public_mail, PublicMailState},
     ses::{CredentialError, ResourceName, SesClient, SesConfiguration, SesCredentials, SesRegion},
-    subscriber::{
-        SubscriberMode, SubscriberPolicy,
-        store::{SubscriberLoadError, SubscriberMutationError},
-    },
+    settings::{EffectiveMailSettings, MailSettingsSource},
+    subscriber::store::{SubscriberLoadError, SubscriberMutationError},
     ui::{MailReviewBinding, MailUiAccess},
 };
 
@@ -48,9 +46,9 @@ impl From<CredentialError> for MailReviewAccessError {
     }
 }
 
-/// Load the actual protected identity off the reactor, then retain only its
-/// configuration binding. No client or worker starts, and no control key is
-/// loaded: these settings alone cannot establish subscriber or send readiness.
+/// Load the protected identity off the reactor and retain its shared snapshot
+/// for later settings bindings. No client or worker starts, and no control key
+/// is loaded: these settings alone cannot establish subscriber or send readiness.
 pub(crate) async fn prepare_review_access(
     configuration: &MailConfiguration,
 ) -> Result<MailUiAccess, MailReviewAccessError> {
@@ -62,7 +60,7 @@ pub(crate) async fn prepare_review_access(
         let credentials =
             SesCredentials::load_protected_file(configuration.view().credential_file.path())?;
         Ok(MailUiAccess::ReviewOnly(
-            MailReviewBinding::from_configuration(configuration, &credentials),
+            MailReviewBinding::from_configuration(configuration, Arc::new(credentials)),
         ))
     })
     .await
@@ -91,7 +89,7 @@ pub(crate) enum MailStartupError {
     #[error("subscriber controls require the initialized application identity")]
     IdentityRequired,
     #[error(
-        "retained subscriber addresses require subscriptions.mode = paused and their existing control key"
+        "retained subscriber addresses require the mail provider and existing control key to preserve removal links"
     )]
     RemovalRequired,
     #[error("the publication origin cannot support bounded email controls")]
@@ -107,11 +105,7 @@ pub(crate) async fn prepare_mail(
 ) -> Result<PreparedMail, MailStartupError> {
     database.subscribers.pause().await?;
     database.subscribers.quarantine_interrupted().await?;
-    let subscription = match configuration {
-        MailConfiguration::Disabled => None,
-        MailConfiguration::Ses(configuration) => configuration.view().subscriptions.cloned(),
-    };
-    let Some(policy) = subscription else {
+    let MailConfiguration::Ses(configuration) = configuration else {
         if database.subscribers.status().await?.addressed_enrollments != 0 {
             return Err(MailStartupError::RemovalRequired);
         }
@@ -122,16 +116,24 @@ pub(crate) async fn prepare_mail(
             feedback: None,
         });
     };
-    let MailConfiguration::Ses(configuration) = configuration else {
-        return Err(MailStartupError::ClientConfiguration);
-    };
     validate_origin(&origin)?;
-    let instance = database
-        .auth
-        .identity_state()
-        .await?
-        .instance
-        .ok_or(MailStartupError::IdentityRequired)?;
+    let identity = database.auth.identity_state().await?.instance;
+    let Some(instance) = identity else {
+        if configuration.view().subscriptions.is_none()
+            && database.subscribers.mail_settings().await?.is_none()
+        {
+            // Preserve provider review during the initial Owner bootstrap.
+            // Subscriber controls require that instance's established identity.
+            return Ok(PreparedMail {
+                access: prepare_review_access(&MailConfiguration::Ses(configuration.clone()))
+                    .await?,
+                public_routes: None,
+                dispatcher: None,
+                feedback: None,
+            });
+        }
+        return Err(MailStartupError::IdentityRequired);
+    };
     let configuration = configuration.as_ref().clone();
     let loaded_configuration = configuration.clone();
     // Bind approvals and both provider workers to one loaded credential snapshot.
@@ -149,53 +151,38 @@ pub(crate) async fn prepare_mail(
         .subscribers
         .initialize_controls(controls.identity_binding(&origin))
         .await?;
-    let binding = configuration.provider_binding(&credentials);
-    let view = configuration.view();
+    let source = MailSettingsSource::new(configuration, credentials.clone());
+    let settings = source.load(&database.subscribers).await?;
+    let view = settings.configuration.view();
+    if view.feedback.is_none()
+        && view
+            .subscriptions
+            .is_some_and(|policy| policy.view().mode == SubscriptionMode::Enabled)
+    {
+        return Err(MailStartupError::ClientConfiguration);
+    }
     database
         .subscribers
-        .set_policy(SubscriberPolicy {
-            configuration_binding: binding,
-            mode: match policy.view().mode {
-                SubscriptionMode::Paused => SubscriberMode::Paused,
-                SubscriptionMode::Enabled => SubscriberMode::Enabled,
-            },
-            max_daily_messages: view.max_daily_messages,
-            max_daily_confirmations: view.max_daily_confirmation_messages,
-            max_campaign_recipients: view.max_campaign_recipients,
-        })
+        .set_policy(settings.subscriber_policy())
         .await?;
-    compose(
-        configuration,
-        policy,
-        credentials,
-        controls,
-        database,
-        origin,
-    )
+    compose(settings, credentials, controls, database, origin)
 }
 
 fn compose(
-    configuration: SesMailConfiguration,
-    policy: SubscriptionPolicy,
+    settings: EffectiveMailSettings,
     credentials: Arc<SesCredentials>,
     controls: Arc<MailControls>,
     database: &DatabaseStore,
     origin: PublicationBaseUrl,
 ) -> Result<PreparedMail, MailStartupError> {
-    let binding = configuration.provider_binding(&credentials);
-    let access = MailUiAccess::DispatchReady(MailReviewBinding::from_configuration(
-        configuration.clone(),
-        &credentials,
-    ));
+    let access = MailUiAccess::DispatchReady(settings.clone());
     let public_routes = public_mail::router(PublicMailState::new(
-        configuration.clone(),
-        &credentials,
-        policy.clone(),
+        settings.source.clone(),
         origin.clone(),
         controls.clone(),
         database.subscribers.clone(),
     ));
-    let view = configuration.view();
+    let view = settings.configuration.view();
     let client = SesClient::new(
         SesRegion::parse(view.region).map_err(|_| MailStartupError::ClientConfiguration)?,
         credentials.clone(),
@@ -213,7 +200,7 @@ fn compose(
                 .map_err(|_| MailStartupError::ClientConfiguration)?,
             controls.clone(),
             database.subscribers.clone(),
-            binding,
+            settings.clone(),
         )),
         None => None,
     };
@@ -223,9 +210,7 @@ fn compose(
         client,
         controls,
         origin,
-        configuration_binding: binding,
-        configuration,
-        policy,
+        settings,
     });
     Ok(PreparedMail {
         access,

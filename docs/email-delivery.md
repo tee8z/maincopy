@@ -1,6 +1,6 @@
 # Email operations and privacy
 
-Status: implemented and locally validated. Production capture and sending remain disabled pending provider and privacy acceptance.
+Status: email delivery is implemented. Admin-managed newsletter settings await build and regression validation. Production capture and sending remain disabled pending provider acceptance.
 
 Use this guide to configure SES, operate the mailing list, and recover interrupted delivery.
 [Implementation](implementation.md) records remaining acceptance. [Deployment](deployment.md) covers the host; [backup and restore](backup-restore.md) covers encrypted checkpoints.
@@ -17,7 +17,7 @@ Select à-la-carte pricing and confirm actual account charges. Avoid unneeded pa
 ## Configure mail
 
 Keep mail disabled until provider and privacy acceptance pass with authorized test recipients.
-For NixOS, configure public settings and protected file references through the module:
+For NixOS, configure the SES connection and protected file references through the module:
 
 ```nix
 services.maincopy.mail = {
@@ -27,18 +27,6 @@ services.maincopy.mail = {
   configurationSet = "maincopy";
   credentialFile = "/var/lib/maincopy-secrets/mail-ses.json";
   controlSigningKeyFile = "/var/lib/maincopy-secrets/mail-controls.key";
-  maxCampaignRecipients = 2000;
-  maxDailyMessages = 5000;
-  maxDailyConfirmationMessages = 100;
-  sendIntervalMilliseconds = 1000;
-  subscriptions = {
-    mode = "paused";
-    operatorName = "Example publication";
-    # Optional: postalAddress = "YOUR PUBLIC POSTAL ADDRESS";
-    purpose = "Email announcements of newly published articles.";
-    privacyUrl = "https://example.com/privacy";
-    contactAddress = "contact@example.com";
-  };
   feedback = {
     queueUrl = "https://sqs.us-east-1.amazonaws.com/123456789012/maincopy-feedback";
     topicArn = "arn:aws:sns:us-east-1:123456789012:maincopy-feedback";
@@ -46,10 +34,7 @@ services.maincopy.mail = {
 };
 ```
 
-Replace all example identities and disclosures. A postal address is optional in Maincopy; omit `postalAddress` or set it to `null`.
-For direct TOML configuration, omit `postal_address`. When supplied, the address appears in signup information, campaign review, and message footers.
-An omitted address produces no empty address fields. Supplied addresses must contain 1–500 bytes without surrounding whitespace or control characters.
-Operators remain responsible for disclosures required for their messages. See the [FTC commercial-email requirements](https://www.ftc.gov/business-guidance/resources/can-spam-act-compliance-guide-business).
+Replace the example sender and provider resources. Configure newsletter details and sending limits under **Admin → Mail → Newsletter settings**.
 
 Supply secret paths as strings. Never use Nix path literals or `builtins.readFile` for secret material.
 The module copies systemd credentials into private service-owned runtime files.
@@ -76,10 +61,39 @@ Retain an independently protected recovery copy. Changing the control key or pub
 Startup rejects that change while linked subscriber state remains. SES credential rotation does not change management-link signatures.
 
 For direct server configuration, use `[mail] mode = "ses"` and the equivalent snake_case field names.
-Use `credential_file`, `control_signing_key_file`, `configuration_set`, and `send_interval_milliseconds`.
-Nested tables are `[mail.subscriptions]` and `[mail.feedback]`.
-Omitting subscriptions enables campaign review only. Omitting mail selects disabled mode.
-Once addresses exist, keep subscriptions configured as `paused` when stopping capture and sending; this preserves removal controls.
+Use `credential_file`, `control_signing_key_file`, `configuration_set`, and the `[mail.feedback]` table.
+Omitting mail selects disabled mode. With SES configured, the server loads subscriber controls even before newsletter details are saved.
+Keep the provider and control key configured while addresses exist. Pause signup and sending in the administration portal to preserve removal links.
+
+## Manage newsletter settings
+
+1. Sign in with a fresh Owner session.
+2. Open **Mail → Newsletter settings**.
+3. Enter the public operator name, monitored contact email, newsletter purpose, and HTTPS privacy notice URL.
+4. Enter a postal address only if you want or need to publish one.
+5. Set campaign, daily message, confirmation, and pacing limits.
+6. Save with signup and sending **Paused** until provider acceptance is complete.
+7. Select **Enabled** and save after acceptance.
+
+You can save paused newsletter details before configuring the provider. Enabling signup requires the configured SES feedback source.
+Sending also requires healthy feedback and separate Owner approval of each campaign.
+Postal addresses are optional in Maincopy. Leave the field empty to omit it from signup information, campaign review, and email footers.
+Supplied addresses must contain 1–500 bytes without surrounding whitespace or control characters.
+Operators remain responsible for disclosures required for their messages. See the [FTC commercial-email requirements](https://www.ftc.gov/business-guidance/resources/can-spam-act-compliance-guide-business).
+
+Settings are stored in SQLite and included in normal backups. Saving updates admission in the same transaction as the settings and audit receipt.
+New requests and delivery work read the saved settings without a service restart. Changed pacing waits a full new interval before another admission.
+Feedback establishes readiness for the changed configuration before sending resumes. An already admitted message can finish with its previous settings.
+Changed details or limits require new campaign approval and retire unsent confirmation requests. Readers can submit a fresh signup request.
+Unsubscribe links remain valid. Stale admin edits and signup forms are rejected; reload the relevant page before submitting again.
+Saving settings does not reset daily usage, suppressions, or consent. Recovery and restored-data quarantine also pause saved newsletter settings.
+
+Existing `[mail.subscriptions]` and host sending limits remain defaults until the first admin save.
+After that save, stored newsletter settings take precedence across restarts. Provider identity, feedback endpoints, and secret files remain host configuration.
+In legacy Nix configuration, omit `postalAddress` or set it to `null`. In legacy TOML configuration, omit `postal_address`.
+
+This change adds database migration `0011_mail_settings.sql`. Preserve a verified pre-upgrade backup before deployment.
+An older binary cannot open the upgraded migration ledger; follow the normal restore acceptance procedure for rollback.
 
 ## Connect SES feedback
 
@@ -207,7 +221,7 @@ Authenticated feedback can establish later acceptance. Silence cannot prove reje
 SES has no documented client idempotency token for [SendEmail](https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html).
 
 Use campaign cancellation to stop new recipients. Cancellation drains already admitted work before finalizing aggregate outcomes.
-Use subscriptions mode `paused` for a host-wide pause while keeping confirmation and removal controls available.
+Select **Paused** in **Mail → Newsletter settings** to stop new admission while keeping confirmation and removal controls available.
 Configuration changes require new approval for affected work. Never route an uncertain submission through another provider.
 
 ## Recover feedback or restored data
@@ -236,7 +250,7 @@ If trustworthy consent/feedback continuity cannot be recovered:
 3. Review the removal scope, then type `REMOVE SUBSCRIBERS` to execute the reset.
 4. Retain the operation identity if the response is lost; retry the same form.
 5. Keep subscriptions paused while isolating old source traffic and validating the repaired provider configuration.
-6. Restart with enabled subscriptions only after the current source establishes healthy feedback readiness.
+6. Select **Enabled** in newsletter settings only after the current source establishes healthy feedback readiness. Restart Maincopy if host provider settings changed.
 
 The reset removes all current enrollment and attempt eligibility, including arrivals after the review page opened.
 It quarantines unfinished campaigns and preserves aggregate history, suppression digests, and daily budgets.

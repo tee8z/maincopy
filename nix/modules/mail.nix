@@ -106,7 +106,7 @@ in
                 contactAddress = publicField 254 "Monitored public ASCII contact mailbox.";
               };
             })
-            "Public consent disclosures; null provides campaign review without subscriber capture or removal routes.";
+            "Initial public newsletter settings. Saved settings in Admin → Mail → Newsletter settings take precedence; null leaves signup paused until configured there.";
         feedback = optional (types.submodule {
           options = {
             queueUrl = publicField 256 "Canonical regional HTTPS URL for the dedicated standard SQS queue.";

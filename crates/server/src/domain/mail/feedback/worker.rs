@@ -19,6 +19,7 @@ use crate::{
         campaign::CampaignId,
         controls::MailControls,
         ses::MessageId,
+        settings::{EffectiveMailSettings, MailSettingsSource},
         subscriber::{
             ApplyFeedback, BeginFeedbackRun, FeedbackHealth, FeedbackKind as StoredFeedbackKind,
             FeedbackObservation, FeedbackPollAdmission, FeedbackPollIntent,
@@ -38,6 +39,8 @@ pub(crate) struct FeedbackWorker {
     controls: Arc<MailControls>,
     subscribers: SubscriberStore,
     configuration_binding: [u8; 32],
+    settings_source: MailSettingsSource,
+    settings_version: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -94,28 +97,77 @@ impl FeedbackWorker {
         client: FeedbackClient,
         controls: Arc<MailControls>,
         subscribers: SubscriberStore,
-        configuration_binding: [u8; 32],
+        settings: EffectiveMailSettings,
     ) -> Self {
         Self {
             client,
             controls,
             subscribers,
-            configuration_binding,
+            configuration_binding: settings.configuration_binding,
+            settings_source: settings.source,
+            settings_version: settings.version,
         }
     }
 
-    pub(crate) async fn run(self, shutdown: CancellationToken) -> Result<(), FeedbackWorkerError> {
-        match self.observe(&shutdown).await {
-            Ok(()) => Ok(()),
-            Err(WriterFailure::Obsolete) => {
-                // A replacement policy owns admission. This worker cannot
-                // refresh or clear the replacement consumer's durable marker.
-                shutdown.cancelled().await;
-                Ok(())
+    pub(crate) async fn run(
+        mut self,
+        shutdown: CancellationToken,
+    ) -> Result<(), FeedbackWorkerError> {
+        loop {
+            match self.observe(&shutdown).await {
+                Ok(()) => return Ok(()),
+                Err(WriterFailure::Obsolete) => {
+                    if !self.reload_settings(&shutdown).await? {
+                        return Ok(());
+                    }
+                }
+                Err(WriterFailure::Fatal(error)) => return Err(error),
+                Err(WriterFailure::Busy | WriterFailure::Conflict) => {
+                    return Err(FeedbackWorkerError::DatabaseInvariant);
+                }
             }
-            Err(WriterFailure::Fatal(error)) => Err(error),
-            Err(WriterFailure::Busy | WriterFailure::Conflict) => {
-                Err(FeedbackWorkerError::DatabaseInvariant)
+        }
+    }
+
+    async fn reload_settings(
+        &mut self,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, FeedbackWorkerError> {
+        loop {
+            if shutdown.is_cancelled() {
+                return Ok(false);
+            }
+            let settings = self
+                .settings_source
+                .load(&self.subscribers)
+                .await
+                .map_err(|_| FeedbackWorkerError::DatabaseUnavailable)?;
+            if settings.version == self.settings_version
+                && settings.configuration_binding == self.configuration_binding
+            {
+                // A reset or another consumer owns this unchanged policy.
+                // Wait for a later settings revision instead of reclaiming it.
+                if cancelled_during(shutdown, INITIAL_BACKOFF).await {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let status = self
+                .subscribers
+                .status()
+                .await
+                .map_err(|_| FeedbackWorkerError::DatabaseUnavailable)?;
+            if status.policy.is_some_and(|policy| {
+                policy.configuration_binding == settings.configuration_binding
+            }) {
+                self.configuration_binding = settings.configuration_binding;
+                self.settings_version = settings.version;
+                // The new run retains the durable visibility lease and drain
+                // interval. No in-flight feedback request is declared settled.
+                return Ok(true);
+            }
+            if cancelled_during(shutdown, INITIAL_BACKOFF).await {
+                return Ok(false);
             }
         }
     }

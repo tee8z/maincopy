@@ -45,17 +45,17 @@ impl SubscriptionPolicy {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SubscriptionCandidate {
-    mode: SubscriptionMode,
-    operator_name: String,
-    postal_address: Option<String>,
-    purpose: String,
-    privacy_url: String,
-    contact_address: String,
+pub(in crate::domain::mail) struct SubscriptionCandidate {
+    pub mode: SubscriptionMode,
+    pub operator_name: String,
+    pub postal_address: Option<String>,
+    pub purpose: String,
+    pub privacy_url: String,
+    pub contact_address: String,
 }
 
 impl SubscriptionCandidate {
-    pub(super) fn validate(
+    pub(in crate::domain::mail) fn validate(
         self,
         diagnostics: &mut Vec<ConfigurationDiagnostic>,
     ) -> Option<SubscriptionPolicy> {

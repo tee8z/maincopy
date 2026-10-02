@@ -1,6 +1,8 @@
 //! Exercise the concrete dispatcher through its supervised task and a local SES
 //! peer. All recipient transitions use the application database's real writer.
 
+use crate::domain::mail::settings::EffectiveMailSettings;
+
 use std::{
     fs::OpenOptions, io::Write as _, os::unix::fs::OpenOptionsExt as _, sync::Arc, time::Duration,
 };
@@ -196,9 +198,10 @@ impl Fixture {
             client,
             controls: self.controls.clone(),
             origin: origin(),
-            configuration_binding: self.binding,
-            configuration: self.configuration.clone(),
-            policy: self.configuration.view().subscriptions.unwrap().clone(),
+            settings: EffectiveMailSettings::from_configuration(
+                self.configuration.clone(),
+                SesCredentials::parse(CREDENTIAL).unwrap().into(),
+            ),
         });
         let stop = CancellationToken::new();
         let stopped = stop.clone();
