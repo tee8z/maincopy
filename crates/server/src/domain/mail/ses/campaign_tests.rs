@@ -768,3 +768,54 @@ async fn restart_skips_uncertain_recipient_and_continues_unsent_recipients() {
     assert!(fixture.mail.requests.try_recv().is_err());
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn signup_backlog_cannot_starve_published_article_delivery() {
+    let mut fixture = CampaignFixture::unpublished().await;
+    let reader = fixture.recipient(1, "reader@example.com").await;
+    fixture.publish("Article with waiting signups").await;
+    let campaign = fixture
+        .mail
+        .store
+        .mail
+        .active_campaign()
+        .await
+        .unwrap()
+        .unwrap();
+    let first_signup = fixture.mail.queue("new-reader@example.com").await;
+    let waiting_signup = fixture.mail.queue("waiting-reader@example.com").await;
+    let task = fixture.mail.dispatch();
+    let confirmation = fixture.mail.request().await;
+    assert_eq!(confirmation.body["EmailTags"].as_array().unwrap().len(), 2);
+    confirmation.reply.send(ACCEPTED).unwrap();
+    let newsletter = fixture.mail.request().await;
+    assert_newsletter(
+        &fixture,
+        &newsletter,
+        "reader@example.com",
+        &reader,
+        &campaign,
+    );
+    task.stop.cancel();
+    newsletter.reply.send(SECOND_ACCEPTED).unwrap();
+    task.finish().await;
+    let signup_outcomes = [
+        fixture.mail.outcome(first_signup).await,
+        fixture.mail.outcome(waiting_signup).await,
+    ];
+    assert_eq!(
+        signup_outcomes
+            .iter()
+            .filter(|outcome| outcome.as_str() == "accepted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        signup_outcomes
+            .iter()
+            .filter(|outcome| outcome.as_str() == "queued")
+            .count(),
+        1
+    );
+    fixture.finish().await;
+}

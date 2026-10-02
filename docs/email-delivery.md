@@ -219,6 +219,7 @@ Upgrades mark existing articles without sending the archive. Articles first publ
 
 Email contains the article title, a short description, and its public link. Long titles and descriptions are clipped at valid UTF-8 boundaries.
 Multiple articles can wait in publication order. One dispatcher sends serially, with a default interval of one second between requests.
+Confirmation emails and article updates take turns when both queues have work. Signup traffic cannot starve article delivery.
 Each recipient admission rechecks current consent, suppression, cancellation, configuration, instance identity, and feedback readiness.
 The audience cutoff uses confirmation sequence; later signups cannot enlarge the original audience. Unsubscribing before admission excludes the reader.
 

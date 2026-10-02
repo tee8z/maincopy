@@ -2229,7 +2229,7 @@ async fn rotate_consent_epoch(
     sqlx::query("DELETE FROM mail_enrollments")
         .execute(&mut **transaction)
         .await?;
-    // The reset does not refund budgets or erase hard-bounce/complaint suppression.
+    // The reset preserves usage totals and hard-bounce/complaint suppression.
     // No restored or retired generation can be reconstructed by a later result.
     sqlx::query("UPDATE mail_settings SET mode='paused',version=version+1")
         .execute(&mut **transaction)

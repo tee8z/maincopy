@@ -43,6 +43,13 @@ pub(crate) struct MailDispatcher {
     settings: EffectiveMailSettings,
     interval: Duration,
     claim: Option<(CampaignId, CampaignFence)>,
+    next_delivery: NextDelivery,
+}
+
+#[derive(Clone, Copy)]
+enum NextDelivery {
+    Confirmation,
+    Article,
 }
 
 pub(super) struct DispatchResources {
@@ -65,6 +72,7 @@ impl MailDispatcher {
             interval: resources.settings.configuration.view().send_interval,
             settings: resources.settings,
             claim: None,
+            next_delivery: NextDelivery::Confirmation,
         }
     }
 
@@ -115,10 +123,19 @@ impl MailDispatcher {
         {
             return Ok(());
         }
+        // A continuous stream of signups must not starve article delivery.
+        if matches!(self.next_delivery, NextDelivery::Article)
+            && let Some(campaign) = campaign
+        {
+            self.next_delivery = NextDelivery::Confirmation;
+            return self.campaign_recipient(campaign, cancellation).await;
+        }
         if self.confirmation(cancellation).await? {
+            self.next_delivery = NextDelivery::Article;
             return Ok(());
         }
         if let Some(campaign) = campaign {
+            self.next_delivery = NextDelivery::Confirmation;
             self.campaign_recipient(campaign, cancellation).await?;
         }
         Ok(())
