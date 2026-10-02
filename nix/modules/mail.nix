@@ -156,16 +156,15 @@ in
       send_interval_milliseconds = settings.sendIntervalMilliseconds;
     }
     // lib.optionalAttrs (subscriptions != null) {
-      subscriptions =
-        {
-          inherit (subscriptions) mode purpose;
-          operator_name = subscriptions.operatorName;
-          privacy_url = subscriptions.privacyUrl;
-          contact_address = subscriptions.contactAddress;
-        }
-        // lib.optionalAttrs (subscriptions.postalAddress != null) {
-          postal_address = subscriptions.postalAddress;
-        };
+      subscriptions = {
+        inherit (subscriptions) mode purpose;
+        operator_name = subscriptions.operatorName;
+        privacy_url = subscriptions.privacyUrl;
+        contact_address = subscriptions.contactAddress;
+      }
+      // lib.optionalAttrs (subscriptions.postalAddress != null) {
+        postal_address = subscriptions.postalAddress;
+      };
     }
     // lib.optionalAttrs (feedback != null) {
       feedback = {

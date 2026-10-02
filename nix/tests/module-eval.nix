@@ -127,8 +127,8 @@ assert
   (hostValue mailWithoutPostalAddress).mail.subscriptions
   == builtins.removeAttrs (hostValue pausedMail).mail.subscriptions [ "postal_address" ];
 assert
-  (hostValue mailWithNullPostalAddress).mail.subscriptions
-  == (hostValue mailWithoutPostalAddress).mail.subscriptions;
+  (hostValue mailWithNullPostalAddress).mail.subscriptions == (hostValue mailWithoutPostalAddress)
+  .mail.subscriptions;
 assert minimal.services.maincopy.mail.mode == "disabled";
 assert (hostValue minimal).mail == { mode = "disabled"; };
 assert minimal.systemd.services.maincopy.serviceConfig.LoadCredential == [ ];
