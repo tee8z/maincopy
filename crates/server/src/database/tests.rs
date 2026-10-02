@@ -1057,7 +1057,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 205);
+    assert_eq!(compact_definitions.matches("check(").count(), 221);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",
