@@ -30,6 +30,10 @@ let
       ];
     }).config;
   minimal = evaluate { };
+  externalBackup = evaluate {
+    backup.externalStatusFile = "/var/lib/maincopy-external-backup/status.json";
+    backup.staleAfterSeconds = 93600;
+  };
   complete = evaluate {
     backup = {
       enable = true;
@@ -116,6 +120,25 @@ let
     !(builtins.tryEval (lib.getAttrFromPath optionPath (evaluate settings).services.maincopy)).success;
 in
 assert lib.all (entry: entry.assertion) minimal.assertions;
+assert lib.all (entry: entry.assertion) externalBackup.assertions;
+assert !(externalBackup.systemd.services ? maincopy-backup);
+assert !(externalBackup.systemd.services ? maincopy-litestream);
+assert
+  (hostValue externalBackup).backup == {
+    status_file = "/var/lib/maincopy-external-backup/status.json";
+    stale_after_seconds = 93600;
+  };
+assert rejected {
+  backup = {
+    enable = true;
+    keyFile = "/run/secrets/backup-crypt";
+    credentialsFile = "/run/secrets/backup-b2";
+    externalStatusFile = "/var/lib/maincopy-external-backup/status.json";
+  };
+};
+assert typedRejected [ "backup" "externalStatusFile" ] {
+  backup.externalStatusFile = "/nix/store/unsafe-status.json";
+};
 assert lib.all (entry: entry.assertion) complete.assertions;
 assert lib.all (entry: entry.assertion) internet.assertions;
 assert lib.all (entry: entry.assertion) pausedMail.assertions;
