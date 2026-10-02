@@ -58,7 +58,7 @@ use crate::{
     error::{
         ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal, StartupStage,
     },
-    frontend_assets::{FrontendAssetManifest, embedded_manifest},
+    frontend_assets::{FrontendAssetManifest, embedded_manifest, previous_manifest},
     git_sync::GitSync,
     identity_bootstrap,
     metrics::{Metrics, MetricsCollector, MetricsServer},
@@ -974,7 +974,7 @@ fn find_retained_public_snapshot(
         .collect::<Vec<_>>();
     for base in retained.values() {
         let catalog = hydrate_catalog(base.as_ref().clone(), retained, pins.clone())?;
-        let Ok(shell) = render_site_shell(catalog, frontend, ledger) else {
+        let Ok(shell) = render_site_shell(Arc::clone(&catalog), frontend, ledger) else {
             continue;
         };
         let shell = shell.bind_tip_recipient(tip_recipient.cloned());
@@ -982,6 +982,14 @@ fn find_retained_public_snapshot(
             continue;
         };
         if &snapshot.digest == expected {
+            return Ok(snapshot);
+        }
+        // Frontend assets participate in site identity. Verify the exact retained
+        // content against the previous release before upgrading its presentation;
+        // never substitute the current checkout or an arbitrary retained candidate.
+        let previous = render_site_shell(catalog, previous_manifest(), ledger)
+            .and_then(|shell| shell.into_snapshot());
+        if previous.is_ok_and(|previous| &previous.digest == expected) {
             return Ok(snapshot);
         }
     }
@@ -2932,6 +2940,69 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         assert!(html.contains(&published_at.to_string()));
 
         stop_built_application(application).await;
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn frontend_upgrade_preserves_the_approved_content_and_rejects_unmatched_heads() {
+        let (root, _, _) = startup_fixture("", VALID_PUBLICATION);
+        let content_root = root.path().join("content");
+        write_durable_post(&content_root);
+        let tree = discover_content_tree(&content_root, ContentTreeLimits::default()).unwrap();
+        let approved = Arc::new(compile_content_catalog(&prepare_content(&tree).unwrap()).unwrap());
+        let post_id = PostId::parse(DURABLE_POST_ID).unwrap();
+        let ledger = PublicLedgerProjection::empty()
+            .with_published(PublishedPostRevision::new(
+                post_id.clone(),
+                approved.current_post(&post_id).unwrap().revision.clone(),
+                OffsetDateTime::from_unix_timestamp(1_777_734_400).unwrap(),
+            ))
+            .unwrap();
+        let previous = render_site_shell(Arc::clone(&approved), previous_manifest(), &ledger)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+        let current = render_site_shell(Arc::clone(&approved), embedded_manifest(), &ledger)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+        assert_ne!(previous.digest, current.digest);
+        fs::write(
+            content_root.join("publication.toml"),
+            VALID_PUBLICATION.replace("Pinned startup source", "Unapproved title"),
+        )
+        .unwrap();
+        let edited_tree =
+            discover_content_tree(&content_root, ContentTreeLimits::default()).unwrap();
+        let edited =
+            Arc::new(compile_content_catalog(&prepare_content(&edited_tree).unwrap()).unwrap());
+        let retained = BTreeMap::from([(tree.digest(), approved), (edited_tree.digest(), edited)]);
+        let rebuilt = find_retained_public_snapshot(
+            &retained,
+            &ledger,
+            &previous.digest,
+            embedded_manifest(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(rebuilt.digest, current.digest);
+        assert!(rebuilt.index_page().contains("Pinned startup source"));
+        assert!(!rebuilt.index_page().contains("Unapproved title"));
+        let repeated = find_retained_public_snapshot(
+            &retained,
+            &ledger,
+            &rebuilt.digest,
+            embedded_manifest(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(repeated.digest, rebuilt.digest);
+        let missing =
+            SiteSnapshotDigest::parse(&format!("site-b3-v1-{}", "ee".repeat(32))).unwrap();
+        assert!(matches!(
+            find_retained_public_snapshot(&retained, &ledger, &missing, embedded_manifest(), None),
+            Err(RetainedCatalogError::PublicSnapshotUnavailable { .. })
+        ));
     }
 
     #[tokio::test]
