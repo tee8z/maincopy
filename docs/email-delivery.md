@@ -34,7 +34,7 @@ services.maincopy.mail = {
   subscriptions = {
     mode = "paused";
     operatorName = "Example publication";
-    postalAddress = "REPLACE WITH YOUR PUBLIC POSTAL ADDRESS";
+    # Optional: postalAddress = "YOUR PUBLIC POSTAL ADDRESS";
     purpose = "Email announcements of newly published articles.";
     privacyUrl = "https://example.com/privacy";
     contactAddress = "contact@example.com";
@@ -46,8 +46,10 @@ services.maincopy.mail = {
 };
 ```
 
-Replace all example identities and disclosures. The postal address appears publicly in signup information and message footers.
-Use a valid public mailing address appropriate for the operator. See the [FTC commercial-email requirements](https://www.ftc.gov/business-guidance/resources/can-spam-act-compliance-guide-business).
+Replace all example identities and disclosures. A postal address is optional in Maincopy; omit `postalAddress` or set it to `null`.
+For direct TOML configuration, omit `postal_address`. When supplied, the address appears in signup information, campaign review, and message footers.
+An omitted address produces no empty address fields. Supplied addresses must contain 1–500 bytes without surrounding whitespace or control characters.
+Operators remain responsible for disclosures required for their messages. See the [FTC commercial-email requirements](https://www.ftc.gov/business-guidance/resources/can-spam-act-compliance-guide-business).
 
 Supply secret paths as strings. Never use Nix path literals or `builtins.readFile` for secret material.
 The module copies systemd credentials into private service-owned runtime files.
@@ -256,7 +258,7 @@ Complete these checks with the selected SES account and explicitly authorized re
 4. Verify effective bounce and complaint suppression, including configuration-set overrides.
 5. Disable open/click tracking and unnecessary destinations or paid services.
 6. Verify SNS/SQS policies, retained envelopes, tagging, and bounded queue retention against actual events.
-7. Inspect delivered HTML, plain text, sender, postal footer, and DKIM coverage of both unsubscribe headers.
+7. Inspect delivered HTML, plain text, sender, footer disclosures, and DKIM coverage of both unsubscribe headers.
 8. Exercise confirmation, scanner visits, one-click removal, suppression, cancellation, outages, restart, and old-checkpoint restore.
 9. Verify gateway redaction, independent key recovery, encrypted B2 retention, and restored-data quarantine.
 10. Begin with a small confirmed audience and inspect readiness and aggregate outcomes before expanding.

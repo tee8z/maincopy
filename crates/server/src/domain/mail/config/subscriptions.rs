@@ -14,7 +14,7 @@ pub(crate) enum SubscriptionMode {
 pub(crate) struct SubscriptionPolicy {
     mode: SubscriptionMode,
     operator_name: String,
-    postal_address: String,
+    postal_address: Option<String>,
     purpose: String,
     privacy_url: Url,
     contact_address: SenderAddress,
@@ -24,7 +24,7 @@ pub(crate) struct SubscriptionPolicy {
 pub(crate) struct SubscriptionPolicyView<'policy> {
     pub mode: SubscriptionMode,
     pub operator_name: &'policy str,
-    pub postal_address: &'policy str,
+    pub postal_address: Option<&'policy str>,
     pub purpose: &'policy str,
     pub privacy_url: &'policy Url,
     pub contact_address: &'policy SenderAddress,
@@ -35,7 +35,7 @@ impl SubscriptionPolicy {
         SubscriptionPolicyView {
             mode: self.mode,
             operator_name: &self.operator_name,
-            postal_address: &self.postal_address,
+            postal_address: self.postal_address.as_deref(),
             purpose: &self.purpose,
             privacy_url: &self.privacy_url,
             contact_address: &self.contact_address,
@@ -48,7 +48,7 @@ impl SubscriptionPolicy {
 pub(super) struct SubscriptionCandidate {
     mode: SubscriptionMode,
     operator_name: String,
-    postal_address: String,
+    postal_address: Option<String>,
     purpose: String,
     privacy_url: String,
     contact_address: String,
@@ -66,7 +66,7 @@ impl SubscriptionCandidate {
             diagnostics,
         );
         let postal_address = validated_field(
-            public_text(self.postal_address, 500),
+            optional_public_text(self.postal_address, 500),
             "mail.subscriptions.postal_address",
             "mail postal address must contain 1 to 500 bytes of public text without control characters",
             diagnostics,
@@ -121,6 +121,13 @@ fn public_text(value: String, limit: usize) -> Option<String> {
         && value.len() <= limit
         && !value.chars().any(char::is_control))
     .then_some(value)
+}
+
+fn optional_public_text(value: Option<String>, limit: usize) -> Option<Option<String>> {
+    match value {
+        Some(value) => public_text(value, limit).map(Some),
+        None => Some(None),
+    }
 }
 
 fn privacy_url(value: &str) -> Option<Url> {

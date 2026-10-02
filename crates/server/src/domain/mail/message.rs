@@ -148,17 +148,23 @@ struct SenderFooter {
 impl SenderFooter {
     fn render(policy: &SubscriptionPolicy) -> Self {
         let policy = policy.view();
+        let mut text = format!("\n\n{}\n", policy.operator_name);
+        if let Some(address) = policy.postal_address {
+            text.push_str(address);
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "Contact: {}\nPrivacy: {}\n",
+            policy.contact_address.as_str(),
+            policy.privacy_url
+        ));
         Self {
-            text: format!(
-                "\n\n{}\n{}\nContact: {}\nPrivacy: {}\n",
-                policy.operator_name,
-                policy.postal_address,
-                policy.contact_address.as_str(),
-                policy.privacy_url
-            ),
+            text,
             html: maud::html! {
                 p { (policy.operator_name) }
-                p { (policy.postal_address) }
+                @if let Some(address) = policy.postal_address {
+                    p { (address) }
+                }
                 p { "Contact: " (policy.contact_address.as_str()) }
                 p { a href=(policy.privacy_url.as_str()) { "Privacy notice" } }
             }
@@ -277,9 +283,7 @@ mod tests {
     const CAMPAIGN: Uuid = Uuid::from_u128(0x11111111_1111_4111_8111_111111111111);
     const ATTEMPT: Uuid = Uuid::from_u128(0x22222222_2222_4222_8222_222222222222);
 
-    fn policy() -> SubscriptionPolicy {
-        let candidate: MailConfigurationCandidate = toml::from_str(
-            r#"
+    const POLICY: &str = r#"
 mode = "ses"
 sender = "newsletter@example.com"
 region = "us-east-1"
@@ -293,15 +297,36 @@ postal_address = "PO Box 123, Example City"
 purpose = "New articles from Example."
 privacy_url = "https://example.com/privacy"
 contact_address = "contact@example.com"
-"#,
-        )
-        .unwrap();
+"#;
+
+    fn policy() -> SubscriptionPolicy {
+        policy_from_source(POLICY)
+    }
+
+    fn policy_from_source(source: &str) -> SubscriptionPolicy {
+        let candidate: MailConfigurationCandidate = toml::from_str(source).unwrap();
         let MailConfiguration::Ses(configuration) =
             candidate.validate(std::path::Path::new("/unused")).unwrap()
         else {
             panic!("SES fixture")
         };
         configuration.view().subscriptions.unwrap().clone()
+    }
+
+    #[test]
+    fn sender_footer_omits_a_missing_address_without_empty_lines_or_paragraphs() {
+        let policy = policy_from_source(
+            &POLICY.replace("postal_address = \"PO Box 123, Example City\"\n", ""),
+        );
+        let footer = SenderFooter::render(&policy);
+        assert_eq!(
+            footer.text,
+            "\n\nExample & Company\nContact: contact@example.com\nPrivacy: https://example.com/privacy\n"
+        );
+        assert_eq!(
+            footer.html,
+            "<p>Example &amp; Company</p><p>Contact: contact@example.com</p><p><a href=\"https://example.com/privacy\">Privacy notice</a></p>"
+        );
     }
 
     // Saved common content is this boundary's input. Publication eligibility is
@@ -347,6 +372,8 @@ contact_address = "contact@example.com"
         assert!(message.html.starts_with(REVIEWED_HTML));
         assert!(message.text.contains("Example & Company"));
         assert!(message.html.contains("Example &amp; Company"));
+        assert!(message.text.contains("\nPO Box 123, Example City\n"));
+        assert!(message.html.contains("<p>PO Box 123, Example City</p>"));
         assert!(message.text.contains("contact@example.com"));
         assert!(message.html.contains("https://example.com/privacy"));
         assert!(message.text.ends_with("Unsubscribe and remove my address: https://example.com/email/unsubscribe/example?first=1&second=2\n"));
@@ -356,7 +383,6 @@ contact_address = "contact@example.com"
         assert_eq!(message.attempt_id, ATTEMPT);
         assert!(!message.text.contains(address.as_str()));
         assert!(!message.html.contains(address.as_str()));
-        drop(newsletter);
         assert_eq!(content, original);
     }
 

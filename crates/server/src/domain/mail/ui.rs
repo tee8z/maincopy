@@ -642,7 +642,9 @@ fn provider_panel(binding: &MailReviewBinding) -> Markup {
             @let policy=policy.view();
             dl {
                 dt { "Publication operator" } dd { (policy.operator_name) }
-                dt { "Postal address in email" } dd { (policy.postal_address) }
+                @if let Some(address) = policy.postal_address {
+                    dt { "Postal address in email" } dd { (address) }
+                }
                 dt { "Mailing purpose" } dd { (policy.purpose) }
                 dt { "Public contact" } dd { (policy.contact_address.as_str()) }
                 dt { "Privacy notice" } dd { a href=(policy.privacy_url.as_str()) { (policy.privacy_url.as_str()) } }

@@ -81,6 +81,14 @@ let
     };
     mail = mailSettings;
   };
+  mailWithoutPostalAddress = evaluate {
+    mail = mailSettings // {
+      subscriptions = builtins.removeAttrs mailSettings.subscriptions [ "postalAddress" ];
+    };
+  };
+  mailWithNullPostalAddress = evaluate {
+    mail = lib.recursiveUpdate mailSettings { subscriptions.postalAddress = null; };
+  };
   activeMail = evaluate {
     mail = lib.recursiveUpdate mailSettings {
       subscriptions.mode = "enabled";
@@ -112,6 +120,15 @@ assert lib.all (entry: entry.assertion) complete.assertions;
 assert lib.all (entry: entry.assertion) internet.assertions;
 assert lib.all (entry: entry.assertion) pausedMail.assertions;
 assert lib.all (entry: entry.assertion) activeMail.assertions;
+assert lib.all (entry: entry.assertion) mailWithoutPostalAddress.assertions;
+assert lib.all (entry: entry.assertion) mailWithNullPostalAddress.assertions;
+assert mailWithoutPostalAddress.services.maincopy.mail.subscriptions.postalAddress == null;
+assert
+  (hostValue mailWithoutPostalAddress).mail.subscriptions
+  == builtins.removeAttrs (hostValue pausedMail).mail.subscriptions [ "postal_address" ];
+assert
+  (hostValue mailWithNullPostalAddress).mail.subscriptions
+  == (hostValue mailWithoutPostalAddress).mail.subscriptions;
 assert minimal.services.maincopy.mail.mode == "disabled";
 assert (hostValue minimal).mail == { mode = "disabled"; };
 assert minimal.systemd.services.maincopy.serviceConfig.LoadCredential == [ ];
@@ -194,6 +211,12 @@ assert typedRejected [ "mail" "subscriptions" "privacyUrl" ] {
   mail = lib.recursiveUpdate mailSettings {
     subscriptions.privacyUrl = "http://example.test/privacy/";
   };
+};
+assert typedRejected [ "mail" "subscriptions" "postalAddress" ] {
+  mail = lib.recursiveUpdate mailSettings { subscriptions.postalAddress = ""; };
+};
+assert typedRejected [ "mail" "subscriptions" "postalAddress" ] {
+  mail = lib.recursiveUpdate mailSettings { subscriptions.postalAddress = " "; };
 };
 assert minimal.systemd.services.maincopy.serviceConfig.User == "maincopy";
 assert minimal.systemd.services.maincopy-gateway.serviceConfig.User == "maincopy-gateway";

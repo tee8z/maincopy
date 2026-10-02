@@ -14,6 +14,8 @@ validation work.
 - Send reviewed article announcements through SES with double opt-in, one-click
   unsubscribe, address removal, suppression, and recovery controls. Email remains
   disabled until provider and privacy acceptance pass.
+- Make the public postal address optional for mailing lists. Omitted addresses
+  leave no empty fields in signup information, campaign review, or message footers.
 - Deploy through a NixOS module with HTTPS, private administration, and Prometheus metrics.
 - Back up continuously with Litestream and server-encrypted Backblaze B2 checkpoints,
   bounded retention, and verified restore that cannot reactivate old subscriber consent.

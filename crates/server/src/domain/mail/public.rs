@@ -496,7 +496,9 @@ fn policy_notice(policy: &SubscriptionPolicy) -> Markup {
     let view = policy.view();
     html! {
         p { "Operator: " (view.operator_name) }
-        p { "Postal address: " (view.postal_address) }
+        @if let Some(address) = view.postal_address {
+            p { "Postal address: " (address) }
+        }
         p { (view.purpose) }
         p { "Your address is stored by this site and processed by Amazon SES to deliver confirmation and announcement emails." }
         p { "Contact: " (view.contact_address.as_str()) }

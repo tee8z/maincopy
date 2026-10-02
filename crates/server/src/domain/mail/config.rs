@@ -123,7 +123,9 @@ impl SesMailConfiguration {
             let view = policy.view();
             for value in [
                 view.operator_name,
-                view.postal_address,
+                // Keep existing bindings unchanged when an address is supplied.
+                // An omitted address uses the otherwise-invalid empty value.
+                view.postal_address.unwrap_or_default(),
                 view.purpose,
                 view.privacy_url.as_str(),
                 view.contact_address.as_str(),
@@ -699,6 +701,37 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
 "#;
 
     #[test]
+    fn subscriptions_allow_omitting_the_postal_address_but_require_a_new_approval() {
+        let credentials = SesCredentials::parse(CREDENTIAL).unwrap();
+        let source = format!("{SES}{SUBSCRIPTIONS}{FEEDBACK}");
+        let with_address = configured(&source);
+        let without_address =
+            configured(&source.replace("postal_address = \"PO Box 123, Example City\"\n", ""));
+        assert_eq!(
+            with_address
+                .view()
+                .subscriptions
+                .unwrap()
+                .view()
+                .postal_address,
+            Some("PO Box 123, Example City")
+        );
+        assert_eq!(
+            without_address
+                .view()
+                .subscriptions
+                .unwrap()
+                .view()
+                .postal_address,
+            None
+        );
+        assert_ne!(
+            with_address.provider_binding(&credentials),
+            without_address.provider_binding(&credentials)
+        );
+    }
+
+    #[test]
     fn enabled_capture_requires_feedback_but_paused_controls_remain_configurable() {
         let paused = configured(&format!("{SES}{SUBSCRIPTIONS}"));
         assert_eq!(
@@ -750,7 +783,13 @@ topic_arn = "arn:aws:sns:us-east-1:123456789012:newsletter"
     fn invalid_public_disclosures_are_rejected_without_echoing_untrusted_values() {
         for (before, after, field) in [
             ("Example Publication", "", "operator_name"),
+            ("PO Box 123, Example City", "", "postal_address"),
             ("PO Box 123, Example City", " ", "postal_address"),
+            (
+                "PO Box 123, Example City",
+                "\\tprivate-marker",
+                "postal_address",
+            ),
             ("New articles from Example.", "\\tprivate-marker", "purpose"),
             (
                 "https://example.com/privacy",
