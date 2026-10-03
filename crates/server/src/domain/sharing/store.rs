@@ -10,10 +10,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::{
-    settings::{
-        Channel, StoredChannel, SubstackSettings, UpdateSubstack, UpdateX, XSettings,
-        stored_substack, stored_x,
-    },
+    settings::{Channel, StoredChannel, SubstackSettings, UpdateSubstack, stored_substack},
     teaser::Teaser,
 };
 use crate::{
@@ -31,7 +28,6 @@ use crate::{
 };
 
 const UPDATE_SUBSTACK_ACTION: &str = "sharing.substack.update";
-const UPDATE_X_ACTION: &str = "sharing.x.update";
 const SHARE_TEASER_ACTION: &str = "sharing.teaser.share";
 const MAX_RECEIPTS: i64 = 10_000;
 /// Transient provider failures are retried with doubling waits for about an hour.
@@ -219,29 +215,6 @@ impl SharingStore {
         stored_channel(&row, settings).map(Some)
     }
 
-    pub(crate) async fn x(&self) -> Result<Option<StoredChannel<XSettings>>, SharingLoadError> {
-        let row = sqlx::query(
-            "SELECT version,mode,credentials_rejected,api_key,api_secret,access_token,\
-             access_token_secret FROM sharing_x WHERE singleton=1",
-        )
-        .fetch_optional(&self.readers)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let settings = stored_x(
-            row.try_get("mode")?,
-            [
-                row.try_get("api_key")?,
-                row.try_get("api_secret")?,
-                row.try_get("access_token")?,
-                row.try_get("access_token_secret")?,
-            ],
-        )
-        .ok_or(SharingLoadError::CorruptStoredState)?;
-        stored_channel(&row, settings).map(Some)
-    }
-
     /// The longest-waiting queued delivery whose retry time has passed.
     pub(crate) async fn due(
         &self,
@@ -322,18 +295,6 @@ impl SharingStore {
         self.mutations
             .send(
                 |respond_to| Mutation::UpdateSharingSubstack {
-                    command,
-                    respond_to,
-                },
-                SharingCommandError::OutcomeUnknown,
-            )
-            .await
-    }
-
-    pub(crate) async fn update_x(&self, command: UpdateX) -> Result<(), SharingMutationError> {
-        self.mutations
-            .send(
-                |respond_to| Mutation::UpdateSharingX {
                     command,
                     respond_to,
                 },
@@ -541,7 +502,6 @@ async fn next_version(
 ) -> Result<(Option<i64>, i64), SharingApplyError> {
     let current: Option<i64> = sqlx::query_scalar(match channel {
         Channel::Substack => "SELECT version FROM sharing_substack WHERE singleton=1",
-        Channel::X => "SELECT version FROM sharing_x WHERE singleton=1",
     })
     .fetch_optional(&mut **transaction)
     .await?;
@@ -621,76 +581,6 @@ pub(crate) async fn update_substack(
         &command.audit,
         executed_at,
         UPDATE_SUBSTACK_ACTION,
-        fingerprint,
-    )
-    .await
-}
-
-pub(crate) async fn update_x(
-    transaction: &mut Transaction<'_, Sqlite>,
-    command: UpdateX,
-    executed_at: OffsetDateTime,
-) -> Result<(), SharingApplyError> {
-    let mut fingerprint = CommandFingerprintBuilder::new(UPDATE_X_ACTION);
-    fingerprint.version(command.expected_version);
-    fingerprint.field(command.mode.as_str().as_bytes());
-    match &command.credentials {
-        Some(credentials) => {
-            fingerprint.field(b"replace");
-            for secret in [
-                &credentials.api_key,
-                &credentials.api_secret,
-                &credentials.access_token,
-                &credentials.access_token_secret,
-            ] {
-                fingerprint.field(secret.expose().as_bytes());
-            }
-        }
-        None => fingerprint.field(b"keep"),
-    }
-    let fingerprint = fingerprint.finish();
-    if replayed(transaction, &command.audit, UPDATE_X_ACTION, fingerprint).await? {
-        return Ok(());
-    }
-    require_fresh_browser_owner(transaction, &command.audit.principal, executed_at)
-        .await
-        .map_err(auth_error)?;
-    let (current, version) =
-        next_version(transaction, Channel::X, command.expected_version).await?;
-    match (&command.credentials, current) {
-        // New credentials clear an earlier provider rejection.
-        (Some(credentials), _) => {
-            sqlx::query(
-                "INSERT INTO sharing_x(singleton,version,mode,credentials_rejected,api_key,\
-                 api_secret,access_token,access_token_secret) VALUES(1,?,?,0,?,?,?,?) \
-                 ON CONFLICT(singleton) DO UPDATE SET version=excluded.version,\
-                 mode=excluded.mode,credentials_rejected=0,api_key=excluded.api_key,\
-                 api_secret=excluded.api_secret,access_token=excluded.access_token,\
-                 access_token_secret=excluded.access_token_secret",
-            )
-            .bind(version)
-            .bind(command.mode.as_str())
-            .bind(credentials.api_key.expose())
-            .bind(credentials.api_secret.expose())
-            .bind(credentials.access_token.expose())
-            .bind(credentials.access_token_secret.expose())
-            .execute(&mut **transaction)
-            .await?;
-        }
-        (None, Some(_)) => {
-            sqlx::query("UPDATE sharing_x SET version=?,mode=? WHERE singleton=1")
-                .bind(version)
-                .bind(command.mode.as_str())
-                .execute(&mut **transaction)
-                .await?;
-        }
-        (None, None) => return Err(SharingCommandError::InvalidValue.into()),
-    }
-    record_receipt(
-        transaction,
-        &command.audit,
-        executed_at,
-        UPDATE_X_ACTION,
         fingerprint,
     )
     .await
@@ -792,10 +682,6 @@ pub(crate) async fn claim(
             "SELECT EXISTS(SELECT 1 FROM sharing_substack WHERE version=? AND mode='enabled' \
              AND credentials_rejected=0)"
         }
-        Channel::X => {
-            "SELECT EXISTS(SELECT 1 FROM sharing_x WHERE version=? AND mode='enabled' \
-             AND credentials_rejected=0)"
-        }
     })
     .bind(version)
     .fetch_one(&mut **transaction)
@@ -878,9 +764,6 @@ pub(crate) async fn finish(
             Channel::Substack => {
                 "UPDATE sharing_substack SET credentials_rejected=1 WHERE singleton=1 AND version=?"
             }
-            Channel::X => {
-                "UPDATE sharing_x SET credentials_rejected=1 WHERE singleton=1 AND version=?"
-            }
         })
         .bind(
             i64::try_from(command.settings_version)
@@ -919,7 +802,7 @@ pub(crate) async fn fail_interrupted(
 
 /// Runs under the offline restore's database lock and acceptance transaction.
 /// A provider may have accepted any unfinished teaser after the backup was
-/// taken, so none is sent again and every channel waits for its Owner.
+/// taken, so none is sent again and the channel waits for its Owner.
 pub(crate) async fn hold_restored_sharing(
     transaction: &mut Transaction<'_, Sqlite>,
     now: OffsetDateTime,
@@ -931,12 +814,9 @@ pub(crate) async fn hold_restored_sharing(
     .bind(now.unix_timestamp())
     .execute(&mut **transaction)
     .await?;
-    for pause in [
-        "UPDATE sharing_substack SET mode='paused'",
-        "UPDATE sharing_x SET mode='paused'",
-    ] {
-        sqlx::query(pause).execute(&mut **transaction).await?;
-    }
+    sqlx::query("UPDATE sharing_substack SET mode='paused'")
+        .execute(&mut **transaction)
+        .await?;
     Ok(())
 }
 
@@ -995,7 +875,6 @@ pub(crate) async fn queue_teaser(
             Channel::Substack => {
                 "SELECT EXISTS(SELECT 1 FROM sharing_substack WHERE mode='enabled')"
             }
-            Channel::X => "SELECT EXISTS(SELECT 1 FROM sharing_x WHERE mode='enabled')",
         })
         .fetch_one(&mut **transaction)
         .await
@@ -1023,7 +902,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn restore_pauses_channels_and_never_resends_an_unfinished_teaser() {
+    async fn restore_pauses_sharing_and_never_resends_an_unfinished_teaser() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("state/maincopy.db");
         database::bootstrap(DatabaseConfigurationView {
@@ -1044,17 +923,18 @@ mod tests {
         let mut transaction = connection.begin().await.unwrap();
         for setup in [
             "INSERT INTO sharing_substack VALUES(1,3,'enabled',0,'example','s%3Asession')",
-            "INSERT INTO sharing_x VALUES(1,1,'enabled',0,'a','b','c','d')",
             "INSERT INTO sharing_teasers VALUES(x'11111111111141118111111111111111',\
              x'22222222222242228222222222222222',0,'Title','','https://example.test/posts/a')",
             "INSERT INTO sharing_teasers VALUES(x'33333333333343338333333333333333',\
              x'44444444444444448444444444444444',0,'Title','','https://example.test/posts/b')",
+            "INSERT INTO sharing_teasers VALUES(x'55555555555545558555555555555555',\
+             x'66666666666646668666666666666666',0,'Title','','https://example.test/posts/c')",
             "INSERT INTO sharing_deliveries VALUES(x'11111111111141118111111111111111',\
              'substack','queued',0,0,0,NULL,NULL,NULL)",
-            "INSERT INTO sharing_deliveries VALUES(x'11111111111141118111111111111111',\
-             'x','sending',1,0,0,NULL,NULL,NULL)",
             "INSERT INTO sharing_deliveries VALUES(x'33333333333343338333333333333333',\
-             'x','posted',1,0,0,NULL,'https://x.com/i/status/1',NULL)",
+             'substack','sending',1,0,0,NULL,NULL,NULL)",
+            "INSERT INTO sharing_deliveries VALUES(x'55555555555545558555555555555555',\
+             'substack','posted',1,0,0,NULL,'https://example.substack.com/p/c',NULL)",
         ] {
             sqlx::query(setup).execute(&mut *transaction).await.unwrap();
         }
@@ -1075,13 +955,11 @@ mod tests {
                 ("posted".to_owned(), None)
             ]
         );
-        let modes: Vec<String> = sqlx::query_scalar(
-            "SELECT mode FROM sharing_substack UNION ALL SELECT mode FROM sharing_x",
-        )
-        .fetch_all(&mut *transaction)
-        .await
-        .unwrap();
-        assert_eq!(modes, ["paused", "paused"]);
+        let mode: String = sqlx::query_scalar("SELECT mode FROM sharing_substack")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        assert_eq!(mode, "paused");
         transaction.commit().await.unwrap();
         connection.close().await.unwrap();
     }

@@ -1,5 +1,5 @@
 //! One short announcement per article, sized for the strictest channel so the
-//! same text can be posted anywhere, by a worker or by hand.
+//! same text can be posted anywhere, by the worker or by hand.
 
 use markdown_compiler::{PostId, PostRevisionDigest};
 use thiserror::Error;
@@ -137,14 +137,12 @@ impl Teaser {
         }
     }
 
-    /// The complete post: title, summary when present, then the link.
-    pub(crate) fn text(&self) -> String {
+    /// The title, then the summary when present: the post text without its
+    /// link, for posting by hand with the link added below or in a reply.
+    pub(crate) fn lead(&self) -> String {
         match self.summary.is_empty() {
-            true => format!("{}{SEPARATOR}{}", self.title, self.url),
-            false => format!(
-                "{}{SEPARATOR}{}{SEPARATOR}{}",
-                self.title, self.summary, self.url
-            ),
+            true => self.title.clone(),
+            false => format!("{}{SEPARATOR}{}", self.title, self.summary),
         }
     }
 }
@@ -231,14 +229,13 @@ mod tests {
         PostId::parse("11111111-1111-4111-8111-111111111111").unwrap()
     }
 
+    /// The weight of the lead and its link posted together as one X post.
     fn weighted_text(teaser: &Teaser) -> usize {
-        let view = teaser.view();
-        let text = teaser.text();
-        weighted_length(&text[..text.len() - view.url.len()]) + LINK_WEIGHT
+        weighted_length(&teaser.lead()) + SEPARATOR.len() + LINK_WEIGHT
     }
 
     #[test]
-    fn short_metadata_is_kept_whole_and_ends_with_the_link() {
+    fn short_metadata_is_kept_whole() {
         let teaser = Teaser::compose(
             post_id(),
             "A short title",
@@ -247,9 +244,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            teaser.text(),
-            format!("A short title\n\nOne sentence about the article.\n\n{URL}")
+            teaser.lead(),
+            "A short title\n\nOne sentence about the article."
         );
+        assert_eq!(teaser.view().url, URL);
         assert!(weighted_text(&teaser) <= MAX_WEIGHTED_LENGTH);
     }
 
@@ -270,7 +268,7 @@ mod tests {
         let view = teaser.view();
         assert!(view.title.ends_with('…'));
         assert!(view.summary.is_empty());
-        assert_eq!(teaser.text(), format!("{}\n\n{URL}", view.title));
+        assert_eq!(teaser.lead(), view.title);
         assert!(weighted_text(&teaser) <= MAX_WEIGHTED_LENGTH);
     }
 
