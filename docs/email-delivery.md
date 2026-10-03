@@ -174,7 +174,8 @@ See [SNS filtering](https://docs.aws.amazon.com/sns/latest/dg/sns-subscription-f
 
 ## Consent, removal, and retention
 
-Link readers to `/email/subscribe` after launch acceptance. Signup requires an explicit consent checkbox and email confirmation.
+The home page and every article link to `/email/subscribe`. Signup requires an explicit consent checkbox and email confirmation.
+Without a configured provider that page offers the RSS feed instead; while signup is paused it says so.
 Addresses are matched case-insensitively; delivery preserves the supplied spelling.
 Generic signup responses avoid revealing existing subscriptions. Confirmation requests have a one-hour cooldown per address. Other readers can continue subscribing.
 

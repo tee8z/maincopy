@@ -47,7 +47,8 @@ use super::{
     },
 };
 
-const SUBSCRIBE_ROUTE: &str = "/email/subscribe";
+/// Public pages link here. Without a provider the feed-only page answers.
+pub(crate) const SUBSCRIBE_ROUTE: &str = "/email/subscribe";
 const CONFIRM_ROUTE: &str = "/email/confirm/{token}";
 const MAX_FORM_BYTES: usize = 4096;
 const PRIVATE_CSP: &str = "default-src 'none'; script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";

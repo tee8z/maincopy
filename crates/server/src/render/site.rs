@@ -21,6 +21,7 @@ use serde::Serialize;
 use thiserror::Error;
 use time::OffsetDateTime;
 
+use crate::domain::mail::public::SUBSCRIBE_ROUTE;
 use crate::domain::profile::TipRecipientProjection;
 use crate::domain::publication::{
     CanonicalSiteUrl, MAX_PUBLIC_ROUTES, PublicLedgerProjection, PublicPagePath,
@@ -592,7 +593,16 @@ fn render_pre_injection_shell(
                 &mut hasher,
                 &mut retained,
                 &path,
-                render_index(renderer, plan.posts, plan.chronology).into_string(),
+                render_index(
+                    renderer,
+                    plan.posts,
+                    plan.chronology,
+                    ReaderActions {
+                        subscribe: false,
+                        tip: None,
+                    },
+                )
+                .into_string(),
             ),
             PreInjectionPage::Archive => hash_pre_injection_html(
                 &mut hasher,
@@ -776,7 +786,16 @@ fn render_snapshot_pages(
     insert_page(
         &mut pages,
         PageRoute::Index,
-        render_index(renderer, &shell.posts, &shell.chronology).into_string(),
+        render_index(
+            renderer,
+            &shell.posts,
+            &shell.chronology,
+            ReaderActions {
+                subscribe: true,
+                tip: tip_handoff,
+            },
+        )
+        .into_string(),
         publication,
         retained,
     )?;
@@ -1576,6 +1595,7 @@ fn render_index(
     renderer: &PageRenderer<'_>,
     posts: &[PublicPostView],
     chronology: &[usize],
+    actions: ReaderActions<'_, '_>,
 ) -> Markup {
     let publication = renderer.publication;
     let canonical_url =
@@ -1589,6 +1609,7 @@ fn render_index(
                 (render_post_list(posts, chronology))
             }
         }
+        (render_reader_actions(actions))
     };
     render_layout(
         renderer,
@@ -1801,21 +1822,37 @@ fn render_tip_qr(code: &QrCode, address: &str, lnurl: &str) -> Markup {
     }
 }
 
-fn render_tip_cta(handoff: &TipHandoff<'_>) -> Markup {
-    let view = handoff.recipient.as_view();
+/// What a reader can do after reading: follow the site and tip its author.
+/// These actions are presentation, so identity shells render neither.
+#[derive(Clone, Copy)]
+struct ReaderActions<'handoff, 'recipient> {
+    /// Link to the signup page, which answers with the feed when email is off.
+    subscribe: bool,
+    tip: Option<&'handoff TipHandoff<'recipient>>,
+}
+
+fn render_reader_actions(actions: ReaderActions<'_, '_>) -> Markup {
     html! {
-        aside class="tip-cta" aria-label="Tip the author" {
-            a class="tip-action" href=(view.wallet_link) { "Leave a tip" }
-            details class="tip-details" {
-                summary { "Lightning address" }
-                div class="tip-details-content" {
-                    p class="tip-recipient" {
-                        code { (view.address) }
-                        " "
-                        button type="button" class="tip-copy" hidden
-                            data-copy-lightning-address=(view.address) { "Copy" }
+        @if actions.subscribe || actions.tip.is_some() {
+            aside class="tip-cta" aria-label="Follow and support" {
+                @if actions.subscribe {
+                    a class="tip-action" href=(SUBSCRIBE_ROUTE) { "Subscribe" }
+                }
+                @if let Some(handoff) = actions.tip {
+                    @let view = handoff.recipient.as_view();
+                    a class="tip-action" href=(view.wallet_link) { "Leave a tip" }
+                    details class="tip-details" {
+                        summary { "Lightning address" }
+                        div class="tip-details-content" {
+                            p class="tip-recipient" {
+                                code { (view.address) }
+                                " "
+                                button type="button" class="tip-copy" hidden
+                                    data-copy-lightning-address=(view.address) { "Copy" }
+                            }
+                            (handoff.qr.clone())
+                        }
                     }
-                    (handoff.qr.clone())
                 }
             }
         }
@@ -1907,11 +1944,11 @@ fn render_post(
                         (trusted_article_markup(article))
                     }
                 }
-                @if tips_enabled {
-                    @if let Some(tip_handoff) = tip_handoff {
-                        (render_tip_cta(tip_handoff))
-                    }
-                }
+                (render_reader_actions(ReaderActions {
+                    // Only a page that carries the article offers to follow it.
+                    subscribe: matches!(article, ArticleBody::Projected(_)),
+                    tip: tip_handoff.filter(|_| tips_enabled),
+                }))
             }
             (render_post_navigation(navigation))
         }
@@ -2631,9 +2668,14 @@ mod tests {
     fn tip_handoff_keeps_payment_details_collapsed_and_the_wallet_link_accessible() {
         let projection = tip_projection(Some("Alice <Writer> & Company"), "alice@example.com");
         let handoff = TipHandoff::new(&projection).unwrap();
-        let html = render_tip_cta(&handoff).into_string();
+        let html = render_reader_actions(ReaderActions {
+            subscribe: false,
+            tip: Some(&handoff),
+        })
+        .into_string();
 
-        assert!(html.contains("aria-label=\"Tip the author\""));
+        assert!(html.contains("aria-label=\"Follow and support\""));
+        assert!(!html.contains(">Subscribe</a>"));
         assert!(html.contains(">Leave a tip</a>"));
         assert!(
             html.contains("<details class=\"tip-details\"><summary>Lightning address</summary>")
@@ -2720,7 +2762,7 @@ mod tests {
         )
         .unwrap()
         .into_string();
-        assert!(inherited_disabled.contains("class=\"tip-cta\""));
+        assert!(inherited_disabled.contains(">Leave a tip</a>"));
 
         let no_recipient = render_post(
             &PageRenderer::new(
@@ -2738,7 +2780,7 @@ mod tests {
         )
         .unwrap()
         .into_string();
-        assert!(!no_recipient.contains("class=\"tip-cta\""));
+        assert!(!no_recipient.contains(">Leave a tip</a>"));
 
         page.tips = PostTipPolicy::Enabled;
         let post_enabled = render_post(
@@ -2757,7 +2799,7 @@ mod tests {
         )
         .unwrap()
         .into_string();
-        assert!(post_enabled.contains("class=\"tip-cta\""));
+        assert!(post_enabled.contains(">Leave a tip</a>"));
 
         publication.tips = DefaultPostTipPolicy::Enabled;
         page.tips = PostTipPolicy::Disabled;
@@ -2777,7 +2819,7 @@ mod tests {
         )
         .unwrap()
         .into_string();
-        assert!(!post_disabled.contains("class=\"tip-cta\""));
+        assert!(!post_disabled.contains(">Leave a tip</a>"));
     }
 
     #[test]
@@ -3645,6 +3687,30 @@ mod tests {
                 .code,
             SiteSnapshotBuildErrorCode::DraftSelected
         );
+    }
+
+    #[test]
+    fn the_home_page_offers_to_subscribe_and_tip_without_changing_identity() {
+        let fixture = fixture();
+        let ledger = projection([entry(&fixture, FIRST_ID, 1_000)]);
+        let plain = build_snapshot(&fixture, &ledger).unwrap();
+        assert!(
+            plain
+                .index_page()
+                .contains("<a class=\"tip-action\" href=\"/email/subscribe\">Subscribe</a>")
+        );
+        assert!(!plain.index_page().contains(">Leave a tip</a>"));
+
+        let tipped = render_site_shell(Arc::clone(&fixture.catalog), embedded_manifest(), &ledger)
+            .unwrap()
+            .bind_tip_recipient(Some(tip_projection(Some("Alice"), "alice@example.com")))
+            .into_snapshot()
+            .unwrap();
+        assert!(tipped.index_page().contains(">Subscribe</a>"));
+        assert!(tipped.index_page().contains(">Leave a tip</a>"));
+        // Reader actions are presentation: the approved site is the same site.
+        assert_eq!(tipped.digest, plain.digest);
+        assert_ne!(tipped.presentation_digest, plain.presentation_digest);
     }
 
     #[test]

@@ -9,9 +9,10 @@ use url::Url;
 
 use super::{
     config::{MailConfiguration, SubscriptionPolicy},
-    public::{page, private_response},
+    public::{SUBSCRIBE_ROUTE, page, private_response},
     subscriber::store::SubscriberStore,
 };
+use crate::domain::publication::RSS_FEED_PATH;
 
 pub(super) const NOTICE_PATH: &str = "/email/privacy";
 
@@ -41,6 +42,26 @@ pub(crate) fn router(subscribers: SubscriberStore, configuration: &MailConfigura
             fallback,
         })
         .layer(middleware::from_fn(private_response))
+}
+
+/// Without an email provider there is no signup form. A reader who follows a
+/// page's "Subscribe" link still gets an answer: the feed.
+pub(crate) fn feed_only_router() -> Router {
+    Router::new()
+        .route(SUBSCRIBE_ROUTE, get(feed_only))
+        .layer(middleware::from_fn(private_response))
+}
+
+async fn feed_only() -> Response {
+    page(
+        StatusCode::OK,
+        "Subscribe",
+        html! {
+            p { "Email updates are not available on this site yet." }
+            p { "Follow new articles with the " a href=(RSS_FEED_PATH) { "RSS feed" } "." }
+            p { a href="/" { "Return to the site" } }
+        },
+    )
 }
 
 async fn notice(State(state): State<PrivacyState>) -> Response {
@@ -82,4 +103,29 @@ async fn notice(State(state): State<PrivacyState>) -> Response {
             p { a href="/" { "Return to the site" } }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, header::CACHE_CONTROL},
+    };
+    use tower::ServiceExt as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn subscribe_answers_with_the_feed_when_no_email_provider_is_configured() {
+        let response = feed_only_router()
+            .oneshot(Request::get(SUBSCRIBE_ROUTE).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, no-store");
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("<a href=\"/feed.xml\">RSS feed</a>"));
+        assert!(!body.contains("<form"));
+    }
 }

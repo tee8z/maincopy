@@ -3,6 +3,9 @@
 ## Unreleased
 
 - Edit a teaser's post text on the sharing page before it is shared.
+- Link the home page and every article to newsletter signup, and show the tip
+  link on the home page too. Without an email provider, the signup page offers
+  the RSS feed.
 
 ## 0.1.7
 

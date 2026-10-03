@@ -1297,7 +1297,11 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         None => {
             PublicServer::bind_router(
                 public_bind,
-                public_router_with_routes(public_state, privacy_routes),
+                // Pages link to signup; without mail routes the feed answers.
+                public_router_with_routes(
+                    public_state,
+                    privacy_routes.merge(privacy::feed_only_router()),
+                ),
             )
             .await
         }
