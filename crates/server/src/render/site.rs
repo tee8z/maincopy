@@ -2704,7 +2704,11 @@ mod tests {
         let view = projection.as_view();
         let first = TipHandoff::new(&projection).unwrap();
         let second = TipHandoff::new(&projection).unwrap();
-        let html = render_tip_cta(&first).into_string();
+        let html = render_reader_actions(ReaderActions {
+            subscribe: false,
+            tip: Some(&first),
+        })
+        .into_string();
 
         assert!(html.contains("<code>alice@example.com</code>"));
         assert!(html.contains(&format!("href=\"{}\"", view.wallet_link)));
@@ -3633,7 +3637,13 @@ mod tests {
             .get_mut(&PageRoute::Post(PostSlug::parse("first-post").unwrap()))
             .unwrap();
         let mut html = page.html.to_string();
-        html.push_str(&render_tip_cta(&handoff).into_string());
+        html.push_str(
+            &render_reader_actions(ReaderActions {
+                subscribe: false,
+                tip: Some(&handoff),
+            })
+            .into_string(),
+        );
         page.html = html.into();
         next.presentation_digest = presentation_digest(
             &next.pages,
