@@ -224,6 +224,55 @@ async fn first_publication_records_one_teaser_for_the_channels_enabled_then() {
     assert!(page.contains("Not shared. "));
     assert!(!page.contains("Share on Substack"));
 
+    // An Owner can rewrite the text; text that no longer fits is refused whole.
+    let edit_path = SHARE.trim_end_matches("/substack");
+    let first = key();
+    for _ in 0..2 {
+        let response = submit(
+            &router,
+            &browser,
+            edit_path,
+            &[
+                ("idempotency_key", &first),
+                ("text", "A better title\r\n\r\nWritten by hand."),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let too_long = format!("Title\r\n{}", "x".repeat(300));
+    for refused in [too_long.as_str(), " "] {
+        let response = submit(
+            &router,
+            &browser,
+            edit_path,
+            &[("idempotency_key", &key()), ("text", refused)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(text(response).await.contains("Nothing was saved"));
+    }
+    let recent = store.recent(RECENT_TEASERS).await.unwrap();
+    assert_eq!(
+        recent[0].teaser.lead(),
+        "A better title\n\nWritten by hand."
+    );
+    assert_eq!(
+        recent[0].teaser.view().url,
+        "https://example.test/posts/article"
+    );
+    let page = text(get(&router, &browser, "/admin/sharing").await).await;
+    assert!(page.contains("A better title\n\nWritten by hand.</textarea>"));
+    let missing = "/admin/sharing/teasers/22222222-2222-4222-8222-222222222222";
+    let response = submit(
+        &router,
+        &browser,
+        missing,
+        &[("idempotency_key", &key()), ("text", "Title")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
     // A channel set up later can still be given the teaser, once.
     let response = save_substack(&router, &browser, &key(), "0", "enabled", SUBSTACK_SESSION).await;
     assert_eq!(response.status(), StatusCode::OK);

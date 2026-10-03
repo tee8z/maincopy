@@ -29,6 +29,7 @@ use crate::{
 
 const UPDATE_SUBSTACK_ACTION: &str = "sharing.substack.update";
 const SHARE_TEASER_ACTION: &str = "sharing.teaser.share";
+const EDIT_TEASER_ACTION: &str = "sharing.teaser.edit";
 const MAX_RECEIPTS: i64 = 10_000;
 /// Transient provider failures are retried with doubling waits for about an hour.
 const MAX_ATTEMPTS: i64 = 6;
@@ -106,6 +107,14 @@ pub(crate) struct DueDelivery {
 pub(crate) struct ShareTeaser {
     pub post_id: PostId,
     pub channel: Channel,
+    pub audit: MutationAuditContext,
+}
+
+/// Replace a teaser's title and summary with text an Owner wrote.
+pub(crate) struct EditTeaser {
+    pub post_id: PostId,
+    /// The first line is the title; the rest is the summary.
+    pub text: String,
     pub audit: MutationAuditContext,
 }
 
@@ -307,6 +316,18 @@ impl SharingStore {
         self.mutations
             .send(
                 |respond_to| Mutation::ShareTeaser {
+                    command,
+                    respond_to,
+                },
+                SharingCommandError::OutcomeUnknown,
+            )
+            .await
+    }
+
+    pub(crate) async fn edit(&self, command: EditTeaser) -> Result<(), SharingMutationError> {
+        self.mutations
+            .send(
+                |respond_to| Mutation::EditSharingTeaser {
                     command,
                     respond_to,
                 },
@@ -647,6 +668,48 @@ pub(crate) async fn share(
         &command.audit,
         executed_at,
         SHARE_TEASER_ACTION,
+        fingerprint,
+    )
+    .await
+}
+
+pub(crate) async fn edit_teaser(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: EditTeaser,
+    executed_at: OffsetDateTime,
+) -> Result<(), SharingApplyError> {
+    let mut fingerprint = CommandFingerprintBuilder::new(EDIT_TEASER_ACTION);
+    fingerprint.uuid(&command.post_id.as_uuid());
+    fingerprint.field(command.text.as_bytes());
+    let fingerprint = fingerprint.finish();
+    if replayed(transaction, &command.audit, EDIT_TEASER_ACTION, fingerprint).await? {
+        return Ok(());
+    }
+    require_fresh_browser_owner(transaction, &command.audit.principal, executed_at)
+        .await
+        .map_err(auth_error)?;
+    let post_id = command.post_id.as_uuid();
+    let row = sqlx::query("SELECT post_id,title,summary,url FROM sharing_teasers WHERE post_id=?")
+        .bind(post_id.as_bytes().as_slice())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(SharingCommandError::NotFound)?;
+    let edited = stored_teaser(&row)
+        .map_err(|_| SharingApplyError::CorruptStoredState)?
+        .edited(&command.text)
+        .map_err(|_| SharingCommandError::InvalidValue)?;
+    let view = edited.view();
+    sqlx::query("UPDATE sharing_teasers SET title=?,summary=? WHERE post_id=?")
+        .bind(view.title)
+        .bind(view.summary)
+        .bind(post_id.as_bytes().as_slice())
+        .execute(&mut **transaction)
+        .await?;
+    record_receipt(
+        transaction,
+        &command.audit,
+        executed_at,
+        EDIT_TEASER_ACTION,
         fingerprint,
     )
     .await

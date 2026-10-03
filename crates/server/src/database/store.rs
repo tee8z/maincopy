@@ -38,7 +38,9 @@ use crate::domain::publication::store::{
 };
 use crate::domain::sharing::{
     settings::UpdateSubstack,
-    store::{ClaimDelivery, FinishDelivery, ShareTeaser, SharingCommandError, SharingStore},
+    store::{
+        ClaimDelivery, EditTeaser, FinishDelivery, ShareTeaser, SharingCommandError, SharingStore,
+    },
 };
 use crate::domain::source::store::{
     AdvanceSourceSync, ApplyManagedSourceCatalog, BeginSourceReconfiguration, BeginSourceSync,
@@ -343,6 +345,10 @@ pub(crate) enum Mutation {
     },
     ShareTeaser {
         command: ShareTeaser,
+        respond_to: oneshot::Sender<Result<(), SharingCommandError>>,
+    },
+    EditSharingTeaser {
+        command: EditTeaser,
         respond_to: oneshot::Sender<Result<(), SharingCommandError>>,
     },
     ClaimSharingDelivery {

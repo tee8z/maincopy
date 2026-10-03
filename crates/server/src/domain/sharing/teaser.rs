@@ -128,6 +128,20 @@ impl Teaser {
         })
     }
 
+    /// Replace the text an Owner edited by hand. The first line is the title
+    /// and the rest is the summary; nothing is clipped, so text that no longer
+    /// fits one post with its link is refused.
+    pub(crate) fn edited(&self, text: &str) -> Result<Self, TeaserError> {
+        let text = text.trim();
+        let (title, summary) = text.split_once('\n').unwrap_or((text, ""));
+        Self::from_parts(
+            self.post_id.clone(),
+            single_line(title),
+            single_line(summary),
+            self.url.clone(),
+        )
+    }
+
     pub(crate) fn view(&self) -> TeaserView<'_> {
         TeaserView {
             post_id: &self.post_id,
@@ -290,6 +304,26 @@ mod tests {
         let view = teaser.view();
         assert_eq!(view.title, "Two lines");
         assert_eq!(view.summary, "Tabbed summary");
+    }
+
+    #[test]
+    fn an_edit_takes_its_first_line_as_the_title_and_is_never_clipped() {
+        let teaser = Teaser::compose(post_id(), "Title", "Summary.", URL).unwrap();
+        let edited = teaser
+            .edited("  A better title\r\n\r\nTwo summary\r\nlines.  ")
+            .unwrap();
+        assert_eq!(edited.lead(), "A better title\n\nTwo summary lines.");
+        assert_eq!(edited.view().url, URL);
+        assert_eq!(edited.view().post_id, &post_id());
+        assert_eq!(
+            teaser.edited("Only a title").unwrap().lead(),
+            "Only a title"
+        );
+        assert_eq!(teaser.edited(" \n "), Err(TeaserError::EmptyTitle));
+        assert_eq!(
+            teaser.edited(&format!("Title\n{}", "x".repeat(300))),
+            Err(TeaserError::TooLong)
+        );
     }
 
     #[test]

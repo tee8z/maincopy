@@ -3267,7 +3267,7 @@ mod tests {
                 .load_full()
                 .post_page(&published_slug)
                 .unwrap()
-                .contains("class=\"tip-cta\"")
+                .contains(">Leave a tip</a>")
         );
 
         let revised = tips_catalog("Revised publication body.");
@@ -3340,7 +3340,7 @@ mod tests {
                 .load_full()
                 .post_page(&published_slug)
                 .unwrap()
-                .contains("class=\"tip-cta\"")
+                .contains(">Leave a tip</a>")
         );
         assert!(readiness.is_ready());
         assert!(!service_cancellation.is_cancelled());

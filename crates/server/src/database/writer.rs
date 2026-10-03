@@ -831,6 +831,13 @@ async fn apply_mutation(
             respond_to,
             sharing_store::share(transaction, command, OffsetDateTime::now_utc()).await,
         ),
+        Mutation::EditSharingTeaser {
+            command,
+            respond_to,
+        } => sharing_response(
+            respond_to,
+            sharing_store::edit_teaser(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
         Mutation::ClaimSharingDelivery {
             command,
             respond_to,
