@@ -16,6 +16,7 @@ use crate::{
         },
         profile::store::ProfileStore,
         publication::store::PublicationStore,
+        sharing::store::{SharingStore, hold_restored_sharing},
         source::store::SourceStore,
     },
     metrics::DatabaseMetrics,
@@ -87,15 +88,16 @@ pub(crate) async fn inspect(path: &Path) -> Result<RestoreInspection, RestoreErr
         mutations.clone(),
         PathBuf::from(wal_path),
     );
-    let store = DatabaseStore::new(
-        AuthStore::new(readers.clone(), mutations.clone()),
-        ProfileStore::new(readers.clone(), mutations.clone()),
-        PublicationStore::new(readers.clone(), mutations.clone()),
-        SourceStore::new(readers.clone(), mutations.clone()),
-        CampaignStore::new(readers.clone(), mutations.clone()),
-        SubscriberStore::new(readers.clone(), mutations),
+    let store = DatabaseStore {
+        auth: AuthStore::new(readers.clone(), mutations.clone()),
+        profiles: ProfileStore::new(readers.clone(), mutations.clone()),
+        publications: PublicationStore::new(readers.clone(), mutations.clone()),
+        source: SourceStore::new(readers.clone(), mutations.clone()),
+        mail: CampaignStore::new(readers.clone(), mutations.clone()),
+        subscribers: SubscriberStore::new(readers.clone(), mutations.clone()),
+        sharing: SharingStore::new(readers.clone(), mutations),
         health,
-    );
+    };
     if let Err(error) = store.mail.validate_all().await {
         readers.close().await;
         return Err(error.into());
@@ -178,6 +180,7 @@ pub(crate) async fn accept(path: &Path, restore_id: Uuid) -> Result<(), RestoreE
         invalidate_restored_credentials(&mut transaction, restore_id, now).await?;
         quarantine_restored_campaigns(&mut transaction, restore_id, now).await?;
         discard_restored_subscribers(&mut transaction, restore_id).await?;
+        hold_restored_sharing(&mut transaction, now).await?;
         transaction.commit().await?;
         // SQLite reports a busy checkpoint as a successful PRAGMA result.
         // Offline acceptance owns the database and must physically truncate the

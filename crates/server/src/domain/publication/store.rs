@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::domain::mail::{campaign::CampaignContent, store::queue_article_notification};
+use crate::domain::sharing::{store::queue_teaser, teaser::Teaser};
 
 use crate::database::store::{
     DatabaseAdmissionError, DatabaseCommandError, DatabaseMutationError, Mutation, MutationSender,
@@ -956,6 +957,8 @@ pub(crate) struct FinishPublication {
     pub publication_id: Uuid,
     /// Required when the newsletter is enabled; omitted for publication-only callers.
     pub newsletter: Option<CampaignContent>,
+    /// Recorded with the article's first publication; omitted when none can be composed.
+    pub teaser: Option<Teaser>,
     pub expected_publication_version: u64,
     pub expected_site: SiteHead,
     pub candidate_site_digest: SiteSnapshotDigest,
@@ -2931,6 +2934,13 @@ async fn finish_activation(
         published.view(),
         command.newsletter,
         version,
+    )
+    .await?;
+    queue_teaser(
+        transaction,
+        publication_id,
+        published.view(),
+        command.teaser,
     )
     .await?;
 

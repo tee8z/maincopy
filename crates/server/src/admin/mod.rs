@@ -9,6 +9,7 @@ use crate::domain::{
     publication::{
         activation::PublicationCoordinatorHandle, admin as publication_admin, ui as publication_ui,
     },
+    sharing::ui::{self as sharing_ui, SharingUiState},
     source::{admin as source_admin, ui as source_ui},
 };
 use crate::source_sync::SourceSyncHandle;
@@ -70,8 +71,9 @@ pub(crate) fn runtime_admin_router(
     profiles: ProfileStore,
     source: SourceSyncHandle,
     mail: MailUiState,
+    sharing: SharingUiState,
 ) -> Router {
-    let (router, document) = registered_router(&security, mail);
+    let (router, document) = registered_router(&security, mail, sharing);
     router
         .layer(Extension(Arc::new(document)))
         .layer(Extension(security.clone()))
@@ -95,6 +97,7 @@ pub(crate) fn runtime_admin_router(
 fn registered_router(
     security: &AdminSecurityState,
     mail: MailUiState,
+    sharing: SharingUiState,
 ) -> (Router<AdminRuntimeState>, utoipa::openapi::OpenApi) {
     let (api, document) = OpenApiRouter::<AdminRuntimeState>::with_openapi(AdminApi::document())
         .routes(scoped_routes(
@@ -259,7 +262,8 @@ fn registered_router(
             .merge(identity::browser_router(security))
             .merge(publication_ui::router(security))
             .merge(source_ui::router(security))
-            .merge(mail_ui::router(security, mail)),
+            .merge(mail_ui::router(security, mail))
+            .merge(sharing_ui::router(security, sharing)),
         document,
     )
 }

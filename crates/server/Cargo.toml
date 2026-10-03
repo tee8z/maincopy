@@ -28,6 +28,7 @@ blake3.workspace = true
 bytes.workspace = true
 clap.workspace = true
 getrandom.workspace = true
+hmac.workspace = true
 libsqlite3-sys.workspace = true
 k256.workspace = true
 maincopy-diagram-renderer = { workspace = true, features = ["client"] }
@@ -42,6 +43,7 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 subtle.workspace = true

@@ -62,6 +62,7 @@ key. You can also supply a local checkout maintained by your own tools.
 | Set up the home server and HTTPS | [Deployment](docs/deployment.md) |
 | Connect a Git repository | [Managed Git](docs/managed-source.md) |
 | Configure email announcements | [Email](docs/email-delivery.md) |
+| Share new articles on Substack and X | [Sharing](docs/sharing.md) |
 | Back up or restore the site | [Backup and restore](docs/backup-restore.md) |
 | Monitor the running service | [Observability](docs/observability.md) |
 | Install or publish a versioned release | [Releases](docs/release.md) |

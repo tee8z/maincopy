@@ -128,6 +128,11 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             "release_operations",
             "reload_operations",
             "reload_post_changes",
+            "sharing_deliveries",
+            "sharing_receipts",
+            "sharing_substack",
+            "sharing_teasers",
+            "sharing_x",
             "site_revisions",
             "site_state",
             "site_tip_recipient",
@@ -1019,6 +1024,12 @@ async fn identifiers_and_hashes_use_blob_storage() {
             "reload_post_changes.expected_post_digest:BLOB",
             "reload_post_changes.reload_operation_id:BLOB",
             "reload_post_changes.stable_post_id:BLOB",
+            "sharing_deliveries.post_id:BLOB",
+            "sharing_receipts.audit_event_id:BLOB",
+            "sharing_receipts.command_fingerprint:BLOB",
+            "sharing_receipts.idempotency_key:BLOB",
+            "sharing_teasers.post_id:BLOB",
+            "sharing_teasers.publication_id:BLOB",
             "site_revisions.site_revision_digest:BLOB",
             "site_revisions.source_commit:BLOB",
             "site_state.current_site_digest:BLOB",
@@ -1061,7 +1072,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 217);
+    assert_eq!(compact_definitions.matches("check(").count(), 251);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",

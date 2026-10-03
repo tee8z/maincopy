@@ -186,6 +186,7 @@ pub enum CriticalTaskName {
     MailDispatch,
     MailFeedback,
     MailRetention,
+    Sharing,
     Worker,
 }
 
@@ -202,6 +203,7 @@ impl_display!(CriticalTaskName {
     Self::MailDispatch => "mail dispatch",
     Self::MailFeedback => "mail feedback",
     Self::MailRetention => "mail retention",
+    Self::Sharing => "article sharing",
     Self::Worker => "worker",
 });
 
@@ -382,6 +384,7 @@ mod tests {
             CriticalTaskName::MailDispatch => "mail dispatch",
             CriticalTaskName::MailFeedback => "mail feedback",
             CriticalTaskName::MailRetention => "mail retention",
+            CriticalTaskName::Sharing => "article sharing",
             CriticalTaskName::Worker => "worker",
             StartupStage::Configuration => "configuration",
             StartupStage::ProcessLock => "process lock",

@@ -8,4 +8,5 @@ pub(crate) mod auth;
 pub(crate) mod mail;
 pub(crate) mod profile;
 pub mod publication;
+pub(crate) mod sharing;
 pub(crate) mod source;

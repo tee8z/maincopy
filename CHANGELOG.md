@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Share each newly published article as one short teaser on Substack and X.
+  Manage both channels and their credentials in the Owner admin portal, without
+  host configuration or a restart. The teaser fits a single X post and is listed
+  for copying elsewhere. Existing articles are not shared on upgrade.
+
 ## 0.1.5
 
 - Send each newly published article once to its active newsletter subscribers.

@@ -1578,6 +1578,7 @@ mod tests {
                 self.runtime.state.profiles.clone(),
                 self.runtime.state.source.clone(),
                 self.runtime.mail.clone(),
+                self.runtime.sharing.clone(),
             )
         }
 
@@ -1788,6 +1789,7 @@ mod tests {
                 harness.runtime.state.profiles.clone(),
                 harness.runtime.state.source.clone(),
                 harness.runtime.mail.clone(),
+                harness.runtime.sharing.clone(),
             );
             let request = Request::builder()
                 .uri("/admin/login")
