@@ -10,27 +10,24 @@ use zeroize::Zeroizing;
 use crate::domain::auth::store::MutationAuditContext;
 
 const MAX_SUBSTACK_SESSION_BYTES: usize = 1024;
-const MAX_X_CREDENTIAL_BYTES: usize = 256;
 const MAX_SUBDOMAIN_BYTES: usize = 63;
 const SUBSTACK_HOST_SUFFIX: &str = ".substack.com";
 /// Substack signs its session cookie in this URL-encoded form.
 const SUBSTACK_SESSION_PREFIX: &str = "s%3A";
 
-/// Every place a teaser can be posted.
+/// Every place Maincopy posts a teaser itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Channel {
     Substack,
-    X,
 }
 
 impl Channel {
-    pub(crate) const ALL: [Self; 2] = [Self::Substack, Self::X];
+    pub(crate) const ALL: [Self; 1] = [Self::Substack];
 
     /// The stable storage and route name.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Substack => "substack",
-            Self::X => "x",
         }
     }
 
@@ -43,7 +40,6 @@ impl Channel {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Substack => "Substack",
-            Self::X => "X",
         }
     }
 }
@@ -82,8 +78,6 @@ pub(crate) enum SettingsError {
         "Paste the value of the substack.sid cookie from a signed-in browser. It starts with s%3A."
     )]
     SubstackSession,
-    #[error("Enter the API key, API secret, access token, and access token secret together.")]
-    XCredentials,
     #[error("Save the channel's credentials before changing whether it is enabled.")]
     CredentialsRequired,
 }
@@ -164,45 +158,6 @@ pub(crate) fn substack_session(value: &str) -> Result<ChannelSecret, SettingsErr
     ChannelSecret::parse(value, MAX_SUBSTACK_SESSION_BYTES).ok_or(SettingsError::SubstackSession)
 }
 
-/// The four static values of an X app with read and write user access.
-#[derive(Debug)]
-pub(crate) struct XCredentials {
-    pub api_key: ChannelSecret,
-    pub api_secret: ChannelSecret,
-    pub access_token: ChannelSecret,
-    pub access_token_secret: ChannelSecret,
-}
-
-impl XCredentials {
-    /// All four blank keeps the saved credentials; a partial set is an error.
-    pub(crate) fn parse_optional(
-        api_key: &str,
-        api_secret: &str,
-        access_token: &str,
-        access_token_secret: &str,
-    ) -> Result<Option<Self>, SettingsError> {
-        let values = [api_key, api_secret, access_token, access_token_secret].map(str::trim);
-        if values.iter().all(|value| value.is_empty()) {
-            return Ok(None);
-        }
-        let [api_key, api_secret, access_token, access_token_secret] = values.map(|value| {
-            ChannelSecret::parse(value, MAX_X_CREDENTIAL_BYTES).ok_or(SettingsError::XCredentials)
-        });
-        Ok(Some(Self {
-            api_key: api_key?,
-            api_secret: api_secret?,
-            access_token: access_token?,
-            access_token_secret: access_token_secret?,
-        }))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct XSettings {
-    pub mode: ChannelMode,
-    pub credentials: XCredentials,
-}
-
 /// Saved settings with the facts the worker and the admin page both need.
 #[derive(Debug)]
 pub(crate) struct StoredChannel<Settings> {
@@ -221,14 +176,6 @@ pub(crate) struct UpdateSubstack {
     pub audit: MutationAuditContext,
 }
 
-pub(crate) struct UpdateX {
-    pub expected_version: u64,
-    pub mode: ChannelMode,
-    /// `None` keeps the saved credentials.
-    pub credentials: Option<XCredentials>,
-    pub audit: MutationAuditContext,
-}
-
 /// Rehydrate stored text; a row that fails validation is corrupt.
 pub(super) fn stored_substack(
     mode: &str,
@@ -244,20 +191,6 @@ pub(super) fn stored_substack(
     })
 }
 
-pub(super) fn stored_x(mode: &str, credentials: [&str; 4]) -> Option<XSettings> {
-    let [api_key, api_secret, access_token, access_token_secret] =
-        credentials.map(|value| ChannelSecret::parse(value, MAX_X_CREDENTIAL_BYTES));
-    Some(XSettings {
-        mode: ChannelMode::parse(mode)?,
-        credentials: XCredentials {
-            api_key: api_key?,
-            api_secret: api_secret?,
-            access_token: access_token?,
-            access_token_secret: access_token_secret?,
-        },
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,7 +200,7 @@ mod tests {
         for channel in Channel::ALL {
             assert_eq!(Channel::parse(channel.as_str()), Some(channel));
         }
-        assert_eq!(Channel::parse("X"), None);
+        assert_eq!(Channel::parse("x"), None);
         assert_eq!(ChannelMode::parse("enabled"), Some(ChannelMode::Enabled));
         assert_eq!(ChannelMode::parse("on"), None);
     }
@@ -311,31 +244,9 @@ mod tests {
     }
 
     #[test]
-    fn x_credentials_are_all_blank_or_all_present() {
-        assert!(
-            XCredentials::parse_optional("", " ", "", "")
-                .unwrap()
-                .is_none()
-        );
-        let credentials = XCredentials::parse_optional("key", "secret", " token ", "token-secret")
-            .unwrap()
-            .unwrap();
-        assert_eq!(credentials.access_token.expose(), "token");
-        for partial in [["key", "", "token", "secret"], ["key", "se cret", "t", "s"]] {
-            assert_eq!(
-                XCredentials::parse_optional(partial[0], partial[1], partial[2], partial[3])
-                    .unwrap_err(),
-                SettingsError::XCredentials
-            );
-        }
-    }
-
-    #[test]
     fn stored_rows_must_already_be_normalized() {
         assert!(stored_substack("enabled", "example", "s%3Aabc").is_some());
         assert!(stored_substack("enabled", "Example", "s%3Aabc").is_none());
         assert!(stored_substack("on", "example", "s%3Aabc").is_none());
-        assert!(stored_x("paused", ["a", "b", "c", "d"]).is_some());
-        assert!(stored_x("paused", ["a", "", "c", "d"]).is_none());
     }
 }

@@ -50,12 +50,11 @@ required acceptance passes. Do not release address capture without removal and d
 
 ## Sharing
 
-First-publication teasers, Owner-managed Substack and X channels, at-most-once
-delivery, and restore safeguards are implemented. See the [sharing guide](sharing.md).
+First-publication teasers, an Owner-managed Substack channel, copyable post text
+for X, at-most-once delivery, and restore safeguards are implemented. See the [sharing guide](sharing.md).
 
-Accept both channels against real accounts before relying on them: confirm a
-Substack teaser publishes without email, and an X teaser posts within its length limit.
-Substack's interface is unofficial; repeat the check after any unexpected failure.
+Accept the Substack channel against a real account before relying on it: confirm a
+teaser publishes without email. Its interface is unofficial; repeat the check after any unexpected failure.
 
 ## Home server and recovery
 
@@ -107,7 +106,7 @@ Keep one current validation baseline above. Detailed batch history belongs in Gi
 ## Deferred work
 
 Outside v1: browser editing and Git write-back; multiple sites; explicit
-retraction; paid access; sharing channels beyond Substack and X; links from
+retraction; paid access; automatic sharing channels beyond Substack; links from
 articles to their shared posts; replaceable themes and typed widgets; sandboxed article code;
 Obsidian Sync/YAML authoring; crawler/archive workers; and database high availability.
 

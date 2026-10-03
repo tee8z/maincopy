@@ -12,13 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     http::client,
-    settings::{Channel, ChannelMode, SubstackSettings, XSettings},
+    settings::{Channel, ChannelMode, SubstackSettings},
     store::{
         ClaimDelivery, DeliveryFailure, DeliveryOutcome, DueDelivery, FinishDelivery,
         SharingCommandError, SharingLoadError, SharingMutationError, SharingStore,
     },
     substack::SubstackClient,
-    x::XClient,
 };
 use crate::database::store::DatabaseAdmissionError;
 
@@ -40,7 +39,6 @@ pub(crate) enum SharingWorkerError {
 /// Enabled settings whose credentials the provider has not refused.
 enum Sender {
     Substack(SubstackSettings),
-    X(XSettings),
 }
 
 impl SharingWorker {
@@ -143,14 +141,6 @@ impl SharingWorker {
                     stored.settings.mode == ChannelMode::Enabled && !stored.credentials_rejected
                 })
                 .map(|stored| (Sender::Substack(stored.settings), stored.version)),
-            Channel::X => self
-                .store
-                .x()
-                .await?
-                .filter(|stored| {
-                    stored.settings.mode == ChannelMode::Enabled && !stored.credentials_rejected
-                })
-                .map(|stored| (Sender::X(stored.settings), stored.version)),
         })
     }
 
@@ -160,10 +150,6 @@ impl SharingWorker {
         match sender {
             Sender::Substack(settings) => match SubstackClient::new(self.http.clone(), settings) {
                 Ok(client) => client.deliver(&due.teaser, due.draft).await,
-                Err(_) => unprepared,
-            },
-            Sender::X(settings) => match XClient::new(self.http.clone()) {
-                Ok(client) => client.deliver(&settings.credentials, &due.teaser).await,
                 Err(_) => unprepared,
             },
         }

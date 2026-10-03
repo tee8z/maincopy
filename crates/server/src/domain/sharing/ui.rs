@@ -26,7 +26,7 @@ use uuid::Uuid;
 use super::{
     settings::{
         Channel, ChannelMode, SettingsError, StoredChannel, SubstackSubdomain, UpdateSubstack,
-        UpdateX, XCredentials, substack_session,
+        substack_session,
     },
     store::{
         Delivery, DeliveryFailure, DeliveryState, ShareTeaser, SharedTeaser, SharingCommandError,
@@ -66,20 +66,6 @@ struct SubstackForm {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct XForm {
-    #[serde(rename = "_csrf")]
-    _csrf: SecretString,
-    idempotency_key: Box<str>,
-    expected_version: u64,
-    mode: ChannelMode,
-    api_key: SecretString,
-    api_secret: SecretString,
-    access_token: SecretString,
-    access_token_secret: SecretString,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ShareForm {
     #[serde(rename = "_csrf")]
     _csrf: SecretString,
@@ -115,7 +101,6 @@ pub(crate) fn router(
         Router::new()
             .route("/admin/sharing", get(overview))
             .route("/admin/sharing/substack", post(save_substack))
-            .route("/admin/sharing/x", post(save_x))
             .route("/admin/sharing/teasers/{post_id}/{channel}", post(share))
             .route_layer(middleware::from_fn(require_owner))
             .layer(DefaultBodyLimit::max(MAX_FORM_BYTES))
@@ -159,7 +144,6 @@ async fn overview_page(
         .substack()
         .await
         .map_err(|_| UiError::Unavailable)?;
-    let x = state.store.x().await.map_err(|_| UiError::Unavailable)?;
     let teasers = state
         .store
         .recent(RECENT_TEASERS)
@@ -171,9 +155,6 @@ async fn overview_page(
     let substack = substack
         .as_ref()
         .map(|stored| ChannelStatus::of(stored, stored.settings.mode));
-    let x = x
-        .as_ref()
-        .map(|stored| ChannelStatus::of(stored, stored.settings.mode));
     let csrf = browser.csrf_token.expose_secret();
     let fresh = browser.session.fresh_until > OffsetDateTime::now_utc();
     Ok(admin_ui::page_response(
@@ -182,7 +163,7 @@ async fn overview_page(
         PageKind::Authenticated,
         html! {
             h1 { "Sharing" }
-            p { "When an article is published for the first time, Maincopy writes one short teaser and posts it to every enabled channel. The teaser always fits a single X post, so you can also paste it anywhere else. Edits and republishing never share an article again." }
+            p { "When an article is published for the first time, Maincopy writes one short teaser: a post text and the article's link. Substack receives it automatically while enabled. For X or anywhere else, copy the post text below and add the link under it or in a reply; together they always fit a single X post. Edits and republishing never share an article again." }
             @if !fresh { p class="notice" { "Sign out and sign in again before saving settings or sharing a teaser. Your session is no longer fresh." } }
             section class="panel" {
                 h2 { "Substack" }
@@ -201,32 +182,12 @@ async fn overview_page(
                 }
             }
             section class="panel" {
-                h2 { "X" }
-                (channel_summary(Channel::X, x))
-                p class="muted" { "Create an app with read and write user permissions in the X developer console, then paste its API key and secret and your account's access token and secret. X charges the app's credit for every post." }
-                form method="post" action="/admin/sharing/x" {
-                    (form_preamble(csrf, x))
-                    (mode_field("x-mode", x))
-                    @for (name, label) in [
-                        ("api_key", "API key"),
-                        ("api_secret", "API key secret"),
-                        ("access_token", "Access token"),
-                        ("access_token_secret", "Access token secret"),
-                    ] {
-                        p { label for=(format!("x-{name}")) { (label) }
-                            input id=(format!("x-{name}")) name=(name) type="password" autocomplete="off" maxlength="256" placeholder=(secret_placeholder(x));
-                        }
-                    }
-                    button type="submit" disabled[!fresh] { "Save X" }
-                }
-            }
-            section class="panel" {
                 h2 { "Teasers" }
                 @if teasers.is_empty() {
                     p { "No article has been published since sharing was added. The next first publication appears here." }
                 }
                 @for teaser in &teasers {
-                    (teaser_panel(teaser, csrf, fresh, [(Channel::Substack, substack), (Channel::X, x)]))
+                    (teaser_panel(teaser, csrf, fresh, [(Channel::Substack, substack)]))
                 }
             }
         },
@@ -279,14 +240,19 @@ fn teaser_panel(
     shared: &SharedTeaser,
     csrf: &str,
     fresh: bool,
-    channels: [(Channel, Option<ChannelStatus>); 2],
+    channels: [(Channel, Option<ChannelStatus>); 1],
 ) -> Markup {
     let view = shared.teaser.view();
     html! {
         article {
             h3 { (view.title) }
             p class="muted" { "First published " (timestamp(shared.created_at)) }
-            textarea readonly rows="6" aria-label="Teaser text" { (shared.teaser.text()) }
+            p { label for=(format!("teaser-text-{}", view.post_id)) { "Post text" }
+                textarea id=(format!("teaser-text-{}", view.post_id)) readonly rows="5" { (shared.teaser.lead()) }
+            }
+            p { label for=(format!("teaser-link-{}", view.post_id)) { "Article link" }
+                input id=(format!("teaser-link-{}", view.post_id)) readonly value=(view.url);
+            }
             dl {
                 @for (channel, status) in channels {
                     @let delivery = shared.deliveries.iter().find(|delivery| delivery.channel == channel);
@@ -384,40 +350,6 @@ async fn save_substack(
             .await
             .map_err(UiError::Mutation)?;
         Ok(saved_page("Substack settings saved"))
-    }
-    .await;
-    respond(request_id, result)
-}
-
-async fn save_x(
-    request_id: RequestId,
-    principal: AdminPrincipal,
-    Extension(state): Extension<SharingUiState>,
-    form: Result<Form<XForm>, FormRejection>,
-) -> Response {
-    let result = async {
-        let form = decode_form(form)?;
-        let credentials = XCredentials::parse_optional(
-            form.api_key.expose_secret(),
-            form.api_secret.expose_secret(),
-            form.access_token.expose_secret(),
-            form.access_token_secret.expose_secret(),
-        )
-        .map_err(UiError::Settings)?;
-        if credentials.is_none() && form.expected_version == 0 {
-            return Err(UiError::Settings(SettingsError::CredentialsRequired));
-        }
-        state
-            .store
-            .update_x(UpdateX {
-                expected_version: form.expected_version,
-                mode: form.mode,
-                credentials,
-                audit: principal.mutation_audit(request_id, operation_key(&form.idempotency_key)?),
-            })
-            .await
-            .map_err(UiError::Mutation)?;
-        Ok(saved_page("X settings saved"))
     }
     .await;
     respond(request_id, result)

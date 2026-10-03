@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Post to X by hand: the sharing page shows each teaser's post text and link
+  in separate fields for copying. The X API channel and its stored keys are removed.
+
 ## 0.1.6
 
 - Share each newly published article as one short teaser on Substack and X.

@@ -20,7 +20,7 @@ use crate::{
 };
 
 const POST_ID: &str = "11111111-1111-4111-8111-111111111111";
-const SHARE_ON_X: &str = "/admin/sharing/teasers/11111111-1111-4111-8111-111111111111/x";
+const SHARE: &str = "/admin/sharing/teasers/11111111-1111-4111-8111-111111111111/substack";
 const SUBSTACK_SESSION: &str = "s%3Asecret-cookie.signature";
 
 async fn get(router: &Router, browser: &BrowserSession, path: &str) -> Response {
@@ -86,29 +86,6 @@ async fn save_substack(
     .await
 }
 
-async fn save_x(
-    router: &Router,
-    browser: &BrowserSession,
-    version: &str,
-    credentials: [&str; 4],
-) -> Response {
-    submit(
-        router,
-        browser,
-        "/admin/sharing/x",
-        &[
-            ("idempotency_key", &key()),
-            ("expected_version", version),
-            ("mode", "enabled"),
-            ("api_key", credentials[0]),
-            ("api_secret", credentials[1]),
-            ("access_token", credentials[2]),
-            ("access_token_secret", credentials[3]),
-        ],
-    )
-    .await
-}
-
 async fn share(router: &Router, browser: &BrowserSession, path: &str, key: &str) -> StatusCode {
     submit(router, browser, path, &[("idempotency_key", key)])
         .await
@@ -168,7 +145,7 @@ async fn channel_settings_are_saved_from_the_page_and_credentials_are_never_rend
     let store = harness.runtime.sharing.store.clone();
 
     let page = text(get(&router, &browser, "/admin/sharing").await).await;
-    assert_eq!(page.matches("Not set up.").count(), 2);
+    assert_eq!(page.matches("Not set up.").count(), 1);
     assert!(page.contains("No article has been published since sharing was added."));
 
     let response = save_substack(&router, &browser, &key(), "0", "enabled", "").await;
@@ -208,32 +185,13 @@ async fn channel_settings_are_saved_from_the_page_and_credentials_are_never_rend
     let response = save_substack(&router, &browser, &key(), "1", "enabled", "").await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 
-    let response = save_x(&router, &browser, "0", ["consumer-key", "", "", ""]).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let response = save_x(
-        &router,
-        &browser,
-        "0",
-        ["consumer-key", "consumer-secret", "token", "token-secret"],
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let stored = store.x().await.unwrap().unwrap();
-    assert_eq!(stored.version, 1);
-    assert_eq!(
-        stored.settings.credentials.api_secret.expose(),
-        "consumer-secret"
-    );
     let page = text(get(&router, &browser, "/admin/sharing").await).await;
     assert!(page.contains("Paused. Nothing is sent, and queued teasers wait."));
-    for secret in [
-        "consumer-key",
-        "consumer-secret",
-        "token-secret",
-        "secret-cookie",
-    ] {
-        assert!(!page.contains(secret));
-    }
+    assert!(!page.contains("secret-cookie"));
+    // Posting to X is manual: the page offers no X form or route.
+    assert!(!page.contains("/admin/sharing/x"));
+    let response = submit(&router, &browser, "/admin/sharing/x", &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     harness.stop().await;
 }
 
@@ -243,30 +201,26 @@ async fn first_publication_records_one_teaser_for_the_channels_enabled_then() {
     let router = harness.router();
     let browser = harness.password_login(&router).await;
     let store = harness.runtime.sharing.store.clone();
-    let response = save_x(&router, &browser, "0", ["a", "b", "c", "d"]).await;
-    assert_eq!(response.status(), StatusCode::OK);
 
     apply_article(&harness, "First article").await;
     publish_article(&harness).await;
     apply_article(&harness, "Renamed article").await;
     publish_article(&harness).await;
 
+    // No channel was enabled, so the teaser exists only for posting by hand.
     let recent = store.recent(RECENT_TEASERS).await.unwrap();
     assert_eq!(recent.len(), 1);
     assert_eq!(
-        recent[0].teaser.text(),
-        "First article\n\nA <script>description & summary.\n\nhttps://example.test/posts/article"
+        recent[0].teaser.lead(),
+        "First article\n\nA <script>description & summary."
     );
-    assert_eq!(recent[0].deliveries.len(), 1);
-    assert_eq!(recent[0].deliveries[0].channel, Channel::X);
-    assert!(matches!(
-        recent[0].deliveries[0].state,
-        DeliveryState::Queued { .. }
-    ));
+    assert!(recent[0].deliveries.is_empty());
 
     let page = text(get(&router, &browser, "/admin/sharing").await).await;
-    assert!(page.contains("A &lt;script&gt;description &amp; summary."));
-    assert!(page.contains("Queued. "));
+    assert!(
+        page.contains("First article\n\nA &lt;script&gt;description &amp; summary.</textarea>")
+    );
+    assert!(page.contains("readonly value=\"https://example.test/posts/article\""));
     assert!(page.contains("Not shared. "));
     assert!(!page.contains("Share on Substack"));
 
@@ -275,35 +229,32 @@ async fn first_publication_records_one_teaser_for_the_channels_enabled_then() {
     assert_eq!(response.status(), StatusCode::OK);
     let page = text(get(&router, &browser, "/admin/sharing").await).await;
     assert!(page.contains("Share on Substack"));
-    let share_on_substack = SHARE_ON_X.replace("/x", "/substack");
     let first = key();
     for _ in 0..2 {
         assert_eq!(
-            share(&router, &browser, &share_on_substack, &first).await,
+            share(&router, &browser, SHARE, &first).await,
             StatusCode::OK
         );
     }
     assert_eq!(
-        share(&router, &browser, &share_on_substack, &key()).await,
+        share(&router, &browser, SHARE, &key()).await,
         StatusCode::CONFLICT
     );
-    assert_eq!(
-        share(&router, &browser, SHARE_ON_X, &key()).await,
-        StatusCode::CONFLICT
-    );
-    assert_eq!(
-        store.recent(RECENT_TEASERS).await.unwrap()[0]
-            .deliveries
-            .len(),
-        2
-    );
+    let recent = store.recent(RECENT_TEASERS).await.unwrap();
+    assert_eq!(recent[0].deliveries.len(), 1);
+    assert!(matches!(
+        recent[0].deliveries[0].state,
+        DeliveryState::Queued { .. }
+    ));
+    let page = text(get(&router, &browser, "/admin/sharing").await).await;
+    assert!(page.contains("Queued. "));
 
-    let missing = "/admin/sharing/teasers/22222222-2222-4222-8222-222222222222/x";
+    let missing = "/admin/sharing/teasers/22222222-2222-4222-8222-222222222222/substack";
     assert_eq!(
         share(&router, &browser, missing, &key()).await,
         StatusCode::NOT_FOUND
     );
-    let unknown = SHARE_ON_X.replace("/x", "/mastodon");
+    let unknown = SHARE.replace("/substack", "/x");
     assert_eq!(
         share(&router, &browser, &unknown, &key()).await,
         StatusCode::BAD_REQUEST
@@ -317,8 +268,6 @@ async fn a_delivery_is_claimed_once_and_follows_its_recorded_outcome() {
     let router = harness.router();
     let browser = harness.password_login(&router).await;
     let store = harness.runtime.sharing.store.clone();
-    let response = save_x(&router, &browser, "0", ["a", "b", "c", "d"]).await;
-    assert_eq!(response.status(), StatusCode::OK);
     let response = save_substack(&router, &browser, &key(), "0", "enabled", SUBSTACK_SESSION).await;
     assert_eq!(response.status(), StatusCode::OK);
     apply_article(&harness, "First article").await;
@@ -326,17 +275,18 @@ async fn a_delivery_is_claimed_once_and_follows_its_recorded_outcome() {
 
     let post_id = PostId::parse(POST_ID).unwrap();
     let now = OffsetDateTime::now_utc();
-    let claim = |channel, settings_version| ClaimDelivery {
+    let claim = |settings_version| ClaimDelivery {
         post_id: post_id.clone(),
-        channel,
+        channel: Channel::Substack,
         settings_version,
     };
-    let finish = |channel, settings_version, outcome| FinishDelivery {
+    let finish = |settings_version, outcome| FinishDelivery {
         post_id: post_id.clone(),
-        channel,
+        channel: Channel::Substack,
         settings_version,
         outcome,
     };
+    let due = |at| store.due(Channel::Substack, at);
     let stale = Err(SharingMutationError::Command(
         SharingCommandError::StaleVersion,
     ));
@@ -344,101 +294,124 @@ async fn a_delivery_is_claimed_once_and_follows_its_recorded_outcome() {
         SharingCommandError::StateConflict,
     ));
 
-    // Substack: one claim, then a recorded post.
-    assert_eq!(store.claim(claim(Channel::Substack, 2)).await, stale);
-    store.claim(claim(Channel::Substack, 1)).await.unwrap();
-    assert_eq!(store.claim(claim(Channel::Substack, 1)).await, conflict);
-    assert!(store.due(Channel::Substack, now).await.unwrap().is_none());
-    let posted = DeliveryOutcome::Posted {
-        url: "https://example.substack.com/p/first-article".to_owned(),
-    };
-    store
-        .finish(finish(Channel::Substack, 1, posted.clone()))
-        .await
-        .unwrap();
-    assert_eq!(
-        store.finish(finish(Channel::Substack, 1, posted)).await,
-        conflict
-    );
+    // One claim at a time, and only under the settings it was read with.
+    assert_eq!(store.claim(claim(2)).await, stale);
+    store.claim(claim(1)).await.unwrap();
+    assert_eq!(store.claim(claim(1)).await, conflict);
+    assert!(due(now).await.unwrap().is_none());
 
-    // X: refused credentials hold the teaser, uncounted, until new ones are saved.
-    store.claim(claim(Channel::X, 1)).await.unwrap();
+    // Refused credentials hold the teaser, uncounted, until new ones are saved.
     store
         .finish(finish(
-            Channel::X,
             1,
             DeliveryOutcome::CredentialsRejected { draft: Some(9) },
         ))
         .await
         .unwrap();
-    assert!(store.x().await.unwrap().unwrap().credentials_rejected);
-    assert_eq!(store.claim(claim(Channel::X, 1)).await, stale);
-    let page = text(get(&router, &browser, "/admin/sharing").await).await;
-    assert!(page.contains("X refused the saved credentials."));
-    assert!(page.contains("Posted: <a href=\"https://example.substack.com/p/first-article\""));
-    let response = save_x(&router, &browser, "1", ["e", "f", "g", "h"]).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(!store.x().await.unwrap().unwrap().credentials_rejected);
-    assert_eq!(
-        store.due(Channel::X, now).await.unwrap().unwrap().draft,
-        Some(9)
+    assert!(
+        store
+            .substack()
+            .await
+            .unwrap()
+            .unwrap()
+            .credentials_rejected
     );
+    assert_eq!(store.claim(claim(1)).await, stale);
+    let page = text(get(&router, &browser, "/admin/sharing").await).await;
+    assert!(page.contains("Substack refused the saved credentials."));
+    let response = save_substack(&router, &browser, &key(), "1", "enabled", SUBSTACK_SESSION).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !store
+            .substack()
+            .await
+            .unwrap()
+            .unwrap()
+            .credentials_rejected
+    );
+    assert_eq!(due(now).await.unwrap().unwrap().draft, Some(9));
 
     // A refusal fails the delivery; an Owner can queue it again.
-    store.claim(claim(Channel::X, 2)).await.unwrap();
+    store.claim(claim(2)).await.unwrap();
     store
-        .finish(finish(
-            Channel::X,
-            2,
-            DeliveryOutcome::Failed(DeliveryFailure::Refused),
-        ))
+        .finish(finish(2, DeliveryOutcome::Failed(DeliveryFailure::Refused)))
         .await
         .unwrap();
     let page = text(get(&router, &browser, "/admin/sharing").await).await;
-    assert!(page.contains("X refused the post. "));
-    assert!(page.contains("Try again on X"));
+    assert!(page.contains("Substack refused the post. "));
+    assert!(page.contains("Try again on Substack"));
     assert_eq!(
-        share(&router, &browser, SHARE_ON_X, &key()).await,
+        share(&router, &browser, SHARE, &key()).await,
         StatusCode::OK
     );
 
     // A delivery left mid-request by a restart fails closed.
-    store.claim(claim(Channel::X, 2)).await.unwrap();
+    store.claim(claim(2)).await.unwrap();
     assert_eq!(store.fail_interrupted().await, Ok(1));
     assert_eq!(store.fail_interrupted().await, Ok(0));
     let page = text(get(&router, &browser, "/admin/sharing").await).await;
     assert!(page.contains("the post may already exist"));
     assert_eq!(
-        share(&router, &browser, SHARE_ON_X, &key()).await,
+        share(&router, &browser, SHARE, &key()).await,
         StatusCode::OK
     );
 
-    // A transient failure waits for its retry time.
-    store.claim(claim(Channel::X, 2)).await.unwrap();
+    // A recorded post ends the delivery.
+    store.claim(claim(2)).await.unwrap();
+    let posted = DeliveryOutcome::Posted {
+        url: "https://example.substack.com/p/first-article".to_owned(),
+    };
+    store.finish(finish(2, posted.clone())).await.unwrap();
+    assert_eq!(store.finish(finish(2, posted)).await, conflict);
+    let page = text(get(&router, &browser, "/admin/sharing").await).await;
+    assert!(page.contains("Posted: <a href=\"https://example.substack.com/p/first-article\""));
+    assert_eq!(
+        share(&router, &browser, SHARE, &key()).await,
+        StatusCode::CONFLICT
+    );
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transient_failure_waits_for_its_retry_time() {
+    let harness = ProtectedAdminHarness::start_with_password().await;
+    let router = harness.router();
+    let browser = harness.password_login(&router).await;
+    let store = harness.runtime.sharing.store.clone();
+    let response = save_substack(&router, &browser, &key(), "0", "enabled", SUBSTACK_SESSION).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    apply_article(&harness, "First article").await;
+    publish_article(&harness).await;
+
+    let post_id = PostId::parse(POST_ID).unwrap();
+    let now = OffsetDateTime::now_utc();
+    let claim = || ClaimDelivery {
+        post_id: post_id.clone(),
+        channel: Channel::Substack,
+        settings_version: 1,
+    };
+    store.claim(claim()).await.unwrap();
     store
-        .finish(finish(
-            Channel::X,
-            2,
-            DeliveryOutcome::Retry { draft: None },
-        ))
+        .finish(FinishDelivery {
+            post_id: post_id.clone(),
+            channel: Channel::Substack,
+            settings_version: 1,
+            outcome: DeliveryOutcome::Retry { draft: Some(7001) },
+        })
         .await
         .unwrap();
-    assert!(
-        store
-            .due(Channel::X, now + Duration::seconds(30))
-            .await
-            .unwrap()
-            .is_none()
+    let due = |at| store.due(Channel::Substack, at);
+    assert!(due(now + Duration::seconds(30)).await.unwrap().is_none());
+    let later = due(now + Duration::hours(1)).await.unwrap().unwrap();
+    assert_eq!(later.draft, Some(7001));
+    assert_eq!(
+        store.claim(claim()).await,
+        Err(SharingMutationError::Command(
+            SharingCommandError::StateConflict
+        ))
     );
-    assert!(
-        store
-            .due(Channel::X, now + Duration::hours(1))
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(store.claim(claim(Channel::X, 2)).await, conflict);
     let page = text(get(&router, &browser, "/admin/sharing").await).await;
     assert!(page.contains("Waiting to retry after "));
+    assert!(!page.contains("Try again on Substack"));
     harness.stop().await;
 }

@@ -132,7 +132,6 @@ async fn empty_directory_bootstraps_the_complete_core_schema() {
             "sharing_receipts",
             "sharing_substack",
             "sharing_teasers",
-            "sharing_x",
             "site_revisions",
             "site_state",
             "site_tip_recipient",
@@ -1072,7 +1071,7 @@ async fn identifiers_and_hashes_use_blob_storage() {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    assert_eq!(compact_definitions.matches("check(").count(), 251);
+    assert_eq!(compact_definitions.matches("check(").count(), 243);
     for constraint in [
         "check(singleton=1)",
         "check(length(site_revision_digest)=32)",
@@ -1308,5 +1307,67 @@ async fn newsletter_upgrade_marks_existing_articles_without_queueing_archive_ema
         .await
         .unwrap();
     assert_eq!(queued, 0);
+    upgraded.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_x_upgrade_drops_x_keys_and_deliveries_and_keeps_substack() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("v14/maincopy.db");
+    prepare_database_file(&path).unwrap();
+    let mut connection = SqliteConnectOptions::new()
+        .filename(&path)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA application_id = 1296257113")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    MIGRATOR.run_to(14, &mut connection).await.unwrap();
+    let post = [1_u8; 16];
+    for setup in [
+        "INSERT INTO sharing_x VALUES(1,1,'enabled',0,'a','b','c','d')",
+        "INSERT INTO sharing_teasers VALUES(?1,x'22222222222242228222222222222222',0,'Title','','https://example.test/posts/a')",
+        "INSERT INTO sharing_deliveries VALUES(?1,'x','queued',0,0,0,NULL,NULL,NULL)",
+        "INSERT INTO sharing_deliveries VALUES(?1,'substack','posted',1,0,7,9,'https://example.substack.com/p/a',NULL)",
+    ] {
+        sqlx::query(setup)
+            .bind(post.as_slice())
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    }
+    connection.close().await.unwrap();
+    let mut upgraded = bootstrap(configuration(&path)).await.unwrap();
+    let kept: Vec<(String, String, i64, i64, String)> =
+        sqlx::query_as("SELECT channel,state,updated_at,draft,posted_url FROM sharing_deliveries")
+            .fetch_all(&mut upgraded._writer)
+            .await
+            .unwrap();
+    assert_eq!(
+        kept,
+        [(
+            "substack".to_owned(),
+            "posted".to_owned(),
+            7,
+            9,
+            "https://example.substack.com/p/a".to_owned()
+        )]
+    );
+    let x_tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_schema WHERE name IN ('sharing_x','sharing_deliveries_next')",
+    )
+    .fetch_one(&mut upgraded._writer)
+    .await
+    .unwrap();
+    assert_eq!(x_tables, 0);
+    assert!(
+        sqlx::query("INSERT INTO sharing_deliveries VALUES(?,'x','queued',0,0,0,NULL,NULL,NULL)")
+            .bind(post.as_slice())
+            .execute(&mut upgraded._writer)
+            .await
+            .is_err()
+    );
     upgraded.close().await.unwrap();
 }
