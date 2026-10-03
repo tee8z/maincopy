@@ -55,6 +55,7 @@ use crate::{
                 RetainedReleaseInput, StartupSnapshotState,
             },
         },
+        sharing::{ui::SharingUiState, worker::SharingWorker},
     },
     error::{
         ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal, StartupStage,
@@ -144,6 +145,7 @@ struct ServingState {
     metrics_collector: MetricsCollector,
     mail_dispatcher: Option<MailDispatcher>,
     mail_feedback: Option<FeedbackWorker>,
+    sharing_worker: SharingWorker,
 }
 
 struct StartedDatabase {
@@ -591,6 +593,7 @@ impl Application {
             metrics_collector,
             mail_dispatcher,
             mail_feedback,
+            sharing_worker,
         } = serving_state;
         #[cfg(test)]
         let public_addr = public_server.local_addr;
@@ -629,8 +632,13 @@ impl Application {
             CriticalTaskName::MailRetention,
             retention.run(cancellation.clone()),
         );
+        let sharing_task = CriticalTask::new(
+            CriticalTaskName::Sharing,
+            sharing_worker.run(cancellation.clone()),
+        );
         let mut tasks = vec![
             retention_task,
+            sharing_task,
             publication_actor_task,
             public_task,
             admin_task,
@@ -1266,6 +1274,9 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
             snapshots: snapshots.clone(),
             access: mail_access,
         },
+        SharingUiState {
+            store: database.sharing.clone(),
+        },
     );
     let public_state = PublicState {
         snapshots,
@@ -1318,9 +1329,17 @@ async fn prepare_serving_state(input: ServingStateInput<'_>) -> Result<ServingSt
         backup,
         tokio::runtime::Handle::current(),
     );
+    let sharing_worker = SharingWorker::new(database.sharing.clone()).map_err(|error| {
+        startup_failure(
+            StartupStage::Configuration,
+            "configure article sharing",
+            error,
+        )
+    })?;
     Ok(ServingState {
         mail_dispatcher,
         mail_feedback,
+        sharing_worker,
         metrics_server,
         metrics_collector,
         readiness,
@@ -2367,8 +2386,9 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
             StartupHostConfiguration::load(root.path().join("maincopy.toml")),
             Err(ProcessError::AlreadyRunning)
         ));
-        // Retention remains supervised even though this fixture disables mail.
-        assert_eq!(application.runtime.critical_tasks.len(), 8);
+        // Retention and sharing remain supervised even though this fixture
+        // disables mail and configures no channel.
+        assert_eq!(application.runtime.critical_tasks.len(), 9);
         assert!(application.runtime.database_writer.is_some());
         let client = reqwest::Client::builder()
             .no_proxy()

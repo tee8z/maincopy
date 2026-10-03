@@ -57,6 +57,7 @@ use crate::{
             activation::{PublicationCoordinator, PublicationCoordinatorHandle},
             store::InstallStartupSnapshot,
         },
+        sharing::ui::SharingUiState,
     },
     frontend_assets::embedded_manifest,
     render::{compile_content_catalog, render_site_shell, snapshot_store},
@@ -84,6 +85,7 @@ pub(crate) struct BrowserSession {
 pub(crate) struct AdminTestRuntime {
     pub(crate) state: AdminRuntimeState,
     pub(crate) mail: MailUiState,
+    pub(crate) sharing: SharingUiState,
     cancellation: CancellationToken,
     actor: Option<JoinHandle<()>>,
 }
@@ -148,6 +150,9 @@ impl AdminTestRuntime {
                 publications: publications.clone(),
                 snapshots,
                 access: MailUiAccess::Unavailable,
+            },
+            sharing: SharingUiState {
+                store: store.sharing.clone(),
             },
             state: AdminRuntimeState {
                 publications,
@@ -292,6 +297,7 @@ impl ProtectedAdminHarness {
             self.store.profiles.clone(),
             SourceSyncHandle::external_checkout(self.store.source.clone()),
             mail,
+            self.runtime.sharing.clone(),
         )
     }
 

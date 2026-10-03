@@ -3,6 +3,7 @@
 Recover Maincopy from complete encrypted Litestream checkpoints, including the database and retained content artifacts.
 Use [deployment](deployment.md#provision-encrypted-b2-backups) to configure B2 credentials, services, encryption, and retention.
 Subscriber tables enter these checkpoints; restore must apply the [mail recovery safeguards](email-delivery.md#recover-feedback-or-restored-data).
+Sharing credentials also enter these checkpoints; restore [pauses sharing](sharing.md#delivery-and-recovery).
 
 ## Complete checkpoint boundary
 

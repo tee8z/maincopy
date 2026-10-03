@@ -24,6 +24,7 @@ use crate::{
             SetTipRecipient, StoredTipRecipientSetting, StoredUserProfile, TipRecipientProjection,
             UpdateProfile,
         },
+        sharing::teaser::Teaser,
         source::store::{ApplyManagedSourceCatalog, SourceStore},
     },
     frontend_assets::FrontendAssetManifest,
@@ -1651,6 +1652,14 @@ impl PublicationCoordinator {
                 .ok_or(PublicationActivationError::DurableStateMismatch)?,
         )
         .map_err(|_| PublicationActivationError::DurableStateMismatch)?;
+        // Sharing is best effort: an article that cannot be teased still publishes.
+        let teaser = Teaser::for_publication(
+            &catalog,
+            &candidate.snapshot,
+            &selected.stable_post_id,
+            &selected.revision,
+        )
+        .ok();
         self.activator
             .activate(&begun.site.digest, candidate.snapshot)
             .map_err(|_| PublicationActivationError::SnapshotActivationConflict)?;
@@ -1662,6 +1671,7 @@ impl PublicationCoordinator {
             .finish_publication(FinishPublication {
                 publication_id: begun.publication_id,
                 newsletter: Some(newsletter),
+                teaser,
                 expected_publication_version: publication_version,
                 expected_site: begun.site,
                 candidate_site_digest: begun.candidate_site_digest,

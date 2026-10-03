@@ -36,6 +36,10 @@ use crate::domain::publication::store::{
     InstallStartupSnapshot, InstallStartupSnapshotResult, PublicationStore, ReleaseChangeReceipt,
     ReleaseCommandError, SchedulePublication, SchedulePublicationResult,
 };
+use crate::domain::sharing::{
+    settings::{UpdateSubstack, UpdateX},
+    store::{ClaimDelivery, FinishDelivery, ShareTeaser, SharingCommandError, SharingStore},
+};
 use crate::domain::source::store::{
     AdvanceSourceSync, ApplyManagedSourceCatalog, BeginSourceReconfiguration, BeginSourceSync,
     BeginSourceSyncResult, FinishSourceSync, PutSourceConfiguration, SourceStore,
@@ -55,28 +59,7 @@ pub(crate) struct DatabaseStore {
     pub(crate) source: SourceStore,
     pub(crate) mail: CampaignStore,
     pub(crate) subscribers: SubscriberStore,
-}
-
-impl DatabaseStore {
-    pub(super) const fn new(
-        auth: AuthStore,
-        profiles: ProfileStore,
-        publications: PublicationStore,
-        source: SourceStore,
-        mail: CampaignStore,
-        subscribers: SubscriberStore,
-        health: DatabaseHealth,
-    ) -> Self {
-        Self {
-            health,
-            auth,
-            profiles,
-            publications,
-            source,
-            mail,
-            subscribers,
-        }
-    }
+    pub(crate) sharing: SharingStore,
 }
 
 #[derive(Clone)]
@@ -353,6 +336,29 @@ pub(crate) enum Mutation {
     FinishSourceSync {
         command: FinishSourceSync,
         respond_to: oneshot::Sender<Result<StoredSourceSync, DatabaseCommandError>>,
+    },
+    UpdateSharingSubstack {
+        command: UpdateSubstack,
+        respond_to: oneshot::Sender<Result<(), SharingCommandError>>,
+    },
+    UpdateSharingX {
+        command: UpdateX,
+        respond_to: oneshot::Sender<Result<(), SharingCommandError>>,
+    },
+    ShareTeaser {
+        command: ShareTeaser,
+        respond_to: oneshot::Sender<Result<(), SharingCommandError>>,
+    },
+    ClaimSharingDelivery {
+        command: ClaimDelivery,
+        respond_to: oneshot::Sender<Result<(), SharingCommandError>>,
+    },
+    FinishSharingDelivery {
+        command: FinishDelivery,
+        respond_to: oneshot::Sender<Result<(), SharingCommandError>>,
+    },
+    FailInterruptedSharing {
+        respond_to: oneshot::Sender<Result<u64, SharingCommandError>>,
     },
 }
 

@@ -48,6 +48,15 @@ acceptance using the [email guide](email-delivery.md#provider-acceptance-before-
 Use SES; DynamoDB is excluded. Keep capture and sending disabled until all
 required acceptance passes. Do not release address capture without removal and delivery controls.
 
+## Sharing
+
+First-publication teasers, Owner-managed Substack and X channels, at-most-once
+delivery, and restore safeguards are implemented. See the [sharing guide](sharing.md).
+
+Accept both channels against real accounts before relying on them: confirm a
+Substack teaser publishes without email, and an X teaser posts within its length limit.
+Substack's interface is unofficial; repeat the check after any unexpected failure.
+
 ## Home server and recovery
 
 Use [deployment](deployment.md), [backup and restore](backup-restore.md), and
@@ -98,8 +107,8 @@ Keep one current validation baseline above. Detailed batch history belongs in Gi
 ## Deferred work
 
 Outside v1: browser editing and Git write-back; multiple sites; explicit
-retraction; paid access; X/Substack share kits; automatic non-email provider
-publishing; replaceable themes and typed widgets; sandboxed article code;
+retraction; paid access; sharing channels beyond Substack and X; links from
+articles to their shared posts; replaceable themes and typed widgets; sandboxed article code;
 Obsidian Sync/YAML authoring; crawler/archive workers; and database high availability.
 
 These require a design review when scheduled. Historical proposals remain in

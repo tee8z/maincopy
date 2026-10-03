@@ -363,6 +363,7 @@ pub(crate) fn page_response(
                             nav class="actions" aria-label="Administration" {
                                 a href="/admin" { "Posts" }
                                 a href="/admin/mail" { "Mail" }
+                                a href="/admin/sharing" { "Sharing" }
                                 a href="/admin/source" { "Source" }
                                 a href="/admin/profile" { "Profile" }
                                 a href="/admin/tips" { "Tips" }

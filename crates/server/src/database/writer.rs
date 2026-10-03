@@ -49,6 +49,9 @@ use crate::domain::publication::store::{
     change_release, finish_publication, index_content_catalog, install_startup,
     schedule_publication,
 };
+use crate::domain::sharing::store::{
+    self as sharing_store, SharingApplyError, SharingCommandError, SharingStore,
+};
 use crate::domain::source::store::{
     SourceApplyError, SourceStore, advance_sync, apply_catalog, begin_reconfiguration, begin_sync,
     finish_sync, put_configuration,
@@ -82,15 +85,16 @@ impl BootstrappedDatabase {
         );
         metrics.queue_capacity.set(capacity as i64);
         (
-            DatabaseStore::new(
-                AuthStore::new(readers.clone(), mutations.clone()),
-                ProfileStore::new(readers.clone(), mutations.clone()),
-                PublicationStore::new(readers.clone(), mutations.clone()),
-                SourceStore::new(readers.clone(), mutations.clone()),
-                CampaignStore::new(readers.clone(), mutations.clone()),
-                SubscriberStore::new(readers.clone(), mutations),
+            DatabaseStore {
+                auth: AuthStore::new(readers.clone(), mutations.clone()),
+                profiles: ProfileStore::new(readers.clone(), mutations.clone()),
+                publications: PublicationStore::new(readers.clone(), mutations.clone()),
+                source: SourceStore::new(readers.clone(), mutations.clone()),
+                mail: CampaignStore::new(readers.clone(), mutations.clone()),
+                subscribers: SubscriberStore::new(readers.clone(), mutations.clone()),
+                sharing: SharingStore::new(readers.clone(), mutations),
                 health,
-            ),
+            },
             DatabaseWriter {
                 metrics,
                 connection,
@@ -813,6 +817,45 @@ async fn apply_mutation(
                 .map_err(ApplyError::source),
             true,
         ),
+        Mutation::UpdateSharingSubstack {
+            command,
+            respond_to,
+        } => sharing_response(
+            respond_to,
+            sharing_store::update_substack(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::UpdateSharingX {
+            command,
+            respond_to,
+        } => sharing_response(
+            respond_to,
+            sharing_store::update_x(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::ShareTeaser {
+            command,
+            respond_to,
+        } => sharing_response(
+            respond_to,
+            sharing_store::share(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::ClaimSharingDelivery {
+            command,
+            respond_to,
+        } => sharing_response(
+            respond_to,
+            sharing_store::claim(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::FinishSharingDelivery {
+            command,
+            respond_to,
+        } => sharing_response(
+            respond_to,
+            sharing_store::finish(transaction, command, OffsetDateTime::now_utc()).await,
+        ),
+        Mutation::FailInterruptedSharing { respond_to } => sharing_response(
+            respond_to,
+            sharing_store::fail_interrupted(transaction, OffsetDateTime::now_utc()).await,
+        ),
     }
 }
 
@@ -870,6 +913,25 @@ fn subscriber_response<Output: Send + 'static>(
         Err(SubscriberApplyError::Operation(error)) => Err(FailedMutation::Operation(error)),
         Err(SubscriberApplyError::CorruptStoredState) => {
             Err(FailedMutation::Corrupt("mail subscriber"))
+        }
+    }
+}
+
+fn sharing_response<Output: Send + 'static>(
+    respond_to: oneshot::Sender<Result<Output, SharingCommandError>>,
+    result: Result<Output, SharingApplyError>,
+) -> Result<AppliedMutation, FailedMutation> {
+    match result {
+        Ok(output) => Ok(AppliedMutation::new(
+            respond_to,
+            output,
+            SharingCommandError::OutcomeUnknown,
+            true,
+        )),
+        Err(SharingApplyError::Command(error)) => Err(command_failure(respond_to, error)),
+        Err(SharingApplyError::Operation(error)) => Err(FailedMutation::Operation(error)),
+        Err(SharingApplyError::CorruptStoredState) => {
+            Err(FailedMutation::Corrupt("article sharing"))
         }
     }
 }
@@ -1323,6 +1385,7 @@ mod tests {
         FinishPublication {
             publication_id: uuid(publication_id),
             newsletter: None,
+            teaser: None,
             expected_publication_version: 2,
             expected_site,
             candidate_site_digest: candidate,
