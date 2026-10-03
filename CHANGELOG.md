@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.7
+
 - Color fenced code blocks by language on public pages and previews, without
   JavaScript. Published articles keep their approved revisions; the upgrade
   changes presentation only.
