@@ -29,8 +29,8 @@ use super::{
         substack_session,
     },
     store::{
-        Delivery, DeliveryFailure, DeliveryState, ShareTeaser, SharedTeaser, SharingCommandError,
-        SharingMutationError, SharingStore,
+        Delivery, DeliveryFailure, DeliveryState, EditTeaser, ShareTeaser, SharedTeaser,
+        SharingCommandError, SharingMutationError, SharingStore,
     },
 };
 use crate::{
@@ -72,6 +72,15 @@ struct ShareForm {
     idempotency_key: Box<str>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditForm {
+    #[serde(rename = "_csrf")]
+    _csrf: SecretString,
+    idempotency_key: Box<str>,
+    text: Box<str>,
+}
+
 /// The article ID and channel name of one delivery.
 type SharePath = Path<(Box<str>, Box<str>)>;
 
@@ -101,6 +110,7 @@ pub(crate) fn router(
         Router::new()
             .route("/admin/sharing", get(overview))
             .route("/admin/sharing/substack", post(save_substack))
+            .route("/admin/sharing/teasers/{post_id}", post(edit))
             .route("/admin/sharing/teasers/{post_id}/{channel}", post(share))
             .route_layer(middleware::from_fn(require_owner))
             .layer(DefaultBodyLimit::max(MAX_FORM_BYTES))
@@ -247,11 +257,17 @@ fn teaser_panel(
         article {
             h3 { (view.title) }
             p class="muted" { "First published " (timestamp(shared.created_at)) }
-            p { label for=(format!("teaser-text-{}", view.post_id)) { "Post text" }
-                textarea id=(format!("teaser-text-{}", view.post_id)) readonly rows="5" { (shared.teaser.lead()) }
+            form method="post" action=(format!("/admin/sharing/teasers/{}", view.post_id)) {
+                input type="hidden" name="_csrf" value=(csrf);
+                input type="hidden" name="idempotency_key" value=(Uuid::new_v4());
+                p { label for=(format!("teaser-text-{}", view.post_id)) { "Post text" }
+                    textarea id=(format!("teaser-text-{}", view.post_id)) name="text" rows="5" cols="60" maxlength="1200" required { (shared.teaser.lead()) }
+                }
+                p class="muted" { "The first line is the title and the Substack headline. With its link, the text must fit one 280-character X post; the link counts as 23 characters." }
+                button type="submit" disabled[!fresh] { "Save text" }
             }
             p { label for=(format!("teaser-link-{}", view.post_id)) { "Article link" }
-                input id=(format!("teaser-link-{}", view.post_id)) readonly value=(view.url);
+                input id=(format!("teaser-link-{}", view.post_id)) type="text" readonly value=(view.url);
             }
             dl {
                 @for (channel, status) in channels {
@@ -355,6 +371,36 @@ async fn save_substack(
     respond(request_id, result)
 }
 
+async fn edit(
+    request_id: RequestId,
+    principal: AdminPrincipal,
+    Extension(state): Extension<SharingUiState>,
+    path: Result<Path<Box<str>>, PathRejection>,
+    form: Result<Form<EditForm>, FormRejection>,
+) -> Response {
+    let result = async {
+        let Path(post_id) = path.map_err(|_| UiError::InvalidInput)?;
+        let form = decode_form(form)?;
+        state
+            .store
+            .edit(EditTeaser {
+                post_id: PostId::parse(&post_id).map_err(|_| UiError::InvalidInput)?,
+                text: form.text.into_string(),
+                audit: principal.mutation_audit(request_id, operation_key(&form.idempotency_key)?),
+            })
+            .await
+            .map_err(|error| match error {
+                SharingMutationError::Command(SharingCommandError::InvalidValue) => {
+                    UiError::TeaserText
+                }
+                error => UiError::Mutation(error),
+            })?;
+        Ok(saved_page("Post text saved"))
+    }
+    .await;
+    respond(request_id, result)
+}
+
 async fn share(
     request_id: RequestId,
     principal: AdminPrincipal,
@@ -419,6 +465,8 @@ enum UiError {
     Unavailable,
     #[error("the sharing settings are invalid")]
     Settings(#[source] SettingsError),
+    #[error("the edited teaser text has no title or does not fit one post")]
+    TeaserText,
     #[error("apply the sharing mutation")]
     Mutation(#[source] SharingMutationError),
 }
@@ -447,6 +495,10 @@ impl UiError {
             Self::InvalidInput | Self::Settings(_) => (
                 StatusCode::BAD_REQUEST,
                 "The sharing form or address is invalid. Return to sharing and review the current values.",
+            ),
+            Self::TeaserText => (
+                StatusCode::BAD_REQUEST,
+                "The post text needs a first line and, with its link, must fit one 280-character X post. Nothing was saved; go back, shorten the text, and save again.",
             ),
             Self::TooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,

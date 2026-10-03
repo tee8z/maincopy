@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Edit a teaser's post text on the sharing page before it is shared.
+
 ## 0.1.7
 
 - Color fenced code blocks by language on public pages and previews, without

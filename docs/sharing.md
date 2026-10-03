@@ -22,6 +22,10 @@ Articles published before the upgrade to this version have no teaser, so enablin
 
 **Admin → Sharing** lists recent teasers with their post text and link in separate fields.
 Copy the post text into a new post, then add the link under it or in a reply.
+
+Edit the post text and select **Save text** to change what is shared. The first line is the title,
+which Substack uses as the headline; the rest is the summary. A save is refused when the text and
+its link no longer fit one X post. Edit before sharing to Substack: a post already published there keeps its text.
 Maincopy does not use the X API and stores no X credentials.
 
 ## Set up Substack
