@@ -84,7 +84,10 @@ Language names are ASCII-case-insensitive. Use one value without extra whitespac
 | XML | `xml` |
 | YAML | `yaml`, `yml` |
 
-Recognized names select a language CSS class. V1 does not apply syntax highlighting.
+Recognized names select a language CSS class and color the code's comments, strings, numbers,
+keywords, types, functions, and attributes, in light and dark themes. HTML, XML, and diffs stay uncolored.
+Coloring is presentation only: it happens when a page is built, needs no JavaScript, and never
+changes an article's approved revision.
 Empty, `text`, `ascii`, unknown, and multi-token values produce plain escaped code.
 
 ## Mermaid diagrams

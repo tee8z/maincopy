@@ -60,7 +60,7 @@ use crate::{
     error::{
         ApplicationError, CriticalTaskName, ProcessError, ProcessExit, ShutdownSignal, StartupStage,
     },
-    frontend_assets::{FrontendAssetManifest, embedded_manifest, previous_manifest},
+    frontend_assets::{FrontendAssetManifest, embedded_manifest, previous_manifests},
     git_sync::GitSync,
     identity_bootstrap,
     metrics::{Metrics, MetricsCollector, MetricsServer},
@@ -994,11 +994,14 @@ fn find_retained_public_snapshot(
             return Ok(snapshot);
         }
         // Frontend assets participate in site identity. Verify the exact retained
-        // content against the previous release before upgrading its presentation;
+        // content against an earlier release before upgrading its presentation;
         // never substitute the current checkout or an arbitrary retained candidate.
-        let previous = render_site_shell(catalog, previous_manifest(), ledger)
-            .and_then(|shell| shell.into_snapshot());
-        if previous.is_ok_and(|previous| &previous.digest == expected) {
+        let upgrades = previous_manifests().into_iter().any(|previous| {
+            render_site_shell(Arc::clone(&catalog), previous, ledger)
+                .and_then(|shell| shell.into_snapshot())
+                .is_ok_and(|previous| &previous.digest == expected)
+        });
+        if upgrades {
             return Ok(snapshot);
         }
     }
@@ -2989,15 +2992,22 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
                 OffsetDateTime::from_unix_timestamp(1_777_734_400).unwrap(),
             ))
             .unwrap();
-        let previous = render_site_shell(Arc::clone(&approved), previous_manifest(), &ledger)
-            .unwrap()
-            .into_snapshot()
-            .unwrap();
+        let previous = previous_manifests().map(|frontend| {
+            render_site_shell(Arc::clone(&approved), frontend, &ledger)
+                .unwrap()
+                .into_snapshot()
+                .unwrap()
+        });
         let current = render_site_shell(Arc::clone(&approved), embedded_manifest(), &ledger)
             .unwrap()
             .into_snapshot()
             .unwrap();
-        assert_ne!(previous.digest, current.digest);
+        assert_ne!(previous[0].digest, previous[1].digest);
+        assert!(
+            previous
+                .iter()
+                .all(|previous| previous.digest != current.digest)
+        );
         fs::write(
             content_root.join("publication.toml"),
             VALID_PUBLICATION.replace("Pinned startup source", "Unapproved title"),
@@ -3008,26 +3018,29 @@ credentials = { source = \"file\", path = \"must-not-open.json\" }\n";
         let edited =
             Arc::new(compile_content_catalog(&prepare_content(&edited_tree).unwrap()).unwrap());
         let retained = BTreeMap::from([(tree.digest(), approved), (edited_tree.digest(), edited)]);
-        let rebuilt = find_retained_public_snapshot(
-            &retained,
-            &ledger,
-            &previous.digest,
-            embedded_manifest(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(rebuilt.digest, current.digest);
-        assert!(rebuilt.index_page().contains("Pinned startup source"));
-        assert!(!rebuilt.index_page().contains("Unapproved title"));
+        // A site published under any earlier frontend upgrades to the current one.
+        for previous in &previous {
+            let rebuilt = find_retained_public_snapshot(
+                &retained,
+                &ledger,
+                &previous.digest,
+                embedded_manifest(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(rebuilt.digest, current.digest);
+            assert!(rebuilt.index_page().contains("Pinned startup source"));
+            assert!(!rebuilt.index_page().contains("Unapproved title"));
+        }
         let repeated = find_retained_public_snapshot(
             &retained,
             &ledger,
-            &rebuilt.digest,
+            &current.digest,
             embedded_manifest(),
             None,
         )
         .unwrap();
-        assert_eq!(repeated.digest, rebuilt.digest);
+        assert_eq!(repeated.digest, current.digest);
         let missing =
             SiteSnapshotDigest::parse(&format!("site-b3-v1-{}", "ee".repeat(32))).unwrap();
         assert!(matches!(

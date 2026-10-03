@@ -7,6 +7,13 @@
   --accent-contrast: #ffffff;
   --surface: #ffffff;
   --border: #d9d4c9;
+  --code-comment: #6b6860;
+  --code-string: #2f6f3e;
+  --code-number: #9a5b00;
+  --code-keyword: #7a3e9d;
+  --code-type: #1f6f8b;
+  --code-function: #2a5db0;
+  --code-meta: #8a6d1b;
   font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif;
   line-height: 1.6;
 }
@@ -160,6 +167,35 @@ pre {
   font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
 }
 
+.tok-comment {
+  color: var(--code-comment);
+  font-style: italic;
+}
+
+.tok-string {
+  color: var(--code-string);
+}
+
+.tok-number {
+  color: var(--code-number);
+}
+
+.tok-keyword {
+  color: var(--code-keyword);
+}
+
+.tok-type {
+  color: var(--code-type);
+}
+
+.tok-function {
+  color: var(--code-function);
+}
+
+.tok-meta {
+  color: var(--code-meta);
+}
+
 small,
 time {
   color: var(--muted-foreground);
@@ -281,5 +317,12 @@ time {
     --accent-contrast: #1d1c19;
     --surface: #292722;
     --border: #48443b;
+    --code-comment: #a39d92;
+    --code-string: #a5d39a;
+    --code-number: #e6b566;
+    --code-keyword: #d9abf2;
+    --code-type: #84d3e3;
+    --code-function: #96b8ff;
+    --code-meta: #dcc880;
   }
 }

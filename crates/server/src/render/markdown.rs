@@ -15,6 +15,7 @@ use super::{
     SnapshotAssetPath,
     code::CodeLanguage,
     diagram::{DiagramRenderError, DiagramRenderErrorCode, MermaidDiagramRenderer},
+    highlight::tokens,
     svg::SanitizedSvg,
 };
 
@@ -333,40 +334,76 @@ impl RenderedArticle {
                     .map_err(|error| local_asset_projection_error(path, error))?;
             }
         }
+        // The plain projection is the bound every page must meet. Highlighting
+        // then spends only the room that projection left under the limit.
         let mut output = String::with_capacity(self.identity_html.len());
+        let mut code = Vec::new();
         for chunk in &*self.plan {
-            let value = match chunk {
-                ArticleChunk::Literal(value) => value.as_ref(),
-                ArticleChunk::LocalAsset(asset) => {
-                    let projected = project(asset)?;
-                    if output
-                        .len()
-                        .checked_add(projected.len())
-                        .is_none_or(|size| size > limit)
-                    {
-                        return Err(rendered_html_limit_error(path));
-                    }
-                    output.push_str(&projected);
-                    continue;
+            let before = output.len();
+            match chunk {
+                ArticleChunk::Literal(value) => output.push_str(value),
+                ArticleChunk::LocalAsset(asset) => output.push_str(&project(asset)?),
+                ArticleChunk::Code { language, source } => {
+                    output.extend(Escaped::body(source));
+                    code.push((before..output.len(), *language, source));
                 }
-            };
-            if output
-                .len()
-                .checked_add(value.len())
-                .is_none_or(|size| size > limit)
-            {
+            }
+            if output.len() > limit {
                 return Err(rendered_html_limit_error(path));
             }
-            output.push_str(value);
         }
-        Ok(output)
+        if code.is_empty() {
+            return Ok(output);
+        }
+        let mut spare = limit - output.len();
+        let mut highlighted = String::with_capacity(output.len());
+        let mut copied = 0;
+        for (plain, language, source) in code {
+            highlighted.push_str(&output[copied..plain.start]);
+            let colored = highlighted_code(language, source);
+            match colored.len().checked_sub(plain.len()) {
+                Some(growth) if growth <= spare => {
+                    spare -= growth;
+                    highlighted.push_str(&colored);
+                }
+                _ => highlighted.push_str(&output[plain.clone()]),
+            }
+            copied = plain.end;
+        }
+        highlighted.push_str(&output[copied..]);
+        Ok(highlighted)
     }
+}
+
+/// Wrap each classified run in its token class; plain runs stay bare, so the
+/// text content is exactly the escaped source.
+fn highlighted_code(language: CodeLanguage, source: &str) -> String {
+    let mut html = String::with_capacity(source.len());
+    for (kind, text) in tokens(language, source) {
+        match kind {
+            Some(kind) => {
+                html.push_str("<span class=\"");
+                html.push_str(kind.html_class());
+                html.push_str("\">");
+                html.extend(Escaped::body(text));
+                html.push_str("</span>");
+            }
+            None => html.extend(Escaped::body(text)),
+        }
+    }
+    html
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ArticleChunk {
     Literal(Arc<str>),
     LocalAsset(DigestedAsset),
+    /// The body of a fenced block in a known language. Identity HTML holds it
+    /// escaped and uncolored; a page may add token classes when projecting it.
+    Code {
+        language: CodeLanguage,
+        source: Arc<str>,
+    },
 }
 
 struct MarkdownEventRenderer<'input, 'renderer> {
@@ -690,10 +727,13 @@ impl<'input, 'renderer> MarkdownEventRenderer<'input, 'renderer> {
             self.write_block_start("<pre class=\"article-code\"><code class=\"")?;
             self.write(language.html_class())?;
             self.write("\">")?;
+            self.writer
+                .write_code(language, source)
+                .map_err(|_| rendered_html_limit_error(&self.document.path))?;
         } else {
             self.write_block_start("<pre><code>")?;
+            self.write_escaped_body(source)?;
         }
-        self.write_escaped_body(source)?;
         self.write("</code></pre>\n")
     }
 
@@ -1002,6 +1042,25 @@ impl ArticleWriter {
 
     fn write_sanitized_svg(&mut self, svg: &SanitizedSvg) -> Result<(), RenderedHtmlLimit> {
         self.write(svg.as_str())
+    }
+
+    fn write_code(
+        &mut self,
+        language: CodeLanguage,
+        source: &str,
+    ) -> Result<(), RenderedHtmlLimit> {
+        let escaped: usize = Escaped::body(source).map(str::len).sum();
+        self.reserve(escaped)?;
+        self.identity_html.extend(Escaped::body(source));
+        self.flush_literal();
+        self.plan.push(ArticleChunk::Code {
+            language,
+            source: Arc::from(source),
+        });
+        if !source.is_empty() {
+            self.end_newline = source.ends_with('\n');
+        }
+        Ok(())
     }
 
     fn write_local_asset(&mut self, asset: DigestedAsset) -> Result<(), RenderedHtmlLimit> {
@@ -1537,6 +1596,85 @@ mod tests {
             .unwrap();
         assert!(projected.contains(&format!("/assets/{}/images/diagram.png", snapshot())));
         assert!(!projected.contains("assets/images/diagram.png\""));
+    }
+
+    #[test]
+    fn highlighting_colors_the_projected_page_and_never_the_article_identity() {
+        let body = "```rust\nfn main() { let n = 1 < 2; } // <done>\n```\n";
+        let rendered = render(&[], body, &[]);
+        assert_eq!(
+            rendered.article.identity_html.as_ref(),
+            "<pre class=\"article-code\"><code class=\"language-rust\">fn main() { let n = 1 &lt; 2; } // &lt;done&gt;\n</code></pre>\n"
+        );
+        let assets = candidate("Renderer", &[], body, false, &[]);
+        let projected = rendered
+            .project_for_snapshot(
+                &snapshot(),
+                assets.view().site_assets,
+                assets.view().local_assets,
+            )
+            .unwrap();
+        assert_eq!(
+            projected,
+            "<pre class=\"article-code\"><code class=\"language-rust\">\
+             <span class=\"tok-keyword\">fn</span> <span class=\"tok-function\">main</span>() { \
+             <span class=\"tok-keyword\">let</span> n = <span class=\"tok-number\">1</span> &lt; \
+             <span class=\"tok-number\">2</span>; } <span class=\"tok-comment\">// &lt;done&gt;</span>\n\
+             </code></pre>\n"
+        );
+        // Plain, unknown, and markup fences project exactly as their identity.
+        for fence in ["", "text", "html"] {
+            let body = format!("```{fence}\nfn main() {{}}\n```\n");
+            let rendered = render(&[], &body, &[]);
+            let assets = candidate("Renderer", &[], &body, false, &[]);
+            let projected = rendered
+                .project_for_snapshot(
+                    &snapshot(),
+                    assets.view().site_assets,
+                    assets.view().local_assets,
+                )
+                .unwrap();
+            assert_eq!(projected, rendered.article.identity_html.as_ref());
+        }
+    }
+
+    #[test]
+    fn highlighting_spends_only_the_room_the_plain_page_leaves() {
+        let body = "```rust\nfn a() {}\n```\n\n```rust\nfn b() {}\n```\n";
+        let rendered = render(&[], body, &[]);
+        let assets = candidate("Renderer", &[], body, false, &[]);
+        let identity = rendered.article.identity_html.as_ref();
+        let project = |spare: usize| {
+            rendered
+                .article
+                .project_with_local_asset_urls(
+                    &rendered.document.path,
+                    assets.view().local_assets,
+                    identity.len() + spare,
+                    |_| unreachable!("the fixture has no local assets"),
+                )
+                .unwrap()
+        };
+        // Each block grows by one keyword span and one function span.
+        let growth =
+            "<span class=\"tok-keyword\"></span><span class=\"tok-function\"></span>".len();
+        assert_eq!(project(growth - 1), identity);
+        let first_only = project(growth);
+        assert_eq!(first_only.matches("<span").count(), 2);
+        assert!(first_only.contains("<span class=\"tok-function\">a</span>"));
+        assert!(first_only.ends_with("fn b() {}\n</code></pre>\n"));
+        assert_eq!(project(2 * growth).matches("<span").count(), 4);
+        assert!(
+            rendered
+                .article
+                .project_with_local_asset_urls(
+                    &rendered.document.path,
+                    assets.view().local_assets,
+                    identity.len() - 1,
+                    |_| unreachable!("the fixture has no local assets"),
+                )
+                .is_err()
+        );
     }
 
     #[test]

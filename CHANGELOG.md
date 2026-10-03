@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Color fenced code blocks by language on public pages and previews, without
+  JavaScript. Published articles keep their approved revisions; the upgrade
+  changes presentation only.
 - Post to X by hand: the sharing page shows each teaser's post text and link
   in separate fields for copying. The X API channel and its stored keys are removed.
 

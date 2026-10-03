@@ -315,10 +315,16 @@ fn format_digest(
 }
 
 mod v0_1_0;
+mod v0_1_1;
 
-/// The frontend whose content identities preceded the quiet-tips release.
-pub(crate) fn previous_manifest() -> &'static FrontendAssetManifest {
-    &v0_1_0::GENERATED_FRONTEND_MANIFEST
+/// The frontends of earlier releases, newest first: 0.1.1 through 0.1.6, then
+/// 0.1.0. A site published under one of them is verified against it before its
+/// presentation is upgraded.
+pub(crate) fn previous_manifests() -> [&'static FrontendAssetManifest; 2] {
+    [
+        &v0_1_1::GENERATED_FRONTEND_MANIFEST,
+        &v0_1_0::GENERATED_FRONTEND_MANIFEST,
+    ]
 }
 
 include!(concat!(env!("OUT_DIR"), "/frontend_manifest.rs"));
