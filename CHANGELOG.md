@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.6
+
 - Share each newly published article as one short teaser on Substack and X.
   Manage both channels and their credentials in the Owner admin portal, without
   host configuration or a restart. The teaser fits a single X post and is listed
