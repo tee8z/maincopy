@@ -4,6 +4,7 @@ mod asset_path;
 mod catalog;
 mod code;
 mod diagram;
+mod highlight;
 mod markdown;
 mod metadata;
 mod policy;

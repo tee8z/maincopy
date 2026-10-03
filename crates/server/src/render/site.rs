@@ -2129,7 +2129,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        frontend_assets::{embedded_manifest, previous_manifest},
+        frontend_assets::{embedded_manifest, previous_manifests},
         render::compile_content_catalog,
     };
     use markdown_compiler::{
@@ -3657,32 +3657,39 @@ mod tests {
         let snapshot = build_snapshot(&fixture, &ledger).unwrap();
         assert_eq!(
             snapshot.digest.to_string(),
-            "site-b3-v1-e2ca3929e130f171853f453a2a84f75269189f72248b71f140c29d6c0bd83707"
+            "site-b3-v1-1cc1eaff41967e2a2e225c67f728df8dcfa22b4a8676b278af165231e780c9f8"
         );
         assert_eq!(
             snapshot.presentation_digest,
             PresentationDigest([
-                144, 142, 140, 43, 94, 223, 157, 114, 58, 121, 199, 23, 180, 6, 248, 69, 106, 246,
-                16, 11, 105, 240, 25, 201, 164, 33, 13, 65, 103, 186, 156, 82,
+                94, 143, 239, 183, 199, 84, 105, 5, 218, 159, 38, 69, 60, 78, 63, 105, 71, 21, 176,
+                80, 250, 153, 187, 66, 115, 40, 11, 120, 20, 234, 181, 232,
             ])
         );
     }
 
     #[test]
-    fn previous_frontend_reproduces_the_v0_1_0_site_identity() {
+    fn previous_frontends_reproduce_their_released_site_identities() {
         let fixture = fixture();
         let ledger = projection([
             entry(&fixture, FIRST_ID, 1_000),
             entry(&fixture, SECOND_ID, 2_000),
         ]);
-        let previous =
-            render_site_shell(Arc::clone(&fixture.catalog), previous_manifest(), &ledger)
+        let digests = previous_manifests().map(|frontend| {
+            render_site_shell(Arc::clone(&fixture.catalog), frontend, &ledger)
                 .unwrap()
                 .into_snapshot()
-                .unwrap();
+                .unwrap()
+                .digest
+                .to_string()
+        });
+        // Releases 0.1.1 through 0.1.6, then 0.1.0.
         assert_eq!(
-            previous.digest.to_string(),
-            "site-b3-v1-d58571601459e2f96420e12d8d9e85b15181c181de9767199f45a8d7138e8b66"
+            digests,
+            [
+                "site-b3-v1-e2ca3929e130f171853f453a2a84f75269189f72248b71f140c29d6c0bd83707",
+                "site-b3-v1-d58571601459e2f96420e12d8d9e85b15181c181de9767199f45a8d7138e8b66",
+            ]
         );
     }
 
